@@ -1,0 +1,8 @@
+[package]
+name = "bpm"
+version = "0.0.0"
+edition = "2021"
+description = "Bloom Package Manager: an npm-compatible, performance-focused package installer"
+license = "MIT"
+
+[dependencies]

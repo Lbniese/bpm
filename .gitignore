@@ -1,0 +1,37 @@
+target/
+.bpm/
+*.log
+.DS_Store
+.vscode/
+
+# local build-environment workarounds for containers with root-owned
+# cargo/target caches; never intended to be committed
+.cargo-dev/
+.target-dev/
+
+# pi agent session state, not project source
+.pi/
+
+# opencode agent session state, not project source
+.opencode/
+
+# Jekyll build output if the docs site is ever built locally
+docs/_site/
+docs/.jekyll-cache/
+
+# local git hooks source — never committed, install via .githooks/install.sh
+.githooks/
+
+# local implementation plan — not part of the public repository
+IMPLEMENTATION.md
+
+# local, machine-specific benchmark run output — not checked in, but curated
+# baseline/profile summaries committed by the project (reference.json,
+# profiles/README.md) are explicitly re-included below
+benchmarks/baselines/*
+!benchmarks/baselines/reference.json
+benchmarks/profiles/*
+!benchmarks/profiles/README.md
+
+# disposable compiled install-plan cache (regenerated from bpm.lock)
+.bpm-state
