@@ -1,0 +1,62 @@
+name: Deploy docs to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "site/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      site_present: ${{ steps.site.outputs.present }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Harden against the path filter firing on a commit whose checkout has no
+      # site/ (e.g. an intermediate tip during a multi-commit push): without
+      # this, upload-pages-artifact fails because ./site does not exist.
+      - name: Check for site directory
+        id: site
+        run: |
+          if [ -d ./site ] && [ -n "$(ls -A ./site 2>/dev/null)" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::site/ is absent in this commit; skipping Pages build/deploy"
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Configure Pages
+        if: steps.site.outputs.present == 'true'
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact
+        if: steps.site.outputs.present == 'true'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./site
+
+  deploy:
+    needs: build
+    if: needs.build.outputs.site_present == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
