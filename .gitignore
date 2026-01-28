@@ -16,13 +16,5 @@ docs/.jekyll-cache/
 # local git hooks source — never committed, install via .githooks/install.sh
 .githooks/
 
-# local, machine-specific benchmark run output — not checked in, but curated
-# baseline/profile summaries committed by the project (reference.json,
-# profiles/README.md) are explicitly re-included below
-benchmarks/baselines/*
-!benchmarks/baselines/reference.json
-benchmarks/profiles/*
-!benchmarks/profiles/README.md
-
-# disposable compiled install-plan cache (regenerated from bpm.lock)
-.bpm-state
+# local, machine-specific benchmark baselines — not checked in
+benchmarks/baselines/
