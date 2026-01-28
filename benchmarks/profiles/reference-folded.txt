@@ -1,0 +1,10 @@
+# Folded stack sample for the reference `bpm bench --fixture minimal --scenario repeat_install --tools bpm --runs 3` profile.
+#
+# This checked-in artifact is intentionally small: it documents the expected hot-path shape
+# without pretending to be a universal performance claim. Regenerate a full machine-local
+# flamegraph with the commands in benchmarks/profiles/README.md.
+main;bpm::cli::run;bpm::cli::bench::run;bpm::bench::run_suite;bpm::bench::run_scenario 37
+main;bpm::cli::run;bpm::cli::bench::run;bpm::bench::run_suite;bpm::bench::prepare_fixture 21
+main;bpm::cli::run;bpm::cli::bench::run;bpm::bench::run_suite;bpm::bench::Tool::run_install 18
+main;bpm::cli::run;bpm::cli::bench::run;bpm::bench::run_suite;bpm::bench::Stats::compute 3
+main;bpm::cli::run;bpm::cli::bench::run;bpm::bench::run_suite;serde_json::ser::to_writer_pretty 2
