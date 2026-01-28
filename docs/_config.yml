@@ -1,0 +1,5 @@
+title: BPM — Bloom Package Manager
+description: An npm-compatible, performance-first package installer.
+theme: jekyll-theme-minimal
+show_downloads: false
+markdown: kramdown
