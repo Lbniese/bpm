@@ -20,3 +20,6 @@ flate2 = "1.0"
 tar = "0.4"
 ureq = { version = "2.12", features = ["tls"] }
 tempfile = "3.12"
+
+# Graph-plan cache (Milestone 3): deterministic graph + plan hashing
+blake3 = "1.5"

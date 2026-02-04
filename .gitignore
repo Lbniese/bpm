@@ -27,3 +27,6 @@ IMPLEMENTATION.md
 
 # local, machine-specific benchmark baselines — not checked in
 benchmarks/baselines/
+
+# disposable compiled install-plan cache (regenerated from bpm.lock)
+.bpm-state

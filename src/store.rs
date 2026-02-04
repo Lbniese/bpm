@@ -36,6 +36,7 @@ use crate::metrics::Metrics;
 
 const ARTIFACTS: &str = "artifacts/sha512";
 const IMAGES: &str = "images/sha512";
+const GRAPHS: &str = "graphs/blake3";
 const TMP: &str = "tmp";
 const LOCKS: &str = "locks";
 
@@ -110,7 +111,7 @@ impl ArtifactStore {
     /// Open (creating) the store at `root`.
     pub fn open(root: &Path) -> Result<Self, StoreError> {
         fs::create_dir_all(root).map_err(|source| io_err(root, source))?;
-        for sub in [ARTIFACTS, IMAGES, TMP, LOCKS] {
+        for sub in [ARTIFACTS, IMAGES, GRAPHS, TMP, LOCKS] {
             fs::create_dir_all(root.join(sub)).map_err(|source| io_err(root, source))?;
         }
         Ok(Self {
@@ -135,6 +136,15 @@ impl ArtifactStore {
     pub fn image_path(&self, id: &ArtifactId) -> PathBuf {
         let hex = id.to_hex();
         self.root.join(IMAGES).join(&hex[..2]).join(&hex)
+    }
+
+    /// Absolute path of the reusable graph volume for `graph_hex` (a 64-char
+    /// lowercase blake3 hex). The volume holds an immutable `node_modules`
+    /// projection keyed by graph id (IMPLEMENTATION §13), shared across
+    /// projects that have the same graph.
+    pub fn graph_volume_path(&self, graph_hex: &str) -> PathBuf {
+        let prefix = graph_hex.get(..2).unwrap_or("");
+        self.root.join(GRAPHS).join(prefix).join(graph_hex)
     }
 
     fn lock_path(&self, key: &str) -> PathBuf {

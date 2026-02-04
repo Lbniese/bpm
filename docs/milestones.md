@@ -15,8 +15,8 @@ the commit history wins.
 | 0 — Benchmark harness | benchmark CLI, fixture runner, recorded toolchain versions, JSON result format, baseline results | ✅ Done — `bpm bench` |
 | 1 — Artifact-store prototype | registry download, integrity verification, immutable archive storage, safe extraction, concurrent cache-safe installation | ✅ Done — `bpm fetch` |
 | 2 — Package-lock frozen installer | `package-lock.json` v3 import, graph construction, basic `node_modules` materialization, bin linking | ✅ Done — `bpm import`, `bpm install --frozen` |
-| 3 — Graph-plan cache | canonical graph hashing, compiled plan format, graph cache lookup, project state validation | ⬜ Not started |
-| 4 — Reusable graph volumes | graph-volume creation, graph-volume reuse across projects, safe project attachment | ⬜ Not started |
+| 3 — Graph-plan cache | canonical graph hashing, compiled plan format, graph cache lookup, project state validation | ✅ Done — `.bpm-state` |
+| 4 — Reusable graph volumes | graph-volume creation, graph-volume reuse across projects, safe project attachment | ✅ Done — `node_modules` attaches via shallow relays |
 | 5 — Lifecycle support | npm-compatible script environment, derived artifact store, native-addon fixture coverage | ⬜ Not started |
 | 6 — Workspaces and optimization | basic npm workspaces, filesystem capability detection, reflink/clone optimization, adaptive concurrency | ⬜ Not started |
 
@@ -101,3 +101,64 @@ it does not rank or market tools against each other. Verified by:
 Note: benchmark execution needs the network (the registry), like the `bpm
 fetch` real-network smoke test, so it is not part of CI by default. Generate a
 baseline with `bpm bench --fixture minimal --save-baseline benchmarks/baselines`.
+
+## Milestone 3 — done
+
+Success criterion: **unchanged repeated install skips resolution and plan
+construction.**
+
+Delivered: `src/graph.rs` — a canonical `GraphId` (blake3 of a byte-stable
+encoding of the lockfile graph + platform), a compiled `InstallPlan` (the
+deterministic record of materialization operations), and plan cache lookup +
+project-state validation. The installer now:
+
+1. computes the graph id from `bpm.lock`;
+2. reads `.bpm-state` and validates it against the current graph id and the
+   live `node_modules` symlinks (a missing/changed symlink invalidates the
+   plan);
+3. on a valid cached plan, skips fetch/extract/materialize entirely
+   (`plan_cache_hit`);
+4. otherwise installs and writes a fresh `.bpm-state`.
+
+Verified by:
+
+- `src/graph.rs` tests — graph id stable across construction order, changes
+  when a dependency version changes, plan roundtrips through disk, absent plan
+  is a miss not an error, version/graph/state drift each invalidate correctly
+- `tests/install.rs` — a repeat install emits "nothing to install" and records
+  `plan_cache_hit` (not `plan_cache_miss`) in `--json-metrics`; deleting a
+  materialized symlink invalidates the plan and forces a full re-install that
+  restores it
+- `cargo fmt --all --check`, `cargo clippy --workspace --all-targets
+  --all-features -- -D warnings`, `cargo test --workspace` all green (120 tests)
+
+## Milestone 4 — done
+
+Success criterion: **a second project with the same graph performs minimal
+filesystem work.**
+
+Delivered: `src/volume.rs` — reusable graph volumes. A graph volume is an
+immutable, complete `node_modules` projection held in the store at
+`graphs/blake3/<prefix>/<graph-id>/`, keyed by the graph id. Building it is a
+one-time, graph-keyed, idempotent operation (a `metadata.json` marker records
+completeness); any project that shares the graph id reuses it unchanged.
+
+Project attachment is **shallow and safe**: the project's `node_modules` becomes
+a set of top-level relays, one per top-level entry in the volume's
+`node_modules`, each pointing into the volume (never a wholesale `node_modules`
+symlink, which would make the immutable store writable through project paths).
+Nested package paths resolve transitively through the top-level relays, so
+project-relative module resolution keeps working.
+
+Verified by:
+
+- `tests/install.rs::second_project_with_same_graph_reuses_the_volume` — a
+  second project with an identical `bpm.lock` (same graph id), sharing the
+  store, installs with `"graph volume reused"` (no rebuild) and a working
+  `node_modules` (packages, nested dep, and bin all resolve through the volume)
+- `tests/install.rs::plan_cache_invalidates_when_a_symlink_disappears` —
+  deleting a project-side relay invalidates the cached plan; the next install
+  re-attaches and restores it (the volume itself is untouched, since project
+  paths are relays, never the durable store entry)
+- `cargo fmt --all --check`, `cargo clippy --workspace --all-targets
+  --all-features -- -D warnings`, `cargo test --workspace` all green (121 tests)

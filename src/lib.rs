@@ -18,6 +18,7 @@ pub mod bench;
 pub mod diagnostic;
 pub mod doctor;
 pub mod download;
+pub mod graph;
 pub mod integrity;
 pub mod lockfile;
 pub mod manifest;
@@ -26,6 +27,7 @@ pub mod metrics;
 pub mod npm_lock;
 pub mod project;
 pub mod store;
+pub mod volume;
 
 pub use diagnostic::{Diagnostic, Severity};
 pub use doctor::{DoctorReport, ManifestSummary};

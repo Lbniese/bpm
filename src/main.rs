@@ -29,10 +29,10 @@ use serde::Serialize;
 
 use bpm::bench::{self, ScenarioKind, Tool};
 use bpm::doctor::run as doctor_run;
+use bpm::graph;
 use bpm::integrity::{ArtifactId, Integrity};
 use bpm::lockfile::{find_lockfile, Lockfile, BPM_LOCK_FILE};
 use bpm::manifest::PackageManifest;
-use bpm::materializer::materialize;
 use bpm::metrics::Metrics;
 use bpm::npm_lock::{import as import_lock, ImportReport};
 use bpm::store::{ArtifactStore, StoreError};
@@ -505,12 +505,57 @@ fn run_install(
         enforce_frozen(&project_root, &lockfile)?;
     }
 
+    let mut metrics = Metrics::new();
+
+    // Graph-plan cache (Milestone 3): if a valid plan for this graph already
+    // exists and the project's node_modules still matches it, this is an
+    // unchanged repeat install — skip fetch/extract/materialize entirely.
+    let plan_path = graph::plan_path_for(&lockfile_path);
+    let cached_plan = graph::read_plan(&plan_path)?;
+    let plan_valid = match cached_plan.as_ref() {
+        Some(plan) => graph::validate_plan(plan, &lockfile, &project_root, &store).is_ok(),
+        None => false,
+    };
+
+    if plan_valid {
+        // Cache hit: the graph + materialized state are unchanged, so there is
+        // no resolution or plan construction work to do. Record the hit so
+        // metrics/trace reflect the skip.
+        metrics.record("plan_cache_hit", std::time::Duration::ZERO);
+        let plan = cached_plan.as_ref().unwrap();
+        let materialized = plan
+            .entries
+            .iter()
+            .filter(|e| !e.link && !e.resolved.is_empty() && !e.artifact_hex.is_empty())
+            .count();
+        let bins = plan.entries.iter().map(|e| e.bin.len()).sum::<usize>();
+        println!(
+            "nothing to install — graph {} unchanged ({} package(s), {} bin(s) already materialized)",
+            graph::graph_id(&lockfile).to_hex_short(),
+            materialized,
+            bins,
+        );
+        if trace_enabled() {
+            metrics
+                .print_trace(&mut io::stderr())
+                .map_err(|e| anyhow::anyhow!("failed to write trace: {e}"))?;
+        }
+        if let Some(path) = json_metrics {
+            fs::write(&path, metrics.to_json()).map_err(|e| {
+                anyhow::anyhow!("failed to write metrics to {}: {e}", path.display())
+            })?;
+        }
+        return Ok(());
+    }
+
+    // Cache miss: record it and proceed to build the work list + install.
+    metrics.record("plan_cache_miss", std::time::Duration::ZERO);
+
     // Build the fetchable work list in lockfile order (deterministic). Each
     // item carries its package index so outcomes can be re-sorted into lockfile
     // order before materialization.
     let work = build_install_work(&lockfile, frozen)?;
 
-    let mut metrics = Metrics::new();
     let mut cached = 0usize;
     let mut fetched = 0usize;
 
@@ -585,21 +630,45 @@ fn run_install(
         }
     }
 
-    // Materialize (sequential): pair each package entry with its ArtifactId.
-    let resolved: Vec<(_, ArtifactId)> = outcomes
+    // Pair each package entry with its ArtifactId for the graph volume.
+    let mut artifact_ids: Vec<Option<ArtifactId>> =
+        (0..lockfile.packages.len()).map(|_| None).collect();
+    for o in &outcomes {
+        if o.idx < artifact_ids.len() {
+            artifact_ids[o.idx] = Some(o.id);
+        }
+    }
+
+    // Build (or reuse) the reusable graph volume for this graph id, then attach
+    // the project to it via shallow top-level relays. A second project that
+    // shares the graph id hits `ensure_graph_volume` as a cache (no rebuild).
+    let volume = bpm::volume::ensure_graph_volume(&store, &lockfile, &artifact_ids, &mut metrics)?;
+    let attach = bpm::volume::attach_project(&project_root, &volume)?;
+
+    // Compile and persist the install plan so the next run can skip resolution
+    // and materialization when the graph + project state are unchanged.
+    let plan = graph::build_plan(&lockfile, &artifact_ids);
+    if let Err(e) = graph::write_plan(&plan, &plan_path) {
+        eprintln!("warning: failed to write plan {}: {e}", plan_path.display());
+    }
+
+    // The volume's materialize stats only count work done on a build; on a cache
+    // reuse (volume.cached) they are zero. Report the project's package count from
+    // the authoritative lockfile so the message is stable across build vs reuse.
+    let package_count = lockfile
+        .packages
         .iter()
-        .map(|o| (&lockfile.packages[o.idx], o.id))
-        .collect();
-    let mat_stats = materialize(&project_root, &store, &resolved)?;
+        .filter(|p| !p.link && !p.resolved.is_empty())
+        .count();
 
     println!(
-        "installed {} package(s) into {} ({} cached, {} fetched; {} bin(s) linked, {} collision(s))",
-        mat_stats.packages_materialized,
+        "installed {} package(s) into {} ({} cached, {} fetched; graph volume {}, {} relay(s))",
+        package_count,
         project_root.join("node_modules").display(),
         cached,
         fetched,
-        mat_stats.bins_linked,
-        mat_stats.bins_collisions,
+        if volume.cached { "reused" } else { "built" },
+        attach.relays_created + attach.relays_unchanged,
     );
 
     if trace_enabled() {
