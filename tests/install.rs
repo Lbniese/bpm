@@ -156,7 +156,8 @@ fn frozen_install_materializes_node_modules_and_bins() {
         stdout.contains("installed 2 package(s)"),
         "stdout: {stdout}"
     );
-    assert!(stdout.contains("1 bin(s) linked"), "stdout: {stdout}");
+    // The project attaches to a reusable graph volume via shallow relays.
+    assert!(stdout.contains("graph volume built"), "stdout: {stdout}");
 
     let nm = project.path().join("node_modules");
     assert_resolves(&nm.join("greet"));
@@ -184,9 +185,16 @@ fn repeat_install_is_a_no_op_on_the_store() {
     let stdout = String::from_utf8_lossy(&second.stdout);
     let stderr = String::from_utf8_lossy(&second.stderr);
     assert!(second.status.success(), "second install failed: {stderr}");
-    // Second run against the populated store: everything served from cache.
-    assert!(stdout.contains("2 cached"), "stdout: {stdout}");
-    assert!(stdout.contains("0 fetched"), "stdout: {stdout}");
+    // Milestone 3: with a valid cached plan, the second run skips resolution
+    // and plan construction entirely — a plan-cache hit, not a store cache hit.
+    assert!(
+        stdout.contains("nothing to install"),
+        "expected plan-cache hit, stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("already materialized"),
+        "expected plan-cache hit, stdout: {stdout}"
+    );
 
     let after = fs::read_link(&greet_link).unwrap();
     assert_eq!(before, after, "idempotent rerun rewrote the symlink");
@@ -223,4 +231,116 @@ fn install_runs_offline_without_network() {
     let (project, store, _tgz) = setup_project();
     let out = run_install(project.path(), store.path());
     assert!(out.status.success());
+}
+
+#[test]
+fn plan_cache_hit_is_recorded_in_metrics() {
+    let (project, store, _tgz) = setup_project();
+    let m1 = project.path().join("m1.json");
+    let m2 = project.path().join("m2.json");
+
+    run_install(project.path(), store.path());
+    // Second run must record a plan cache hit, not a miss.
+    Command::new(bpm_bin())
+        .arg("install")
+        .arg("--frozen")
+        .arg("--store")
+        .arg(store.path())
+        .arg("--json-metrics")
+        .arg(&m2)
+        .current_dir(project.path())
+        .output()
+        .expect("failed to run bpm");
+    let m2_text = fs::read_to_string(&m2).unwrap();
+    assert!(m2_text.contains("\"plan_cache_hit\""), "metrics: {m2_text}");
+    assert!(
+        !m2_text.contains("\"plan_cache_miss\""),
+        "second run should not miss: {m2_text}"
+    );
+    let _ = m1;
+}
+
+#[test]
+fn plan_cache_invalidates_when_a_symlink_disappears() {
+    let (project, store, _tgz) = setup_project();
+
+    let first = run_install(project.path(), store.path());
+    assert!(first.status.success());
+    // A second run hits the cache.
+    let second = run_install(project.path(), store.path());
+    let stdout = String::from_utf8_lossy(&second.stdout);
+    assert!(stdout.contains("nothing to install"), "stdout: {stdout}");
+
+    // Drift: someone deleted a materialized package symlink. The cached plan's
+    // project-state validation must reject it and force a full re-install.
+    let target = project.path().join("node_modules/greet");
+    fs::remove_file(&target).unwrap();
+
+    let third = run_install(project.path(), store.path());
+    let stdout = String::from_utf8_lossy(&third.stdout);
+    let stderr = String::from_utf8_lossy(&third.stderr);
+    assert!(third.status.success(), "reinstall failed: {stderr}");
+    assert!(
+        stdout.contains("installed 2 package(s)"),
+        "expected a full re-install after drift, stdout: {stdout}"
+    );
+    assert!(target.exists(), "package symlink should be restored");
+}
+
+#[test]
+fn second_project_with_same_graph_reuses_the_volume() {
+    // Milestone 4 success criterion: a second project that shares the same
+    // graph (identical bpm.lock) performs minimal filesystem work — it reuses
+    // the already-built graph volume in the shared store rather than rebuilding.
+
+    // Project A builds the volume the first time.
+    let (proj_a, store, tgz) = setup_project();
+    let out_a = run_install(proj_a.path(), store.path());
+    let stdout_a = String::from_utf8_lossy(&out_a.stdout);
+    assert!(out_a.status.success());
+    assert!(
+        stdout_a.contains("graph volume built"),
+        "stdout: {stdout_a}"
+    );
+
+    // Project B: same store, identical bpm.lock (same graph id) + package.json.
+    let proj_b = tempdir().unwrap();
+    fs::write(
+        proj_b.path().join("package.json"),
+        fs::read_to_string(proj_a.path().join("package.json")).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        proj_b.path().join("bpm.lock"),
+        fs::read_to_string(proj_a.path().join("bpm.lock")).unwrap(),
+    )
+    .unwrap();
+    let _ = tgz; // tarballs live via file:// URLs in the shared lockfile
+
+    let out_b = run_install(proj_b.path(), store.path());
+    let stdout_b = String::from_utf8_lossy(&out_b.stdout);
+    let stderr_b = String::from_utf8_lossy(&out_b.stderr);
+    assert!(out_b.status.success(), "second install failed: {stderr_b}");
+    // The volume is reused (no rebuild); only the project relays were created.
+    assert!(
+        stdout_b.contains("graph volume reused"),
+        "expected volume reuse, stdout: {stdout_b}"
+    );
+    // And the project view works through the reused volume.
+    assert!(proj_b
+        .path()
+        .join("node_modules/greet/package.json")
+        .exists());
+    assert!(proj_b
+        .path()
+        .join("node_modules/greet/node_modules/dep/package.json")
+        .exists());
+    assert!(proj_b.path().join("node_modules/.bin/hello").exists());
+    // Project B's node_modules is a relay layer INTO the shared volume.
+    let relay = fs::read_link(proj_b.path().join("node_modules/greet")).unwrap();
+    assert!(
+        relay.to_string_lossy().contains("graphs/blake3"),
+        "relay should point into the graph volume: {}",
+        relay.display()
+    );
 }
