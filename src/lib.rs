@@ -20,6 +20,7 @@ pub mod doctor;
 pub mod download;
 pub mod graph;
 pub mod integrity;
+pub mod lifecycle;
 pub mod lockfile;
 pub mod manifest;
 pub mod materializer;
@@ -28,6 +29,7 @@ pub mod npm_lock;
 pub mod project;
 pub mod store;
 pub mod volume;
+pub mod workspace;
 
 pub use diagnostic::{Diagnostic, Severity};
 pub use doctor::{DoctorReport, ManifestSummary};
