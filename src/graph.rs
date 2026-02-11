@@ -173,6 +173,29 @@ pub fn graph_id(lockfile: &Lockfile) -> GraphId {
     GraphId(blake3::hash(&bytes))
 }
 
+/// Graph id including the workspace layout (IMPLEMENTATION §15: "include
+/// workspace layout in the graph ID"). Falls back to the plain graph id when
+/// the project has no workspaces.
+pub fn graph_id_with_workspace(
+    lockfile: &Lockfile,
+    workspace: &crate::workspace::WorkspaceLayout,
+) -> GraphId {
+    if workspace.packages.is_empty() && workspace.patterns.is_empty() {
+        return graph_id(lockfile);
+    }
+    let mut bytes = canonical_graph_bytes(lockfile);
+    bytes.extend(crate::workspace::canonical_workspace_bytes(workspace));
+    GraphId(blake3::hash(&bytes))
+}
+
+/// Graph id for a project: discovers the workspace layout from `project_root`
+/// and folds it into the id, so a change to the workspace tree invalidates the
+/// cached plan/volume.
+pub fn graph_id_for_project(lockfile: &Lockfile, project_root: &Path) -> GraphId {
+    let ws = crate::workspace::discover(project_root);
+    graph_id_with_workspace(lockfile, &ws)
+}
+
 /// Build a compiled plan from a lockfile and the resolved artifact id for each
 /// fetchable package. `artifact_ids` is indexed by package position in
 /// `lockfile.packages` (the installer sorts outcomes back into this order).
@@ -288,7 +311,7 @@ pub fn validate_plan(
     if plan.plan_version != PLAN_VERSION || plan.materializer_version != MATERIALIZER_VERSION {
         return Err(PlanInvalid::VersionMismatch);
     }
-    let current = graph_id(lockfile).to_hex();
+    let current = graph_id_for_project(lockfile, project_root).to_hex();
     if plan.graph_id_hex != current {
         return Err(PlanInvalid::GraphChanged);
     }

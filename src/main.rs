@@ -125,9 +125,15 @@ enum Commands {
         /// Write phase metrics as canonical JSON to `PATH`.
         #[arg(long = "json-metrics")]
         json_metrics: Option<PathBuf>,
-        /// Do not run lifecycle scripts (no-op for now; scripts arrive later).
+        /// Do not run lifecycle scripts (scripts run by default now; this
+        /// skips them for a trust-free install).
         #[arg(long)]
         ignore_scripts: bool,
+    },
+    /// Run a `package.json` lifecycle script with an npm-compatible environment.
+    Run {
+        /// Script name to run (e.g. `build`, `test`, `preinstall`).
+        script: String,
     },
 }
 
@@ -184,6 +190,13 @@ fn main() -> ExitCode {
             json_metrics,
             ignore_scripts,
         } => match run_install(frozen, store, concurrency, json_metrics, ignore_scripts) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("error: {err:#}");
+                ExitCode::FAILURE
+            }
+        },
+        Commands::Run { script } => match run_script_cmd(&script) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 eprintln!("error: {err:#}");
@@ -531,7 +544,7 @@ fn run_install(
         let bins = plan.entries.iter().map(|e| e.bin.len()).sum::<usize>();
         println!(
             "nothing to install — graph {} unchanged ({} package(s), {} bin(s) already materialized)",
-            graph::graph_id(&lockfile).to_hex_short(),
+            graph::graph_id_for_project(&lockfile, &project_root).to_hex_short(),
             materialized,
             bins,
         );
@@ -645,9 +658,47 @@ fn run_install(
     let volume = bpm::volume::ensure_graph_volume(&store, &lockfile, &artifact_ids, &mut metrics)?;
     let attach = bpm::volume::attach_project(&project_root, &volume)?;
 
+    // Lifecycle scripts (Milestone 5): run permitted scripts for installed
+    // packages in isolated sandboxes. `--ignore-scripts` skips the whole phase.
+    if !ignore_scripts {
+        let policy = bpm::lifecycle::LifecyclePolicy {
+            ignore_scripts: false,
+        };
+        match bpm::lifecycle::run_lifecycle(
+            &project_root,
+            &store,
+            &lockfile,
+            &artifact_ids,
+            policy,
+            &mut metrics,
+        ) {
+            Ok(lc) => {
+                if lc.packages_with_scripts > 0 {
+                    eprintln!(
+                        "lifecycle: {} package(s) with scripts ({} phase(s) executed, {} succeeded, {} failed)",
+                        lc.packages_with_scripts,
+                        lc.phases_executed,
+                        lc.phases_succeeded,
+                        lc.phases_failed,
+                    );
+                    for o in &lc.outcomes {
+                        let mark = if o.exit_code == Some(0) { "ok" } else { "FAIL" };
+                        eprintln!("  [{mark}] {}.{}) {}", o.package, o.phase, o.command);
+                    }
+                }
+            }
+            Err(e) => eprintln!("warning: lifecycle phase failed: {e}"),
+        }
+    } else {
+        metrics.record("lifecycle", std::time::Duration::ZERO);
+    }
+
     // Compile and persist the install plan so the next run can skip resolution
-    // and materialization when the graph + project state are unchanged.
-    let plan = graph::build_plan(&lockfile, &artifact_ids);
+    // and materialization when the graph + project state are unchanged. The graph
+    // id folds in the workspace layout (if any), so a workspace-tree change
+    // invalidates the cached plan/volume.
+    let mut plan = graph::build_plan(&lockfile, &artifact_ids);
+    plan.graph_id_hex = graph::graph_id_for_project(&lockfile, &project_root).to_hex();
     if let Err(e) = graph::write_plan(&plan, &plan_path) {
         eprintln!("warning: failed to write plan {}: {e}", plan_path.display());
     }
@@ -684,7 +735,59 @@ fn run_install(
     Ok(())
 }
 
-/// `--frozen` drift guard: refuse if the set of root dependency names declared
+/// Run a `package.json` script by name with an npm-compatible environment.
+fn run_script_cmd(script: &str) -> anyhow::Result<()> {
+    let cwd = env::current_dir()?;
+    let manifest = PackageManifest::from_path(&cwd.join("package.json"))
+        .map_err(|e| anyhow::anyhow!("no readable package.json in {}: {e}", cwd.display()))?;
+    let command = manifest
+        .scripts
+        .get(script)
+        .ok_or_else(|| anyhow::anyhow!("script '{script}' is not defined in package.json"))?;
+
+    let bin = cwd.join("node_modules").join(".bin");
+    let mut child = std::process::Command::new("sh");
+    child.arg("-c").arg(command).current_dir(&cwd);
+    // npm-compatible environment (IMPLEMENTATION §14).
+    child.env("npm_lifecycle_event", script);
+    child.env("npm_lifecycle_script", command);
+    child.env(
+        "npm_package_name",
+        manifest.name.clone().unwrap_or_default(),
+    );
+    child.env(
+        "npm_package_version",
+        manifest.version.clone().unwrap_or_default(),
+    );
+    child.env("npm_config_user_agent", "bpm/0.1.0");
+    child.env("npm_execpath", "bpm");
+    child.env("INIT_CWD", &cwd);
+    child.env("NODE", which("node").unwrap_or_else(|| "node".into()));
+    if let Some(path) = env::var_os("PATH") {
+        let mut new_path = std::ffi::OsString::from(&bin);
+        new_path.push(std::path::MAIN_SEPARATOR.to_string());
+        new_path.push(&path);
+        child.env("PATH", new_path);
+    }
+    let status = child
+        .status()
+        .map_err(|e| anyhow::anyhow!("failed to run script: {e}"))?;
+    if !status.success() {
+        anyhow::bail!("script '{script}' exited with status {:?}", status.code());
+    }
+    Ok(())
+}
+
+fn which(tool: &str) -> Option<String> {
+    std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("command -v {tool}"))
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+}
 /// in `package.json` (`dependencies` ∪ `devDependencies`) differs from the set
 /// recorded in `bpm.lock`'s root entry. A missing/unreadable `package.json` is
 /// treated as a warning, not an error (a project may ship only a lockfile).

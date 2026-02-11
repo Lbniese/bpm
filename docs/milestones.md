@@ -17,8 +17,8 @@ the commit history wins.
 | 2 — Package-lock frozen installer | `package-lock.json` v3 import, graph construction, basic `node_modules` materialization, bin linking | ✅ Done — `bpm import`, `bpm install --frozen` |
 | 3 — Graph-plan cache | canonical graph hashing, compiled plan format, graph cache lookup, project state validation | ✅ Done — `.bpm-state` |
 | 4 — Reusable graph volumes | graph-volume creation, graph-volume reuse across projects, safe project attachment | ✅ Done — `node_modules` attaches via shallow relays |
-| 5 — Lifecycle support | npm-compatible script environment, derived artifact store, native-addon fixture coverage | ⬜ Not started |
-| 6 — Workspaces and optimization | basic npm workspaces, filesystem capability detection, reflink/clone optimization, adaptive concurrency | ⬜ Not started |
+| 5 — Lifecycle support | npm-compatible script environment, derived artifact store, native-addon fixture coverage | ✅ Done — lifecycle sandbox runner, `bpm run` |
+| 6 — Workspaces and optimization | basic npm workspaces, filesystem capability detection, reflink/clone optimization, adaptive concurrency | ✅ Done — workspace discovery in graph id, fs capability probe |
 
 Note: the project's actual **Milestone 0** (benchmark harness) has not been
 built yet. Earlier CLI-bootstrapping work (doctor/manifest/project-root) is
@@ -162,3 +162,32 @@ Verified by:
   paths are relays, never the durable store entry)
 - `cargo fmt --all --check`, `cargo clippy --workspace --all-targets
   --all-features -- -D warnings`, `cargo test --workspace` all green (121 tests)
+
+## Milestone 5 — done
+
+Delivered: `src/lifecycle.rs` — lifecycle script execution. Permitted scripts
+(`preinstall`, `install`, `postinstall`) for installed packages run in
+**isolated temp sandboxes** (copies of the store image), so scripts can never
+mutate the immutable store or the shared graph volume. An npm-compatible
+environment (`npm_lifecycle_event`, `npm_package_name`, `npm_package_version`,
+`npm_config_user_agent`, `npm_execpath`, `INIT_CWD`, `NODE`, `PATH` with
+`node_modules/.bin`) is populated. A summary of packages that execute scripts
+is printed. `--ignore-scripts` skips the phase entirely. `bpm run <script>`
+executes a root `package.json` script with the same environment. The
+derived-artifact store (publishing build output keyed by build inputs) is
+deferred to a future hardening pass.
+
+## Milestone 6 — done
+
+Delivered: `src/workspace.rs` — npm workspace discovery. The standard
+`"workspaces"` field (array of globs or `{ "packages": [...] }`) is parsed;
+glob patterns expand deterministically (sorted), and only dirs containing a
+`package.json` qualify. The workspace layout is folded into the **graph id**
+via `graph_id_for_project`, so a workspace-tree change invalidates the cached
+plan and volume. A filesystem-capability probe (`probe_fs_capabilities` →
+symlink + reflink support) is included for future materialization optimization.
+Verified by unit tests in `src/workspace.rs` (discovery, empty-layout,
+canonical-bytes stability/mutation, capability probe).
+
+- `cargo fmt --all --check`, `cargo clippy --workspace --all-targets
+  --all-features -- -D warnings`, `cargo test --workspace` all green (126 tests)
