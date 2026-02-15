@@ -1,0 +1,90 @@
+[package]
+name = "bpm"
+version = "0.3.0"
+edition = "2021"
+description = "Bloom Package Manager: an npm-compatible, performance-focused package installer"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+
+# Artifact store + download
+hex = "0.4"
+sha2 = "0.10"
+base64 = "0.22"
+flate2 = "1.0"
+tar = "0.4"
+# HTTP transport: reqwest::blocking over a pooled client, negotiating HTTP/2
+# over TLS (ALPN) so concurrent registry/tarball requests multiplex per host.
+# rustls negotiates HTTP/2 reliably across platforms; native-tls on macOS often
+# fails ALPN and silently falls back to HTTP/1.1, capping metadata throughput.
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "blocking", "http2", "stream"] }
+
+# Async runtime for the non-blocking resolver path. Used by `async_resolver`
+# to issue concurrent packument fetches without stalling the resolution thread.
+# `net` is also used by the bench parity proxy to bind its listener.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net"] }
+# Stream combinators used to bound retryable async response-body draining
+# (shared with the blocking client's bounded drain limit).
+futures-util = "0.3"
+httpdate = "1.0.3"
+tempfile = "3.12"
+
+# Hidden terminal input for interactive password/OTP entry. Secrets are
+# resolved from `$BPM_PASSWORD`/`$BPM_OTP` for automation or a hidden prompt for
+# interactive use; they are never accepted as argv values. Cross-platform
+# (unix/windows/macos) and pure-Rust, no system deps beyond the libc already
+# pulled in for reflinks.
+rpassword = "7"
+
+# Graph-plan cache: deterministic graph + plan hashing
+blake3 = "1.5"
+
+# Registry resolution: package-spec -> version range matching
+semver = "1.0"
+# Percent-encoding of user-controlled registry path segments (dist-tags,
+# collaborator names, token keys) so reserved delimiters cannot change the
+# request target. Direct dep so we do not rely on `url`'s transitive copy.
+percent-encoding = "2.3"
+
+# In-memory LRU cache for parsed packument bodies in the resolver
+lru = "0.16"
+
+# Persistent metadata index (filesystem objects remain the source of truth).
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+url = "2.5"
+ignore = "0.4"
+
+# Benchmark parity proxy: a counting HTTP/1.1 reverse proxy that
+# sits in front of npm/pnpm/bpm during `bpm bench --profile-parity` so every
+# tool's {request_count, response_bytes, peak_concurrent} is captured on the
+# same footing. hyper 1.x splits the server runtime into `hyper-util` and body
+# helpers into `http-body-util`; the upstream fetch reuses reqwest (rustls).
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["server", "http1", "tokio"] }
+http-body = "1"
+http-body-util = "0.1"
+http = "1"
+bytes = "1"
+
+# Unix-only: copy-on-write reflink/clone syscalls for the project-local view
+# backend (macOS `clonefile(2)`, Linux `FICLONE` ioctl). The `Reflink`
+# materialize backend degrades to hardlink->copy when the filesystem lacks
+# support, so this dep only adds a faster path, never a correctness dependency.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+]}
+
+[dev-dependencies]
+# Deterministic property and malformed-input regression tests.
+proptest = "1.11.0"
