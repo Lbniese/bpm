@@ -9,9 +9,10 @@
 //! - `materializer`: project-local `node_modules` materialization for the
 //!   frozen installer.
 //! - `bench`: benchmark harness and tool runner.
+//! - `registry`: npm-registry packument resolution (name/spec -> tarball).
 //!
-//! Resolver/registry-metadata/graph/lifecycle work is intentionally absent and
-//! arrives in later milestones.
+//! Full graph dependency resolution is intentionally still absent and arrives
+//! in later milestones.
 
 pub mod archive;
 pub mod bench;
@@ -27,6 +28,7 @@ pub mod materializer;
 pub mod metrics;
 pub mod npm_lock;
 pub mod project;
+pub mod registry;
 pub mod store;
 pub mod volume;
 pub mod workspace;

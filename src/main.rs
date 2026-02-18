@@ -5,10 +5,12 @@
 //! * `bpm --version` — prints the built-in package version (handled by clap).
 //! * `bpm doctor` — inspects the nearest `package.json` and reports
 //!   structured diagnostics.
-//! * `bpm fetch <url>` — downloads a package tarball by exact URL, verifies
-//!   its SHA-512 integrity, stores it immutably, and (by default) extracts it
-//!   into a package image. Repeated `fetch` performs no network or extraction
-//!   work (Milestone 1 artifact-store prototype).
+//! * `bpm fetch <spec|url>` — downloads a package by npm-style spec (`lodash`,
+//!   `lodash@4.17.21`, `@scope/pkg@^1`) resolved against the registry, or by an
+//!   exact tarball URL / `file://` path; verifies its SHA-512 integrity, stores
+//!   it immutably, and (by default) extracts it into a package image. Repeated
+//!   `fetch` performs no network or extraction work (Milestone 1 artifact-store
+//!   prototype).
 //! * `bpm install --frozen` — reads `bpm.lock`, fetches+verifies+extracts every
 //!   locked package through the global artifact store, and materializes
 //!   `node_modules` with linked executable bins (Milestone 2 frozen installer).
@@ -57,14 +59,21 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// Download, verify, store, and extract a package tarball by exact URL.
+    /// Download, verify, store, and extract a package by spec or exact URL.
     Fetch {
-        /// Exact tarball URL to download.
-        url: String,
-        /// Expected integrity string (`sha512-<base64>`). Recommended; enables
+        /// Package spec (`lodash`, `lodash@4.17.21`, `@scope/pkg@^1`) or an
+        /// exact tarball URL / `file://` path. Specs are resolved against the
+        /// registry; URLs/paths are fetched directly.
+        target: String,
+        /// Expected integrity string (`sha512-<base64>`). For a spec this
+        /// overrides the registry's `dist.integrity`; for a URL it enables
         /// verification and cache-hit reuse without re-downloading.
         #[arg(long)]
         integrity: Option<String>,
+        /// Registry base URL for spec resolution (defaults to
+        /// `$BPM_REGISTRY` or `https://registry.npmjs.org`). Ignored for URLs.
+        #[arg(long)]
+        registry: Option<String>,
         /// Store root (defaults to `$BPM_STORE` or `$HOME/.bpm`).
         #[arg(long)]
         store: Option<PathBuf>,
@@ -149,12 +158,20 @@ fn main() -> ExitCode {
             }
         },
         Commands::Fetch {
-            url,
+            target,
             integrity,
+            registry,
             store,
             no_extract,
             json_metrics,
-        } => match run_fetch(&url, integrity, store, no_extract, json_metrics) {
+        } => match run_fetch(
+            &target,
+            integrity,
+            registry,
+            store,
+            no_extract,
+            json_metrics,
+        ) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 eprintln!("error: {err:#}");
@@ -224,8 +241,9 @@ fn run_doctor(json: bool) -> anyhow::Result<()> {
 }
 
 fn run_fetch(
-    url: &str,
+    target: &str,
     integrity: Option<String>,
+    registry: Option<String>,
     store: Option<PathBuf>,
     no_extract: bool,
     json_metrics: Option<PathBuf>,
@@ -236,10 +254,42 @@ fn run_fetch(
         .ok_or_else(|| anyhow::anyhow!("no --store given and $BPM_STORE/$HOME is unset"))?;
 
     let store = ArtifactStore::open(&store_root)?;
-    let integrity = integrity.map(|s| Integrity::parse(&s)).transpose()?;
 
     let mut metrics = Metrics::new();
-    let artifact = store.ensure_artifact(url, integrity.as_ref(), &mut metrics)?;
+
+    // Decide whether `target` is an npm-style package spec (resolve against the
+    // registry) or a direct source (exact URL / file:// / bare path -> fetched
+    // as-is). The check is strict: only valid npm names take the spec path, so
+    // URLs, file:// paths, and bare local paths keep their existing behavior.
+    let (url, integrity): (String, Option<Integrity>) =
+        if bpm::registry::is_valid_npm_name(name_of_spec(target)) {
+            let registry_base = registry
+                .or_else(|| env::var_os("BPM_REGISTRY").map(|s| s.to_string_lossy().into_owned()))
+                .unwrap_or_else(|| "https://registry.npmjs.org".to_string());
+            let spec = bpm::registry::parse_spec(target)?;
+            let resolved = metrics
+                .measure("metadata_fetch", || {
+                    bpm::registry::resolve(&spec, &registry_base)
+                })
+                .map_err(|e| {
+                    anyhow::anyhow!("failed to resolve '{target}' from {registry_base}: {e}")
+                })?;
+            // A CLI `--integrity` (if given) wins; otherwise trust the registry.
+            let integ = match integrity.as_deref() {
+                Some(s) => Integrity::parse(s)?,
+                None => Integrity::parse(&resolved.integrity)?,
+            };
+            eprintln!(
+                "resolved {}@{} -> {}",
+                resolved.name, resolved.version, resolved.tarball_url
+            );
+            (resolved.tarball_url, Some(integ))
+        } else {
+            let integ = integrity.as_deref().map(Integrity::parse).transpose()?;
+            (target.to_string(), integ)
+        };
+
+    let artifact = store.ensure_artifact(&url, integrity.as_ref(), &mut metrics)?;
     println!(
         "artifact {} ({}) -> {}",
         artifact.id,
@@ -268,6 +318,15 @@ fn run_fetch(
     }
 
     Ok(())
+}
+
+/// The name portion of a possibly-versioned spec, for the spec-vs-source check.
+/// `lodash` / `@scope/pkg` -> themselves; `lodash@1.2.3` -> `lodash`.
+fn name_of_spec(target: &str) -> &str {
+    match target.rfind('@') {
+        Some(0) | None => target,
+        Some(i) => &target[..i],
+    }
 }
 
 fn run_bench(

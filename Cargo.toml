@@ -23,3 +23,6 @@ tempfile = "3.12"
 
 # Graph-plan cache (Milestone 3): deterministic graph + plan hashing
 blake3 = "1.5"
+
+# Registry resolution: package-spec -> version range matching
+semver = "1.0"
