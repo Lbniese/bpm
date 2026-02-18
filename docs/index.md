@@ -25,9 +25,11 @@ BPM is in early implementation. What exists today and works end to end:
 
 - **`bpm doctor`** — locates a project's `package.json` and reports
   structured, deterministic diagnostics.
-- **`bpm fetch <url>`** — downloads a package tarball, verifies its SHA-512
-  integrity, stores it immutably, and safely extracts it exactly once.
-  Repeated fetches of the same artifact do no network or extraction work.
+- **`bpm fetch <spec|url>`** — resolves an npm-style package spec (`lodash`,
+  `lodash@4.17.21`, `@scope/pkg@^1`) against the registry, or fetches a
+  tarball by exact URL / `file://` path; verifies its SHA-512 integrity,
+  stores it immutably, and safely extracts it exactly once. Repeated fetches
+  of the same artifact do no network or extraction work.
 - **`bpm import [package-lock.json]`** — imports an npm
   `package-lock.json` (`lockfileVersion` 3) into a canonical, deterministic
   `bpm.lock`.

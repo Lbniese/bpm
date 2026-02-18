@@ -15,7 +15,8 @@ curl -fsSL https://raw.githubusercontent.com/Lbniese/bpm/main/install.sh | sh
 
 cd my-project
 bpm doctor              # inspect project configuration
-bpm fetch <tarball-url> # download and cache a package
+bpm fetch lodash        # download and cache a package by name (npm/bun-style)
+bpm fetch lodash@4.17.21 # or by exact version / semver range
 bpm import              # convert package-lock.json to bpm.lock
 ```
 
@@ -55,7 +56,7 @@ no re-resolving.
 | Command | Description |
 |---|---|
 | `bpm doctor` | Inspect the nearest `package.json` and report diagnostics |
-| `bpm fetch <url>` | Download, verify, and cache a package tarball |
+| `bpm fetch <spec\|url>` | Resolve a package by spec (`lodash`, `lodash@4.17.21`) or fetch a tarball by exact URL, then verify, store, and extract |
 | `bpm import` | Convert npm `package-lock.json` v3 to `bpm.lock` |
 | `bpm bench` | Run performance benchmark scenarios and emit timing results |
 

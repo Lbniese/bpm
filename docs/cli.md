@@ -30,29 +30,45 @@ bpm doctor
 bpm doctor --json
 ```
 
-## `bpm fetch <url> [flags]`
+## `bpm fetch <target> [flags]`
 
-Downloads a package tarball by **exact URL**, verifies its SHA-512
-integrity, stores it immutably, and (by default) extracts it once into a
-package image.
+Fetches a package by **npm-style spec** or **exact URL**. For a spec, BPM
+resolves the name against the registry (like `npm`/`bun`), reads the tarball URL
+and integrity from the packument, then downloads, verifies its SHA-512
+integrity, stores it immutably, and (by default) extracts it once into a package
+image. For an exact URL or `file://`/local path, BPM downloads it directly.
+
+Accepted targets:
+
+| Target | Behavior |
+|---|---|
+| `lodash` | resolve `dist-tags.latest` from the registry |
+| `lodash@4.17.21` | exact version |
+| `lodash@^4.17.0`, `@~`, `@>=`, `@4.x`, `@*` | highest published version matching the semver range |
+| `@scope/pkg`, `@scope/pkg@1.0.0` | scoped names |
+| `https://.../pkg.tgz`, `file:///abs/x.tgz`, `./x.tgz` | fetched directly (no resolution) |
 
 | Flag | Meaning |
 |---|---|
-| `--integrity sha512-<base64>` | Expected integrity. Enables verification and cache-hit reuse without re-downloading. Without it, BPM must download to learn the digest. |
+| `--registry <url>` | Registry base URL for spec resolution. Defaults to `$BPM_REGISTRY`, then `https://registry.npmjs.org`. Ignored for URL/path targets. |
+| `--integrity sha512-<base64>` | Expected integrity. For a spec this overrides the registry's `dist.integrity`; for a URL it enables verification and cache-hit reuse without re-downloading. |
 | `--store <dir>` | Store root. Defaults to `$BPM_STORE`, then `$HOME/.bpm`. |
 | `--no-extract` | Only download/verify/store the archive; skip extraction. |
 | `--json-metrics <path>` | Write phase-timing metrics as canonical JSON to `path`. |
 
-Environment: `BPM_TRACE=1` prints a CSV phase trace to stderr.
+Environment: `BPM_TRACE=1` prints a CSV phase trace to stderr; `BPM_REGISTRY`
+sets the default registry.
 
 ```bash
+bpm fetch lodash --store /tmp/store
+bpm fetch lodash@4.17.21 --registry https://registry.npmjs.org
 bpm fetch https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz \
-    --integrity sha512-XXXX... \
-    --store /tmp/store
+    --integrity sha512-XXXX...
 ```
 
 Repeated `fetch` of the same artifact/integrity performs no network or
-extraction work — this is the Milestone 1 success criterion.
+extraction work (a spec is re-resolved each run, but the tarball itself is
+served from the immutable store) — this is the Milestone 1 success criterion.
 
 ## `bpm import [path] [flags]`
 
