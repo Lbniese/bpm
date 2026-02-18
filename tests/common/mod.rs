@@ -71,6 +71,9 @@ pub fn integrity_of(bytes: &[u8]) -> String {
     Sha512Digest::hash_bytes(bytes).to_npm_string()
 }
 
+/// A response body plus its content type, returned by a [`MiniServer`] route.
+pub struct RouteBody(pub Vec<u8>, pub &'static str);
+
 /// A single-endpoint HTTP/1.1 server returning fixed bytes for any GET.
 pub struct MiniServer {
     addr: String,
@@ -78,13 +81,27 @@ pub struct MiniServer {
     _handle: thread::JoinHandle<()>,
 }
 
+type Responder = Arc<dyn Fn(&str) -> Option<RouteBody> + Send + Sync>;
+
 impl MiniServer {
     /// Start serving `body` for every request. Counts every accepted request.
     pub fn start(body: Vec<u8>) -> Self {
+        let body = Arc::new(body);
+        Self::start_routed(move |_path: &str| Some(RouteBody((*body).clone(), "application/gzip")))
+    }
+
+    /// Start serving requests via a path-dispatching responder. The responder
+    /// receives the request path (e.g. `/lodash`) and returns the body +
+    /// content type, or `None` for a 404. Used by registry tests to serve a
+    /// packument on `/<name>` and the tarball on the tarball path.
+    pub fn start_routed<F>(responder: F) -> Self
+    where
+        F: Fn(&str) -> Option<RouteBody> + Send + Sync + 'static,
+    {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("local_addr").to_string();
         let hits = Arc::new(AtomicUsize::new(0));
-        let body = Arc::new(body);
+        let responder: Responder = Arc::new(responder);
         let hits_for_thread = hits.clone();
 
         // Keep connections short so repeated fetches don't reuse a pooled one.
@@ -92,9 +109,9 @@ impl MiniServer {
         let handle = thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { break };
-                let body = body.clone();
+                let responder = responder.clone();
                 let hits = hits_for_thread.clone();
-                thread::spawn(move || serve(stream, body, hits));
+                thread::spawn(move || serve(stream, responder, hits));
             }
         });
 
@@ -107,7 +124,7 @@ impl MiniServer {
 
     pub fn url(&self, path: &str) -> String {
         let addr = &self.addr;
-        format!("http://{addr}/{path}", path = path)
+        format!("http://{addr}/{path}", path = path.trim_start_matches('/'))
     }
 
     pub fn url_for(&self) -> String {
@@ -119,7 +136,7 @@ impl MiniServer {
     }
 }
 
-fn serve(mut stream: TcpStream, body: Arc<Vec<u8>>, hits: Arc<AtomicUsize>) {
+fn serve(mut stream: TcpStream, responder: Responder, hits: Arc<AtomicUsize>) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
     hits.fetch_add(1, Ordering::Relaxed);
@@ -128,12 +145,29 @@ fn serve(mut stream: TcpStream, body: Arc<Vec<u8>>, hits: Arc<AtomicUsize>) {
     let mut buf = [0u8; 1024];
     let _ = std::io::Read::read(&mut stream, &mut buf);
 
-    let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/gzip\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    let _ = stream.write_all(response.as_bytes());
-    let _ = stream.write_all(&body);
+    // Parse the request path from the first line: `GET /path HTTP/1.1`.
+    let request_line = std::str::from_utf8(&buf)
+        .unwrap_or("")
+        .lines()
+        .next()
+        .unwrap_or("");
+    let path = request_line.split_whitespace().nth(1).unwrap_or("/");
+
+    match responder(path) {
+        Some(RouteBody(body, content_type)) => {
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: {content_type}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.write_all(&body);
+        }
+        None => {
+            let _ = stream.write_all(
+                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+        }
+    }
 }
 
 /// One raw tar entry, written byte-for-byte (bypassing `tar::Builder`'s path

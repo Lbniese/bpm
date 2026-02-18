@@ -1,0 +1,934 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BPM — Bloom Package Manager</title>
+<meta name="description" content="BPM is an npm-compatible package manager that caches whole dependency graphs in a content-addressed store, so repeated installs cost nothing.">
+
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='30' fill='%23F7F5EE'/%3E%3Cg fill='%232E8B57'%3E%3Cellipse cx='32' cy='18' rx='8' ry='13'/%3E%3Cellipse cx='32' cy='46' rx='8' ry='13'/%3E%3Cellipse cx='18' cy='32' rx='13' ry='8'/%3E%3Cellipse cx='46' cy='32' rx='13' ry='8'/%3E%3C/g%3E%3Ccircle cx='32' cy='32' r='7' fill='%23F7F5EE'/%3E%3C/svg%3E">
+
+<link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/geist-sans@5.1.1/index.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/geist-sans@5.1.1/600.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/geist-sans@5.1.1/700.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/geist-mono@5.1.1/index.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/geist-mono@5.1.1/500.css">
+
+<style>
+  :root{
+    --green:        oklch(0.58 0.14 152);
+    --green-dark:   oklch(0.34 0.10 152);
+    --green-deep:   oklch(0.24 0.05 155);
+    --green-tint:   oklch(0.95 0.035 152);
+    --green-tint-2: oklch(0.905 0.05 152);
+    --bg:           oklch(0.985 0.006 95);
+    --surface:      oklch(0.965 0.010 95);
+    --surface-2:    oklch(0.945 0.012 95);
+    --border:       oklch(0.885 0.014 100);
+    --text:         oklch(0.23 0.018 155);
+    --text-muted:   oklch(0.47 0.018 155);
+    --text-faint:   oklch(0.62 0.016 150);
+    --amber:        oklch(0.72 0.14 75);
+
+    --font-sans: "Geist Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --font-mono: "Geist Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+
+    --radius-sm: 6px;
+    --radius-md: 10px;
+    --radius-lg: 16px;
+    --shadow-sm: 0 1px 2px oklch(0.23 0.02 155 / 0.06);
+    --shadow-md: 0 8px 24px oklch(0.23 0.02 155 / 0.08);
+    --max-w: 1160px;
+  }
+
+  *,*::before,*::after{ box-sizing:border-box; }
+  html{ scroll-behavior:smooth; }
+  @media (prefers-reduced-motion: reduce){
+    html{ scroll-behavior:auto; }
+    *,*::before,*::after{ animation-duration:0.01ms !important; animation-iteration-count:1 !important; transition-duration:0.01ms !important; scroll-behavior:auto !important; }
+  }
+
+  body{
+    margin:0;
+    font-family:var(--font-sans);
+    background:var(--bg);
+    color:var(--text);
+    -webkit-font-smoothing:antialiased;
+    line-height:1.5;
+  }
+
+  img,svg{ display:block; max-width:100%; }
+  a{ color:inherit; }
+
+  .wrap{ max-width:var(--max-w); margin:0 auto; padding:0 24px; }
+
+  ::selection{ background:var(--green-tint-2); color:var(--green-deep); }
+
+  :focus-visible{
+    outline:2px solid var(--green);
+    outline-offset:2px;
+    border-radius:4px;
+  }
+
+  code, .mono{ font-family:var(--font-mono); }
+
+  h1,h2,h3{ margin:0; font-weight:700; letter-spacing:-0.02em; color:var(--green-deep); }
+  p{ margin:0; }
+
+  .eyebrow{
+    font-family:var(--font-mono);
+    font-size:12.5px;
+    font-weight:500;
+    letter-spacing:0.08em;
+    text-transform:uppercase;
+    color:var(--green-dark);
+    display:inline-flex;
+    align-items:center;
+    gap:8px;
+  }
+  .eyebrow::before{
+    content:"";
+    width:6px; height:6px; border-radius:50%;
+    background:var(--green);
+    box-shadow:0 0 0 3px var(--green-tint-2);
+  }
+
+  .btn{
+    display:inline-flex;
+    align-items:center;
+    justify-content:center;
+    gap:8px;
+    font-family:var(--font-sans);
+    font-weight:600;
+    font-size:14.5px;
+    padding:11px 20px;
+    border-radius:var(--radius-md);
+    border:1px solid transparent;
+    cursor:pointer;
+    text-decoration:none;
+    transition:transform .15s ease, box-shadow .15s ease, background .15s ease, border-color .15s ease;
+    white-space:nowrap;
+  }
+  .btn:active{ transform:translateY(1px); }
+  .btn-primary{
+    background:var(--green);
+    color:oklch(0.99 0.005 152);
+    box-shadow:var(--shadow-sm);
+  }
+  .btn-primary:hover{ background:var(--green-dark); box-shadow:var(--shadow-md); }
+  .btn-secondary{
+    background:transparent;
+    color:var(--green-deep);
+    border-color:var(--border);
+  }
+  .btn-secondary:hover{ border-color:var(--green); background:var(--green-tint); }
+  .btn-ghost{
+    background:var(--surface);
+    color:var(--text);
+    border-color:var(--border);
+  }
+  .btn-ghost:hover{ border-color:var(--green); color:var(--green-dark); }
+
+  /* ---------- Header ---------- */
+  .site-header{
+    position:sticky; top:0; z-index:50;
+    background:oklch(0.985 0.006 95 / 0.82);
+    backdrop-filter:blur(10px) saturate(140%);
+    -webkit-backdrop-filter:blur(10px) saturate(140%);
+    border-bottom:1px solid var(--border);
+  }
+  .site-header .wrap{
+    display:flex; align-items:center; justify-content:space-between;
+    height:64px;
+  }
+  .brand{ display:flex; align-items:center; gap:10px; text-decoration:none; }
+  .brand svg{ width:28px; height:28px; }
+  .brand-name{ font-weight:700; font-size:16.5px; letter-spacing:-0.01em; color:var(--green-deep); }
+  .brand-name .sub{ font-weight:500; color:var(--text-faint); font-size:12.5px; display:block; margin-top:-2px; font-family:var(--font-mono); letter-spacing:0; }
+
+  .main-nav{ display:flex; align-items:center; gap:28px; }
+  .main-nav a{
+    text-decoration:none; color:var(--text-muted); font-size:14.5px; font-weight:500;
+    position:relative; padding:4px 2px;
+  }
+  .main-nav a:hover{ color:var(--green-deep); }
+  .main-nav a::after{
+    content:""; position:absolute; left:0; right:0; bottom:-3px; height:2px;
+    background:var(--green); transform:scaleX(0); transform-origin:left; transition:transform .2s ease;
+  }
+  .main-nav a:hover::after{ transform:scaleX(1); }
+
+  .header-actions{ display:flex; align-items:center; gap:12px; }
+  .icon-btn{
+    display:inline-flex; align-items:center; justify-content:center;
+    width:36px; height:36px; border-radius:var(--radius-sm);
+    color:var(--text-muted); text-decoration:none;
+    border:1px solid transparent;
+  }
+  .icon-btn:hover{ background:var(--surface); color:var(--green-deep); }
+  .nav-toggle{ display:none; }
+
+  /* ---------- Hero ---------- */
+  .hero{ padding:88px 0 72px; }
+  .hero-grid{
+    display:grid; grid-template-columns:1.05fr 0.95fr; gap:56px; align-items:center;
+  }
+  .hero-copy h1{
+    font-size:clamp(34px, 4.6vw, 54px);
+    line-height:1.06;
+    margin:18px 0 20px;
+  }
+  .hero-copy h1 .accent{ color:var(--green); }
+  .hero-copy p.lede{
+    font-size:17.5px; color:var(--text-muted); max-width:46ch; margin-bottom:30px;
+  }
+
+  .install-box{
+    display:flex; align-items:center; gap:0;
+    background:var(--green-deep); color:oklch(0.95 0.02 150);
+    border-radius:var(--radius-md);
+    padding:4px 4px 4px 18px;
+    font-family:var(--font-mono);
+    font-size:14px;
+    max-width:520px;
+    box-shadow:var(--shadow-md);
+    margin-bottom:22px;
+  }
+  .install-box .prompt{ color:oklch(0.72 0.10 150); margin-right:10px; user-select:none; }
+  .install-box code{
+    flex:1; overflow-x:auto; white-space:nowrap; padding:12px 0;
+    color:oklch(0.97 0.01 150);
+  }
+  .install-box code::-webkit-scrollbar{ display:none; }
+  .copy-btn{
+    display:inline-flex; align-items:center; justify-content:center; gap:6px;
+    background:oklch(0.32 0.06 152); color:oklch(0.95 0.02 150);
+    border:none; border-radius:8px; padding:9px 13px;
+    font-family:var(--font-sans); font-size:12.5px; font-weight:600;
+    cursor:pointer; transition:background .15s ease;
+    flex-shrink:0;
+  }
+  .copy-btn:hover{ background:oklch(0.40 0.08 152); }
+  .copy-btn svg{ width:14px; height:14px; }
+  .copy-btn.copied{ background:var(--green); color:var(--green-deep); }
+
+  .hero-ctas{ display:flex; gap:12px; flex-wrap:wrap; margin-bottom:14px; }
+  .hero-note{ font-size:13px; color:var(--text-faint); }
+  .hero-note code{ background:var(--surface-2); padding:1px 6px; border-radius:4px; font-size:12px; }
+
+  /* Terminal mock */
+  .terminal{
+    background:oklch(0.19 0.015 155);
+    border-radius:var(--radius-lg);
+    box-shadow:var(--shadow-md);
+    overflow:hidden;
+    border:1px solid oklch(0.30 0.02 155);
+  }
+  .terminal-bar{
+    display:flex; align-items:center; gap:7px;
+    padding:12px 16px;
+    background:oklch(0.16 0.012 155);
+    border-bottom:1px solid oklch(0.28 0.02 155);
+  }
+  .terminal-bar span{ width:11px; height:11px; border-radius:50%; }
+  .terminal-bar span:nth-child(1){ background:#EC6A5E; }
+  .terminal-bar span:nth-child(2){ background:#F5BD4F; }
+  .terminal-bar span:nth-child(3){ background:#61C554; }
+  .terminal-bar .t-title{
+    margin-left:8px; font-family:var(--font-mono); font-size:12px; color:oklch(0.6 0.02 150);
+  }
+  .terminal-body{
+    padding:20px 20px 24px;
+    font-family:var(--font-mono);
+    font-size:13.2px;
+    line-height:1.85;
+    color:oklch(0.85 0.02 150);
+  }
+  .terminal-body .l-prompt{ color:oklch(0.65 0.12 152); }
+  .terminal-body .l-dim{ color:oklch(0.5 0.02 150); }
+  .terminal-body .l-ok{ color:oklch(0.72 0.13 152); }
+  .terminal-body .l-warn{ color:var(--amber); }
+  .terminal-body .l-bar{ color:oklch(0.6 0.02 150); }
+  .terminal-body .cursor{
+    display:inline-block; width:7px; height:14px; background:oklch(0.72 0.13 152);
+    vertical-align:-2px; animation:blink 1.1s steps(1) infinite;
+  }
+  @keyframes blink{ 50%{ opacity:0; } }
+
+  /* ---------- Section shells ---------- */
+  section{ padding:96px 0; }
+  .section-head{ max-width:640px; margin-bottom:52px; }
+  .section-head h2{ font-size:clamp(26px, 3vw, 36px); margin-top:14px; }
+  .section-head p{ color:var(--text-muted); font-size:16px; margin-top:14px; }
+
+  .band-alt{ background:var(--surface); border-top:1px solid var(--border); border-bottom:1px solid var(--border); }
+
+  /* ---------- How it works / signature diagram ---------- */
+  .store-diagram{
+    background:oklch(0.99 0.004 95);
+    border:1px solid var(--border);
+    border-radius:var(--radius-lg);
+    padding:40px 32px 32px;
+    box-shadow:var(--shadow-sm);
+  }
+  .store-projects{
+    display:grid; grid-template-columns:1fr 1fr; gap:28px; margin-bottom:8px;
+  }
+  .store-project{
+    border:1px dashed var(--border);
+    border-radius:var(--radius-md);
+    padding:16px;
+    background:var(--bg);
+  }
+  .store-project .p-label{
+    font-family:var(--font-mono); font-size:12px; color:var(--text-muted);
+    margin-bottom:12px; display:block;
+  }
+  .store-caption{
+    text-align:center; font-family:var(--font-mono); font-size:12.5px; color:var(--text-faint);
+    margin-top:18px;
+  }
+  .store-caption strong{ color:var(--green-dark); font-weight:600; }
+
+  /* ---------- Features ---------- */
+  .feature-grid{
+    display:grid; grid-template-columns:repeat(3, 1fr); gap:20px;
+  }
+  .feature-card{
+    background:var(--bg);
+    border:1px solid var(--border);
+    border-radius:var(--radius-lg);
+    padding:26px 24px 24px;
+    transition:border-color .18s ease, box-shadow .18s ease, transform .18s ease;
+  }
+  .feature-card:hover{
+    border-color:oklch(0.75 0.06 152);
+    box-shadow:var(--shadow-md);
+    transform:translateY(-2px);
+  }
+  .feature-icon{
+    width:40px; height:40px; border-radius:10px;
+    background:var(--green-tint);
+    display:flex; align-items:center; justify-content:center;
+    margin-bottom:16px;
+    color:var(--green-dark);
+  }
+  .feature-icon svg{ width:20px; height:20px; }
+  .feature-card h3{ font-size:16.5px; margin-bottom:8px; }
+  .feature-card p{ font-size:14.5px; color:var(--text-muted); line-height:1.6; }
+
+  /* ---------- Performance ---------- */
+  .perf-layout{ display:grid; grid-template-columns:1.1fr 0.9fr; gap:56px; align-items:start; }
+  .bench-chart{
+    background:var(--bg); border:1px solid var(--border); border-radius:var(--radius-lg);
+    padding:28px 28px 22px;
+  }
+  .bench-row{ margin-bottom:20px; }
+  .bench-row:last-child{ margin-bottom:0; }
+  .bench-row-label{
+    display:flex; justify-content:space-between; align-items:baseline;
+    font-family:var(--font-mono); font-size:13px; margin-bottom:7px;
+  }
+  .bench-row-label .name{ color:var(--text); font-weight:500; }
+  .bench-row-label .val{ color:var(--text-muted); }
+  .bench-track{
+    height:12px; border-radius:6px; background:var(--surface-2); overflow:hidden;
+  }
+  .bench-fill{
+    height:100%; border-radius:6px;
+    background:linear-gradient(90deg, var(--green), oklch(0.66 0.13 150));
+    width:0%;
+    transition:width 1.1s cubic-bezier(.2,.7,.2,1);
+  }
+  .bench-fill.alt{ background:oklch(0.80 0.015 100); }
+  .bench-note{
+    margin-top:18px; font-size:12.5px; color:var(--text-faint); font-family:var(--font-mono);
+  }
+
+  .stat-list{ display:flex; flex-direction:column; gap:28px; }
+  .stat-item .stat-num{
+    font-size:clamp(30px, 3.4vw, 42px); font-weight:700; color:var(--green-deep); letter-spacing:-0.02em;
+    display:flex; align-items:baseline; gap:6px;
+  }
+  .stat-item .stat-num .unit{ font-size:16px; color:var(--text-faint); font-weight:600; }
+  .stat-item .stat-label{ font-size:14px; color:var(--text-muted); margin-top:4px; }
+
+  /* ---------- Usage ---------- */
+  .usage-grid{ display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+  .usage-card{
+    background:var(--bg); border:1px solid var(--border); border-radius:var(--radius-md);
+    padding:20px 22px;
+  }
+  .usage-cmd{
+    display:flex; align-items:center; justify-content:space-between; gap:12px;
+    margin-bottom:10px;
+  }
+  .usage-cmd code{
+    font-size:14.5px; color:var(--green-deep); font-weight:500; background:var(--green-tint);
+    padding:5px 10px; border-radius:6px;
+  }
+  .usage-copy{
+    background:transparent; border:1px solid var(--border); border-radius:6px;
+    width:28px; height:28px; display:flex; align-items:center; justify-content:center;
+    color:var(--text-faint); cursor:pointer; flex-shrink:0;
+  }
+  .usage-copy:hover{ color:var(--green-dark); border-color:var(--green); }
+  .usage-copy svg{ width:13px; height:13px; }
+  .usage-card p{ font-size:13.8px; color:var(--text-muted); line-height:1.55; }
+
+  /* ---------- CTA ---------- */
+  .cta-section{
+    background:var(--green-deep);
+    color:oklch(0.95 0.02 150);
+    border-radius:var(--radius-lg);
+    margin:0 24px;
+    padding:64px 40px;
+    text-align:center;
+  }
+  .cta-inner{ max-width:640px; margin:0 auto; }
+  .cta-section h2{ color:oklch(0.98 0.01 150); font-size:clamp(26px,3.4vw,38px); margin-bottom:14px; }
+  .cta-section p{ color:oklch(0.8 0.03 150); font-size:16px; margin-bottom:32px; }
+  .cta-install{
+    display:flex; align-items:center; gap:0; justify-content:space-between;
+    background:oklch(0.15 0.02 155);
+    border:1px solid oklch(0.30 0.03 155);
+    border-radius:var(--radius-md);
+    padding:4px 4px 4px 18px;
+    font-family:var(--font-mono); font-size:14px;
+    max-width:480px; margin:0 auto 22px;
+  }
+  .cta-install .prompt{ color:oklch(0.68 0.11 150); margin-right:10px; }
+  .cta-install code{ flex:1; text-align:left; overflow-x:auto; white-space:nowrap; color:oklch(0.95 0.02 150); }
+  .cta-btns{ display:flex; gap:12px; justify-content:center; flex-wrap:wrap; }
+  .cta-section .btn-primary{ background:var(--green); }
+  .cta-section .btn-secondary{ border-color:oklch(0.4 0.03 155); color:oklch(0.95 0.02 150); }
+  .cta-section .btn-secondary:hover{ background:oklch(0.24 0.03 155); border-color:oklch(0.5 0.05 155); }
+
+  /* ---------- Footer ---------- */
+  footer{ padding:72px 0 40px; }
+  .footer-grid{
+    display:grid; grid-template-columns:1.4fr repeat(4, 1fr); gap:32px;
+    padding-bottom:44px; border-bottom:1px solid var(--border);
+  }
+  .footer-brand .brand{ margin-bottom:14px; }
+  .footer-brand p{ font-size:13.8px; color:var(--text-faint); max-width:32ch; line-height:1.6; }
+  .footer-col h4{
+    font-size:12px; text-transform:uppercase; letter-spacing:0.07em; color:var(--text-faint);
+    font-weight:600; margin-bottom:14px; font-family:var(--font-mono);
+  }
+  .footer-col ul{ list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:10px; }
+  .footer-col a{ text-decoration:none; font-size:14px; color:var(--text-muted); }
+  .footer-col a:hover{ color:var(--green-dark); }
+  .footer-bottom{
+    display:flex; justify-content:space-between; align-items:center; padding-top:24px; flex-wrap:wrap; gap:12px;
+  }
+  .footer-bottom p{ font-size:13px; color:var(--text-faint); }
+  .footer-social{ display:flex; gap:10px; }
+
+  /* ---------- Reveal animation ---------- */
+  .reveal{ opacity:0; transform:translateY(16px); transition:opacity .6s ease, transform .6s ease; }
+  .reveal.in{ opacity:1; transform:translateY(0); }
+
+  /* ---------- Responsive ---------- */
+  @media (max-width: 900px){
+    .hero-grid{ grid-template-columns:1fr; }
+    .terminal{ order:-1; }
+    .perf-layout{ grid-template-columns:1fr; }
+    .feature-grid{ grid-template-columns:1fr 1fr; }
+    .footer-grid{ grid-template-columns:1fr 1fr; }
+    .footer-brand{ grid-column:1 / -1; }
+  }
+  @media (max-width: 720px){
+    .main-nav{ display:none; }
+    section{ padding:64px 0; }
+    .hero{ padding:56px 0 48px; }
+    .usage-grid{ grid-template-columns:1fr; }
+    .feature-grid{ grid-template-columns:1fr; }
+    .footer-grid{ grid-template-columns:1fr 1fr; }
+    .store-projects{ grid-template-columns:1fr; }
+    .cta-section{ padding:48px 24px; margin:0 16px; }
+  }
+</style>
+</head>
+<body>
+
+<header class="site-header">
+  <div class="wrap">
+    <a href="#top" class="brand">
+      <svg viewBox="0 0 64 64" aria-hidden="true">
+        <g fill="currentColor" style="color:var(--green)">
+          <ellipse cx="32" cy="18" rx="8" ry="13"/>
+          <ellipse cx="32" cy="46" rx="8" ry="13"/>
+          <ellipse cx="18" cy="32" rx="13" ry="8"/>
+          <ellipse cx="46" cy="32" rx="13" ry="8"/>
+        </g>
+        <circle cx="32" cy="32" r="7" fill="var(--bg)"/>
+      </svg>
+      <span class="brand-name">BPM<span class="sub">bloom package manager</span></span>
+    </a>
+    <nav class="main-nav" aria-label="Primary">
+      <a href="#how-it-works">How it works</a>
+      <a href="#features">Features</a>
+      <!-- <a href="#performance">Performance</a> -->
+      <a href="#usage">Usage</a>
+      <a href="https://lbniese.github.io/bpm/" target="_blank" rel="noopener">Docs</a>
+    </nav>
+    <div class="header-actions">
+      <a class="icon-btn" href="https://github.com/lbniese/bpm" target="_blank" rel="noopener" aria-label="View BPM on GitHub">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true"><path d="M12 .5C5.65.5.5 5.65.5 12c0 5.09 3.29 9.4 7.86 10.93.58.1.79-.25.79-.56v-2.16c-3.2.7-3.88-1.36-3.88-1.36-.52-1.34-1.28-1.7-1.28-1.7-1.04-.72.08-.7.08-.7 1.15.08 1.76 1.19 1.76 1.19 1.03 1.75 2.7 1.25 3.36.96.1-.75.4-1.25.73-1.54-2.55-.29-5.24-1.28-5.24-5.7 0-1.26.45-2.29 1.18-3.1-.12-.29-.51-1.46.11-3.05 0 0 .97-.31 3.18 1.18a11 11 0 0 1 5.79 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.24 2.76.12 3.05.74.81 1.18 1.84 1.18 3.1 0 4.43-2.7 5.4-5.27 5.69.42.36.78 1.07.78 2.16v3.2c0 .31.21.67.8.56A10.52 10.52 0 0 0 23.5 12C23.5 5.65 18.35.5 12 .5Z"/></svg>
+      </a>
+      <a class="btn btn-primary" href="https://lbniese.github.io/bpm/" target="_blank" rel="noopener">Get started</a>
+    </div>
+  </div>
+</header>
+
+<main id="top">
+
+  <!-- ================= HERO ================= -->
+  <section class="hero">
+    <div class="wrap hero-grid">
+      <div class="hero-copy">
+        <span class="eyebrow">npm-compatible · written in Rust</span>
+        <h1>The package manager that grows with <span class="accent">you</span>, not your disk.</h1>
+        <p class="lede">BPM caches whole dependency graphs in a content-addressed store. Resolve the same graph twice, and the second install reuses every byte of the first — no re-download, no re-extract, no re-resolve.</p>
+
+        <div class="install-box">
+          <span class="prompt">$</span>
+          <code id="install-cmd">curl -fsSL https://raw.githubusercontent.com/Lbniese/bpm/main/install.sh | sh</code>
+          <button class="copy-btn" data-copy-target="install-cmd" aria-label="Copy install command">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+            <span class="copy-label">Copy</span>
+          </button>
+        </div>
+
+        <div class="hero-ctas">
+          <a class="btn btn-primary" href="https://lbniese.github.io/bpm/" target="_blank" rel="noopener">Read the docs</a>
+          <a class="btn btn-secondary" href="https://github.com/lbniese/bpm" target="_blank" rel="noopener">View on GitHub</a>
+        </div>
+        <p class="hero-note">No Rust locally? Grab a pre-built binary from <a href="https://github.com/lbniese/bpm/releases" target="_blank" rel="noopener">Releases</a>, or set <code>BPM_INSTALL_DIR</code> to install without <code>sudo</code>.</p>
+      </div>
+
+      <div class="terminal reveal" aria-hidden="false">
+        <div class="terminal-bar">
+          <span></span><span></span><span></span>
+          <span class="t-title">bpm — my-project</span>
+        </div>
+        <div class="terminal-body">
+          <div><span class="l-prompt">➜</span> bpm import</div>
+          <div class="l-ok">✓ imported 214 packages into bpm.lock</div>
+          <div>&nbsp;</div>
+          <div><span class="l-prompt">➜</span> bpm install --frozen</div>
+          <div class="l-ok">✓ installed 214 packages (214 cached, graph volume built)</div>
+          <div>&nbsp;</div>
+          <div><span class="l-prompt">➜</span> bpm install --frozen</div>
+          <div class="l-dim">nothing to install — graph unchanged</div>
+          <div class="l-ok">✓ 214 packages already materialized · 0.01s<span class="cursor"></span></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= HOW IT WORKS (signature) ================= -->
+  <section id="how-it-works" class="band-alt">
+    <div class="wrap">
+      <div class="section-head reveal">
+        <span class="eyebrow">The core idea</span>
+        <h2>Most managers cache packages. BPM caches graphs.</h2>
+        <p>Two projects that resolve to the same dependency graph share every artifact — the tarball, the extracted files, and the resolution itself. The second project's install has almost nothing left to do.</p>
+      </div>
+
+      <div class="store-diagram reveal">
+        <div class="store-projects">
+          <div class="store-project">
+            <span class="p-label">project-a/package.json</span>
+            <svg viewBox="0 0 320 150" width="100%" height="150" aria-hidden="true">
+              <g stroke="var(--border)" stroke-width="1.5" fill="none">
+                <line x1="40" y1="30" x2="100" y2="70"/>
+                <line x1="40" y1="30" x2="160" y2="55"/>
+                <line x1="100" y1="70" x2="70" y2="120"/>
+                <line x1="100" y1="70" x2="150" y2="120"/>
+                <line x1="160" y1="55" x2="150" y2="120"/>
+                <line x1="160" y1="55" x2="230" y2="90"/>
+              </g>
+              <circle cx="40" cy="30" r="9" fill="var(--surface-2)" stroke="var(--text-faint)" stroke-width="1.5"/>
+              <circle cx="100" cy="70" r="9" fill="var(--green-tint-2)" stroke="var(--green)" stroke-width="1.6"/>
+              <circle cx="160" cy="55" r="9" fill="var(--green-tint-2)" stroke="var(--green)" stroke-width="1.6"/>
+              <circle cx="70" cy="120" r="9" fill="var(--surface-2)" stroke="var(--text-faint)" stroke-width="1.5"/>
+              <circle cx="150" cy="120" r="9" fill="var(--green-tint-2)" stroke="var(--green)" stroke-width="1.6"/>
+              <circle cx="230" cy="90" r="9" fill="var(--surface-2)" stroke="var(--text-faint)" stroke-width="1.5"/>
+            </svg>
+          </div>
+          <div class="store-project">
+            <span class="p-label">project-b/package.json</span>
+            <svg viewBox="0 0 320 150" width="100%" height="150" aria-hidden="true">
+              <g stroke="var(--border)" stroke-width="1.5" fill="none">
+                <line x1="280" y1="26" x2="220" y2="66"/>
+                <line x1="280" y1="26" x2="160" y2="50"/>
+                <line x1="220" y1="66" x2="250" y2="118"/>
+                <line x1="220" y1="66" x2="170" y2="118"/>
+                <line x1="160" y1="50" x2="170" y2="118"/>
+                <line x1="160" y1="50" x2="90" y2="86"/>
+              </g>
+              <circle cx="280" cy="26" r="9" fill="var(--surface-2)" stroke="var(--text-faint)" stroke-width="1.5"/>
+              <circle cx="220" cy="66" r="9" fill="var(--green-tint-2)" stroke="var(--green)" stroke-width="1.6"/>
+              <circle cx="160" cy="50" r="9" fill="var(--green-tint-2)" stroke="var(--green)" stroke-width="1.6"/>
+              <circle cx="250" cy="118" r="9" fill="var(--surface-2)" stroke="var(--text-faint)" stroke-width="1.5"/>
+              <circle cx="170" cy="118" r="9" fill="var(--green-tint-2)" stroke="var(--green)" stroke-width="1.6"/>
+              <circle cx="90" cy="86" r="9" fill="var(--surface-2)" stroke="var(--text-faint)" stroke-width="1.5"/>
+            </svg>
+          </div>
+        </div>
+
+        <svg viewBox="0 0 700 46" width="100%" height="46" aria-hidden="true" style="margin:4px 0;">
+          <line x1="150" y1="0" x2="330" y2="40" stroke="var(--green)" stroke-width="1.5" stroke-dasharray="3 4"/>
+          <line x1="550" y1="0" x2="370" y2="40" stroke="var(--green)" stroke-width="1.5" stroke-dasharray="3 4"/>
+        </svg>
+
+        <div style="background:var(--green-deep); border-radius:var(--radius-md); padding:16px 20px; display:flex; align-items:center; justify-content:center; gap:14px; flex-wrap:wrap;">
+          <span class="mono" style="color:oklch(0.85 0.02 150); font-size:12.5px; letter-spacing:0.03em;">CONTENT-ADDRESSED STORE</span>
+          <span style="display:flex; gap:8px;">
+            <span style="width:16px;height:16px;border-radius:4px;background:var(--green);"></span>
+            <span style="width:16px;height:16px;border-radius:4px;background:var(--green);"></span>
+            <span style="width:16px;height:16px;border-radius:4px;background:var(--green);"></span>
+            <span style="width:16px;height:16px;border-radius:4px;background:oklch(0.4 0.03 155);"></span>
+            <span style="width:16px;height:16px;border-radius:4px;background:oklch(0.4 0.03 155);"></span>
+          </span>
+        </div>
+        <p class="store-caption">Shared nodes are fetched, extracted, and verified <strong>once</strong> — every later project that resolves to them just points at the existing bytes.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= FEATURES ================= -->
+  <section id="features">
+    <div class="wrap">
+      <div class="section-head reveal">
+        <span class="eyebrow">Why BPM</span>
+        <h2>Built on a few strict guarantees</h2>
+        <p>Every one of these is a design constraint, not a nice-to-have — the store is only fast because the pieces underneath are immutable and provably correct.</p>
+      </div>
+
+      <div class="feature-grid">
+        <article class="feature-card reveal">
+          <div class="feature-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 3 14h9l-1 8 10-12h-9l1-8Z"/></svg>
+          </div>
+          <h3>Zero-cost repeat installs</h3>
+          <p>Whole dependency graphs are cached, not just individual tarballs. A second project with the same graph reuses every byte of the first.</p>
+        </article>
+
+        <article class="feature-card reveal">
+          <div class="feature-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+          </div>
+          <h3>Immutable by design</h3>
+          <p>Downloaded archives, extracted files, and resolved graphs are never mutated in place — only built, verified, and published atomically.</p>
+        </article>
+
+        <article class="feature-card reveal">
+          <div class="feature-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><circle cx="5" cy="6" r="2"/><circle cx="19" cy="6" r="2"/><circle cx="5" cy="18" r="2"/><circle cx="19" cy="18" r="2"/><path d="M9.5 10 6.5 7.3M14.5 10l3-2.7M9.5 14l-3 2.7M14.5 14l3 2.7"/></svg>
+          </div>
+          <h3>Concurrent by default</h3>
+          <p>Per-artifact locking replaces one global install lock, so multiple installs — even across projects — run safely in parallel.</p>
+        </article>
+
+        <article class="feature-card reveal">
+          <div class="feature-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
+          </div>
+          <h3>Deterministic output</h3>
+          <p>Lockfiles and benchmark metrics are byte-for-byte reproducible, independent of hash-map ordering, thread scheduling, or network timing.</p>
+        </article>
+
+        <article class="feature-card reveal">
+          <div class="feature-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2 2 7l10 5 10-5-10-5Z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
+          </div>
+          <h3>Speaks npm's lockfile</h3>
+          <p><code class="mono" style="font-size:13px;">bpm import</code> converts an existing <code class="mono" style="font-size:13px;">package-lock.json</code> v3 straight into <code class="mono" style="font-size:13px;">bpm.lock</code> — no rewrite required.</p>
+        </article>
+
+        <article class="feature-card reveal">
+          <div class="feature-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="m19 9-5 5-4-4-4 4"/></svg>
+          </div>
+          <h3>Measured, not assumed</h3>
+          <p>Every phase is instrumented. <code class="mono" style="font-size:13px;">bpm bench</code> compares against npm and pnpm with median, p95, and standard deviation.</p>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= PERFORMANCE (commented out — benchmarks coming soon) =================
+  <section id="performance" class="band-alt">
+    <div class="wrap">
+      <div class="section-head reveal">
+        <span class="eyebrow">Performance</span>
+        <h2>Where the time actually goes</h2>
+        <p>Illustrative timings for a warm-store reinstall of a mid-sized graph (~200 packages). Run <code class="mono" style="font-size:13px;">bpm bench</code> against your own project for real numbers.</p>
+      </div>
+
+      <div class="perf-layout">
+        <div class="bench-chart reveal">
+          <div class="bench-row">
+            <div class="bench-row-label"><span class="name">bpm</span><span class="val">0.09s</span></div>
+            <div class="bench-track"><div class="bench-fill" data-width="4%"></div></div>
+          </div>
+          <div class="bench-row">
+            <div class="bench-row-label"><span class="name">pnpm</span><span class="val">2.10s</span></div>
+            <div class="bench-track"><div class="bench-fill alt" data-width="47%"></div></div>
+          </div>
+          <div class="bench-row">
+            <div class="bench-row-label"><span class="name">yarn</span><span class="val">3.40s</span></div>
+            <div class="bench-track"><div class="bench-fill alt" data-width="76%"></div></div>
+          </div>
+          <div class="bench-row">
+            <div class="bench-row-label"><span class="name">npm</span><span class="val">4.50s</span></div>
+            <div class="bench-track"><div class="bench-fill alt" data-width="100%"></div></div>
+          </div>
+          <p class="bench-note">warm store · 214 packages · median of 10 runs (illustrative)</p>
+        </div>
+
+        <div class="stat-list reveal">
+          <div class="stat-item">
+            <div class="stat-num">0<span class="unit">re-downloads</span></div>
+            <p class="stat-label">on a store hit, every artifact is already verified and on disk</p>
+          </div>
+          <div class="stat-item">
+            <div class="stat-num">p50 / p95<span class="unit">/ σ reported</span></div>
+            <p class="stat-label">every <code class="mono" style="font-size:13px;">bpm bench</code> run emits full timing distributions, not a single number</p>
+          </div>
+          <div class="stat-item">
+            <div class="stat-num">1<span class="unit">global store</span></div>
+            <p class="stat-label">shared across every project on the machine, keyed by content hash</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+  ==================== END PERFORMANCE ================= -->
+
+  <!-- ================= USAGE ================= -->
+  <section id="usage">
+    <div class="wrap">
+      <div class="section-head reveal">
+        <span class="eyebrow">Usage</span>
+        <h2>A small, honest command set</h2>
+        <p>BPM doesn't try to do everything yet — these are the commands that exist today.</p>
+      </div>
+
+      <div class="usage-grid">
+        <div class="usage-card reveal">
+          <div class="usage-cmd">
+            <code id="cmd-doctor">bpm doctor</code>
+            <button class="usage-copy" data-copy-target="cmd-doctor" aria-label="Copy bpm doctor"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>
+          </div>
+          <p>Inspects the nearest <code class="mono" style="font-size:13px;">package.json</code> and reports diagnostics before you install anything.</p>
+        </div>
+
+        <div class="usage-card reveal">
+          <div class="usage-cmd">
+            <code id="cmd-fetch">bpm fetch lodash</code>
+            <button class="usage-copy" data-copy-target="cmd-fetch" aria-label="Copy bpm fetch"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>
+          </div>
+          <p>Resolves a package by name, version, or range (<code class="mono" style="font-size:13px;">lodash</code>, <code class="mono" style="font-size:13px;">lodash@4.17.21</code>) like npm/bun — or by exact URL — then verifies and caches it in the content-addressed store.</p>
+        </div>
+
+        <div class="usage-card reveal">
+          <div class="usage-cmd">
+            <code id="cmd-import">bpm import</code>
+            <button class="usage-copy" data-copy-target="cmd-import" aria-label="Copy bpm import"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>
+          </div>
+          <p>Converts an existing npm <code class="mono" style="font-size:13px;">package-lock.json</code> v3 into <code class="mono" style="font-size:13px;">bpm.lock</code>.</p>
+        </div>
+
+        <div class="usage-card reveal">
+          <div class="usage-cmd">
+            <code id="cmd-bench">bpm bench</code>
+            <button class="usage-copy" data-copy-target="cmd-bench" aria-label="Copy bpm bench"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>
+          </div>
+          <p>Runs performance benchmark scenarios against npm and pnpm, and emits full timing results.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= FINAL CTA ================= -->
+  <section>
+    <div class="wrap">
+      <div class="cta-section reveal">
+        <div class="cta-inner">
+          <h2>Install once. Reuse forever.</h2>
+          <p>One curl command, and every project on this machine starts sharing a store.</p>
+          <div class="cta-install">
+            <span class="prompt">$</span>
+            <code id="cta-install-cmd">curl -fsSL https://raw.githubusercontent.com/Lbniese/bpm/main/install.sh | sh</code>
+            <button class="copy-btn" data-copy-target="cta-install-cmd" aria-label="Copy install command">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+            </button>
+          </div>
+          <div class="cta-btns">
+            <a class="btn btn-primary" href="https://github.com/lbniese/bpm" target="_blank" rel="noopener">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M12 .5C5.65.5.5 5.65.5 12c0 5.09 3.29 9.4 7.86 10.93.58.1.79-.25.79-.56v-2.16c-3.2.7-3.88-1.36-3.88-1.36-.52-1.34-1.28-1.7-1.28-1.7-1.04-.72.08-.7.08-.7 1.15.08 1.76 1.19 1.76 1.19 1.03 1.75 2.7 1.25 3.36.96.1-.75.4-1.25.73-1.54-2.55-.29-5.24-1.28-5.24-5.7 0-1.26.45-2.29 1.18-3.1-.12-.29-.51-1.46.11-3.05 0 0 .97-.31 3.18 1.18a11 11 0 0 1 5.79 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.24 2.76.12 3.05.74.81 1.18 1.84 1.18 3.1 0 4.43-2.7 5.4-5.27 5.69.42.36.78 1.07.78 2.16v3.2c0 .31.21.67.8.56A10.52 10.52 0 0 0 23.5 12C23.5 5.65 18.35.5 12 .5Z"/></svg>
+              Star on GitHub
+            </a>
+            <a class="btn btn-secondary" href="https://lbniese.github.io/bpm/" target="_blank" rel="noopener">Read the docs</a>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <div class="footer-grid">
+      <div class="footer-brand">
+        <a href="#top" class="brand">
+          <svg viewBox="0 0 64 64" width="26" height="26" aria-hidden="true">
+            <g fill="var(--green)">
+              <ellipse cx="32" cy="18" rx="8" ry="13"/>
+              <ellipse cx="32" cy="46" rx="8" ry="13"/>
+              <ellipse cx="18" cy="32" rx="13" ry="8"/>
+              <ellipse cx="46" cy="32" rx="13" ry="8"/>
+            </g>
+            <circle cx="32" cy="32" r="7" fill="var(--bg)"/>
+          </svg>
+          <span class="brand-name">BPM</span>
+        </a>
+        <p>An npm-compatible package manager with a content-addressed store, built in Rust. MIT licensed.</p>
+      </div>
+
+      <div class="footer-col">
+        <h4>Docs</h4>
+        <ul>
+          <li><a href="https://lbniese.github.io/bpm/" target="_blank" rel="noopener">Overview</a></li>
+          <li><a href="https://github.com/lbniese/bpm/blob/main/docs/architecture.md" target="_blank" rel="noopener">Architecture</a></li>
+          <li><a href="https://github.com/lbniese/bpm/blob/main/docs/cli.md" target="_blank" rel="noopener">CLI reference</a></li>
+          <li><a href="https://github.com/lbniese/bpm/blob/main/docs/milestones.md" target="_blank" rel="noopener">Milestones</a></li>
+        </ul>
+      </div>
+
+      <div class="footer-col">
+        <h4>Project</h4>
+        <ul>
+          <li><a href="https://github.com/lbniese/bpm" target="_blank" rel="noopener">GitHub</a></li>
+          <li><a href="https://github.com/lbniese/bpm/releases" target="_blank" rel="noopener">Releases</a></li>
+          <li><a href="https://github.com/lbniese/bpm/actions/workflows/ci.yml" target="_blank" rel="noopener">CI status</a></li>
+          <li><a href="https://github.com/lbniese/bpm/blob/main/docs/development.md" target="_blank" rel="noopener">Development</a></li>
+        </ul>
+      </div>
+
+      <div class="footer-col">
+        <h4>Community</h4>
+        <ul>
+          <li><a href="https://github.com/lbniese/bpm/blob/main/CONTRIBUTING.md" target="_blank" rel="noopener">Contributing</a></li>
+          <li><a href="https://github.com/lbniese/bpm/issues" target="_blank" rel="noopener">Issues</a></li>
+          <li><a href="https://github.com/lbniese/bpm/discussions" target="_blank" rel="noopener">Discussions</a></li>
+        </ul>
+      </div>
+
+      <div class="footer-col">
+        <h4>Install</h4>
+        <ul>
+          <li><a href="#top">Quick start</a></li>
+          <li><a href="https://github.com/lbniese/bpm/blob/main/install.sh" target="_blank" rel="noopener">install.sh</a></li>
+          <li><a href="https://github.com/lbniese/bpm/blob/main/LICENSE" target="_blank" rel="noopener">License (MIT)</a></li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="footer-bottom">
+      <p>© 2026 BPM — Bloom Package Manager. Source available on GitHub.</p>
+      <div class="footer-social">
+        <a class="icon-btn" href="https://github.com/lbniese/bpm" target="_blank" rel="noopener" aria-label="GitHub">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true"><path d="M12 .5C5.65.5.5 5.65.5 12c0 5.09 3.29 9.4 7.86 10.93.58.1.79-.25.79-.56v-2.16c-3.2.7-3.88-1.36-3.88-1.36-.52-1.34-1.28-1.7-1.28-1.7-1.04-.72.08-.7.08-.7 1.15.08 1.76 1.19 1.76 1.19 1.03 1.75 2.7 1.25 3.36.96.1-.75.4-1.25.73-1.54-2.55-.29-5.24-1.28-5.24-5.7 0-1.26.45-2.29 1.18-3.1-.12-.29-.51-1.46.11-3.05 0 0 .97-.31 3.18 1.18a11 11 0 0 1 5.79 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.24 2.76.12 3.05.74.81 1.18 1.84 1.18 3.1 0 4.43-2.7 5.4-5.27 5.69.42.36.78 1.07.78 2.16v3.2c0 .31.21.67.8.56A10.52 10.52 0 0 0 23.5 12C23.5 5.65 18.35.5 12 .5Z"/></svg>
+        </a>
+      </div>
+    </div>
+  </div>
+</footer>
+
+<script>
+  // Copy-to-clipboard for all copy buttons
+  document.querySelectorAll('[data-copy-target]').forEach(function(btn){
+    btn.addEventListener('click', function(){
+      var target = document.getElementById(btn.getAttribute('data-copy-target'));
+      if(!target) return;
+      var text = target.textContent.trim();
+      var restore = function(){
+        btn.classList.remove('copied');
+        var label = btn.querySelector('.copy-label');
+        if(label) label.textContent = 'Copy';
+        btn.setAttribute('aria-label', 'Copy command');
+      };
+      var onSuccess = function(){
+        btn.classList.add('copied');
+        var label = btn.querySelector('.copy-label');
+        if(label) label.textContent = 'Copied';
+        btn.setAttribute('aria-label', 'Copied to clipboard');
+        setTimeout(restore, 1800);
+      };
+      if(navigator.clipboard && navigator.clipboard.writeText){
+        navigator.clipboard.writeText(text).then(onSuccess).catch(function(){
+          fallbackCopy(text); onSuccess();
+        });
+      } else {
+        fallbackCopy(text); onSuccess();
+      }
+    });
+  });
+
+  function fallbackCopy(text){
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    try{ document.execCommand('copy'); }catch(e){}
+    document.body.removeChild(ta);
+  }
+
+  // Scroll-reveal
+  var revealEls = document.querySelectorAll('.reveal');
+  if('IntersectionObserver' in window){
+    var io = new IntersectionObserver(function(entries){
+      entries.forEach(function(entry){
+        if(entry.isIntersecting){
+          entry.target.classList.add('in');
+          io.unobserve(entry.target);
+        }
+      });
+    }, { threshold: 0.12, rootMargin: '0px 0px -40px 0px' });
+    revealEls.forEach(function(el){ io.observe(el); });
+  } else {
+    revealEls.forEach(function(el){ el.classList.add('in'); });
+  }
+
+  // Animate benchmark bars once visible
+  var benchChart = document.querySelector('.bench-chart');
+  if(benchChart && 'IntersectionObserver' in window){
+    var benchIo = new IntersectionObserver(function(entries){
+      entries.forEach(function(entry){
+        if(entry.isIntersecting){
+          entry.target.querySelectorAll('.bench-fill').forEach(function(fill){
+            fill.style.width = fill.getAttribute('data-width');
+          });
+          benchIo.unobserve(entry.target);
+        }
+      });
+    }, { threshold: 0.3 });
+    benchIo.observe(benchChart);
+  } else if(benchChart){
+    benchChart.querySelectorAll('.bench-fill').forEach(function(fill){
+      fill.style.width = fill.getAttribute('data-width');
+    });
+  }
+</script>
+
+</body>
+</html>

@@ -20,6 +20,17 @@ the commit history wins.
 | 5 — Lifecycle support | npm-compatible script environment, derived artifact store, native-addon fixture coverage | ✅ Done — lifecycle sandbox runner, `bpm run` |
 | 6 — Workspaces and optimization | basic npm workspaces, filesystem capability detection, reflink/clone optimization, adaptive concurrency | ✅ Done — workspace discovery in graph id, fs capability probe |
 
+### Post-M6 — registry name resolution (not in the original plan)
+
+`bpm fetch` now resolves an npm-style spec (`lodash`, `lodash@4.17.21`,
+`lodash@^4.17.0`, scoped names) against the registry before download, matching
+`npm`/`bun` UX, while exact-URL/`file://` targets keep working unchanged.
+Delivered: `src/registry.rs` (packument fetch + version selection via `semver`),
+`fetch` CLI `--registry` / `BPM_REGISTRY`, and offline integration tests. The
+immutable store layer is unchanged — resolution only produces a
+`(tarball_url, integrity)` pair that the existing store consumes. Full graph
+dependency resolution is still deferred.
+
 Note: the project's actual **Milestone 0** (benchmark harness) has not been
 built yet. Earlier CLI-bootstrapping work (doctor/manifest/project-root) is
 foundational scaffolding, not a substitute for it — no installer
