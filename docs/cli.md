@@ -70,6 +70,43 @@ Repeated `fetch` of the same artifact/integrity performs no network or
 extraction work (a spec is re-resolved each run, but the tarball itself is
 served from the immutable store) — this is the Milestone 1 success criterion.
 
+## `bpm install [target] [flags]`
+
+Two modes:
+
+- **`bpm install` (no argument)** — installs the locked dependency graph from
+  `bpm.lock` into `node_modules` (see the frozen-installer docs). Requires a
+  `bpm.lock` in the current or a parent directory.
+- **`bpm install <target>`** — fetches a single package (resolved exactly like
+  `bpm fetch`) and links its declared executables into a global bin directory so
+  they appear on your `PATH`. This is handy for quickly grabbing a CLI tool
+  (e.g. `bpm install cowsay`).
+
+The bin directory is chosen in this order: `$BPM_BIN`, then `~/.local/bin`
+(if it exists), then `~/bin`. Each declared `bin` becomes a symlink there
+pointing at the immutable store image; the linked file is made executable.
+
+```bash
+bpm install cowsay                 # links `cowsay` + `cowthink` into ~/.local/bin
+bpm install lodash@4.17.21         # resolves an exact version, then links bins
+bpm install --registry https://my.registry.dev my-cli
+```
+
+Notes:
+
+- Packages whose `package.json` declares no `bin` fail with a clear error
+  (`declares no 'bin' executables; nothing to link`) — `install <target>` only
+  links executables, it does not resolve the package's *dependencies*.
+- Re-running is idempotent: an already-correct symlink is left in place.
+- If the chosen bin directory is not on your `PATH`, `bpm` prints a hint.
+
+| Flag | Meaning |
+|---|---|
+| `<target>` | Package spec or exact URL/`file://`/path, resolved like `bpm fetch`. Omit for lockfile install. |
+| `--registry <url>` | Registry base URL for spec resolution (bin-install mode only). |
+| `--store <dir>` | Store root. Defaults to `$BPM_STORE`, then `$HOME/.bpm`. |
+| `--frozen`, `--concurrency`, `--json-metrics`, `--ignore-scripts` | Apply to the lockfile install mode (no `<target>`). |
+
 ## `bpm import [path] [flags]`
 
 Imports an npm `package-lock.json` (`lockfileVersion` 3 only) into a
