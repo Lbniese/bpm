@@ -57,6 +57,7 @@ no re-resolving.
 |---|---|
 | `bpm doctor` | Inspect the nearest `package.json` and report diagnostics |
 | `bpm fetch <spec\|url>` | Resolve a package by spec (`lodash`, `lodash@4.17.21`) or fetch a tarball by exact URL, then verify, store, and extract |
+| `bpm install [<spec\|url>]` | Install from `bpm.lock`, or fetch a package and link its bins globally (`bpm install cowsay`) |
 | `bpm import` | Convert npm `package-lock.json` v3 to `bpm.lock` |
 | `bpm bench` | Run performance benchmark scenarios and emit timing results |
 

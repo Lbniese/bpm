@@ -120,11 +120,24 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// Install the locked dependency graph from `bpm.lock` into `node_modules`.
+    /// Install packages. With no argument, install the locked dependency graph
+    /// from `bpm.lock` into `node_modules`. With a package spec or URL argument
+    /// (e.g. `bpm install cowsay`, `bpm install lodash@4.17.21`), fetch that
+    /// package and link its declared executables into a global bin directory
+    /// (`$BPM_BIN`, else `~/.local/bin`, else `~/bin`) so they appear on PATH.
     Install {
+        /// Package spec (`lodash`, `lodash@4.17.21`, `@scope/pkg@^1`) or an
+        /// exact tarball URL / `file://` path to fetch and link bins for. When
+        /// omitted, install from `bpm.lock` instead.
+        target: Option<String>,
         /// Require `package.json` and `bpm.lock` to agree; never change versions.
+        /// Only applies to the lockfile install mode (no `target`).
         #[arg(long)]
         frozen: bool,
+        /// Registry base URL for spec resolution in `bpm install <spec>` mode
+        /// (defaults to `$BPM_REGISTRY` or `https://registry.npmjs.org`).
+        #[arg(long)]
+        registry: Option<String>,
         /// Store root (defaults to `$BPM_STORE` or `$HOME/.bpm`).
         #[arg(long)]
         store: Option<PathBuf>,
@@ -201,12 +214,22 @@ fn main() -> ExitCode {
             }
         },
         Commands::Install {
+            target,
             frozen,
+            registry,
             store,
             concurrency,
             json_metrics,
             ignore_scripts,
-        } => match run_install(frozen, store, concurrency, json_metrics, ignore_scripts) {
+        } => match run_install(
+            target,
+            frozen,
+            registry,
+            store,
+            concurrency,
+            json_metrics,
+            ignore_scripts,
+        ) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 eprintln!("error: {err:#}");
@@ -544,7 +567,9 @@ fn run_import(path: Option<PathBuf>, out: Option<PathBuf>, json: bool) -> anyhow
 /// With `--frozen`, refuses if `package.json` and `bpm.lock` disagree on the
 /// root dependency set (IMPLEMENTATION §17, §18).
 fn run_install(
+    target: Option<String>,
     frozen: bool,
+    registry: Option<String>,
     store: Option<PathBuf>,
     concurrency: usize,
     json_metrics: Option<PathBuf>,
@@ -553,6 +578,13 @@ fn run_install(
     // --ignore-scripts is accepted but lifecycle scripts arrive in a later
     // milestone (M5); for now it is an acknowledged no-op.
     let _ = ignore_scripts;
+
+    // `bpm install <spec|url>` — fetch a single package and link its declared
+    // executables into a global bin directory. This is a distinct mode from the
+    // lockfile graph install below.
+    if let Some(target) = target {
+        return run_install_bin(&target, registry, store);
+    }
 
     let store_root = store
         .or_else(|| env::var_os("BPM_STORE").map(PathBuf::from))
@@ -793,6 +825,198 @@ fn run_install(
 
     Ok(())
 }
+
+/// `bpm install <spec|url>` — fetch a single package, extract it, and link its
+/// declared executables into a global bin directory so they appear on PATH.
+///
+/// Resolution mirrors [`run_fetch`]: a valid npm name is resolved against the
+/// registry (honoring `$BPM_REGISTRY`), while a URL/`file://`/bare path is used
+/// as-is. The package's extracted image `package.json` `bin` field (a string or
+/// name->path map) drives which executables are linked. Each bin becomes a
+/// symlink in the bin dir pointing at the absolute image path, and the target
+/// file is made executable.
+fn run_install_bin(
+    target: &str,
+    registry: Option<String>,
+    store: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let store_root = store
+        .or_else(|| env::var_os("BPM_STORE").map(PathBuf::from))
+        .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".bpm")))
+        .ok_or_else(|| anyhow::anyhow!("no --store given and $BPM_STORE/$HOME is unset"))?;
+    let store = ArtifactStore::open(&store_root)?;
+
+    let mut metrics = Metrics::new();
+
+    // Resolve `target` to a concrete (url, integrity) pair, exactly like fetch.
+    let (url, integrity): (String, Option<Integrity>) =
+        if bpm::registry::is_valid_npm_name(name_of_spec(target)) {
+            let registry_base = registry
+                .or_else(|| env::var_os("BPM_REGISTRY").map(|s| s.to_string_lossy().into_owned()))
+                .unwrap_or_else(|| "https://registry.npmjs.org".to_string());
+            let spec = bpm::registry::parse_spec(target)?;
+            let resolved = metrics
+                .measure("metadata_fetch", || {
+                    bpm::registry::resolve(&spec, &registry_base)
+                })
+                .map_err(|e| {
+                    anyhow::anyhow!("failed to resolve '{target}' from {registry_base}: {e}")
+                })?;
+            eprintln!(
+                "resolved {}@{} -> {}",
+                resolved.name, resolved.version, resolved.tarball_url
+            );
+            let integ = Integrity::parse(&resolved.integrity)?;
+            (resolved.tarball_url, Some(integ))
+        } else {
+            (target.to_string(), None)
+        };
+
+    let artifact = store.ensure_artifact(&url, integrity.as_ref(), &mut metrics)?;
+    let image = store.ensure_image(&artifact.id, &mut metrics)?;
+    println!(
+        "fetched {} ({}) -> {}",
+        artifact.id,
+        if artifact.cached { "cached" } else { "stored" },
+        image.path.display()
+    );
+
+    // Read the package's declared executables from its package.json.
+    let manifest_path = image.path.join("package.json");
+    let manifest = PackageManifest::from_path(&manifest_path)
+        .map_err(|e| anyhow::anyhow!("could not read {}: {e}", manifest_path.display()))?;
+    let bins: Vec<(String, String)> = match &manifest.bin {
+        Some(bpm::manifest::BinField::Map(m)) => {
+            m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        }
+        Some(bpm::manifest::BinField::One(p)) => {
+            let name = manifest.name.clone().unwrap_or_else(|| target.to_string());
+            vec![(name, p.clone())]
+        }
+        None => Vec::new(),
+    };
+
+    if bins.is_empty() {
+        anyhow::bail!(
+            "package {} declares no `bin` executables; nothing to link",
+            manifest.name.as_deref().unwrap_or(target)
+        );
+    }
+
+    let bin_dir = bin_dir()?;
+    fs::create_dir_all(&bin_dir)
+        .map_err(|e| anyhow::anyhow!("could not create {}: {e}", bin_dir.display()))?;
+
+    let mut linked = Vec::new();
+    for (name, relpath) in &bins {
+        let relpath = relpath.strip_prefix("./").unwrap_or(relpath);
+        let target_file = image.path.join(relpath);
+        if !target_file.exists() {
+            eprintln!(
+                "warning: bin '{}' points at missing file {}; skipping",
+                name,
+                target_file.display()
+            );
+            continue;
+        }
+        // Make the executable bit stick (npm convention), idempotent.
+        set_executable(&target_file);
+        let link = bin_dir.join(name);
+        link_bin(&link, &target_file)?;
+        linked.push(name.clone());
+    }
+
+    if linked.is_empty() {
+        anyhow::bail!("no bins were linked for {}", target);
+    }
+    println!(
+        "linked {} bin(s) into {}: {}",
+        linked.len(),
+        bin_dir.display(),
+        linked.join(", ")
+    );
+    if !bin_dir_on_path() {
+        eprintln!(
+            "note: {} is not on your PATH; add it (e.g. `export PATH=\"{}:$PATH\"`)",
+            bin_dir.display(),
+            bin_dir.display()
+        );
+    }
+    Ok(())
+}
+
+/// The directory bins are linked into, in priority order:
+/// `$BPM_BIN` -> `~/.local/bin` -> `~/bin`.
+fn bin_dir() -> anyhow::Result<PathBuf> {
+    if let Some(p) = env::var_os("BPM_BIN") {
+        return Ok(PathBuf::from(p));
+    }
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("$HOME is unset; cannot choose a bin dir"))?;
+    let local = home.join(".local").join("bin");
+    if local.is_dir() {
+        return Ok(local);
+    }
+    Ok(home.join("bin"))
+}
+
+/// `true` if any PATH entry equals `bin_dir`.
+fn bin_dir_on_path() -> bool {
+    let bin_dir = match bin_dir() {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+    env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).any(|e| e == bin_dir))
+        .unwrap_or(false)
+}
+
+/// Point `link` at `target`, replacing any existing entry (idempotent on a
+/// correct target). Uses a symlink so the immutable store image is the source
+/// of truth and `bpm install` is repeatable.
+fn link_bin(link: &Path, target: &Path) -> anyhow::Result<()> {
+    if let Some(parent) = link.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| anyhow::anyhow!("could not create {}: {e}", parent.display()))?;
+    }
+    if let Ok(existing) = fs::read_link(link) {
+        if same_file_path(&existing, target) {
+            return Ok(());
+        }
+    }
+    let _ = fs::remove_file(link);
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).map_err(|e| {
+        anyhow::anyhow!(
+            "could not symlink {} -> {}: {e}",
+            link.display(),
+            target.display()
+        )
+    })?;
+    #[cfg(not(unix))]
+    anyhow::bail!("bin linking is only supported on Unix-like systems");
+    Ok(())
+}
+
+/// Component-wise path equality (ignores trailing separators / OS flavor).
+fn same_file_path(a: &Path, b: &Path) -> bool {
+    a.components().eq(b.components())
+}
+
+/// Add owner/group/other execute bits to `path` (best-effort, Unix-only).
+#[cfg(unix)]
+fn set_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(meta) = fs::metadata(path) {
+        let mut perms = meta.permissions();
+        let mode = perms.mode();
+        perms.set_mode(mode | 0o111);
+        let _ = fs::set_permissions(path, perms);
+    }
+}
+#[cfg(not(unix))]
+fn set_executable(_path: &Path) {}
 
 /// Run a `package.json` script by name with an npm-compatible environment.
 fn run_script_cmd(script: &str) -> anyhow::Result<()> {
