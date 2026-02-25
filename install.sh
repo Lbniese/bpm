@@ -8,12 +8,26 @@
 #
 # Overrides (env):
 #   BPM_REPO         git repo to clone / release source   (default: upstream)
-#   BPM_VERSION      release version to download          (default: 0.1.0)
+#   BPM_VERSION      release version to download          (default: latest, else DEFAULT_VERSION)
 #   BPM_INSTALL_DIR  binary install directory             (default: /usr/local/bin)
 set -eu
 
+# Fallback version used only if the GitHub API is unreachable/rate-limited.
+# Kept in sync with the newest release so a transient API failure can NEVER
+# silently downgrade to a stale binary. Override with BPM_VERSION if needed.
+DEFAULT_VERSION="0.1.2"
+
 BPM_REPO="${BPM_REPO:-https://github.com/Lbniese/bpm}"
-BPM_VERSION="${BPM_VERSION:-0.1.0}"
+# Default to the latest published release so a stale hardcoded version can
+# never ship a broken binary. Override with BPM_VERSION if needed.
+if [ -z "${BPM_VERSION:-}" ]; then
+    BPM_VERSION=$(curl -fsSL -H "User-Agent: bpm-installer" "https://api.github.com/repos/${BPM_REPO#https://}/releases/latest" 2>/dev/null \
+        | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name":[[:space:]]*"v?([^"]+)".*/\1/')
+    if [ -z "$BPM_VERSION" ]; then
+        BPM_VERSION="$DEFAULT_VERSION"
+        print_info "Could not reach the GitHub API for the latest release; using v$BPM_VERSION"
+    fi
+fi
 BPM_INSTALL_DIR="${BPM_INSTALL_DIR:-/usr/local/bin}"
 
 INSTALL_URL="https://raw.githubusercontent.com/Lbniese/bpm/main/install.sh"
@@ -81,6 +95,23 @@ install_binary() {
     sudo install -m 755 "$src" "$dst"
 }
 
+# Return 0 iff the downloaded binary actually supports npm-style package-name
+# resolution (the `fetch` command exposes a `--registry` flag). Pre-built
+# release assets that predate the registry feature lack this flag and would
+# fail on `bpm fetch lodash` with `RelativeUrlWithoutBase`; we detect that and
+# fall back to a source build instead of shipping a broken binary.
+#
+# $1 = path to the candidate binary.
+# Reject binaries that lack the npm-name resolution (`--registry` on `fetch`)
+# or the single-package bin install (`bin directory` on `install`). Either
+# gap means the asset is a stale pre-feature build that would fail real use.
+verify_binary() {
+    bin=$1
+    [ -x "$bin" ] || return 1
+    "$bin" fetch --help 2>&1 | grep -q -- '--registry' && \
+        "$bin" install --help 2>&1 | grep -q -- 'bin directory'
+}
+
 try_prebuilt() {
     # $1 = platform target
     platform=$1
@@ -89,16 +120,22 @@ try_prebuilt() {
     tmpdir=$(mktemp -d)
     if curl -fsSL "$release_url" 2>/dev/null | tar xz -C "$tmpdir" 2>/dev/null; then
         if [ -f "$tmpdir/bpm" ]; then
-            print_info "Installing bpm v$BPM_VERSION..."
-            install_binary "$tmpdir/bpm" "$BPM_INSTALL_DIR/bpm" || {
-                print_err "Installation failed."
-                suggest_command
+            # Guard against stale release assets that cannot resolve package
+            # names (they would fail every `bpm fetch <name>`). Verify first.
+            if verify_binary "$tmpdir/bpm"; then
+                print_info "Installing bpm v$BPM_VERSION..."
+                install_binary "$tmpdir/bpm" "$BPM_INSTALL_DIR/bpm" || {
+                    print_err "Installation failed."
+                    suggest_command
+                    rm -rf "$tmpdir"
+                    exit 1
+                }
                 rm -rf "$tmpdir"
-                exit 1
-            }
-            rm -rf "$tmpdir"
-            print_ok "bpm installed to $BPM_INSTALL_DIR/bpm"
-            return 0
+                print_ok "bpm installed to $BPM_INSTALL_DIR/bpm"
+                return 0
+            else
+                print_info "Pre-built v$BPM_VERSION lacks npm-name resolution; falling back to source build."
+            fi
         fi
     fi
     rm -rf "$tmpdir"
@@ -122,29 +159,37 @@ build_from_source() {
     print_info "Building from source..."
     ensure_cargo
 
-    tmpdir=$(mktemp -d)
-    print_info "Cloning $BPM_REPO..."
-    git clone --depth 1 "$BPM_REPO" "$tmpdir" 2>/dev/null || {
-        print_err "Failed to clone repository."
-        rm -rf "$tmpdir"
-        exit 1
-    }
+    # Prefer a local checkout: if we are invoked from inside the bpm repo,
+    # build that (already on disk, no clone, uses the current code).
+    if [ -f Cargo.toml ] && grep -q '^name = "bpm"' Cargo.toml 2>/dev/null; then
+        print_info "Using local checkout at $(pwd)..."
+        srcdir=$(pwd)
+    else
+        tmpdir=$(mktemp -d)
+        print_info "Cloning $BPM_REPO..."
+        git clone --depth 1 "$BPM_REPO" "$tmpdir" 2>/dev/null || {
+            print_err "Failed to clone repository."
+            rm -rf "$tmpdir"
+            exit 1
+        }
+        srcdir=$tmpdir
+    fi
 
     print_info "Building (this may take a few minutes)..."
-    (cd "$tmpdir" && cargo build --release) || {
+    (cd "$srcdir" && cargo build --release) || {
         print_err "Build failed. See output above."
-        rm -rf "$tmpdir"
+        [ -n "${tmpdir:-}" ] && rm -rf "$tmpdir"
         exit 1
     }
 
-    install_binary "$tmpdir/target/release/bpm" "$BPM_INSTALL_DIR/bpm" || {
+    install_binary "$srcdir/target/release/bpm" "$BPM_INSTALL_DIR/bpm" || {
         print_err "Installation failed."
         suggest_command
-        rm -rf "$tmpdir"
+        [ -n "${tmpdir:-}" ] && rm -rf "$tmpdir"
         exit 1
     }
 
-    rm -rf "$tmpdir"
+    [ -n "${tmpdir:-}" ] && rm -rf "$tmpdir"
     print_ok "bpm installed to $BPM_INSTALL_DIR/bpm"
 }
 
