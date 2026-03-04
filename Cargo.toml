@@ -19,6 +19,7 @@ base64 = "0.22"
 flate2 = "1.0"
 tar = "0.4"
 ureq = { version = "2.12", features = ["tls"] }
+httpdate = "1.0.3"
 tempfile = "3.12"
 
 # Graph-plan cache (Milestone 3): deterministic graph + plan hashing
@@ -26,3 +27,10 @@ blake3 = "1.5"
 
 # Registry resolution: package-spec -> version range matching
 semver = "1.0"
+
+# Persistent metadata index (filesystem objects remain the source of truth).
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+
+[dev-dependencies]
+# Deterministic property and malformed-input regression tests.
+proptest = "1.11.0"

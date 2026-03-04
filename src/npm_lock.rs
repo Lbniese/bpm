@@ -224,6 +224,7 @@ pub fn import(json: &str) -> Result<ImportReport, NpmLockError> {
             name,
             version,
             resolved,
+            workspace_target: None,
             integrity,
             link,
             dev: pkg.dev.unwrap_or(false),

@@ -1,0 +1,12 @@
+{
+  "name": "@bpm-fixtures/shared",
+  "version": "1.0.0",
+  "private": true,
+  "main": "index.cjs",
+  "scripts": {
+    "smoke": "node -e \"require('lodash'); require('.'); process.stdout.write('shared:ok\\n')\""
+  },
+  "dependencies": {
+    "lodash": "4.17.21"
+  }
+}

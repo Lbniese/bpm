@@ -28,6 +28,7 @@ use thiserror::Error;
 
 use crate::archive::{self, ExtractError};
 use crate::download::{self, DownloadError};
+use crate::http::HttpClient;
 use crate::integrity::{ArtifactId, Integrity, IntegrityError, Sha512Digest};
 use crate::metrics::Metrics;
 
@@ -138,6 +139,11 @@ impl ArtifactStore {
         self.root.join(IMAGES).join(&hex[..2]).join(&hex)
     }
 
+    /// Path to the deterministic seekable package-image sidecar.
+    pub fn image_index_path(&self, id: &ArtifactId) -> PathBuf {
+        self.image_path(id).with_extension("bpi")
+    }
+
     /// Absolute path of the reusable graph volume for `graph_hex` (a 64-char
     /// lowercase blake3 hex). The volume holds an immutable `node_modules`
     /// projection keyed by graph id (IMPLEMENTATION §13), shared across
@@ -183,20 +189,58 @@ impl ArtifactStore {
         Ok(self.root.join(TMP).join(name))
     }
 
-    /// Ensure the tarball for `url` is present and verified, downloading if
-    /// necessary. Repeated calls with the same integrity perform no network work.
+    /// Compatibility-only artifact entry point using the process-default HTTP
+    /// client.
     ///
-    /// When `integrity` is `Some`, the target path is known up front and a
-    /// per-digest lock protects the whole step (cache hit serves immediately).
-    /// When `integrity` is `None`, the digest is only known after download; the
-    /// artifact is still published atomically, but a redundant download may
-    /// occur on concurrent misses (acceptable: we cannot share what we cannot name).
+    /// New production callers must use [`Self::ensure_artifact_with_client`] so
+    /// registry metadata and tarball requests share one effective npm
+    /// configuration and pooled client. Local files retain their existing
+    /// behavior because the download layer does not consult the HTTP client for
+    /// local paths.
     pub fn ensure_artifact(
         &self,
         url: &str,
         integrity: Option<&Integrity>,
         metrics: &mut Metrics,
     ) -> Result<ArtifactRef, StoreError> {
+        self.ensure_artifact_using(url, integrity, metrics, download::download)
+    }
+
+    /// Ensure the tarball for `url` is present and verified using a
+    /// caller-owned pooled HTTP client.
+    ///
+    /// HTTP downloads inherit the client's authentication, retry, redirect,
+    /// and timeout policy. Local file sources bypass HTTP while preserving the
+    /// same integrity, locking, metrics, cleanup, and atomic publication path.
+    pub fn ensure_artifact_with_client(
+        &self,
+        client: &HttpClient,
+        url: &str,
+        integrity: Option<&Integrity>,
+        metrics: &mut Metrics,
+    ) -> Result<ArtifactRef, StoreError> {
+        self.ensure_artifact_using(url, integrity, metrics, |url, dest| {
+            download::download_with_client(client, url, dest)
+        })
+    }
+
+    /// Shared artifact pipeline for compatibility and configured-client entry
+    /// points. Keeping all store semantics here prevents either HTTP boundary
+    /// from diverging in integrity, locking, metrics, cleanup, or publication.
+    fn ensure_artifact_using<F>(
+        &self,
+        url: &str,
+        integrity: Option<&Integrity>,
+        metrics: &mut Metrics,
+        mut retrieve: F,
+    ) -> Result<ArtifactRef, StoreError>
+    where
+        F: FnMut(&str, &Path) -> Result<Sha512Digest, DownloadError>,
+    {
+        // Repeated calls with the same integrity perform no network work. When
+        // integrity is known, a per-digest lock protects the whole step. When
+        // it is absent, publication remains atomic, though concurrent misses
+        // may redundantly download an artifact that cannot yet be named.
         match integrity {
             Some(integ) => {
                 let id = *integ.digest();
@@ -213,7 +257,7 @@ impl ArtifactStore {
                 }
                 let tmp = self.unique_tmp(&format!("dl-{}", id.to_hex()))?;
                 let computed = metrics
-                    .measure("artifact_download", || download::download(url, &tmp))
+                    .measure("artifact_download", || retrieve(url, &tmp))
                     .map_err(|source| StoreError::Download {
                         url: url.to_string(),
                         source,
@@ -237,7 +281,7 @@ impl ArtifactStore {
             None => {
                 let tmp = self.unique_tmp(&format!("dl-anon-{}", sanitize_hint(url)))?;
                 let computed = metrics
-                    .measure("artifact_download", || download::download(url, &tmp))
+                    .measure("artifact_download", || retrieve(url, &tmp))
                     .map_err(|source| StoreError::Download {
                         url: url.to_string(),
                         source,
@@ -272,6 +316,12 @@ impl ArtifactStore {
         let _guard = self.acquire_lock(&format!("img-{}", id.to_hex()))?;
         let img = self.image_path(id);
         if img.exists() {
+            let index = self.image_index_path(id);
+            if !index.exists() {
+                let bytes = crate::package_image::from_directory(&img)
+                    .map_err(|error| io_err(&index, std::io::Error::other(error.to_string())))?;
+                fs::write(&index, bytes).map_err(|source| io_err(&index, source))?;
+            }
             metrics.record("artifact_extract", std::time::Duration::ZERO);
             return Ok(ImageRef {
                 id: *id,
@@ -295,11 +345,17 @@ impl ArtifactStore {
             fs::create_dir_all(parent).map_err(|source| io_err(parent, source))?;
         }
         match fs::rename(&tmp, &img) {
-            Ok(()) => Ok(ImageRef {
-                id: *id,
-                path: img,
-                cached: false,
-            }),
+            Ok(()) => {
+                let index = self.image_index_path(id);
+                let bytes = crate::package_image::from_directory(&img)
+                    .map_err(|error| io_err(&index, std::io::Error::other(error.to_string())))?;
+                fs::write(&index, bytes).map_err(|source| io_err(&index, source))?;
+                Ok(ImageRef {
+                    id: *id,
+                    path: img,
+                    cached: false,
+                })
+            }
             Err(e) => {
                 if img.exists() {
                     let _ = fs::remove_dir_all(&tmp);
@@ -392,4 +448,121 @@ fn sanitize_hint(url: &str) -> String {
         .take(96)
         .collect::<String>()
         .replace('/', "-")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::NpmConfig;
+    use crate::http::HttpClient;
+    use std::io::Write as _;
+    use std::net::TcpListener;
+
+    fn authenticated_server(body: Vec<u8>) -> (String, std::thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept artifact request");
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut chunk).expect("read artifact request");
+                assert_ne!(read, 0, "request ended before headers");
+                request.extend_from_slice(&chunk[..read]);
+            }
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .expect("write response headers");
+            stream.write_all(&body).expect("write response body");
+            String::from_utf8(request).expect("request headers are utf8")
+        });
+        (format!("http://{address}/artifact.tgz"), handle)
+    }
+
+    fn configured_client(url: &str, directory: &Path) -> HttpClient {
+        let authority = url
+            .strip_prefix("http://")
+            .and_then(|value| value.split_once('/'))
+            .map(|(authority, _)| authority)
+            .expect("test URL authority");
+        let npmrc = directory.join("configured.npmrc");
+        fs::write(
+            &npmrc,
+            format!("//{authority}/:_authToken=artifact-secret\nfetch-retries=0\n"),
+        )
+        .expect("write npmrc");
+        HttpClient::new(NpmConfig::load_paths(None, Some(&npmrc)).expect("load npmrc"))
+    }
+
+    #[test]
+    fn configured_client_is_used_for_known_integrity_http_artifacts() {
+        let body = b"known integrity artifact".to_vec();
+        let expected = Integrity::sha512(Sha512Digest::hash_bytes(&body));
+        let server_dir = tempfile::tempdir().expect("server config dir");
+        let (url, request) = authenticated_server(body.clone());
+        let client = configured_client(&url, server_dir.path());
+        let store_dir = tempfile::tempdir().expect("store dir");
+        let store = ArtifactStore::open(store_dir.path()).expect("open store");
+        let mut metrics = Metrics::new();
+
+        let artifact = store
+            .ensure_artifact_with_client(&client, &url, Some(&expected), &mut metrics)
+            .expect("store configured artifact");
+
+        assert!(!artifact.cached);
+        assert_eq!(fs::read(&artifact.path).expect("read artifact"), body);
+        assert!(metrics.to_json().contains("artifact_download"));
+        assert!(metrics.to_json().contains("integrity_verify"));
+        assert!(request
+            .join()
+            .expect("join server")
+            .contains("Authorization: Bearer artifact-secret\r\n"));
+        assert_eq!(
+            fs::read_dir(store.root().join(TMP))
+                .expect("read temp directory")
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn configured_client_preserves_anonymous_and_local_artifact_paths() {
+        let body = b"anonymous artifact".to_vec();
+        let server_dir = tempfile::tempdir().expect("server config dir");
+        let (url, request) = authenticated_server(body.clone());
+        let client = configured_client(&url, server_dir.path());
+        let store_dir = tempfile::tempdir().expect("store dir");
+        let store = ArtifactStore::open(store_dir.path()).expect("open store");
+        let mut metrics = Metrics::new();
+
+        let anonymous = store
+            .ensure_artifact_with_client(&client, &url, None, &mut metrics)
+            .expect("store anonymous configured artifact");
+        assert_eq!(anonymous.id, Sha512Digest::hash_bytes(&body));
+        assert!(!anonymous.cached);
+        assert!(request
+            .join()
+            .expect("join server")
+            .contains("Authorization: Bearer artifact-secret\r\n"));
+
+        let local_body = b"local artifact";
+        let local_source = store_dir.path().join("local.tgz");
+        fs::write(&local_source, local_body).expect("write local artifact");
+        let local_integrity = Integrity::sha512(Sha512Digest::hash_bytes(local_body));
+        let local = store
+            .ensure_artifact_with_client(
+                &client,
+                local_source.to_str().expect("utf8 temp path"),
+                Some(&local_integrity),
+                &mut metrics,
+            )
+            .expect("store local artifact");
+        assert_eq!(
+            fs::read(local.path).expect("read local artifact"),
+            local_body
+        );
+    }
 }

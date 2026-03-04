@@ -130,6 +130,33 @@ fn reports_workspaces_overrides_and_engines() {
 }
 
 #[test]
+fn reports_peer_override_and_optional_dependency_diagnostics_together() {
+    let tmp = tempdir().unwrap();
+    write(
+        tmp.path(),
+        "package.json",
+        r#"{
+            "name":"diagnostic-fixture",
+            "version":"1.0.0",
+            "peerDependencies":{"react":"^18.0.0"},
+            "optionalDependencies":{"fsevents":"^2.3.3"},
+            "overrides":{"semver":"7.7.2"}
+        }"#,
+    );
+
+    let report = run(tmp.path());
+    let actual = codes(&report);
+
+    assert_eq!(report.manifest.declared_dependencies, 2);
+    assert_eq!(report.manifest.overrides, 1);
+    assert_eq!(
+        actual,
+        vec!["DECLARED_DEPENDENCIES", "OVERRIDES_UNSUPPORTED"],
+        "peer and optional dependencies must contribute to the dependency diagnostic while overrides retain their dedicated warning"
+    );
+}
+
+#[test]
 fn malformed_manifest_is_error_diagnostic() {
     let tmp = tempdir().unwrap();
     let root = tmp.path();

@@ -30,11 +30,12 @@ fn fixtures_have_meaningful_packages() {
 fn scenario_kinds_are_stable_and_unique() {
     let all = ScenarioKind::all();
     let names: Vec<&str> = all.iter().map(|s| s.name()).collect();
-    assert_eq!(names.len(), 4);
+    assert_eq!(names.len(), 8);
     // None of these tests run the network, so just assert on the encoding.
     let set: std::collections::BTreeSet<&str> = names.iter().copied().collect();
-    assert_eq!(set.len(), 4, "scenario names must be unique");
+    assert_eq!(set.len(), 8, "scenario names must be unique");
     assert!(names.contains(&"repeat_install"));
+    assert!(names.contains(&"monorepo_incremental"));
 }
 
 #[test]
@@ -91,6 +92,8 @@ fn tools_include_bpm_after_milestone_2() {
     let names: Vec<&str> = Tool::all().iter().map(|c| c.name()).collect();
     assert!(names.contains(&"bpm"), "bpm tool missing: {names:?}");
     assert!(names.contains(&"npm"));
+    assert!(names.contains(&"yarn"));
+    assert!(names.contains(&"bun"));
 }
 
 #[test]

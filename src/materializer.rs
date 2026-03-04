@@ -28,7 +28,7 @@ use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
 
 use crate::integrity::ArtifactId;
-use crate::lockfile::PackageEntry;
+use crate::lockfile::{Lockfile, PackageEntry};
 use crate::store::ArtifactStore;
 
 /// Default permission bits applied to a linked bin (owner rwx, group rx, other rx).
@@ -46,6 +46,22 @@ pub struct MaterializeStats {
     pub bins_collisions: usize,
     /// Entries skipped because they are workspace/link entries or unresolved.
     pub links_skipped: usize,
+}
+
+/// Materialization visibility policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaterializeMode {
+    /// Accept the resolver's npm-v3-compatible placement as authoritative.
+    Compatible,
+    /// Require every placement to be reachable through an explicit lock edge.
+    Strict,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaterializeBackend {
+    Symlink,
+    Hardlink,
+    Auto,
 }
 
 #[derive(Debug, Error)]
@@ -78,20 +94,57 @@ pub fn materialize(
     store: &ArtifactStore,
     resolved: &[(&PackageEntry, ArtifactId)],
 ) -> Result<MaterializeStats, MaterializeError> {
+    materialize_with_backend(project_root, store, resolved, MaterializeBackend::Auto)
+}
+
+pub fn materialize_with_backend(
+    project_root: &Path,
+    store: &ArtifactStore,
+    resolved: &[(&PackageEntry, ArtifactId)],
+    backend: MaterializeBackend,
+) -> Result<MaterializeStats, MaterializeError> {
     let mut stats = MaterializeStats::default();
     // Names already linked into node_modules/.bin, for deterministic collision
     // reporting (first declarant wins).
     let mut linked_bins: BTreeSet<String> = BTreeSet::new();
 
     for (entry, id) in resolved {
-        if entry.link || entry.resolved.is_empty() {
+        if entry.link {
+            if let Some(relative) = entry.workspace_target.as_deref() {
+                let target = project_root.join(relative);
+                link_path(&project_root.join(&entry.path), &target)?;
+            }
+            stats.links_skipped += 1;
+            continue;
+        }
+        if entry.resolved.is_empty() {
             stats.links_skipped += 1;
             continue;
         }
 
         let image_dir = store.image_path(id);
         let target = project_root.join(&entry.path);
-        link_path(&target, &image_dir)?;
+        let symlink_bins = match backend {
+            MaterializeBackend::Symlink => {
+                link_path(&target, &image_dir)?;
+                true
+            }
+            MaterializeBackend::Hardlink => {
+                hardlink_tree(&image_dir, &target)?;
+                false
+            }
+            MaterializeBackend::Auto => {
+                if let Err(error) = link_path(&target, &image_dir) {
+                    if !matches!(error, MaterializeError::SymlinksUnsupported) {
+                        return Err(error);
+                    }
+                    hardlink_tree(&image_dir, &target)?;
+                    false
+                } else {
+                    true
+                }
+            }
+        };
         stats.packages_materialized += 1;
 
         if !entry.bin.is_empty() {
@@ -102,11 +155,181 @@ pub fn materialize(
                 &entry.bin,
                 &mut linked_bins,
                 &mut stats,
+                symlink_bins,
             )?;
         }
     }
 
     Ok(stats)
+}
+
+fn hardlink_tree(source: &Path, target: &Path) -> Result<(), MaterializeError> {
+    if target.exists() || symlink_exists(target) {
+        remove_any(target)?;
+    }
+    let index_path = source.with_extension("bpi");
+    if index_path.is_file() {
+        return hardlink_tree_from_index(source, target, &index_path);
+    }
+    hardlink_tree_by_walking_directory(source, target)
+}
+
+fn hardlink_tree_by_walking_directory(
+    source: &Path,
+    target: &Path,
+) -> Result<(), MaterializeError> {
+    fs::create_dir_all(target).map_err(|source| io_err(target, source))?;
+    for item in fs::read_dir(source).map_err(|error| io_err(source, error))? {
+        let item = item.map_err(|error| io_err(source, error))?;
+        let from = item.path();
+        let to = target.join(item.file_name());
+        if item
+            .file_type()
+            .map_err(|source| io_err(&from, source))?
+            .is_dir()
+        {
+            hardlink_tree_by_walking_directory(&from, &to)?;
+        } else if item
+            .file_type()
+            .map_err(|source| io_err(&from, source))?
+            .is_file()
+        {
+            hardlink_or_copy_file(&from, &to)?;
+        } else if item
+            .file_type()
+            .map_err(|source| io_err(&from, source))?
+            .is_symlink()
+        {
+            let link = fs::read_link(&from).map_err(|source| io_err(&from, source))?;
+            make_symlink(&link, &to)?;
+        }
+    }
+    Ok(())
+}
+
+fn hardlink_tree_from_index(
+    source: &Path,
+    target: &Path,
+    index_path: &Path,
+) -> Result<(), MaterializeError> {
+    let bytes = fs::read(index_path).map_err(|source| io_err(index_path, source))?;
+    let entries = crate::package_image::decode(&bytes).map_err(|error| MaterializeError::Io {
+        path: index_path.display().to_string(),
+        source: std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()),
+    })?;
+    fs::create_dir_all(target).map_err(|source| io_err(target, source))?;
+    for entry in entries {
+        match entry {
+            crate::package_image::Entry::File { path, .. } => {
+                let from = safe_relative_join(source, &path)?;
+                let to = safe_relative_join(target, &path)?;
+                hardlink_or_copy_file(&from, &to)?;
+            }
+            crate::package_image::Entry::Symlink { path, target: link } => {
+                let to = safe_relative_join(target, &path)?;
+                if let Some(parent) = to.parent() {
+                    fs::create_dir_all(parent).map_err(|source| io_err(parent, source))?;
+                }
+                make_symlink(Path::new(&link), &to)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn hardlink_or_copy_file(from: &Path, to: &Path) -> Result<(), MaterializeError> {
+    if let Some(parent) = to.parent() {
+        fs::create_dir_all(parent).map_err(|source| io_err(parent, source))?;
+    }
+    fs::hard_link(from, to)
+        .or_else(|_| fs::copy(from, to).map(|_| ()))
+        .map_err(|source| io_err(to, source))
+}
+
+/// Validate and materialize a complete lockfile using the selected visibility
+/// policy. Strict mode prevents accidental hoisting from exposing packages
+/// that no dependency is allowed to see.
+pub fn materialize_lockfile(
+    project_root: &Path,
+    store: &ArtifactStore,
+    lockfile: &Lockfile,
+    artifact_ids: &[Option<ArtifactId>],
+    mode: MaterializeMode,
+) -> Result<MaterializeStats, MaterializeError> {
+    if mode == MaterializeMode::Strict {
+        validate_strict_layout(lockfile).map_err(|message| MaterializeError::Io {
+            path: project_root.display().to_string(),
+            source: std::io::Error::new(std::io::ErrorKind::InvalidData, message),
+        })?;
+    }
+    let mut workspace_links = 0;
+    for package in lockfile.packages.iter().filter(|package| package.link) {
+        if let Some(relative) = package.workspace_target.as_deref() {
+            link_path(
+                &project_root.join(&package.path),
+                &project_root.join(relative),
+            )?;
+            workspace_links += 1;
+        }
+    }
+    let resolved = artifact_ids
+        .iter()
+        .zip(&lockfile.packages)
+        .filter_map(|(id, package)| id.map(|id| (package, id)))
+        .collect::<Vec<_>>();
+    let mut stats = materialize(project_root, store, &resolved)?;
+    stats.links_skipped += workspace_links;
+    Ok(stats)
+}
+
+fn validate_strict_layout(lockfile: &Lockfile) -> Result<(), String> {
+    let package_paths = lockfile
+        .packages
+        .iter()
+        .map(|package| package.path.as_str())
+        .collect::<BTreeSet<_>>();
+    for package in &lockfile.packages {
+        let Some((parent, name)) = package.path.rsplit_once("/node_modules/") else {
+            let expected = format!("node_modules/{}", package.name);
+            if package.path != expected {
+                return Err(format!(
+                    "package {} has invalid root placement {}",
+                    package.name, package.path
+                ));
+            }
+            if !lockfile.root.dependencies.contains_key(&package.name) {
+                return Err(format!(
+                    "package {} is hoisted without a root dependency",
+                    package.path
+                ));
+            }
+            continue;
+        };
+        let parent_entry = lockfile
+            .packages
+            .iter()
+            .find(|candidate| candidate.path == parent)
+            .ok_or_else(|| format!("package {} has missing parent {}", package.path, parent))?;
+        let dependency = lockfile
+            .resolution
+            .packages
+            .get(parent)
+            .and_then(|resolution| resolution.dependencies.get(name))
+            .ok_or_else(|| format!("package {} is not declared by {}", package.path, parent))?;
+        if dependency.target != package.path {
+            return Err(format!(
+                "dependency {} from {} targets {}, not {}",
+                name, parent, dependency.target, package.path
+            ));
+        }
+        if !package_paths.contains(dependency.target.as_str()) || parent_entry.name.is_empty() {
+            return Err(format!(
+                "package {} has an invalid strict dependency target",
+                package.path
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Point `link` at `target`, creating parent dirs and replacing any stale entry.
@@ -133,6 +356,7 @@ fn link_bins(
     bins: &std::collections::BTreeMap<String, String>,
     linked_bins: &mut BTreeSet<String>,
     stats: &mut MaterializeStats,
+    symlink_bins: bool,
 ) -> Result<(), MaterializeError> {
     let bin_dir = project_root.join("node_modules").join(".bin");
     fs::create_dir_all(&bin_dir).map_err(|source| io_err(&bin_dir, source))?;
@@ -149,7 +373,10 @@ fn link_bins(
         let link = bin_dir.join(name);
         // Relative target from node_modules/.bin/ to <pkg_path>/<relpath>.
         let rel_target = relative_bin_target(pkg_path, relpath);
-        if read_link_if_points_to(&link, Path::new(&rel_target))?.is_some() {
+        let materialized_bin = project_root.join(pkg_path).join(strip_dot_slash(relpath));
+        if read_link_if_points_to(&link, Path::new(&rel_target))?.is_some()
+            || (!symlink_bins && same_file(&link, &materialized_bin))
+        {
             // A previous run of this same install already linked this bin
             // correctly; record and continue.
             linked_bins.insert(name.clone());
@@ -170,10 +397,14 @@ fn link_bins(
             linked_bins.insert(name.clone());
             continue;
         }
-        make_symlink(Path::new(&rel_target), &link)?;
         // Ensure the bin file is executable (npm convention). Applied to the
         // resolved image file; idempotent and shared across projects.
         ensure_executable(image_dir, relpath);
+        if symlink_bins {
+            make_symlink(Path::new(&rel_target), &link)?;
+        } else {
+            hardlink_or_copy_file(&materialized_bin, &link)?;
+        }
         linked_bins.insert(name.clone());
         stats.bins_linked += 1;
     }
@@ -265,6 +496,39 @@ fn same_path(a: &Path, b: &Path) -> bool {
     a.components().eq(b.components())
 }
 
+fn same_file(a: &Path, b: &Path) -> bool {
+    let (Ok(a), Ok(b)) = (fs::metadata(a), fs::metadata(b)) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        a.dev() == b.dev() && a.ino() == b.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        a.len() == b.len()
+    }
+}
+
+fn safe_relative_join(root: &Path, relative: &str) -> Result<PathBuf, MaterializeError> {
+    let path = Path::new(relative);
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
+    {
+        return Err(MaterializeError::Io {
+            path: root.join(relative).display().to_string(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unsafe package image path {relative}"),
+            ),
+        });
+    }
+    Ok(root.join(path))
+}
+
 /// Remove a file, symlink, or directory tree at `path` (best-effort).
 fn remove_any(path: &Path) -> Result<(), MaterializeError> {
     let meta = match fs::symlink_metadata(path) {
@@ -313,7 +577,6 @@ fn ensure_executable(image_dir: &Path, relpath: &str) {
 }
 
 #[cfg(not(unix))]
-#[allow(clippy::unnamed_argument)]
 fn ensure_executable(_image_dir: &Path, _relpath: &str) {}
 
 fn io_err(path: &Path, source: std::io::Error) -> MaterializeError {
@@ -326,8 +589,11 @@ fn io_err(path: &Path, source: std::io::Error) -> MaterializeError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::integrity::{Integrity, Sha512Digest};
+    #[cfg(unix)]
+    use crate::integrity::Integrity;
+    use crate::integrity::Sha512Digest;
     use crate::lockfile::{Lockfile, PackageEntry, RootEntry};
+    #[cfg(unix)]
     use crate::metrics::Metrics;
     use crate::store::ArtifactStore;
     use std::collections::BTreeMap;
@@ -336,6 +602,7 @@ mod tests {
     /// Build an npm-style gzip+tar with `package/<rel>` entries, returning the
     /// raw bytes (mirrors `tests/common`, kept local so the module is unit-test
     /// self-contained).
+    #[cfg(unix)]
     fn build_pkg_tgz(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         let mut builder = tar::Builder::new(enc);
@@ -360,6 +627,7 @@ mod tests {
 
     /// Push a package into the store (download via file://, verify, extract),
     /// returning its ArtifactId and the store image path.
+    #[cfg(unix)]
     fn stage_package(store: &ArtifactStore, tgz: &[u8], tmp_src: &Path, n: usize) -> ArtifactId {
         let id = Sha512Digest::hash_bytes(tgz);
         let src = tmp_src.join(format!("pkg-{n}.tgz"));
@@ -375,6 +643,7 @@ mod tests {
         id
     }
 
+    #[cfg(unix)]
     fn entry(path: &str, name: &str, resolved: &str, id: &ArtifactId) -> PackageEntry {
         PackageEntry {
             path: path.into(),
@@ -387,6 +656,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn read_link_str(p: &Path) -> String {
         fs::read_link(p).unwrap().to_string_lossy().into_owned()
     }
@@ -453,6 +723,50 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o755);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hardlink_backend_uses_real_bin_files() {
+        let project = tempdir().unwrap();
+        let store_dir = tempdir().unwrap();
+        let src = tempdir().unwrap();
+        let store = ArtifactStore::open(store_dir.path()).unwrap();
+
+        let tgz = build_pkg_tgz(&[
+            (
+                "package/package.json",
+                br#"{"name":"foo","version":"1.0.0"}"#,
+            ),
+            (
+                "package/bin/cli.js",
+                b"#!/usr/bin/env node\nconsole.log(42);\n",
+            ),
+        ]);
+        let id = stage_package(&store, &tgz, src.path(), 0);
+        assert!(store.image_index_path(&id).is_file());
+        let mut e = entry("node_modules/foo", "foo", "file://x", &id);
+        e.bin.insert("foocli".into(), "./bin/cli.js".into());
+
+        let stats = materialize_with_backend(
+            project.path(),
+            &store,
+            &[(&e, id)],
+            MaterializeBackend::Hardlink,
+        )
+        .unwrap();
+        assert_eq!(stats.packages_materialized, 1);
+        assert_eq!(stats.bins_linked, 1);
+
+        let package = project.path().join("node_modules/foo");
+        assert!(package.is_dir());
+        assert!(!fs::symlink_metadata(&package)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let bin = project.path().join("node_modules/.bin/foocli");
+        assert!(bin.is_file());
+        assert!(!fs::symlink_metadata(&bin).unwrap().file_type().is_symlink());
     }
 
     #[cfg(unix)]
@@ -664,10 +978,11 @@ mod tests {
             resolved: "file:///x".into(),
             ..Default::default()
         };
-        let err = materialize(
+        let err = materialize_with_backend(
             project.path(),
             &store,
             &[(&e, Sha512Digest::from_bytes([0u8; 64]))],
+            MaterializeBackend::Symlink,
         )
         .unwrap_err();
         assert!(matches!(err, MaterializeError::SymlinksUnsupported));
