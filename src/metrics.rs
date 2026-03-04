@@ -13,10 +13,50 @@ use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
+/// Concurrency/throughput counters used to tune bounded-stage concurrency
+/// (IMPLEMENTATION §20 / S6.1.1). All counters are cumulative for the run
+/// except the depth/overlap "high water marks", which track the maximum
+/// value observed rather than a running total, since depth and overlap are
+/// instantaneous quantities rather than counts of discrete events.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Counters {
+    /// Highest number of queued-but-not-yet-started work items observed at
+    /// any point during the run (a queue "high water mark").
+    pub max_queue_depth: u64,
+    /// Highest number of concurrently in-flight work items observed at any
+    /// point during the run (an overlap "high water mark").
+    pub max_concurrent_overlap: u64,
+    /// Total bytes transferred (e.g. downloaded artifact/tarball bytes).
+    pub bytes_transferred: u64,
+    /// Total store/artifact cache hits.
+    pub cache_hits: u64,
+    /// Total store/artifact cache misses.
+    pub cache_misses: u64,
+    /// Total outbound network requests issued.
+    pub requests_sent: u64,
+}
+
+impl Counters {
+    /// Fold `other` into `self`: cumulative counters add; high-water-mark
+    /// counters take the larger of the two. Used when merging per-worker
+    /// counters back into the command's main metrics.
+    pub fn merge(&mut self, other: &Counters) {
+        self.max_queue_depth = self.max_queue_depth.max(other.max_queue_depth);
+        self.max_concurrent_overlap = self
+            .max_concurrent_overlap
+            .max(other.max_concurrent_overlap);
+        self.bytes_transferred += other.bytes_transferred;
+        self.cache_hits += other.cache_hits;
+        self.cache_misses += other.cache_misses;
+        self.requests_sent += other.requests_sent;
+    }
+}
+
 /// Collection of named phase timings for a single command run.
 #[derive(Default)]
 pub struct Metrics {
     phases: Vec<(&'static str, Duration)>,
+    counters: Counters,
 }
 
 impl Metrics {
@@ -29,11 +69,50 @@ impl Metrics {
         self.phases.push((name, dur));
     }
 
-    /// Append another metric set's phases into this one (additive). Used to
-    /// merge per-worker timings back into the command's main metrics after a
-    /// bounded-concurrency phase completes.
+    /// Observe a queue-depth sample, updating the high-water mark if `depth`
+    /// exceeds the current maximum.
+    pub fn observe_queue_depth(&mut self, depth: u64) {
+        self.counters.max_queue_depth = self.counters.max_queue_depth.max(depth);
+    }
+
+    /// Observe a concurrent-overlap sample, updating the high-water mark if
+    /// `overlap` exceeds the current maximum.
+    pub fn observe_concurrent_overlap(&mut self, overlap: u64) {
+        self.counters.max_concurrent_overlap = self.counters.max_concurrent_overlap.max(overlap);
+    }
+
+    /// Add `bytes` to the cumulative transferred-bytes counter.
+    pub fn add_bytes_transferred(&mut self, bytes: u64) {
+        self.counters.bytes_transferred += bytes;
+    }
+
+    /// Increment the cache-hit counter.
+    pub fn record_cache_hit(&mut self) {
+        self.counters.cache_hits += 1;
+    }
+
+    /// Increment the cache-miss counter.
+    pub fn record_cache_miss(&mut self) {
+        self.counters.cache_misses += 1;
+    }
+
+    /// Increment the outbound-request counter.
+    pub fn record_request(&mut self) {
+        self.counters.requests_sent += 1;
+    }
+
+    /// Snapshot of the current counters.
+    pub fn counters(&self) -> Counters {
+        self.counters
+    }
+
+    /// Append another metric set's phases and counters into this one
+    /// (additive for phases and cumulative counters; high-water marks take
+    /// the max). Used to merge per-worker timings back into the command's
+    /// main metrics after a bounded-concurrency phase completes.
     pub fn extend(&mut self, other: &Metrics) {
         self.phases.extend(other.phases.iter().cloned());
+        self.counters.merge(&other.counters);
     }
 
     /// Run `f`, recording the elapsed time under `name`, and return its result
@@ -51,7 +130,9 @@ impl Metrics {
         !self.phases.is_empty()
     }
 
-    /// Canonical, deterministic JSON: `{"phases": {name: elapsed_ms, ...}, "total_ms": n}`.
+    /// Canonical, deterministic JSON: `{"phases": {name: elapsed_ms, ...},
+    /// "total_ms": n, "counters": {max_queue_depth, max_concurrent_overlap,
+    /// bytes_transferred, cache_hits, cache_misses, requests_sent}}`.
     pub fn to_json(&self) -> String {
         let mut by_name: BTreeMap<String, f64> = BTreeMap::new();
         let mut total = 0.0f64;
@@ -60,12 +141,38 @@ impl Metrics {
             *by_name.entry((*name).to_string()).or_insert(0.0) += ms;
             total += ms;
         }
+        let mut counters = serde_json::Map::new();
+        counters.insert(
+            "max_queue_depth".into(),
+            serde_json::Value::from(self.counters.max_queue_depth),
+        );
+        counters.insert(
+            "max_concurrent_overlap".into(),
+            serde_json::Value::from(self.counters.max_concurrent_overlap),
+        );
+        counters.insert(
+            "bytes_transferred".into(),
+            serde_json::Value::from(self.counters.bytes_transferred),
+        );
+        counters.insert(
+            "cache_hits".into(),
+            serde_json::Value::from(self.counters.cache_hits),
+        );
+        counters.insert(
+            "cache_misses".into(),
+            serde_json::Value::from(self.counters.cache_misses),
+        );
+        counters.insert(
+            "requests_sent".into(),
+            serde_json::Value::from(self.counters.requests_sent),
+        );
         let mut root = serde_json::Map::new();
         root.insert(
             "phases".to_string(),
             serde_json::to_value(&by_name).expect("phase metrics serialize"),
         );
         root.insert("total_ms".into(), serde_json::Value::from(total));
+        root.insert("counters".into(), serde_json::Value::Object(counters));
         serde_json::to_string_pretty(&root).expect("metrics serialize")
     }
 
@@ -103,5 +210,72 @@ mod tests {
         let j = m.to_json();
         assert!(j.contains("\"artifact_download\""));
         assert!(j.contains("\"total_ms\""));
+    }
+
+    #[test]
+    fn counters_track_high_water_marks_and_cumulative_totals() {
+        let mut m = Metrics::new();
+        m.observe_queue_depth(3);
+        m.observe_queue_depth(7);
+        m.observe_queue_depth(2);
+        m.observe_concurrent_overlap(4);
+        m.observe_concurrent_overlap(1);
+        m.add_bytes_transferred(100);
+        m.add_bytes_transferred(50);
+        m.record_cache_hit();
+        m.record_cache_hit();
+        m.record_cache_miss();
+        m.record_request();
+        m.record_request();
+        m.record_request();
+
+        let c = m.counters();
+        assert_eq!(c.max_queue_depth, 7);
+        assert_eq!(c.max_concurrent_overlap, 4);
+        assert_eq!(c.bytes_transferred, 150);
+        assert_eq!(c.cache_hits, 2);
+        assert_eq!(c.cache_misses, 1);
+        assert_eq!(c.requests_sent, 3);
+    }
+
+    #[test]
+    fn extend_merges_counters_with_max_for_high_water_marks() {
+        let mut a = Metrics::new();
+        a.observe_queue_depth(2);
+        a.observe_concurrent_overlap(5);
+        a.add_bytes_transferred(10);
+        a.record_cache_hit();
+        a.record_request();
+
+        let mut b = Metrics::new();
+        b.observe_queue_depth(9);
+        b.observe_concurrent_overlap(1);
+        b.add_bytes_transferred(20);
+        b.record_cache_miss();
+        b.record_request();
+
+        a.extend(&b);
+        let c = a.counters();
+        assert_eq!(c.max_queue_depth, 9);
+        assert_eq!(c.max_concurrent_overlap, 5);
+        assert_eq!(c.bytes_transferred, 30);
+        assert_eq!(c.cache_hits, 1);
+        assert_eq!(c.cache_misses, 1);
+        assert_eq!(c.requests_sent, 2);
+    }
+
+    #[test]
+    fn json_includes_counters_object() {
+        let mut m = Metrics::new();
+        m.observe_queue_depth(5);
+        m.add_bytes_transferred(1024);
+        m.record_cache_hit();
+        m.record_request();
+        let j = m.to_json();
+        assert!(j.contains("\"counters\""));
+        assert!(j.contains("\"max_queue_depth\""));
+        assert!(j.contains("\"bytes_transferred\""));
+        assert!(j.contains("\"cache_hits\""));
+        assert!(j.contains("\"requests_sent\""));
     }
 }

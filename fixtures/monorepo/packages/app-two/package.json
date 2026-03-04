@@ -1,0 +1,12 @@
+{
+  "name": "@bpm-fixtures/app-two",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "smoke": "node -e \"require('lodash'); require('@bpm-fixtures/shared'); process.stdout.write('app-two:ok\\n')\""
+  },
+  "dependencies": {
+    "@bpm-fixtures/shared": "1.0.0",
+    "lodash": "4.17.21"
+  }
+}

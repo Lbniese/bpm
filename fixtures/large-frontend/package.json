@@ -1,0 +1,19 @@
+{
+  "name": "@bpm-fixtures/large-frontend",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "smoke": "node -e \"Promise.all([import('react'), import('react-dom'), import('vite'), import('typescript'), import('zod'), import('lodash-es')]).then(() => process.stdout.write('large-frontend:ok\\n'))\""
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "4.3.3",
+    "lodash-es": "4.17.21",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "react-router-dom": "6.28.0",
+    "typescript": "5.6.3",
+    "vite": "5.4.10",
+    "zod": "3.23.8",
+    "zustand": "5.0.1"
+  }
+}

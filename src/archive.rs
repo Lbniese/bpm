@@ -53,6 +53,7 @@ pub enum ExtractError {
 /// `image_root` must already exist (the store creates it). The caller writes
 /// into a temporary directory and renames atomically (see [`crate::store`]).
 pub fn extract(archive_path: &Path, image_root: &Path) -> Result<(), ExtractError> {
+    let strip_prefix = detect_archive_root_prefix(archive_path)?;
     let file = fs::File::open(archive_path).map_err(|source| ExtractError::Read {
         path: archive_path.display().to_string(),
         source,
@@ -71,7 +72,7 @@ pub fn extract(archive_path: &Path, image_root: &Path) -> Result<(), ExtractErro
             .path()
             .map_err(|e| ExtractError::InvalidArchive(format!("invalid entry path header: {e}")))?
             .into_owned();
-        let stripped = strip_package_prefix(&raw);
+        let stripped = strip_package_prefix(&raw, strip_prefix.as_deref());
         let rel =
             validate_returned_relative(&stripped).map_err(|reason| ExtractError::UnsafePath {
                 path: raw.display().to_string(),
@@ -148,11 +149,54 @@ pub fn extract(archive_path: &Path, image_root: &Path) -> Result<(), ExtractErro
     Ok(())
 }
 
-/// Drop a leading `package/` component if present (npm convention).
-fn strip_package_prefix(p: &Path) -> PathBuf {
+/// Detect the archive root directory to strip.
+///
+/// npm tarballs conventionally use `package/`, while hosted Git archives use a
+/// generated `repo-ref/` directory. Strip a common first component only when a
+/// `package.json` lives directly under that component; archives already rooted
+/// at `package.json` are left untouched.
+fn detect_archive_root_prefix(archive_path: &Path) -> Result<Option<PathBuf>, ExtractError> {
+    let file = fs::File::open(archive_path).map_err(|source| ExtractError::Read {
+        path: archive_path.display().to_string(),
+        source,
+    })?;
+    let gz = GzDecoder::new(file);
+    let mut archive = tar::Archive::new(gz);
+    let entries = archive
+        .entries()
+        .map_err(|e| ExtractError::InvalidArchive(format!("cannot enumerate tar entries: {e}")))?;
+    let mut common: Option<PathBuf> = None;
+    let mut has_prefixed_manifest = false;
+    for entry in entries {
+        let entry =
+            entry.map_err(|e| ExtractError::InvalidArchive(format!("corrupt tar entry: {e}")))?;
+        let raw = entry
+            .path()
+            .map_err(|e| ExtractError::InvalidArchive(format!("invalid entry path header: {e}")))?
+            .into_owned();
+        let mut comps = raw.components();
+        let Some(Component::Normal(first)) = comps.next() else {
+            continue;
+        };
+        let first = PathBuf::from(first);
+        if common.as_ref().is_some_and(|value| value != &first) {
+            return Ok(None);
+        }
+        common = Some(first.clone());
+        if comps.as_path() == Path::new("package.json") {
+            has_prefixed_manifest = true;
+        }
+    }
+    Ok(common.filter(|_| has_prefixed_manifest))
+}
+
+/// Drop the detected archive root component if present.
+fn strip_package_prefix(p: &Path, detected_prefix: Option<&Path>) -> PathBuf {
     let mut comps = p.components();
     if let Some(Component::Normal(first)) = comps.next() {
-        if first == std::ffi::OsStr::new(PACKAGE_PREFIX) {
+        let should_strip = detected_prefix.is_some_and(|prefix| prefix == Path::new(first))
+            || first == std::ffi::OsStr::new(PACKAGE_PREFIX);
+        if should_strip {
             return comps.as_path().to_path_buf();
         }
     }
@@ -247,15 +291,15 @@ mod tests {
     #[test]
     fn strips_package_prefix() {
         assert_eq!(
-            strip_package_prefix(Path::new("package/file.js")),
+            strip_package_prefix(Path::new("package/file.js"), None),
             Path::new("file.js")
         );
         assert_eq!(
-            strip_package_prefix(Path::new("package/sub/x.js")),
+            strip_package_prefix(Path::new("package/sub/x.js"), None),
             Path::new("sub/x.js")
         );
         assert_eq!(
-            strip_package_prefix(Path::new("other/x.js")),
+            strip_package_prefix(Path::new("other/x.js"), None),
             Path::new("other/x.js")
         );
     }

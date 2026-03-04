@@ -16,11 +16,13 @@ fn bin() -> String {
 /// A mock registry serving `demo-cli`'s packument (latest 1.0.0) and tarball.
 /// The tarball mimics an npm package: files at the archive root, with a
 /// `package.json` declaring two bins and a shebang script for each.
+#[cfg(unix)]
 struct RegistryMock {
     _server: MiniServer,
     registry_url: String,
 }
 
+#[cfg(unix)]
 impl RegistryMock {
     fn start() -> Self {
         let tgz = fixture_tgz();
@@ -68,6 +70,7 @@ impl RegistryMock {
 
 /// Build the fixture tarball with files at the **root** (npm layout), declaring
 /// two bins (`demo` and `demo-alt`) pointing at two shebang scripts.
+#[cfg(unix)]
 fn fixture_tgz() -> Vec<u8> {
     build_tgz(|b| {
         common::add_file(
@@ -111,6 +114,7 @@ fn run_install(
     )
 }
 
+#[cfg(unix)]
 #[test]
 fn install_pkg_links_all_declared_bins() {
     let reg = RegistryMock::start();
@@ -148,6 +152,82 @@ fn install_pkg_links_all_declared_bins() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn install_pkg_uses_project_npmrc_for_metadata_and_tarball_requests() {
+    let tgz = fixture_tgz();
+    let integrity = integrity_of(&tgz);
+    let base: std::sync::Arc<std::sync::Mutex<String>> =
+        std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let base_c = base.clone();
+    let tgz = std::sync::Arc::new(tgz);
+    let server = MiniServer::start_routed(move |path| {
+        let base = base_c.lock().unwrap().clone();
+        if path == "/demo-cli" {
+            let packument = serde_json::json!({
+                "dist-tags": { "latest": "1.0.0" },
+                "versions": {
+                    "1.0.0": {
+                        "dist": {
+                            "tarball": format!("{base}demo-cli/-/demo-cli-1.0.0.tgz"),
+                            "integrity": integrity,
+                        }
+                    }
+                }
+            });
+            Some(RouteBody(
+                serde_json::to_vec(&packument).unwrap(),
+                "application/json",
+            ))
+        } else if path.ends_with(".tgz") {
+            Some(RouteBody((*tgz).clone(), "application/gzip"))
+        } else {
+            None
+        }
+    });
+    *base.lock().unwrap() = server.url("");
+
+    let project = tempfile::tempdir().unwrap();
+    let store = tempfile::tempdir().unwrap();
+    let bin_dir = tempfile::tempdir().unwrap();
+    let npmrc = project.path().join(".npmrc");
+    let registry = server.url("");
+    let authority = registry
+        .strip_prefix("http://")
+        .unwrap_or(&registry)
+        .trim_end_matches('/');
+    std::fs::write(
+        &npmrc,
+        format!("//{authority}/:_authToken=install-secret\n"),
+    )
+    .unwrap();
+
+    let out = Command::new(bin())
+        .args(["install", "demo-cli", "--registry", &registry])
+        .env("BPM_BIN", bin_dir.path())
+        .env("BPM_STORE", store.path())
+        .current_dir(project.path())
+        .output()
+        .expect("run bpm install");
+
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2, "expected metadata and tarball requests");
+    assert!(
+        requests
+            .iter()
+            .all(|request| { request.header("authorization") == Some("Bearer install-secret") }),
+        "expected configured auth on both metadata and tarball requests: {requests:?}"
+    );
+    assert_eq!(requests[0].path, "/demo-cli");
+    assert!(requests[1].path.ends_with(".tgz"));
+}
+
+#[cfg(unix)]
 #[test]
 fn install_pkg_is_idempotent() {
     let reg = RegistryMock::start();

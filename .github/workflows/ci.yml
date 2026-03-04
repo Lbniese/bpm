@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    - cron: '17 3 * * 1'
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -12,7 +15,11 @@ concurrency:
 jobs:
   test:
     name: fmt, clippy, test, build
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -36,3 +43,33 @@ jobs:
 
       - name: cargo build --release
         run: cargo build --release --workspace
+
+  benchmark-smoke:
+    name: benchmark harness smoke
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo run -- bench --list
+      - run: cargo test --test bench
+
+  benchmark-baseline:
+    name: benchmark baseline regression
+    runs-on: macos-14
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo run --release -- bench --fixture minimal --scenario repeat_install --tools bpm --runs 3 --json /tmp/current.json
+      - name: Compare baseline envelope
+        run: |
+          python3 - <<'PY'
+          import json
+          baseline = json.load(open('benchmarks/baselines/reference.json'))[0]['tools'][0]['wall_clock_ms']['median']
+          current = json.load(open('/tmp/current.json'))[0]['tools'][0]['wall_clock_ms']['median']
+          limit = baseline * 2.0
+          print(f'baseline={baseline:.3f}ms current={current:.3f}ms limit={limit:.3f}ms')
+          if current > limit:
+              raise SystemExit('benchmark regression exceeds 2x baseline')
+          PY
