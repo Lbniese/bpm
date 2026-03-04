@@ -1,0 +1,12 @@
+{
+  "name": "@bpm-fixtures/many-small-files",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "generate": "node scripts/generate.cjs",
+    "smoke": "node scripts/generate.cjs --check"
+  },
+  "dependencies": {
+    "seedrandom": "3.0.5"
+  }
+}

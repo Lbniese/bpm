@@ -25,8 +25,13 @@ docs/.jekyll-cache/
 # local implementation plan — not part of the public repository
 IMPLEMENTATION.md
 
-# local, machine-specific benchmark baselines — not checked in
-benchmarks/baselines/
+# local, machine-specific benchmark run output — not checked in, but curated
+# baseline/profile summaries committed by the project (reference.json,
+# profiles/README.md) are explicitly re-included below
+benchmarks/baselines/*
+!benchmarks/baselines/reference.json
+benchmarks/profiles/*
+!benchmarks/profiles/README.md
 
 # disposable compiled install-plan cache (regenerated from bpm.lock)
 .bpm-state

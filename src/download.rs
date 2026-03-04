@@ -19,14 +19,21 @@
 use std::fs::File;
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use sha2::{Digest, Sha512};
 use thiserror::Error;
 
+use crate::config::NpmConfig;
+use crate::http::{HttpClient, HttpError};
 use crate::integrity::Sha512Digest;
 
 const BUF_BYTES: usize = 64 * 1024;
 const FILE_SCHEME: &str = "file://";
+
+/// Process-wide default client used by compatibility callers that do not
+/// supply effective npm configuration explicitly.
+static DEFAULT_HTTP_CLIENT: OnceLock<HttpClient> = OnceLock::new();
 
 /// Which kind of source `url` denotes, and (for files) the resolved path.
 enum Source<'a> {
@@ -118,12 +125,24 @@ fn stream_to_dest_and_hash<R: Read>(
 ///
 /// `dest` must not exist (the caller manages a unique temp path).
 pub fn download(url: &str, dest: &Path) -> Result<Sha512Digest, DownloadError> {
+    let client = DEFAULT_HTTP_CLIENT.get_or_init(|| HttpClient::new(NpmConfig::default()));
+    download_with_client(client, url, dest)
+}
+
+/// Retrieve an artifact using a caller-owned pooled HTTP client.
+///
+/// HTTP sources inherit the client's configured authentication, redirects,
+/// timeouts, and bounded retries. Local paths and `file://` sources never use
+/// the client and preserve the same open, stream, hash, and error behavior as
+/// [`download`].
+pub fn download_with_client(
+    client: &HttpClient,
+    url: &str,
+    dest: &Path,
+) -> Result<Sha512Digest, DownloadError> {
     match classify(url) {
         Source::Http(u) => {
-            let mut reader = ureq::get(u)
-                .call()
-                .map_err(|e| map_call_error(e, url))?
-                .into_reader();
+            let mut reader = client.stream(u).map_err(map_http_error)?;
             stream_to_dest_and_hash(&mut reader, dest)
         }
         Source::File(path) => {
@@ -136,29 +155,42 @@ pub fn download(url: &str, dest: &Path) -> Result<Sha512Digest, DownloadError> {
     }
 }
 
-fn map_call_error(e: ureq::Error, url: &str) -> DownloadError {
-    match e {
-        ureq::Error::Status(code, _) => DownloadError::HttpStatus {
-            url: url.to_string(),
+fn map_http_error(error: HttpError) -> DownloadError {
+    match error {
+        HttpError::Status {
+            url,
             code,
+            attempts,
+        } => DownloadError::HttpStatus {
+            url,
+            code,
+            attempts,
         },
-        ureq::Error::Transport(t) => DownloadError::Transport {
-            kind: format!("{:?}", t.kind()),
-            message: t.message().map(|m| m.to_string()),
-            url: url.to_string(),
+        HttpError::Transport {
+            url,
+            kind,
+            attempts,
+        } => DownloadError::Transport {
+            kind,
+            url,
+            attempts,
         },
     }
 }
 
 #[derive(Debug, Error)]
 pub enum DownloadError {
-    #[error("http request to {url} returned status {code}")]
-    HttpStatus { url: String, code: u16 },
-    #[error("transport error downloading {url} ({kind}){what}", what = message.as_deref().map(|m| format!(": {m}")).unwrap_or_default())]
+    #[error("HTTP GET {url} returned status {code} after {attempts} attempt(s)")]
+    HttpStatus {
+        url: String,
+        code: u16,
+        attempts: usize,
+    },
+    #[error("HTTP GET {url} failed with transport error {kind} after {attempts} attempt(s)")]
     Transport {
         kind: String,
-        message: Option<String>,
         url: String,
+        attempts: usize,
     },
     #[error("io error at {path}: {source}")]
     Io { path: String, source: io::Error },

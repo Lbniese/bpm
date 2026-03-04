@@ -278,7 +278,7 @@ fn inspect(manifest: &PackageManifest, project_root: &Path, diagnostics: &mut Ve
         diagnostics.push(
             warn(
                 codes::WORKSPACES_UNSUPPORTED,
-                "\"workspaces\" declared; workspace installation is not yet supported",
+                "\"workspaces\" declared; native workspace linking is supported for the configured workspace subset",
             )
             .with_field("workspaces"),
         );

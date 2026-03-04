@@ -2,8 +2,10 @@
 //!
 //! Submodules:
 //! - `manifest`, `project`, `diagnostic`, `doctor`: project inspection.
+//! - `config`, `http`: npm configuration and shared HTTP transport.
 //! - `integrity`, `download`, `archive`, `store`, `metrics`: the immutable
 //!   artifact store.
+//! - `derived`: lifecycle output cache keyed by build-visible inputs.
 //! - `lockfile`, `npm_lock`: package-lock v3 import and the canonical
 //!   `bpm.lock`.
 //! - `materializer`: project-local `node_modules` materialization for the
@@ -11,24 +13,33 @@
 //! - `bench`: benchmark harness and tool runner.
 //! - `registry`: npm-registry packument resolution (name/spec -> tarball).
 //!
-//! Full graph dependency resolution is intentionally still absent and arrives
-//! in later milestones.
+//! Registry graph resolution is exposed through [`resolver`]; peer and
+//! workspace edge cases remain incremental hardening work.
 
+pub mod alternate_lock;
 pub mod archive;
 pub mod bench;
+pub mod config;
+pub mod derived;
 pub mod diagnostic;
 pub mod doctor;
 pub mod download;
+pub mod gc;
 pub mod graph;
+pub mod http;
 pub mod integrity;
 pub mod lifecycle;
 pub mod lockfile;
 pub mod manifest;
 pub mod materializer;
+pub mod metadata;
 pub mod metrics;
 pub mod npm_lock;
+pub mod package_image;
+pub mod patch;
 pub mod project;
 pub mod registry;
+pub mod resolver;
 pub mod store;
 pub mod volume;
 pub mod workspace;
