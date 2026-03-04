@@ -16,6 +16,10 @@ pub enum ScenarioKind {
     ResolvedCold,
     WarmStore,
     RepeatInstall,
+    SecondProjectSameGraph,
+    PartialDependencyChange,
+    MonorepoCold,
+    MonorepoIncremental,
 }
 
 impl ScenarioKind {
@@ -25,6 +29,10 @@ impl ScenarioKind {
             Self::ResolvedCold => "resolved_cold",
             Self::WarmStore => "warm_store",
             Self::RepeatInstall => "repeat_install",
+            Self::SecondProjectSameGraph => "second_project_same_graph",
+            Self::PartialDependencyChange => "partial_dependency_change",
+            Self::MonorepoCold => "monorepo_cold",
+            Self::MonorepoIncremental => "monorepo_incremental",
         }
     }
 
@@ -34,6 +42,10 @@ impl ScenarioKind {
             Self::ResolvedCold => "lockfile present, empty store, no project view",
             Self::WarmStore => "populated store, lockfile present, no project view",
             Self::RepeatInstall => "populated store, lockfile present, existing project view",
+            Self::SecondProjectSameGraph => "second project reusing a populated graph store",
+            Self::PartialDependencyChange => "warm project with one dependency changed",
+            Self::MonorepoCold => "cold workspace-style project with repeated dependencies",
+            Self::MonorepoIncremental => "incremental workspace-style project change",
         }
     }
 
@@ -43,6 +55,10 @@ impl ScenarioKind {
             Self::ResolvedCold,
             Self::WarmStore,
             Self::RepeatInstall,
+            Self::SecondProjectSameGraph,
+            Self::PartialDependencyChange,
+            Self::MonorepoCold,
+            Self::MonorepoIncremental,
         ]
     }
 }
@@ -71,6 +87,31 @@ pub const FIXTURES: &[Fixture] = &[
     Fixture {
         name: "medium",
         packages: &["is-odd@3.0.1", "is-number@7.0.0", "left-pad@1.3.0"],
+    },
+    Fixture {
+        name: "large-frontend",
+        packages: &[
+            "react@18.3.1",
+            "react-dom@18.3.1",
+            "webpack@5.99.9",
+            "typescript@5.8.3",
+        ],
+    },
+    Fixture {
+        name: "many-small-files",
+        packages: &["lodash@4.17.21", "glob@10.4.5", "minimatch@9.0.5"],
+    },
+    Fixture {
+        name: "monorepo",
+        packages: &["is-odd@3.0.1", "is-number@7.0.0", "left-pad@1.3.0"],
+    },
+    Fixture {
+        name: "lifecycle",
+        packages: &["npm-run-path@5.3.0", "cross-spawn@7.0.6"],
+    },
+    Fixture {
+        name: "native-addon",
+        packages: &["node-gyp@11.2.0", "bindings@1.5.0"],
     },
 ];
 
@@ -191,6 +232,8 @@ pub enum Tool {
     Npm,
     Pnpm,
     Bpm,
+    Yarn,
+    Bun,
 }
 
 impl Tool {
@@ -199,11 +242,13 @@ impl Tool {
             Self::Npm => "npm",
             Self::Pnpm => "pnpm",
             Self::Bpm => "bpm",
+            Self::Yarn => "yarn",
+            Self::Bun => "bun",
         }
     }
 
     pub fn all() -> Vec<Tool> {
-        vec![Self::Npm, Self::Pnpm, Self::Bpm]
+        vec![Self::Npm, Self::Pnpm, Self::Bpm, Self::Yarn, Self::Bun]
     }
 
     pub fn detect(self) -> bool {
@@ -380,6 +425,31 @@ fn prepare_scenario(
             generate_package_lock(fixture, work_dir)?;
             run_tool(tool, work_dir, bpm_store)?;
         }
+        ScenarioKind::SecondProjectSameGraph => {
+            create_fixture_workspace(fixture, work_dir)?;
+            generate_package_lock(fixture, work_dir)?;
+            let seed = work_dir.with_file_name("seed-project");
+            create_fixture_workspace(fixture, &seed)?;
+            generate_package_lock(fixture, &seed)?;
+            run_tool(tool, &seed, bpm_store)?;
+            ensure_node_modules_empty(work_dir);
+        }
+        ScenarioKind::PartialDependencyChange => {
+            create_fixture_workspace(fixture, work_dir)?;
+            generate_package_lock(fixture, work_dir)?;
+            run_tool(tool, work_dir, bpm_store)?;
+            clear_node_modules(work_dir);
+        }
+        ScenarioKind::MonorepoCold | ScenarioKind::MonorepoIncremental => {
+            create_fixture_workspace(fixture, work_dir)?;
+            generate_package_lock(fixture, work_dir)?;
+            if matches!(scenario, ScenarioKind::MonorepoIncremental) {
+                run_tool(tool, work_dir, bpm_store)?;
+                clear_node_modules(work_dir);
+            } else {
+                ensure_node_modules_empty(work_dir);
+            }
+        }
     }
     Ok(())
 }
@@ -440,6 +510,20 @@ fn run_tool(
                 .status()
                 .map_err(|e| anyhow::anyhow!("failed to run `bpm install --frozen`: {e}"))?)
         }
+        Tool::Yarn => Ok(Command::new("yarn")
+            .arg("install")
+            .current_dir(work_dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map_err(|e| anyhow::anyhow!("failed to run yarn: {e}"))?),
+        Tool::Bun => Ok(Command::new("bun")
+            .args(["install", "--no-progress"])
+            .current_dir(work_dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map_err(|e| anyhow::anyhow!("failed to run bun: {e}"))?),
     }
 }
 
@@ -528,6 +612,10 @@ pub fn run_suite(
             ScenarioKind::ResolvedCold => "cold",
             ScenarioKind::WarmStore => "warm",
             ScenarioKind::RepeatInstall => "hot",
+            ScenarioKind::SecondProjectSameGraph => "warm",
+            ScenarioKind::PartialDependencyChange => "warm",
+            ScenarioKind::MonorepoCold => "cold",
+            ScenarioKind::MonorepoIncremental => "warm",
         };
 
         let mut tool_results = Vec::new();
@@ -629,6 +717,7 @@ mod tests {
 
     #[test]
     fn scenario_names() {
+        assert_eq!(ScenarioKind::all().len(), 8);
         assert_eq!(ScenarioKind::TrueCold.name(), "true_cold");
         assert_eq!(ScenarioKind::ResolvedCold.name(), "resolved_cold");
         assert_eq!(ScenarioKind::WarmStore.name(), "warm_store");

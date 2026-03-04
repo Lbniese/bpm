@@ -5,9 +5,9 @@ title: CLI reference
 
 # CLI reference
 
-This reflects the CLI as implemented today. Flags and commands not listed
-surface (`bpm install --frozen`, `bpm run`, `bpm exec`, `bpm gc`), which
-arrives with later milestones.
+This reflects the CLI as implemented today, including lockfile resolution,
+network configuration, execution, garbage collection, publishing, and audit
+commands.
 
 ## `bpm --version`
 
@@ -18,7 +18,7 @@ Prints the built-in package version.
 Locates the nearest `package.json` (project root) and the repository root
 (nearest `.git`, falling back to the project root), parses the manifest,
 and reports structured diagnostics: missing/invalid manifest fields,
-lifecycle scripts, native addons, unsupported workspace/override usage, and
+lifecycle scripts, native addons, workspace/override usage, and
 declared-dependency counts.
 
 - Exit code is nonzero if any diagnostic has `error` severity.
@@ -75,8 +75,9 @@ served from the immutable store) — this is the Milestone 1 success criterion.
 Two modes:
 
 - **`bpm install` (no argument)** — installs the locked dependency graph from
-  `bpm.lock` into `node_modules` (see the frozen-installer docs). Requires a
-  `bpm.lock` in the current or a parent directory.
+  `bpm.lock` into `node_modules` (see the frozen-installer docs). If no lockfile
+  exists, it resolves the nearest `package.json` and writes `bpm.lock` first;
+  use `--frozen` to require an existing lockfile.
 - **`bpm install <target>`** — fetches a single package (resolved exactly like
   `bpm fetch`) and links its declared executables into a global bin directory so
   they appear on your `PATH`. This is handy for quickly grabbing a CLI tool
@@ -105,7 +106,7 @@ Notes:
 | `<target>` | Package spec or exact URL/`file://`/path, resolved like `bpm fetch`. Omit for lockfile install. |
 | `--registry <url>` | Registry base URL for spec resolution (bin-install mode only). |
 | `--store <dir>` | Store root. Defaults to `$BPM_STORE`, then `$HOME/.bpm`. |
-| `--frozen`, `--concurrency`, `--json-metrics`, `--ignore-scripts` | Apply to the lockfile install mode (no `<target>`). |
+| `--frozen`, `--concurrency`, `--json-metrics`, `--ignore-scripts`, `--legacy-peer-deps` | Apply to the lockfile install mode (no `<target>`). |
 
 ## `bpm import [path] [flags]`
 
@@ -128,9 +129,32 @@ bpm import                        # ./package-lock.json -> ./bpm.lock
 bpm import path/to/lock.json --out path/to/bpm.lock --json
 ```
 
+## `bpm exec <command> [args...]`
+
+Runs a command from the nearest project's `node_modules/.bin` with that
+folder prepended to `PATH`, preserving native arguments and the child's exit
+status.
+
+## `bpm gc [flags]`
+
+Removes unreferenced store objects older than 30 days. Use `--older-than 30d` to
+change the grace period or `--max-size 50GB` to reclaim eligible objects until
+the store is within a size cap. Active leases and graphs attached to projects
+are always retained.
+
 ## Exit codes
 
 `0` on success. Nonzero on any hard error (missing/invalid input, integrity
 mismatch, unsupported lockfile version) or when `bpm doctor` finds an
-`error`-severity diagnostic. Error messages are structured and actionable
+`error`-severity diagnostic. Error messages are structured and actionable,
 never a bare "installation failed".
+
+## Publish and audit
+
+`bpm publish` creates an npm-compatible package attachment from the current
+project and uploads it using the configured registry credentials. `bpm audit`
+posts the project's dependency inventory to the registry advisory endpoint;
+use `--json` for the raw advisory response.
+
+`bpm import` accepts npm `package-lock.json` plus the supported text forms of
+Yarn, pnpm, and Bun lockfiles and writes the canonical `bpm.lock`.

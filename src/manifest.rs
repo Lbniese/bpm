@@ -10,9 +10,10 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
+use serde_json::Value;
 use thiserror::Error;
 
 /// Error while reading or parsing a manifest. Carries the source path so the
@@ -61,9 +62,38 @@ impl Workspaces {
     }
 }
 
+/// A dependency request using BPM's explicit `workspace:` protocol extension.
+///
+/// npm workspace declarations and ordinary dependency ranges remain strings in
+/// the manifest. Resolver code can use this type to distinguish the supported
+/// local-workspace requests without re-parsing protocol spelling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkspaceSpec {
+    Any,
+    Caret,
+    Tilde,
+    Range(String),
+}
+
+impl WorkspaceSpec {
+    /// Parse a `workspace:` dependency request, returning `None` for other
+    /// dependency protocols.
+    pub fn parse(spec: &str) -> Option<Self> {
+        let payload = spec.strip_prefix("workspace:")?;
+        Some(match payload {
+            "*" => Self::Any,
+            "^" => Self::Caret,
+            "~" => Self::Tilde,
+            range => Self::Range(range.to_owned()),
+        })
+    }
+}
+
 /// A parsed `package.json`.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct PackageManifest {
+    #[serde(skip)]
+    pub source_dir: Option<PathBuf>,
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]
@@ -91,7 +121,13 @@ pub struct PackageManifest {
     #[serde(default)]
     pub engines: BTreeMap<String, String>,
     #[serde(default)]
-    pub overrides: BTreeMap<String, String>,
+    pub overrides: BTreeMap<String, Value>,
+    #[serde(default, deserialize_with = "deserialize_string_list")]
+    pub os: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_string_list")]
+    pub cpu: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_string_list")]
+    pub libc: Vec<String>,
 }
 
 /// `peerDependenciesMeta` entry. Only `optional` is tracked for this milestone.
@@ -99,6 +135,28 @@ pub struct PackageManifest {
 pub struct PeerMeta {
     #[serde(default)]
     pub optional: bool,
+}
+
+/// Deserialize npm platform constraints from either the documented array form
+/// or the string form found in registry metadata, then canonicalize ordering.
+fn deserialize_string_list<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringList {
+        One(String),
+        Many(Vec<String>),
+    }
+
+    let mut values = match StringList::deserialize(deserializer)? {
+        StringList::One(value) => vec![value],
+        StringList::Many(values) => values,
+    };
+    values.sort();
+    values.dedup();
+    Ok(values)
 }
 
 /// Whether `name` is a valid npm package name (scoped or unscoped).
@@ -146,11 +204,12 @@ impl PackageManifest {
 
     /// Parse a manifest from a JSON string, tagging errors with `path`.
     pub fn from_json(contents: &str, path: &Path) -> Result<Self, ManifestError> {
-        let manifest: Self =
+        let mut manifest: Self =
             serde_json::from_str(contents).map_err(|source| ManifestError::Parse {
                 path: path.display().to_string(),
                 source,
             })?;
+        manifest.source_dir = path.parent().map(Path::to_path_buf);
         Ok(manifest)
     }
 
@@ -245,11 +304,45 @@ mod tests {
     #[test]
     fn parses_overrides_and_peer_meta() {
         let m = parse(
-            r#"{"name":"a","overrides":{"lodash":"^4.0.0"},
-            "peerDependenciesMeta":{"react":{"optional":true}}}"#,
+            r#"{"name":"a","overrides":{"lodash":"^4.0.0","foo":{"bar":"2"}},
+            "peerDependenciesMeta":{"react":{"optional":true},"react-dom":{}}}"#,
         );
-        assert_eq!(m.overrides.get("lodash").unwrap(), "^4.0.0");
+        assert_eq!(m.overrides.get("lodash"), Some(&Value::from("^4.0.0")));
+        assert_eq!(m.overrides["foo"]["bar"], Value::from("2"));
         assert!(m.peer_dependencies_meta.get("react").unwrap().optional);
+        assert!(!m.peer_dependencies_meta.get("react-dom").unwrap().optional);
+    }
+
+    #[test]
+    fn parses_and_canonicalizes_platform_constraints() {
+        let m = parse(
+            r#"{"name":"a","os":["linux","!win32","linux"],"cpu":"arm64",
+            "libc":["musl","glibc"]}"#,
+        );
+        assert_eq!(m.os, ["!win32", "linux"]);
+        assert_eq!(m.cpu, ["arm64"]);
+        assert_eq!(m.libc, ["glibc", "musl"]);
+    }
+
+    #[test]
+    fn parses_workspace_dependency_specs_without_changing_other_specs() {
+        assert_eq!(
+            WorkspaceSpec::parse("workspace:*"),
+            Some(WorkspaceSpec::Any)
+        );
+        assert_eq!(
+            WorkspaceSpec::parse("workspace:^"),
+            Some(WorkspaceSpec::Caret)
+        );
+        assert_eq!(
+            WorkspaceSpec::parse("workspace:~"),
+            Some(WorkspaceSpec::Tilde)
+        );
+        assert_eq!(
+            WorkspaceSpec::parse("workspace:>=1 <2"),
+            Some(WorkspaceSpec::Range(">=1 <2".into()))
+        );
+        assert_eq!(WorkspaceSpec::parse("^1.0.0"), None);
     }
 
     #[test]

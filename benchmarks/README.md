@@ -41,10 +41,15 @@ checked in. Regenerate on a given machine with the command above.
 | `resolved_cold` | empty | present | absent |
 | `warm_store` | populated | present | absent |
 | `repeat_install` | populated | present | present |
+| `second_project_same_graph` | populated | present | second project |
+| `partial_dependency_change` | populated | present | one dependency changed |
+| `monorepo_cold` | empty | present | workspace-style |
+| `monorepo_incremental` | populated | present | workspace change |
 
 ## Fixtures
 
-`minimal`, `small`, `medium` — each is a small `package.json` with pinned
-direct dependencies; a real `package-lock.json` is generated per run with
-`npm install --package-lock-only` so every tool installs from an identical,
-integrity-bearing lockfile.
+`minimal`, `small`, and `medium` are small dependency graphs. Additional
+fixtures cover `large-frontend`, `many-small-files`, `monorepo`, `lifecycle`,
+and `native-addon`; list them with `bpm bench --list`. A real
+`package-lock.json` is generated per run where the selected tool needs one, so
+every tool installs from an identical, integrity-bearing lockfile.

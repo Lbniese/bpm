@@ -5,8 +5,10 @@
 mod common;
 
 use std::fs;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use bpm::integrity::Integrity;
 use bpm::metrics::Metrics;
@@ -186,6 +188,115 @@ fn concurrent_writers_publish_once() {
 
     let _ = id;
     let _ = store_dir; // keep tempdir alive for assertions
+}
+
+const STRESS_STORE_ENV: &str = "BPM_STORE_STRESS_ROOT";
+const STRESS_URL_ENV: &str = "BPM_STORE_STRESS_URL";
+const STRESS_INTEGRITY_ENV: &str = "BPM_STORE_STRESS_INTEGRITY";
+
+/// Child-process entry point for [`high_process_count_same_artifact_publication`].
+/// A normal test-suite run leaves the environment unset, making this a no-op.
+#[test]
+fn same_artifact_stress_worker() {
+    let Some(root) = std::env::var_os(STRESS_STORE_ENV) else {
+        return;
+    };
+    let url = std::env::var(STRESS_URL_ENV).expect("stress URL");
+    let integrity = std::env::var(STRESS_INTEGRITY_ENV).expect("stress integrity");
+    let integrity = Integrity::parse(&integrity).expect("valid stress integrity");
+    let store = ArtifactStore::open(std::path::Path::new(&root)).expect("open shared store");
+    let mut metrics = Metrics::new();
+
+    let artifact = store
+        .ensure_artifact(&url, Some(&integrity), &mut metrics)
+        .expect("publish or reuse shared artifact");
+    assert!(artifact.path.is_file());
+    store
+        .verify_artifact(&artifact.id)
+        .expect("shared artifact must verify");
+}
+
+#[test]
+fn high_process_count_same_artifact_publication() {
+    let tgz = fixture_tgz();
+    let integrity = integrity_of(&tgz);
+    let parsed = Integrity::parse(&integrity).unwrap();
+    let server = MiniServer::start(tgz);
+    let store_dir = tempfile::tempdir().unwrap();
+
+    // Keep enough contention to exercise the OS-level advisory lock while
+    // bounding process pressure on small CI runners.
+    let process_count = thread::available_parallelism()
+        .map(|parallelism| parallelism.get().saturating_mul(2))
+        .unwrap_or(16)
+        .clamp(12, 32);
+    let test_binary = std::env::current_exe().expect("current integration-test executable");
+    let mut children = Vec::with_capacity(process_count);
+    for _ in 0..process_count {
+        children.push(
+            Command::new(&test_binary)
+                .arg("--exact")
+                .arg("same_artifact_stress_worker")
+                .arg("--test-threads=1")
+                .env(STRESS_STORE_ENV, store_dir.path())
+                .env(STRESS_URL_ENV, server.url_for())
+                .env(STRESS_INTEGRITY_ENV, &integrity)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn stress worker"),
+        );
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut statuses = vec![None; process_count];
+    loop {
+        for (index, child) in children.iter_mut().enumerate() {
+            if statuses[index].is_none() {
+                statuses[index] = child.try_wait().expect("poll stress worker");
+            }
+        }
+        if statuses.iter().all(Option::is_some) {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let completed = statuses.iter().filter(|status| status.is_some()).count();
+            for (child, status) in children.iter_mut().zip(&statuses) {
+                if status.is_none() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+            panic!(
+                "same-artifact publication deadlocked or exceeded 20s: {completed}/{process_count} workers completed"
+            );
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    for (index, status) in statuses.into_iter().enumerate() {
+        assert!(
+            status.expect("worker status").success(),
+            "stress worker {index} failed"
+        );
+    }
+
+    let store = ArtifactStore::open(store_dir.path()).unwrap();
+    store
+        .verify_artifact(parsed.digest())
+        .expect("published artifact verifies after process contention");
+    assert_eq!(glob::glob_artifacts(&store).len(), 1);
+    assert_eq!(
+        server.hits(),
+        1,
+        "per-artifact process lock must permit exactly one download"
+    );
+    assert_eq!(
+        fs::read_dir(store.root().join("tmp")).unwrap().count(),
+        0,
+        "stress publication must leave no temporary files"
+    );
 }
 
 #[test]
