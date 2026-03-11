@@ -17,6 +17,7 @@
 //! expects (`/` -> `%2F`) so the whole name is one path segment.
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Deserializer};
@@ -240,6 +241,10 @@ pub struct ResolvedArtifact {
 pub struct RegistryClient {
     config: NpmConfig,
     http: HttpClient,
+    /// Packuments are immutable for the lifetime of one resolution. Sharing
+    /// this small cache avoids fetching the same transitive package once per
+    /// physical placement (common with peer and nested dependency graphs).
+    packument_cache: Arc<Mutex<BTreeMap<String, Packument>>>,
 }
 
 impl RegistryClient {
@@ -260,7 +265,11 @@ impl RegistryClient {
     /// should use [`Self::with_client`] with their caller-owned client.
     pub fn new(config: NpmConfig) -> Self {
         let http = HttpClient::new(config.clone());
-        Self { config, http }
+        Self {
+            config,
+            http,
+            packument_cache: Arc::new(Mutex::new(BTreeMap::new())),
+        }
     }
 
     /// Construct a registry facade using the caller's pooled HTTP client.
@@ -268,20 +277,34 @@ impl RegistryClient {
     /// Cloning `http` before passing it here lets metadata and artifact
     /// requests share the same underlying agent and connection pool.
     pub fn with_client(config: NpmConfig, http: HttpClient) -> Self {
-        Self { config, http }
+        Self {
+            config,
+            http,
+            packument_cache: Arc::new(Mutex::new(BTreeMap::new())),
+        }
     }
 
     /// Fetch the configured scoped/default registry and resolve one package.
     pub fn resolve(&self, spec: &PackageSpec) -> Result<ResolvedArtifact, RegistryError> {
         let registry = self.config.registry_for_package(&spec.name);
-        let packument = fetch_packument(&self.http, &spec.name, registry)?;
+        let packument = self.packument(&spec.name)?;
         resolve_packument(spec, &packument, registry)
     }
 
     /// Fetch a typed packument for use by dependency-graph resolution.
     pub fn packument(&self, name: &str) -> Result<Packument, RegistryError> {
         let registry = self.config.registry_for_package(name);
-        fetch_packument(&self.http, name, registry)
+        let key = format!("{}\0{name}", registry.trim_end_matches('/'));
+        if let Ok(cache) = self.packument_cache.lock() {
+            if let Some(packument) = cache.get(&key) {
+                return Ok(packument.clone());
+            }
+        }
+        let packument = fetch_packument(&self.http, name, registry)?;
+        if let Ok(mut cache) = self.packument_cache.lock() {
+            cache.insert(key, packument.clone());
+        }
+        Ok(packument)
     }
 }
 

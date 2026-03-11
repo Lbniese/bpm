@@ -197,8 +197,8 @@ pub fn import(json: &str) -> Result<ImportReport, NpmLockError> {
                 "PLATFORM_CONSTRAINT",
                 name.clone(),
                 format!(
-                    "package \"{name}\" declares os/cpu constraints ({}) that \
-                     BPM records but does not yet enforce",
+                    "package \"{name}\" declares os/cpu constraints ({}); \
+                     BPM records and enforces them during installation",
                     format_constraints(&pkg.os, &pkg.cpu)
                 ),
             ));

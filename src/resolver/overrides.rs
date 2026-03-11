@@ -86,6 +86,9 @@ struct Selector {
 struct OverrideRule {
     ancestors: Vec<Selector>,
     package: String,
+    /// The target selector's version qualifier, if any. It must match the
+    /// request too; otherwise `foo@1` would incorrectly override `foo@2`.
+    package_req: Option<String>,
     spec: String,
     key: String,
 }
@@ -125,6 +128,7 @@ impl OverrideSet {
             .iter()
             .filter(|rule| rule.package == package)
             .filter(|rule| ancestors_match(&rule.ancestors, ancestors))
+            .filter(|rule| request_matches_selector(rule.package_req.as_deref(), requested))
             .max_by(|a, b| {
                 a.ancestors
                     .len()
@@ -274,6 +278,7 @@ fn add_rule(
     rules.push(OverrideRule {
         ancestors: ancestors.to_vec(),
         package: selector.name,
+        package_req: selector.req,
         spec: effective,
         key,
     });
@@ -344,6 +349,51 @@ impl<'a> EmptyReq<'a> for (&'a str, &'a str) {
             (self.0, Some(self.1))
         }
     }
+}
+
+fn request_matches_selector(selector_req: Option<&str>, requested: &str) -> bool {
+    let Some(selector_req) = selector_req else {
+        return true;
+    };
+    let selector_exact = Version::parse(selector_req).ok();
+    let selector = VersionReq::parse(selector_req).ok();
+    let Ok(parsed) = crate::registry::parse_spec(&format!("override-probe@{requested}")) else {
+        // Source and tag requests do not expose a version before resolution;
+        // leave range-qualified rules eligible for the normal resolver.
+        return true;
+    };
+    match parsed.req {
+        crate::registry::VersionRequest::Exact(version) => selector_exact.map_or_else(
+            || selector.is_some_and(|req| req.matches(&version)),
+            |exact| exact == version,
+        ),
+        crate::registry::VersionRequest::Latest => true,
+        crate::registry::VersionRequest::Range(request) => selector
+            .as_ref()
+            .is_some_and(|selector| ranges_intersect(selector, &request)),
+    }
+}
+
+/// Semver has no public range-intersection operation. Testing the finite set of
+/// comparator boundaries (and their immediate successors) is sufficient for
+/// npm's ordinary major/minor/patch ranges and avoids applying a `foo@^1`
+/// override to a request constrained to `^2`.
+fn ranges_intersect(left: &VersionReq, right: &VersionReq) -> bool {
+    let mut candidates = vec![Version::new(0, 0, 0)];
+    for comparator in left.comparators.iter().chain(&right.comparators) {
+        let minor = comparator.minor.unwrap_or(0);
+        let patch = comparator.patch.unwrap_or(0);
+        candidates.push(Version::new(comparator.major, minor, patch));
+        candidates.push(Version::new(
+            comparator.major,
+            minor,
+            patch.saturating_add(1),
+        ));
+        candidates.push(Version::new(comparator.major.saturating_add(1), 0, 0));
+    }
+    candidates
+        .iter()
+        .any(|candidate| left.matches(candidate) && right.matches(candidate))
 }
 
 fn ancestors_match(selectors: &[Selector], ancestors: &[(String, Version)]) -> bool {
@@ -509,6 +559,26 @@ mod tests {
             ),
             "3.1.0"
         );
+    }
+
+    #[test]
+    fn version_qualified_rules_do_not_match_a_different_exact_request() {
+        let set = normalize_root_overrides(
+            &BTreeMap::from([("transitive@1.0.0".into(), json!("9.0.0"))]),
+            &BTreeMap::new(),
+            OverrideOrigin::Root,
+        )
+        .unwrap();
+        assert_eq!(set.effective_spec("transitive", "1.0.0"), "9.0.0");
+        assert_eq!(set.effective_spec("transitive", "2.0.0"), "2.0.0");
+
+        let ranges = normalize_root_overrides(
+            &BTreeMap::from([("transitive@^1".into(), json!("9.0.0"))]),
+            &BTreeMap::new(),
+            OverrideOrigin::Root,
+        )
+        .unwrap();
+        assert_eq!(ranges.effective_spec("transitive", "^2"), "^2");
     }
 
     #[test]
