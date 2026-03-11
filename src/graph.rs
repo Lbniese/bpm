@@ -128,7 +128,7 @@ pub fn platform_descriptor() -> String {
 pub fn canonical_graph_bytes(lockfile: &Lockfile) -> Vec<u8> {
     let mut buf = Vec::with_capacity(1024);
     // Header bounds the encoding so unrelated trailing bytes can't collide.
-    buf.extend_from_slice(b"bpm-graph-v1\n");
+    buf.extend_from_slice(b"bpm-graph-v2\n");
     write_field(&mut buf, &platform_descriptor());
 
     // Root declared dependencies: name -> spec, sorted (BTreeMap iteration order).
@@ -137,6 +137,21 @@ pub fn canonical_graph_bytes(lockfile: &Lockfile) -> Vec<u8> {
     for (name, spec) in &lockfile.root.dependencies {
         write_field(&mut buf, name);
         write_field(&mut buf, spec);
+    }
+    // Resolver inputs that may alter the effective graph without changing
+    // the compatibility root dependency map.
+    write_u64(&mut buf, lockfile.resolution.root.overrides.len() as u64);
+    for (name, spec) in &lockfile.resolution.root.overrides {
+        write_field(&mut buf, name);
+        write_field(&mut buf, spec);
+    }
+    if let Some(target) = &lockfile.resolution.root.target {
+        write_bool(&mut buf, true);
+        write_field(&mut buf, &target.os);
+        write_field(&mut buf, &target.cpu);
+        write_field(&mut buf, target.libc.as_deref().unwrap_or(""));
+    } else {
+        write_bool(&mut buf, false);
     }
 
     // Package entries in list order (bpm.lock keeps them path-sorted).
@@ -151,6 +166,22 @@ pub fn canonical_graph_bytes(lockfile: &Lockfile) -> Vec<u8> {
         write_bool(&mut buf, p.link);
         write_bool(&mut buf, p.dev);
         write_bool(&mut buf, p.optional);
+        write_u64(&mut buf, p.os.len() as u64);
+        for value in &p.os {
+            write_field(&mut buf, value);
+        }
+        write_u64(&mut buf, p.cpu.len() as u64);
+        for value in &p.cpu {
+            write_field(&mut buf, value);
+        }
+        if let Some(resolution) = lockfile.resolution.packages.get(&p.path) {
+            write_u64(&mut buf, resolution.libc.len() as u64);
+            for value in &resolution.libc {
+                write_field(&mut buf, value);
+            }
+        } else {
+            write_u64(&mut buf, 0);
+        }
         // bin map sorted (BTreeMap).
         write_u64(&mut buf, p.bin.len() as u64);
         for (bname, bpath) in &p.bin {

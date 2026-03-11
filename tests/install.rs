@@ -234,6 +234,104 @@ fn install_runs_offline_without_network() {
 }
 
 #[test]
+fn frozen_install_skips_optional_package_incompatible_with_host_platform() {
+    // Platform filtering must skip an optional dependency whose `os` constraint
+    // does not match this host, while still installing everything else. This
+    // exercises build_install_work -> check_package_platform end to end and
+    // proves the graph volume omits the skipped placement (its artifact id is
+    // None, so it is never materialized).
+    let project = tempdir().unwrap();
+    let store = tempdir().unwrap();
+    let tgz = tempdir().unwrap();
+
+    let (greet_path, greet_int) = seed_tarball(
+        tgz.path(),
+        "greet.tgz",
+        &build_tgz(&[(
+            "package/package.json",
+            b"{\"name\":\"greet\",\"version\":\"1.0.0\"}",
+            0o644,
+        )]),
+    );
+    // A real tarball so the entry is well-formed even though it is skipped.
+    let (native_path, native_int) = seed_tarball(
+        tgz.path(),
+        "native.tgz",
+        &build_tgz(&[(
+            "package/package.json",
+            b"{\"name\":\"native\",\"version\":\"1.0.0\",\"os\":[\"win32\"]}",
+            0o644,
+        )]),
+    );
+
+    // The optional dependency targets a platform no unix host satisfies.
+    fs::write(
+        project.path().join("package.json"),
+        r#"{"name":"app","version":"1.0.0","dependencies":{"greet":"^1.0.0"},"optionalDependencies":{"native":"^1.0.0"}}"#,
+    )
+    .unwrap();
+
+    let mut lf = Lockfile::new("bpm-test");
+    lf.root = RootEntry {
+        name: Some("app".into()),
+        version: Some("1.0.0".into()),
+        dependencies: BTreeMap::from([
+            ("greet".into(), "^1.0.0".into()),
+            ("native".into(), "^1.0.0".into()),
+        ]),
+    };
+    // The frozen guard requires the recorded optional map to match the manifest.
+    lf.resolution.root.optional_dependencies = BTreeMap::from([("native".into(), "^1.0.0".into())]);
+    lf.packages.push(PackageEntry {
+        path: "node_modules/greet".into(),
+        name: "greet".into(),
+        version: "1.0.0".into(),
+        resolved: format!("file://{}", greet_path.display()),
+        integrity: Some(greet_int.to_npm_string()),
+        ..Default::default()
+    });
+    lf.packages.push(PackageEntry {
+        path: "node_modules/native".into(),
+        name: "native".into(),
+        version: "1.0.0".into(),
+        resolved: format!("file://{}", native_path.display()),
+        integrity: Some(native_int.to_npm_string()),
+        optional: true,
+        os: vec!["win32".to_string()],
+        ..Default::default()
+    });
+    lf.sort_packages();
+    lf.write_to(&project.path().join("bpm.lock")).unwrap();
+
+    let out = run_install(project.path(), store.path());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "install failed: {stderr}\n--stdout--\n{stdout}"
+    );
+
+    // The compatible production dependency is still installed.
+    assert!(
+        project
+            .path()
+            .join("node_modules/greet/package.json")
+            .exists(),
+        "greet should be installed: {stdout} {stderr}"
+    );
+    // The platform-incompatible optional dependency is skipped, never linked.
+    assert!(
+        !project.path().join("node_modules/native").exists(),
+        "native should be skipped on this platform: {stdout} {stderr}"
+    );
+    // The skip is surfaced as a stable platform diagnostic.
+    assert!(
+        stderr.contains("platform:"),
+        "expected a platform skip diagnostic: {stderr}"
+    );
+}
+
+#[test]
 fn plan_cache_hit_is_recorded_in_metrics() {
     let (project, store, _tgz) = setup_project();
     let m1 = project.path().join("m1.json");
