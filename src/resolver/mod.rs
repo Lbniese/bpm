@@ -6,7 +6,7 @@ pub mod peer;
 pub mod platform;
 pub mod workspaces;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
@@ -106,6 +106,24 @@ pub fn resolve_manifest_with_workspaces(
     )
 }
 
+/// Workspace-aware variant of [`resolve_manifest_with_target`].
+pub fn resolve_manifest_with_workspaces_and_target(
+    manifest: &PackageManifest,
+    registry: &RegistryClient,
+    generator: &str,
+    workspace: Option<&crate::resolver::workspaces::WorkspaceIndex>,
+    target: TargetPlatform,
+) -> Result<Lockfile, ResolveError> {
+    resolve_manifest_with_options_and_target(
+        manifest,
+        registry,
+        generator,
+        workspace,
+        crate::resolver::peer::PeerMode::Strict,
+        target,
+    )
+}
+
 pub fn resolve_manifest_with_options(
     manifest: &PackageManifest,
     registry: &RegistryClient,
@@ -113,12 +131,61 @@ pub fn resolve_manifest_with_options(
     workspace: Option<&crate::resolver::workspaces::WorkspaceIndex>,
     peer_mode: crate::resolver::peer::PeerMode,
 ) -> Result<Lockfile, ResolveError> {
+    resolve_manifest_with_options_and_target(
+        manifest,
+        registry,
+        generator,
+        workspace,
+        peer_mode,
+        current_target_platform(),
+    )
+}
+
+/// Resolve a manifest for an explicit npm target platform.
+///
+/// Keeping the target in the resolver (rather than consulting the host from
+/// deep in the traversal) makes cross-platform lock generation deterministic
+/// and lets callers use the same graph on CI and build machines.
+pub fn resolve_manifest_with_target(
+    manifest: &PackageManifest,
+    registry: &RegistryClient,
+    generator: &str,
+    target: TargetPlatform,
+) -> Result<Lockfile, ResolveError> {
+    resolve_manifest_with_options_and_target(
+        manifest,
+        registry,
+        generator,
+        None,
+        crate::resolver::peer::PeerMode::Strict,
+        target,
+    )
+}
+
+pub fn resolve_manifest_with_options_and_target(
+    manifest: &PackageManifest,
+    registry: &RegistryClient,
+    generator: &str,
+    workspace: Option<&crate::resolver::workspaces::WorkspaceIndex>,
+    peer_mode: crate::resolver::peer::PeerMode,
+    target: TargetPlatform,
+) -> Result<Lockfile, ResolveError> {
     let mut root_deps = manifest.dependencies.clone();
+    // npm's optionalDependencies take precedence over dependencies with the
+    // same name. Peer dependencies are root requests too: npm installs a
+    // missing root peer so that packages below the root can bind to it.
     for (name, spec) in &manifest.optional_dependencies {
         root_deps.insert(name.clone(), spec.clone());
     }
+    for (name, spec) in &manifest.peer_dependencies {
+        root_deps
+            .entry(name.clone())
+            .or_insert_with(|| spec.clone());
+    }
     for (name, spec) in &manifest.dev_dependencies {
-        root_deps.insert(name.clone(), spec.clone());
+        root_deps
+            .entry(name.clone())
+            .or_insert_with(|| spec.clone());
     }
     let overrides = crate::resolver::overrides::OverrideSet::from_manifest(
         &manifest.overrides,
@@ -135,13 +202,14 @@ pub fn resolve_manifest_with_options(
         diagnostics: Vec::new(),
         workspace,
         root_dir: manifest.source_dir.clone(),
+        target: target.clone(),
     };
     let mut root_targets = BTreeMap::new();
     for (name, spec) in &root_deps {
-        let optional = manifest.optional_dependencies.contains_key(name)
-            && !manifest.dependencies.contains_key(name);
+        let optional = manifest.optional_dependencies.contains_key(name);
         let dev = manifest.dev_dependencies.contains_key(name)
-            && !manifest.dependencies.contains_key(name);
+            && !manifest.dependencies.contains_key(name)
+            && !manifest.optional_dependencies.contains_key(name);
         if let Some(path) = resolver.resolve_dependency("", name, spec, optional, dev)? {
             root_targets.insert(name.clone(), (spec.clone(), path));
         }
@@ -157,6 +225,11 @@ pub fn resolve_manifest_with_options(
         dev_dependencies: manifest.dev_dependencies.clone(),
         optional_dependencies: manifest.optional_dependencies.clone(),
         overrides: normalized_overrides,
+        target: Some(crate::lockfile::LockTarget {
+            os: target.os,
+            cpu: target.cpu,
+            libc: target.libc,
+        }),
         ..RootResolution::default()
     };
     lock.resolution.root.peer_mode = match peer_mode {
@@ -304,6 +377,7 @@ struct GraphResolver<'a> {
     diagnostics: Vec<String>,
     workspace: Option<&'a crate::resolver::workspaces::WorkspaceIndex>,
     root_dir: Option<PathBuf>,
+    target: TargetPlatform,
 }
 
 impl<'a> GraphResolver<'a> {
@@ -333,6 +407,7 @@ impl<'a> GraphResolver<'a> {
                 };
                 let path = format!("node_modules/{name}");
                 if self.nodes.contains_key(&path) {
+                    self.upgrade_reachability(&path, optional, dev);
                     return Ok(Some(path));
                 }
 
@@ -343,6 +418,9 @@ impl<'a> GraphResolver<'a> {
                         .get(name)
                         .and_then(|workspace| workspace.manifest.as_ref()),
                 );
+                if !self.platform_allows(name, &metadata, optional)? {
+                    return Ok(None);
+                }
                 let dependencies = merged_dependencies(&metadata);
                 self.nodes.insert(
                     path.clone(),
@@ -370,7 +448,7 @@ impl<'a> GraphResolver<'a> {
                 );
                 for (child, child_spec) in dependencies {
                     let child_optional = self.nodes.get(&path).is_some_and(|node| {
-                        node.metadata.optional_dependencies.contains_key(&child)
+                        optional || node.metadata.optional_dependencies.contains_key(&child)
                     });
                     if let Some(target) =
                         self.resolve_dependency(&path, &child, &child_spec, child_optional, dev)?
@@ -388,6 +466,7 @@ impl<'a> GraphResolver<'a> {
         }
         let (_, visible_spec) = registry_request(name, &spec);
         if let Some(path) = self.find_visible(parent, name, &visible_spec) {
+            self.upgrade_reachability(&path, optional, dev);
             return Ok(Some(path));
         }
         let path = if parent.is_empty() {
@@ -466,18 +545,8 @@ impl<'a> GraphResolver<'a> {
                 }
             }
         }
-        if !platform_compatible(&resolved.metadata) {
-            if optional {
-                self.diagnostics.push(format!(
-                    "optional package {name}@{} skipped on this platform",
-                    resolved.version
-                ));
-                return Ok(None);
-            }
-            return Err(ResolveError::Platform {
-                package: name.to_owned(),
-                version: resolved.version.to_string(),
-            });
+        if !self.platform_allows(name, &resolved.metadata, optional)? {
+            return Ok(None);
         }
         let dependencies = merged_dependencies(&resolved.metadata);
         self.nodes.insert(
@@ -502,10 +571,9 @@ impl<'a> GraphResolver<'a> {
             },
         );
         for (child, child_spec) in dependencies {
-            let child_optional = self
-                .nodes
-                .get(&path)
-                .is_some_and(|node| node.metadata.optional_dependencies.contains_key(&child));
+            let child_optional = self.nodes.get(&path).is_some_and(|node| {
+                optional || node.metadata.optional_dependencies.contains_key(&child)
+            });
             if let Some(target) =
                 self.resolve_dependency(&path, &child, &child_spec, child_optional, dev)?
             {
@@ -532,6 +600,7 @@ impl<'a> GraphResolver<'a> {
             format!("{parent}/node_modules/{name}")
         };
         if self.nodes.contains_key(&path) {
+            self.upgrade_reachability(&path, optional, dev);
             return Ok(Some(path));
         }
         let base_dir = self.base_dir_for(parent);
@@ -552,6 +621,9 @@ impl<'a> GraphResolver<'a> {
                 })?,
         };
         let metadata = resolved.metadata;
+        if !self.platform_allows(name, &metadata, optional)? {
+            return Ok(None);
+        }
         let dependencies = merged_dependencies(&metadata);
         self.nodes.insert(
             path.clone(),
@@ -573,10 +645,9 @@ impl<'a> GraphResolver<'a> {
             },
         );
         for (child, child_spec) in dependencies {
-            let child_optional = self
-                .nodes
-                .get(&path)
-                .is_some_and(|node| node.metadata.optional_dependencies.contains_key(&child));
+            let child_optional = self.nodes.get(&path).is_some_and(|node| {
+                optional || node.metadata.optional_dependencies.contains_key(&child)
+            });
             if let Some(target) =
                 self.resolve_dependency(&path, &child, &child_spec, child_optional, dev)?
             {
@@ -715,6 +786,49 @@ impl<'a> GraphResolver<'a> {
             .get(parent)
             .and_then(|node| node.source_dir.clone())
             .unwrap_or_else(|| self.root_dir.clone().unwrap_or_else(|| PathBuf::from(".")))
+    }
+
+    fn upgrade_reachability(&mut self, path: &str, optional: bool, dev: bool) {
+        if let Some(node) = self.nodes.get_mut(path) {
+            // A package is optional/dev only when every path reaching it has
+            // that property. A later required or production edge therefore
+            // upgrades an already-created placement in place.
+            node.optional &= optional;
+            node.dev &= dev;
+        }
+    }
+
+    fn platform_allows(
+        &mut self,
+        name: &str,
+        metadata: &VersionMetadata,
+        optional: bool,
+    ) -> Result<bool, ResolveError> {
+        let constraints = crate::resolver::model::PlatformConstraints {
+            os: metadata.os.iter().cloned().collect::<BTreeSet<_>>(),
+            cpu: metadata.cpu.iter().cloned().collect::<BTreeSet<_>>(),
+            libc: metadata.libc.iter().cloned().collect::<BTreeSet<_>>(),
+        };
+        match crate::resolver::platform::check_package_platform(
+            &format!("{}@{}", name, metadata.version),
+            &constraints,
+            &self.target,
+            if optional {
+                crate::resolver::platform::PackageReachability::OptionalOnly
+            } else {
+                crate::resolver::platform::PackageReachability::Required
+            },
+        ) {
+            Ok(crate::resolver::platform::PlatformDisposition::Compatible) => Ok(true),
+            Ok(crate::resolver::platform::PlatformDisposition::SkipOptional(diagnostic)) => {
+                self.diagnostics.push(diagnostic.message);
+                Ok(false)
+            }
+            Err(_) => Err(ResolveError::Platform {
+                package: name.to_owned(),
+                version: metadata.version.to_string(),
+            }),
+        }
     }
 
     fn find_visible(&self, parent: &str, name: &str, spec: &str) -> Option<String> {
@@ -1338,76 +1452,37 @@ fn version_request_to_string(request: &crate::registry::VersionRequest) -> Strin
     }
 }
 
-fn platform_compatible(metadata: &VersionMetadata) -> bool {
-    matches_constraints(&metadata.os, &current_os_aliases())
-        && matches_constraints(&metadata.cpu, &current_cpu_aliases())
-        && matches_constraints(&metadata.libc, &current_libc_aliases())
-}
-
-fn matches_constraints(values: &[String], current_aliases: &[&'static str]) -> bool {
-    if values.is_empty()
-        || values.iter().any(|value| value == "any")
-        || current_aliases.contains(&"any")
-    {
-        return true;
-    }
-    let matches_current = |value: &str| current_aliases.contains(&value);
-    if values
-        .iter()
-        .filter_map(|value| value.strip_prefix('!'))
-        .any(matches_current)
-    {
-        return false;
-    }
-    values
-        .iter()
-        .filter(|value| !value.starts_with('!'))
-        .count()
-        == 0
-        || values
-            .iter()
-            .filter(|value| !value.starts_with('!'))
-            .any(|value| matches_current(value))
-}
-
-fn current_os_aliases() -> Vec<&'static str> {
-    match std::env::consts::OS {
-        "macos" => vec!["darwin", "macos", "osx"],
-        "windows" => vec!["win32", "windows"],
-        "linux" => vec!["linux"],
-        "freebsd" => vec!["freebsd"],
-        "openbsd" => vec!["openbsd"],
-        "netbsd" => vec!["netbsd"],
-        "dragonfly" => vec!["dragonfly"],
-        "android" => vec!["android", "linux"],
-        "ios" => vec!["ios", "darwin"],
-        value => vec![value],
-    }
-}
-
-fn current_cpu_aliases() -> Vec<&'static str> {
-    match std::env::consts::ARCH {
-        "x86_64" => vec!["x64", "x86_64", "amd64"],
-        "x86" => vec!["ia32", "x86", "i386", "i686"],
-        "aarch64" => vec!["arm64", "aarch64"],
-        "arm" => vec!["arm"],
-        "powerpc64" => vec!["ppc64", "powerpc64"],
-        "s390x" => vec!["s390x"],
-        "mips" => vec!["mips"],
-        "mips64" => vec!["mips64"],
-        "riscv64" => vec!["riscv64"],
-        value => vec![value],
-    }
-}
-
-fn current_libc_aliases() -> Vec<&'static str> {
-    if std::env::consts::OS != "linux" {
-        return vec!["any"];
-    }
-    if cfg!(target_env = "musl") {
-        vec!["musl"]
+/// Return the host as npm's canonical target names.
+///
+/// This is intentionally small and stable: it is also the default used by
+/// the compatibility resolver APIs. Cross-platform callers should pass an
+/// explicit target to [`resolve_manifest_with_target`].
+pub fn current_target_platform() -> TargetPlatform {
+    let os = match std::env::consts::OS {
+        "macos" => "darwin",
+        "windows" => "win32",
+        value => value,
+    };
+    let cpu = match std::env::consts::ARCH {
+        "x86_64" => "x64",
+        "x86" => "ia32",
+        "aarch64" => "arm64",
+        "powerpc64" => "ppc64",
+        value => value,
+    };
+    let libc = if os == "linux" {
+        Some(if cfg!(target_env = "musl") {
+            "musl".to_owned()
+        } else {
+            "glibc".to_owned()
+        })
     } else {
-        vec!["glibc", "gnu"]
+        None
+    };
+    TargetPlatform {
+        os: os.to_owned(),
+        cpu: cpu.to_owned(),
+        libc,
     }
 }
 

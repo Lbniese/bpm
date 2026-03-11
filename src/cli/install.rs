@@ -15,6 +15,8 @@ use bpm::manifest::PackageManifest;
 use bpm::metrics::Metrics;
 use bpm::registry::RegistryClient;
 use bpm::resolver;
+use bpm::resolver::model::PlatformConstraints;
+use bpm::resolver::platform::{check_package_platform, PackageReachability, PlatformDisposition};
 use bpm::store::{ArtifactStore, StoreError};
 
 use super::fetch::{name_of_spec, store_root, write_metrics};
@@ -181,27 +183,46 @@ pub(super) fn run(options: Options) -> anyhow::Result<()> {
                     move || -> Result<(Vec<FetchOutcome>, Metrics), FetchFail> {
                         let mut local = Metrics::new();
                         let mut outcomes = Vec::new();
+                        let mut first_error: Option<FetchFail> = None;
                         loop {
                             let message = receive.lock().expect("pipeline receiver lock").recv();
                             let Ok(message) = message else {
                                 break;
                             };
-                            let pending = message?;
-                            let image = store
-                                .ensure_image(&pending.artifact.id, &mut local)
-                                .map_err(|source| FetchFail {
-                                    name: pending.name.clone(),
-                                    url: pending.url.clone(),
-                                    source: Box::new(source),
-                                })?;
-                            outcomes.push(FetchOutcome {
-                                index: pending.index,
-                                id: pending.artifact.id,
-                                artifact_cached: pending.artifact.cached,
-                                image_cached: image.cached,
-                            });
+                            let Ok(pending) = message else {
+                                // Keep draining the bounded channel after one
+                                // worker fails. Returning immediately would
+                                // strand downloaders blocked on send and turn
+                                // a normal fetch error into an install hang.
+                                if first_error.is_none() {
+                                    first_error = message.err();
+                                }
+                                continue;
+                            };
+                            if first_error.is_some() {
+                                continue;
+                            }
+                            match store.ensure_image(&pending.artifact.id, &mut local) {
+                                Ok(image) => outcomes.push(FetchOutcome {
+                                    index: pending.index,
+                                    id: pending.artifact.id,
+                                    artifact_cached: pending.artifact.cached,
+                                    image_cached: image.cached,
+                                }),
+                                Err(source) => {
+                                    first_error = Some(FetchFail {
+                                        name: pending.name,
+                                        url: pending.url,
+                                        source: Box::new(source),
+                                    });
+                                }
+                            }
                         }
-                        Ok((outcomes, local))
+                        if let Some(error) = first_error {
+                            Err(error)
+                        } else {
+                            Ok((outcomes, local))
+                        }
                     },
                 ));
             }
@@ -551,8 +572,38 @@ fn enforce_frozen(project_root: &Path, lockfile: &Lockfile) -> anyhow::Result<()
     let mut declared = BTreeSet::new();
     declared.extend(manifest.dependencies.keys().cloned());
     declared.extend(manifest.dev_dependencies.keys().cloned());
+    declared.extend(manifest.optional_dependencies.keys().cloned());
+    declared.extend(manifest.peer_dependencies.keys().cloned());
     let locked: BTreeSet<String> = lockfile.root.dependencies.keys().cloned().collect();
-    if declared == locked {
+
+    let mut root_declarations = manifest.dependencies.clone();
+    for (name, spec) in &manifest.optional_dependencies {
+        root_declarations.insert(name.clone(), spec.clone());
+    }
+    for (name, spec) in &manifest.peer_dependencies {
+        root_declarations
+            .entry(name.clone())
+            .or_insert_with(|| spec.clone());
+    }
+    for (name, spec) in &manifest.dev_dependencies {
+        root_declarations
+            .entry(name.clone())
+            .or_insert_with(|| spec.clone());
+    }
+    let expected_overrides = resolver::overrides::OverrideSet::from_manifest(
+        &manifest.overrides,
+        &root_declarations,
+        resolver::overrides::OverrideOrigin::Root,
+    )
+    .map_err(|error| anyhow::anyhow!("frozen install refused: invalid overrides: {error}"))?
+    .as_map()
+    .clone();
+    let root_resolution = &lockfile.resolution.root;
+    if declared == locked
+        && root_resolution.dev_dependencies == manifest.dev_dependencies
+        && root_resolution.optional_dependencies == manifest.optional_dependencies
+        && root_resolution.overrides == expected_overrides
+    {
         return Ok(());
     }
     let only_manifest = declared
@@ -611,9 +662,38 @@ struct FetchFail {
 
 fn build_install_work(lockfile: &Lockfile, frozen: bool) -> anyhow::Result<Vec<InstallWork>> {
     let mut work = Vec::new();
+    let target = resolver::current_target_platform();
     for (index, package) in lockfile.packages.iter().enumerate() {
         if package.link || package.resolved.is_empty() {
             continue;
+        }
+        let constraints = PlatformConstraints {
+            os: package.os.iter().cloned().collect(),
+            cpu: package.cpu.iter().cloned().collect(),
+            libc: lockfile
+                .resolution
+                .packages
+                .get(&package.path)
+                .map(|resolution| resolution.libc.iter().cloned().collect())
+                .unwrap_or_default(),
+        };
+        match check_package_platform(
+            &format!("{}@{}", package.name, package.version),
+            &constraints,
+            &target,
+            if package.optional {
+                PackageReachability::OptionalOnly
+            } else {
+                PackageReachability::Required
+            },
+        )
+        .map_err(|error| anyhow::anyhow!("platform filtering failed: {error}"))?
+        {
+            PlatformDisposition::Compatible => {}
+            PlatformDisposition::SkipOptional(diagnostic) => {
+                eprintln!("platform: {}", diagnostic.message);
+                continue;
+            }
         }
         let integrity = match package.integrity.as_deref() {
             Some(value) => Some(Integrity::parse(value).map_err(|error| {
