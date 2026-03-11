@@ -10,6 +10,42 @@ once a 1.0 release is cut.
 
 No unreleased changes.
 
+## [0.1.4] - 2026-07-17
+
+### Added
+
+- Performant dependency installation: a shared packument cache in the
+  registry client avoids re-fetching the same transitive package metadata once
+  per physical placement, and the concurrent install loop now drains its
+  bounded download channel after a worker error so a single fetch failure no
+  longer strands workers and turns into an install hang.
+- npm-compatible platform filtering via a dedicated `resolver::platform` module.
+  Operating system, CPU, and libc declarations are evaluated independently
+  with npm's `checkList` rule against an explicit `TargetPlatform`, so
+  resolution is reproducible across machines. Optional packages that are
+  incompatible with the target are skipped (and surfaced as stable diagnostics);
+  required packages that cannot run on the target fail fast. A package reached
+  through both optional and required paths is upgraded to required, matching
+  npm's reachability semantics.
+- Version-qualified dependency `overrides`: a rule such as `transitive@1.0.0`
+  or `transitive@^1` no longer overrides `transitive@2`, with semver range
+  intersection checking so range-qualified rules only apply to intersecting
+  requests.
+- `bpm install` now records the resolution target in the lockfile and skips
+  platform-incompatible optional packages during materialization.
+- Canonical graph id bumped to `bpm-graph-v2` so it incorporates the resolved
+  target, override map, and per-package platform constraints.
+
+### Changed
+
+- The frozen-install guard now verifies that the lockfile's override map and
+  optional/dev dependency maps match the manifest, in addition to the declared
+  dependency set.
+- `bpm import` reports `package-lock.json` platform constraints as enforced
+  rather than recorded-only.
+- Package version bumped to `0.1.4` so `bpm --version` reports the release
+  version.
+
 ## [0.1.3] - 2026-06-28
 
 ### Added
@@ -75,7 +111,8 @@ Initial release.
   into the graph id.
 - Install-timing benchmark harness with machine-stamped baselines.
 
-[Unreleased]: https://github.com/lbniese/bpm/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/lbniese/bpm/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/lbniese/bpm/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/lbniese/bpm/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/lbniese/bpm/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/lbniese/bpm/compare/v0.1.0...v0.1.1
