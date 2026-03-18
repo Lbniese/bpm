@@ -26,7 +26,9 @@ use thiserror::Error;
 use crate::graph::graph_id;
 use crate::integrity::ArtifactId;
 use crate::lockfile::Lockfile;
-use crate::materializer::{materialize, MaterializeError, MaterializeStats};
+use crate::materializer::{
+    materialize_with_backend, MaterializeBackend, MaterializeError, MaterializeStats,
+};
 use crate::metrics::Metrics;
 use crate::store::ArtifactStore;
 
@@ -35,11 +37,20 @@ use crate::store::ArtifactStore;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct VolumeMeta {
     graph_id_hex: String,
+    /// On-disk layout generation this volume was built with. A cached volume
+    /// whose recorded layout differs from [`VOLUME_LAYOUT_VERSION`] is rebuilt.
+    #[serde(default)]
+    layout_version: u32,
     packages_materialized: usize,
     bins_linked: usize,
 }
 
 const META_FILE: &str = "metadata.json";
+
+/// Bumped when the on-disk volume layout changes (e.g. symlink -> hardlink
+/// materialization of package images). A cached volume whose recorded layout
+/// differs is discarded and rebuilt so every project sees the current layout.
+const VOLUME_LAYOUT_VERSION: u32 = 2;
 
 #[derive(Debug, Error)]
 pub enum VolumeError {
@@ -84,11 +95,14 @@ pub fn ensure_graph_volume(
     let graph_hex = gid.to_hex();
     let volume_dir = store.graph_volume_path(&graph_hex);
 
-    // Reuse: a complete marker means another process/project already built this
-    // exact graph volume; attaching to it is the fast path.
+    // Reuse: a complete marker whose graph id AND layout version match means
+    // another process/project already built this exact volume; attaching to it
+    // is the fast path. A graph or layout mismatch means the on-disk volume is
+    // stale and must be rebuilt from scratch.
+    let mut stale = false;
     if let Ok(meta_bytes) = fs::read(volume_dir.join(META_FILE)) {
         if let Ok(meta) = serde_json::from_slice::<VolumeMeta>(&meta_bytes) {
-            if meta.graph_id_hex == graph_hex {
+            if meta.graph_id_hex == graph_hex && meta.layout_version == VOLUME_LAYOUT_VERSION {
                 metrics.record("graph_volume_hit", std::time::Duration::ZERO);
                 return Ok(VolumeRef {
                     path: volume_dir,
@@ -96,10 +110,23 @@ pub fn ensure_graph_volume(
                     stats: MaterializeStats::default(),
                 });
             }
+            stale = true;
         }
     }
+    if stale {
+        // Discard the stale projection so the rebuild contains no orphan
+        // entries from the previous layout/graph. Removing hardlinked entries
+        // only unlinks directory entries; the shared store images persist.
+        let _ = fs::remove_dir_all(&volume_dir);
+    }
 
-    // Build: materialize the full node_modules projection inside the volume.
+    // Build: materialize the full node_modules projection inside the volume as
+    // HARDLINKS (real directories sharing inodes with the immutable store
+    // images) rather than symlinks into the store. A package's realpath then
+    // lands inside the volume, where `node_modules/<self>` is reachable as a
+    // sibling, so self-referential requires (e.g. `require('next/...')` issued
+    // from within next's own code) resolve instead of escaping into the store
+    // (which has no node_modules and breaks them).
     fs::create_dir_all(volume_dir.join("node_modules"))
         .map_err(|source| io_err(&volume_dir, source))?;
     let resolved: Vec<(_, ArtifactId)> = artifact_ids
@@ -107,10 +134,16 @@ pub fn ensure_graph_volume(
         .zip(lockfile.packages.iter())
         .filter_map(|(maybe_id, pkg)| maybe_id.map(|id| (pkg, id)))
         .collect();
-    let stats = materialize(volume_dir.as_path(), store, &resolved)?;
+    let stats = materialize_with_backend(
+        volume_dir.as_path(),
+        store,
+        &resolved,
+        MaterializeBackend::Hardlink,
+    )?;
 
     let meta = VolumeMeta {
         graph_id_hex: graph_hex,
+        layout_version: VOLUME_LAYOUT_VERSION,
         packages_materialized: stats.packages_materialized,
         bins_linked: stats.bins_linked,
     };
