@@ -31,7 +31,7 @@ mod codes {
     pub const LIFECYCLE_SCRIPTS: &str = "LIFECYCLE_SCRIPTS";
     pub const NATIVE_ADDON: &str = "NATIVE_ADDON";
     pub const WORKSPACES_UNSUPPORTED: &str = "WORKSPACES_UNSUPPORTED";
-    pub const OVERRIDES_UNSUPPORTED: &str = "OVERRIDES_UNSUPPORTED";
+    pub const OVERRIDES_DECLARED: &str = "OVERRIDES_DECLARED";
     pub const ENGINES_NODE: &str = "ENGINES_NODE";
 }
 
@@ -286,9 +286,9 @@ fn inspect(manifest: &PackageManifest, project_root: &Path, diagnostics: &mut Ve
 
     if !manifest.overrides.is_empty() {
         diagnostics.push(
-            warn(
-                codes::OVERRIDES_UNSUPPORTED,
-                "\"overrides\" declared; overrides are not yet honored",
+            info(
+                codes::OVERRIDES_DECLARED,
+                "\"overrides\" declared; honored during dependency resolution",
             )
             .with_field("overrides"),
         );
