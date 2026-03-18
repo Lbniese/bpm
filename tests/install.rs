@@ -160,13 +160,29 @@ fn frozen_install_materializes_node_modules_and_bins() {
     assert!(stdout.contains("graph volume built"), "stdout: {stdout}");
 
     let nm = project.path().join("node_modules");
+    // Top-level relay: a symlink into the shared graph volume.
     assert_resolves(&nm.join("greet"));
-    assert_resolves(&nm.join("greet/node_modules/dep"));
+    // Nested packages and bins live inside the volume as hardlinked real
+    // files/dirs (not symlinks), reached transitively through the top-level
+    // relay. They must still be reachable and correct from the project view.
+    assert!(nm.join("greet/node_modules/dep").exists());
     assert!(nm.join("greet/package.json").exists());
     assert!(nm.join("greet/node_modules/dep/package.json").exists());
 
+    // The volume entry itself (the relay target) must be a REAL directory, not
+    // a symlink: hardlink materialization keeps a package's realpath inside the
+    // volume so self-referential requires resolve.
+    let volume_entry = fs::read_link(nm.join("greet")).unwrap();
+    let volume_meta = fs::symlink_metadata(&volume_entry).unwrap();
+    assert!(
+        volume_meta.is_dir(),
+        "volume entry should be a real directory, not a symlink: {}",
+        volume_entry.display()
+    );
+    assert!(!volume_meta.file_type().is_symlink());
+
     let bin = nm.join(".bin").join("hello");
-    assert_resolves(&bin);
+    assert!(bin.exists(), "bin must be reachable through the relay");
     assert!(is_executable(&bin), "bin must keep its executable bit");
 }
 

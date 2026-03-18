@@ -122,7 +122,7 @@ fn reports_workspaces_overrides_and_engines() {
     let report = run(tmp.path());
     let c = codes(&report);
     assert!(c.contains(&"WORKSPACES_UNSUPPORTED".to_string()));
-    assert!(c.contains(&"OVERRIDES_UNSUPPORTED".to_string()));
+    assert!(c.contains(&"OVERRIDES_DECLARED".to_string()));
     assert!(c.contains(&"ENGINES_NODE".to_string()));
     assert_eq!(report.manifest.workspaces, 1);
     assert_eq!(report.manifest.overrides, 1);
@@ -151,8 +151,8 @@ fn reports_peer_override_and_optional_dependency_diagnostics_together() {
     assert_eq!(report.manifest.overrides, 1);
     assert_eq!(
         actual,
-        vec!["DECLARED_DEPENDENCIES", "OVERRIDES_UNSUPPORTED"],
-        "peer and optional dependencies must contribute to the dependency diagnostic while overrides retain their dedicated warning"
+        vec!["DECLARED_DEPENDENCIES", "OVERRIDES_DECLARED"],
+        "peer and optional dependencies must contribute to the dependency diagnostic while overrides are noted as honored"
     );
 }
 
