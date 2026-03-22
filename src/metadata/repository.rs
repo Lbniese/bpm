@@ -1,0 +1,2193 @@
+//! Transactional access to BPM's rebuildable SQLite metadata index.
+//!
+//! Paths stored in SQLite are inventory hints only. Every operation validates
+//! a typed object key and derives its path beneath the configured store root.
+
+use std::collections::BTreeSet;
+use std::ffi::OsStr;
+use std::fs;
+use std::io::Write;
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use rusqlite::{params, Connection, Transaction, TransactionBehavior};
+
+use super::schema;
+use crate::derived::{DerivedMetadata, DerivedRecord};
+use crate::gc::policy::{DeletionRank, GcPolicy, PolicyCandidate, PolicyEvaluation};
+use crate::resolution_cache::ResolutionSnapshotCache;
+use crate::store_lock;
+
+const DATABASE_NAME: &str = "store.db";
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(120);
+const DEFAULT_RENEW_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Milliseconds since the Unix epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Timestamp(u64);
+
+impl Timestamp {
+    pub const fn from_millis(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn as_millis(self) -> u64 {
+        self.0
+    }
+
+    pub(crate) fn now() -> Result<Self, MetadataError> {
+        let duration = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| MetadataError::Clock)?;
+        u64::try_from(duration.as_millis())
+            .map(Self)
+            .map_err(|_| MetadataError::TimeOverflow)
+    }
+}
+
+/// Kind of immutable object indexed by the repository.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ObjectKind {
+    Artifact,
+    Image,
+    Derived,
+    Graph,
+    Plan,
+}
+
+impl ObjectKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Artifact => "artifact",
+            Self::Image => "image",
+            Self::Derived => "derived",
+            Self::Graph => "graph",
+            Self::Plan => "plan",
+        }
+    }
+}
+
+/// Validated identity of one managed store object.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ObjectKey {
+    Artifact(String),
+    Image(String),
+    Derived(String),
+    Graph(String),
+    Plan(String),
+}
+
+impl ObjectKey {
+    pub fn artifact(id: impl Into<String>) -> Result<Self, MetadataError> {
+        Self::new(ObjectKind::Artifact, id.into())
+    }
+
+    pub fn image(id: impl Into<String>) -> Result<Self, MetadataError> {
+        Self::new(ObjectKind::Image, id.into())
+    }
+
+    pub fn derived(id: impl Into<String>) -> Result<Self, MetadataError> {
+        Self::new(ObjectKind::Derived, id.into())
+    }
+
+    pub fn graph(id: impl Into<String>) -> Result<Self, MetadataError> {
+        Self::new(ObjectKind::Graph, id.into())
+    }
+
+    pub fn plan(id: impl Into<String>) -> Result<Self, MetadataError> {
+        Self::new(ObjectKind::Plan, id.into())
+    }
+
+    fn new(kind: ObjectKind, id: String) -> Result<Self, MetadataError> {
+        validate_id(kind, &id)?;
+        Ok(match kind {
+            ObjectKind::Artifact => Self::Artifact(id),
+            ObjectKind::Image => Self::Image(id),
+            ObjectKind::Derived => Self::Derived(id),
+            ObjectKind::Graph => Self::Graph(id),
+            ObjectKind::Plan => Self::Plan(id),
+        })
+    }
+
+    pub const fn kind(&self) -> ObjectKind {
+        match self {
+            Self::Artifact(_) => ObjectKind::Artifact,
+            Self::Image(_) => ObjectKind::Image,
+            Self::Derived(_) => ObjectKind::Derived,
+            Self::Graph(_) => ObjectKind::Graph,
+            Self::Plan(_) => ObjectKind::Plan,
+        }
+    }
+
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Artifact(id)
+            | Self::Image(id)
+            | Self::Derived(id)
+            | Self::Graph(id)
+            | Self::Plan(id) => id,
+        }
+    }
+
+    fn relative_path(&self) -> PathBuf {
+        let id = self.id();
+        match self.kind() {
+            ObjectKind::Artifact => PathBuf::from("artifacts/sha512")
+                .join(&id[..2])
+                .join(format!("{id}.tgz")),
+            ObjectKind::Image => PathBuf::from("images/sha512").join(&id[..2]).join(id),
+            ObjectKind::Derived => PathBuf::from("derived/blake3").join(&id[..2]).join(id),
+            ObjectKind::Graph => PathBuf::from("graphs/blake3").join(&id[..2]).join(id),
+            ObjectKind::Plan => PathBuf::from("plans/blake3")
+                .join(&id[..2])
+                .join(format!("{id}.json")),
+        }
+    }
+
+    pub fn lock_name(&self) -> String {
+        format!("{}-{}", self.kind().as_str(), self.id())
+    }
+}
+
+/// Metadata recorded after an immutable object has been published.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectRecord {
+    pub key: ObjectKey,
+    pub size_bytes: u64,
+    pub published_at: Timestamp,
+}
+
+/// Complete graph inventory recorded in one transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphRecord {
+    pub graph: ObjectRecord,
+    pub artifacts: Vec<(String, bool)>,
+    pub derived: Vec<String>,
+}
+
+/// One project root's current attached graph.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectRegistration {
+    pub root: PathBuf,
+    pub graph_id: String,
+}
+
+/// Lease timing policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeaseOptions {
+    pub ttl: Duration,
+    pub renew_every: Duration,
+}
+
+impl Default for LeaseOptions {
+    fn default() -> Self {
+        Self {
+            ttl: DEFAULT_LEASE_TTL,
+            renew_every: DEFAULT_RENEW_INTERVAL,
+        }
+    }
+}
+
+/// Summary of a filesystem-to-index reconciliation.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RepairReport {
+    pub observed: usize,
+    pub upserted: usize,
+    pub removed_stale: usize,
+    pub unknown_entries: Vec<PathBuf>,
+}
+
+/// Files removed by one garbage-collection pass.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct GcReport {
+    pub repaired: RepairReport,
+    pub evaluation: Option<PolicyEvaluation>,
+    pub deleted: usize,
+    pub deleted_bytes: u64,
+    /// Objects the collector preserved because they were protected, had
+    /// incomplete ownership, or failed a lock/recheck at deletion time.
+    pub preserved: usize,
+}
+
+/// One object discovered by a filesystem scan, with the durable metadata
+/// needed to rebuild ownership edges: a plan's owning graph, or a graph's
+/// complete inventory.
+#[derive(Debug, Clone)]
+struct ScannedObject {
+    record: ObjectRecord,
+    /// Present only for plans: the owning graph id parsed from the plan file.
+    plan_graph_id: Option<String>,
+    /// Present only for graphs whose durable `metadata.json` carries a
+    /// complete artifact/derived inventory. `None` marks a legacy/incomplete
+    /// graph that GC must protect.
+    graph_inventory: Option<crate::volume::GraphInventory>,
+}
+
+/// Repository errors never expose a database-provided deletion path.
+#[derive(Debug, thiserror::Error)]
+pub enum MetadataError {
+    #[error("invalid {kind} object id {id:?}")]
+    InvalidId { kind: &'static str, id: String },
+    #[error("metadata object {kind}:{id} is absent or not a safe published object")]
+    MissingObject { kind: &'static str, id: String },
+    #[error("project root must be an absolute lexically normalized path: {0}")]
+    InvalidProjectRoot(String),
+    #[error("lease TTL must be at least three renewal intervals")]
+    InvalidLeaseOptions,
+    #[error("lease has expired or its ownership token no longer matches")]
+    LeaseLost,
+    #[error("system clock is before the Unix epoch")]
+    Clock,
+    #[error("timestamp or object size exceeds SQLite's signed integer range")]
+    TimeOverflow,
+    #[error("metadata filesystem operation failed at {path}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(transparent)]
+    Schema(#[from] schema::SchemaError),
+    #[error("metadata database operation failed")]
+    Sql(#[from] rusqlite::Error),
+}
+
+/// Rebuildable metadata index for one store root.
+#[derive(Debug, Clone)]
+pub struct MetadataRepository {
+    db_path: PathBuf,
+    store_root: PathBuf,
+}
+
+impl MetadataRepository {
+    /// Open and migrate `<store_root>/store.db`.
+    pub fn open(store_root: &Path) -> Result<Self, MetadataError> {
+        fs::create_dir_all(store_root).map_err(|source| io_error(store_root, source))?;
+        let store_root = absolute_lexical(store_root)?;
+        let repository = Self {
+            db_path: store_root.join(DATABASE_NAME),
+            store_root,
+        };
+        repository.connection()?;
+        Ok(repository)
+    }
+
+    fn connection(&self) -> Result<Connection, MetadataError> {
+        let mut connection = Connection::open(&self.db_path)?;
+        connection.busy_timeout(BUSY_TIMEOUT)?;
+        connection.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=NORMAL;")?;
+        schema::migrate(&mut connection)?;
+        // WAL is best-effort for filesystems that support SQLite shared memory.
+        let _: String = connection.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+        let _ = connection.pragma_update(None, "journal_mode", "WAL");
+        Ok(connection)
+    }
+
+    pub fn record_publication(&self, record: &ObjectRecord) -> Result<(), MetadataError> {
+        self.ensure_published(&record.key)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        upsert_object(&transaction, record, None, None)?;
+        upsert_access(&transaction, &record.key, record.published_at)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Record a plan and its owning graph after both files are published.
+    pub fn record_plan_publication(
+        &self,
+        record: &ObjectRecord,
+        graph_id: &str,
+    ) -> Result<(), MetadataError> {
+        if record.key.kind() != ObjectKind::Plan {
+            return Err(MetadataError::InvalidId {
+                kind: "plan",
+                id: record.key.id().to_owned(),
+            });
+        }
+        let graph = ObjectKey::graph(graph_id)?;
+        self.ensure_published(&record.key)?;
+        self.ensure_published(&graph)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        upsert_object(&transaction, record, Some(graph_id), None)?;
+        upsert_access(&transaction, &record.key, record.published_at)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn record_graph_publication(&self, record: &GraphRecord) -> Result<(), MetadataError> {
+        if record.graph.key.kind() != ObjectKind::Graph {
+            return Err(MetadataError::InvalidId {
+                kind: "graph",
+                id: record.graph.key.id().to_owned(),
+            });
+        }
+        self.ensure_published(&record.graph.key)?;
+        let artifacts = canonical_artifacts(&record.artifacts)?;
+        let derived = canonical_ids(ObjectKind::Derived, &record.derived)?;
+        for (id, _) in &artifacts {
+            self.ensure_published(&ObjectKey::artifact(id.clone())?)?;
+        }
+        for id in &derived {
+            self.ensure_published(&ObjectKey::derived(id.clone())?)?;
+        }
+
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        upsert_object(&transaction, &record.graph, None, Some(true))?;
+        set_graph_complete(&transaction, record.graph.key.id(), true)?;
+        transaction.execute(
+            "DELETE FROM graph_artifacts WHERE graph_id=?1",
+            [record.graph.key.id()],
+        )?;
+        transaction.execute(
+            "DELETE FROM graph_derived WHERE graph_id=?1",
+            [record.graph.key.id()],
+        )?;
+        for (id, requires_image) in artifacts {
+            transaction.execute(
+                "INSERT INTO graph_artifacts(graph_id,artifact_id,requires_image) VALUES (?1,?2,?3)",
+                params![record.graph.key.id(), id, i64::from(requires_image)],
+            )?;
+        }
+        for id in derived {
+            transaction.execute(
+                "INSERT INTO graph_derived(graph_id,derived_id) VALUES (?1,?2)",
+                params![record.graph.key.id(), id],
+            )?;
+        }
+        upsert_access(&transaction, &record.graph.key, record.graph.published_at)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Coalesce access times monotonically, independent of input order.
+    pub fn record_access(&self, keys: &[ObjectKey], at: Timestamp) -> Result<(), MetadataError> {
+        let keys = canonical_keys(keys);
+        for key in &keys {
+            self.ensure_published(key)?;
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for key in &keys {
+            upsert_access(&transaction, key, at)?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Upsert a project and atomically replace its sole graph reference.
+    pub fn replace_project_graph_ref(
+        &self,
+        registration: &ProjectRegistration,
+        at: Timestamp,
+    ) -> Result<(), MetadataError> {
+        let root = absolute_lexical(&registration.root)?;
+        if root != registration.root {
+            return Err(MetadataError::InvalidProjectRoot(
+                registration.root.display().to_string(),
+            ));
+        }
+        let graph = ObjectKey::graph(registration.graph_id.clone())?;
+        self.ensure_published(&graph)?;
+
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        upsert_project_ref(&transaction, &root, &registration.graph_id, at)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Record publication of an object already published to the store,
+    /// deriving its size and publication timestamp from the filesystem. Used
+    /// by the install path to register fetched artifacts/images/graphs in the
+    /// rebuildable index without duplicating size/mtime logic.
+    pub fn record_published_object(&self, key: &ObjectKey) -> Result<(), MetadataError> {
+        self.ensure_published(key)?;
+        let path = self.store_root.join(key.relative_path());
+        let metadata = fs::symlink_metadata(&path).map_err(|source| io_error(&path, source))?;
+        let size_bytes = logical_size(&path)?;
+        let published_at = modified_timestamp(&metadata)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        upsert_object(
+            &transaction,
+            &ObjectRecord {
+                key: key.clone(),
+                size_bytes,
+                published_at,
+            },
+            None,
+            None,
+        )?;
+        upsert_access(&transaction, key, Timestamp::now().unwrap_or(published_at))?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Atomically publish a durable project registration under
+    /// `<store>/projects/<hh>/<blake3>`, keyed by BLAKE3 of the canonical
+    /// project root. Written after graph attachment succeeds so a failed
+    /// install never points a project at a graph it never attached.
+    /// `repair_index` rebuilds `projects`/`project_graph_refs` from these
+    /// files, so deleting only `store.db` cannot orphan an installed project.
+    pub fn write_durable_registration(
+        &self,
+        root: &Path,
+        graph_id: &str,
+    ) -> Result<(), MetadataError> {
+        write_registration_file(&self.store_root, root, graph_id)
+    }
+
+    /// Record one graph's publication (complete edges included) from its
+    /// durable inventory, deriving the graph's size and publication timestamp
+    /// from the filesystem. Used by the install path after a graph volume is
+    /// durably published so the index rebuild and protection queries see its
+    /// artifact/derived membership.
+    pub fn record_graph_with_inventory(
+        &self,
+        graph_hex: &str,
+        inventory: &crate::volume::GraphInventory,
+    ) -> Result<(), MetadataError> {
+        let graph_key = ObjectKey::graph(graph_hex)?;
+        self.ensure_published(&graph_key)?;
+        let graph_path = self.store_root.join(graph_key.relative_path());
+        let metadata =
+            fs::symlink_metadata(&graph_path).map_err(|source| io_error(&graph_path, source))?;
+        let graph_record = ObjectRecord {
+            key: graph_key,
+            size_bytes: logical_size(&graph_path)?,
+            published_at: modified_timestamp(&metadata)?,
+        };
+        self.record_graph_publication(&GraphRecord {
+            graph: graph_record,
+            artifacts: inventory.artifacts.clone(),
+            derived: inventory.derived.clone(),
+        })?;
+        Ok(())
+    }
+
+    /// Acquire one renewable lease covering a sorted, deduplicated object set.
+    pub fn acquire_lease(
+        &self,
+        keys: &[ObjectKey],
+        options: LeaseOptions,
+    ) -> Result<LeaseGuard, MetadataError> {
+        validate_lease_options(options)?;
+        let keys = canonical_keys(keys);
+        // Hold each object's canonical lock across the publication check +
+        // lease-row insert so a concurrent GC collector cannot delete an
+        // object between discovering it is published and recording the lease
+        // that protects it. The locks release at the end of this block; the
+        // durable lease rows (renewed by the heartbeat) provide ongoing
+        // protection, coordinated with GC via the same locks at delete time.
+        let _locks = store_lock::acquire_all(&self.store_root, &keys)
+            .map_err(|source| io_error(&store_lock::lock_dir(&self.store_root), source))?;
+        for key in &keys {
+            self.ensure_published(key)?;
+        }
+        let now = Timestamp::now()?;
+        let expires = checked_add_duration(now, options.ttl)?;
+        let lease_id = nonce("lease", &self.store_root);
+        let owner_token = nonce("owner", &self.store_root);
+        self.insert_lease(&lease_id, &owner_token, &keys, now, expires)?;
+
+        let stop = Arc::new((Mutex::new(false), Condvar::new()));
+        let lost = Arc::new(AtomicBool::new(false));
+        let worker = self.spawn_heartbeat(
+            lease_id.clone(),
+            owner_token.clone(),
+            options,
+            Arc::clone(&stop),
+            Arc::clone(&lost),
+        );
+        Ok(LeaseGuard {
+            repository: self.clone(),
+            lease_id,
+            owner_token,
+            keys,
+            ttl: options.ttl,
+            stop,
+            lost,
+            worker: Some(worker),
+            released: false,
+        })
+    }
+
+    fn insert_lease(
+        &self,
+        lease_id: &str,
+        owner_token: &str,
+        keys: &[ObjectKey],
+        now: Timestamp,
+        expires: Timestamp,
+    ) -> Result<(), MetadataError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for key in keys {
+            transaction.execute(
+                "INSERT INTO leases(lease_id,owner_token,owner_pid,object_kind,object_id,acquired_at_ms,renewed_at_ms,expires_at_ms)
+                 VALUES (?1,?2,?3,?4,?5,?6,?6,?7)",
+                params![
+                    lease_id,
+                    owner_token,
+                    i64::from(std::process::id()),
+                    key.kind().as_str(),
+                    key.id(),
+                    sqlite_u64(now.as_millis())?,
+                    sqlite_u64(expires.as_millis())?
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn spawn_heartbeat(
+        &self,
+        lease_id: String,
+        owner_token: String,
+        options: LeaseOptions,
+        stop: Arc<(Mutex<bool>, Condvar)>,
+        lost: Arc<AtomicBool>,
+    ) -> JoinHandle<()> {
+        let repository = self.clone();
+        let expiry = Arc::new(AtomicU64::new(
+            Timestamp::now()
+                .and_then(|now| checked_add_duration(now, options.ttl))
+                .map(Timestamp::as_millis)
+                .unwrap_or(0),
+        ));
+        thread::spawn(move || loop {
+            let (mutex, condition) = &*stop;
+            let stopped = mutex.lock().unwrap_or_else(|poison| poison.into_inner());
+            let (stopped, _) = condition
+                .wait_timeout_while(stopped, options.renew_every, |value| !*value)
+                .unwrap_or_else(|poison| poison.into_inner());
+            if *stopped {
+                break;
+            }
+            drop(stopped);
+            let now = match Timestamp::now() {
+                Ok(now) => now,
+                Err(_) => {
+                    lost.store(true, Ordering::Release);
+                    break;
+                }
+            };
+            let renewed = checked_add_duration(now, options.ttl).and_then(|expires| {
+                let result = repository.renew_lease(&lease_id, &owner_token, now, expires)?;
+                if result {
+                    expiry.store(expires.as_millis(), Ordering::Release);
+                }
+                Ok(result)
+            });
+            if !matches!(renewed, Ok(true)) && now.as_millis() >= expiry.load(Ordering::Acquire) {
+                lost.store(true, Ordering::Release);
+                break;
+            }
+        })
+    }
+
+    fn renew_lease(
+        &self,
+        lease_id: &str,
+        owner_token: &str,
+        now: Timestamp,
+        expires: Timestamp,
+    ) -> Result<bool, MetadataError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let expected: i64 = transaction.query_row(
+            "SELECT count(*) FROM leases WHERE lease_id=?1 AND owner_token=?2",
+            params![lease_id, owner_token],
+            |row| row.get(0),
+        )?;
+        let changed = transaction.execute(
+            "UPDATE leases SET renewed_at_ms=?3,expires_at_ms=?4
+             WHERE lease_id=?1 AND owner_token=?2 AND expires_at_ms>?3",
+            params![
+                lease_id,
+                owner_token,
+                sqlite_u64(now.as_millis())?,
+                sqlite_u64(expires.as_millis())?
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(expected > 0 && changed == usize::try_from(expected).unwrap_or(usize::MAX))
+    }
+
+    fn release_lease(&self, lease_id: &str, owner_token: &str) -> Result<(), MetadataError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "DELETE FROM leases WHERE lease_id=?1 AND owner_token=?2",
+            params![lease_id, owner_token],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Reconcile fixed object namespaces and remove rows whose canonical path
+    /// is no longer a safe published object. Unknown entries are reported only.
+    /// Graph edges (`graph_artifacts`/`graph_derived`) and the `complete`
+    /// marker are rebuilt from each volume's durable inventory; a graph whose
+    /// inventory is incomplete or references missing objects stays
+    /// `complete=0` (protected) and contributes no edges.
+    pub fn repair_index(&self) -> Result<RepairReport, MetadataError> {
+        let mut report = RepairReport::default();
+        let observed = self.scan_namespaces(&mut report.unknown_entries)?;
+        report.observed = observed.len();
+
+        // Index the observed object keys so a graph's inventory can be checked
+        // for complete referenced membership before edges are reconstructed.
+        let observed_keys: BTreeSet<(ObjectKind, String)> = observed
+            .iter()
+            .map(|object| (object.record.key.kind(), object.record.key.id().to_owned()))
+            .collect();
+
+        let mut connection = self.connection()?;
+        // Filesystem validation happens before the short write transaction.
+        let stale = self.stale_rows(&connection)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for object in &observed {
+            if upsert_object(
+                &transaction,
+                &object.record,
+                object.plan_graph_id.as_deref(),
+                None,
+            )? > 0
+            {
+                report.upserted += 1;
+            }
+            if object.record.key.kind() == ObjectKind::Graph {
+                // A graph is complete iff its durable inventory is present AND
+                // every artifact/derived it references is observed in the store.
+                // Missing inventory or missing referenced objects => incomplete.
+                let complete =
+                    object.graph_inventory.as_ref().is_some_and(|inventory| {
+                        inventory.artifacts.iter().all(|(id, _)| {
+                            observed_keys.contains(&(ObjectKind::Artifact, id.clone()))
+                        }) && inventory
+                            .derived
+                            .iter()
+                            .all(|id| observed_keys.contains(&(ObjectKind::Derived, id.clone())))
+                    });
+                set_graph_complete(&transaction, object.record.key.id(), complete)?;
+                if complete {
+                    let inventory = object
+                        .graph_inventory
+                        .as_ref()
+                        .expect("complete implies inventory present");
+                    upsert_graph_edges(&transaction, object.record.key.id(), inventory)?;
+                } else {
+                    // Drop any stale edges for an incomplete graph so the index
+                    // never authorizes deletion from guessed membership.
+                    transaction.execute(
+                        "DELETE FROM graph_artifacts WHERE graph_id=?1",
+                        [object.record.key.id()],
+                    )?;
+                    transaction.execute(
+                        "DELETE FROM graph_derived WHERE graph_id=?1",
+                        [object.record.key.id()],
+                    )?;
+                }
+            }
+        }
+        report.removed_stale = remove_stale_rows(&transaction, &stale)?;
+        // Rebuild project ownership from durable registration files. Only
+        // registrations whose referenced graph was observed in this scan
+        // contribute a project_graph_ref (the FK would otherwise dangle); a
+        // registration to a missing graph is left on disk untouched, since the
+        // project may live on an unmounted filesystem.
+        let observed_graphs: BTreeSet<String> = observed
+            .iter()
+            .filter(|object| object.record.key.kind() == ObjectKind::Graph)
+            .map(|object| object.record.key.id().to_owned())
+            .collect();
+        for registration in scan_registration_files(&self.store_root)? {
+            if !observed_graphs.contains(&registration.graph_id) {
+                continue;
+            }
+            upsert_project_ref(
+                &transaction,
+                &registration.root,
+                &registration.graph_id,
+                Timestamp::from_millis(registration.updated_at_ms),
+            )?;
+        }
+        transaction.commit()?;
+        report.unknown_entries.sort();
+        report.unknown_entries.dedup();
+        Ok(report)
+    }
+
+    /// Reclaim unreferenced immutable objects without trusting database paths.
+    pub fn collect(&self, policy: GcPolicy) -> Result<GcReport, MetadataError> {
+        let repaired = self.repair_index()?;
+        let now = Timestamp::now()?;
+        let mut connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT object_kind, object_id, size_bytes,
+                    COALESCE((SELECT accessed_at_ms FROM access_log a
+                              WHERE a.object_kind=o.object_kind AND a.object_id=o.object_id),
+                             published_at_ms),
+                    CASE object_kind
+                      WHEN 'plan' THEN 0 WHEN 'graph' THEN 1 WHEN 'derived' THEN 2
+                      WHEN 'image' THEN 3 ELSE 4 END,
+                    CASE
+                      WHEN EXISTS (SELECT 1 FROM leases l WHERE l.object_kind=o.object_kind
+                                   AND l.object_id=o.object_id AND l.expires_at_ms > ?1) THEN 1
+                      WHEN object_kind='graph' AND EXISTS
+                           (SELECT 1 FROM project_graph_refs p WHERE p.graph_id=o.object_id) THEN 1
+                      WHEN object_kind='graph' AND EXISTS
+                           (SELECT 1 FROM graphs gi WHERE gi.id=o.object_id AND gi.complete=0) THEN 1
+                      WHEN object_kind='artifact' AND EXISTS
+                           (SELECT 1 FROM graph_artifacts g JOIN project_graph_refs p
+                            ON p.graph_id=g.graph_id JOIN graphs cg ON cg.id=g.graph_id AND cg.complete=1
+                            WHERE g.artifact_id=o.object_id) THEN 1
+                      WHEN object_kind='derived' AND EXISTS
+                           (SELECT 1 FROM graph_derived g JOIN project_graph_refs p
+                            ON p.graph_id=g.graph_id JOIN graphs cg ON cg.id=g.graph_id AND cg.complete=1
+                            WHERE g.derived_id=o.object_id) THEN 1
+                      WHEN object_kind='image' AND EXISTS
+                           (SELECT 1 FROM graph_artifacts g JOIN project_graph_refs p
+                            ON p.graph_id=g.graph_id JOIN graphs cg ON cg.id=g.graph_id AND cg.complete=1
+                            WHERE g.artifact_id=o.object_id AND g.requires_image=1) THEN 1
+                      WHEN object_kind IN ('artifact','image','derived') AND EXISTS
+                           (SELECT 1 FROM graphs WHERE complete=0) THEN 1
+                      ELSE 0 END
+             FROM (
+               SELECT 'artifact' AS object_kind,id AS object_id, size_bytes,published_at_ms FROM artifacts
+               UNION ALL SELECT 'image',id,size_bytes,published_at_ms FROM images
+               UNION ALL SELECT 'derived',id,size_bytes,published_at_ms FROM derived_artifacts
+               UNION ALL SELECT 'graph',id,size_bytes,published_at_ms FROM graphs
+               UNION ALL SELECT 'plan',id,size_bytes,published_at_ms FROM plans
+             ) o",
+        )?;
+        let candidates = statement
+            .query_map([sqlite_u64(now.as_millis())?], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    u64::try_from(row.get::<_, i64>(2)?)
+                        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(2, i64::MIN))?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, bool>(5)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        let total = candidates
+            .iter()
+            .try_fold(0_u64, |sum, row| sum.checked_add(row.2))
+            .ok_or(MetadataError::TimeOverflow)?;
+        let policy_candidates = candidates
+            .iter()
+            .map(|row| PolicyCandidate {
+                effective_access_ms: row.3,
+                deletion_rank: match row.4 {
+                    0 => DeletionRank::Plan,
+                    1 => DeletionRank::Graph,
+                    2 => DeletionRank::Derived,
+                    3 => DeletionRank::Image,
+                    _ => DeletionRank::Artifact,
+                },
+                object_id: format!("{}:{}", row.0, row.1),
+                size_bytes: row.2,
+                protected: row.5,
+            })
+            .collect::<Vec<_>>();
+        let evaluation = policy
+            .evaluate(
+                i64::try_from(now.as_millis()).map_err(|_| MetadataError::TimeOverflow)?,
+                total,
+                &policy_candidates,
+            )
+            .map_err(|_| MetadataError::TimeOverflow)?;
+        let mut report = GcReport {
+            repaired,
+            evaluation: Some(evaluation.clone()),
+            ..GcReport::default()
+        };
+        let mut selected_objects = evaluation.selected.clone();
+        selected_objects.sort_by_key(|candidate| candidate.deletion_rank);
+        for selected in selected_objects {
+            let Some((kind, id, size, _, _, _)) = candidates
+                .iter()
+                .find(|row| format!("{}:{}", row.0, row.1) == selected.object_id)
+            else {
+                continue;
+            };
+            let key = ObjectKey::new(
+                match kind.as_str() {
+                    "artifact" => ObjectKind::Artifact,
+                    "image" => ObjectKind::Image,
+                    "derived" => ObjectKind::Derived,
+                    "graph" => ObjectKind::Graph,
+                    _ => ObjectKind::Plan,
+                },
+                id.clone(),
+            )?;
+            // Race-safe deletion. Acquire the canonical object lock shared
+            // with publishers and lease acquirers, then revalidate type/path
+            // and requery protection in the deletion transaction immediately
+            // before unlinking. If the lock cannot be acquired, protection
+            // appeared, the object changed type, or ownership is incomplete,
+            // preserve it rather than risk deleting live data.
+            let _lock = match store_lock::acquire(&self.store_root, &key) {
+                Ok(guard) => guard,
+                Err(_) => {
+                    report.preserved += 1;
+                    continue;
+                }
+            };
+            if !self.is_published(&key)? {
+                // Already gone or no longer a safe published object of this
+                // kind: nothing to delete, and not an error.
+                continue;
+            }
+            let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if self.protection_active(&tx, &key, now)? {
+                report.preserved += 1;
+                // No row changes were made; the transaction rolls back on drop.
+                continue;
+            }
+            let path = self.store_root.join(key.relative_path());
+            let result = if key.kind() == ObjectKind::Artifact || key.kind() == ObjectKind::Plan {
+                fs::remove_file(&path)
+            } else {
+                fs::remove_dir_all(&path)
+            };
+            if let Err(error) = result {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    return Err(io_error(&path, error));
+                }
+            }
+            match key.kind() {
+                ObjectKind::Artifact => {
+                    tx.execute("DELETE FROM artifacts WHERE id=?1", [id])?;
+                }
+                ObjectKind::Image => {
+                    tx.execute("DELETE FROM images WHERE id=?1", [id])?;
+                }
+                ObjectKind::Derived => {
+                    tx.execute("DELETE FROM derived_artifacts WHERE id=?1", [id])?;
+                }
+                ObjectKind::Graph => {
+                    tx.execute("DELETE FROM graphs WHERE id=?1", [id])?;
+                }
+                ObjectKind::Plan => {
+                    tx.execute("DELETE FROM plans WHERE id=?1", [id])?;
+                }
+            }
+            tx.commit()?;
+            report.deleted += 1;
+            report.deleted_bytes += *size;
+        }
+
+        // Resolution snapshots are an acceleration cache (never source of
+        // truth), are not metadata-DB-tracked, and are disposable. Age-sweep
+        // them with the same grace window, folding reclaimed bytes into the
+        // report. Best-effort: a read-only or missing snapshot directory must
+        // never abort GC.
+        let snapshot_cutoff =
+            UNIX_EPOCH + Duration::from_millis(now.as_millis()).saturating_sub(policy.grace);
+        let reclaimed_bytes =
+            ResolutionSnapshotCache::new(&self.store_root).prune_older_than(snapshot_cutoff);
+        if reclaimed_bytes > 0 {
+            report.deleted_bytes = report.deleted_bytes.saturating_add(reclaimed_bytes);
+        }
+        Ok(report)
+    }
+
+    /// Fresh, single-object protection recheck used at deletion time. Mirrors
+    /// the candidate-query `protected` CASE: an object is protected if it has
+    /// an active lease, is a graph referenced by a project (or is an
+    /// incomplete graph), is referenced by a *complete* project-attached
+    /// graph, or — for artifacts/images/derived — any incomplete graph exists
+    /// (fail closed because its dependency set is unknown). This MUST stay in
+    /// sync with the `collect` candidate query.
+    fn protection_active(
+        &self,
+        connection: &Connection,
+        key: &ObjectKey,
+        now: Timestamp,
+    ) -> Result<bool, MetadataError> {
+        let kind = key.kind().as_str();
+        let id = key.id();
+        let now_ms = sqlite_u64(now.as_millis())?;
+        let protected: i64 = connection.query_row(
+            "SELECT CASE
+               WHEN EXISTS (SELECT 1 FROM leases l WHERE l.object_kind=?1
+                            AND l.object_id=?2 AND l.expires_at_ms > ?3) THEN 1
+               WHEN ?1='graph' AND EXISTS
+                    (SELECT 1 FROM project_graph_refs p WHERE p.graph_id=?2) THEN 1
+               WHEN ?1='graph' AND EXISTS
+                    (SELECT 1 FROM graphs gi WHERE gi.id=?2 AND gi.complete=0) THEN 1
+               WHEN ?1='artifact' AND EXISTS
+                    (SELECT 1 FROM graph_artifacts g JOIN project_graph_refs p
+                     ON p.graph_id=g.graph_id JOIN graphs cg ON cg.id=g.graph_id AND cg.complete=1
+                     WHERE g.artifact_id=?2) THEN 1
+               WHEN ?1='derived' AND EXISTS
+                    (SELECT 1 FROM graph_derived g JOIN project_graph_refs p
+                     ON p.graph_id=g.graph_id JOIN graphs cg ON cg.id=g.graph_id AND cg.complete=1
+                     WHERE g.derived_id=?2) THEN 1
+               WHEN ?1='image' AND EXISTS
+                    (SELECT 1 FROM graph_artifacts g JOIN project_graph_refs p
+                     ON p.graph_id=g.graph_id JOIN graphs cg ON cg.id=g.graph_id AND cg.complete=1
+                     WHERE g.artifact_id=?2 AND g.requires_image=1) THEN 1
+               WHEN ?1 IN ('artifact','image','derived') AND EXISTS
+                    (SELECT 1 FROM graphs WHERE complete=0) THEN 1
+               ELSE 0 END",
+            params![kind, id, now_ms],
+            |row| row.get(0),
+        )?;
+        Ok(protected != 0)
+    }
+
+    fn stale_rows(
+        &self,
+        connection: &Connection,
+    ) -> Result<Vec<(ObjectKind, &'static str, String)>, MetadataError> {
+        let mut stale = Vec::new();
+        for (kind, table) in [
+            (ObjectKind::Plan, "plans"),
+            (ObjectKind::Graph, "graphs"),
+            (ObjectKind::Image, "images"),
+            (ObjectKind::Derived, "derived_artifacts"),
+            (ObjectKind::Artifact, "artifacts"),
+        ] {
+            let ids = {
+                let mut statement = connection.prepare(&format!("SELECT id FROM {table}"))?;
+                let ids = statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                ids
+            };
+            for id in ids {
+                let key = ObjectKey::new(kind, id.clone())?;
+                if !self.is_published(&key)? {
+                    stale.push((kind, table, id));
+                }
+            }
+        }
+        Ok(stale)
+    }
+
+    fn scan_namespaces(
+        &self,
+        unknown: &mut Vec<PathBuf>,
+    ) -> Result<Vec<ScannedObject>, MetadataError> {
+        let mut records = Vec::new();
+        for kind in [
+            ObjectKind::Artifact,
+            ObjectKind::Image,
+            ObjectKind::Derived,
+            ObjectKind::Graph,
+            ObjectKind::Plan,
+        ] {
+            let base = self.store_root.join(namespace(kind));
+            let metadata = match fs::symlink_metadata(&base) {
+                Ok(value) => value,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(source) => return Err(io_error(&base, source)),
+            };
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                unknown.push(base);
+                continue;
+            }
+            for prefix in read_dir_sorted(&base)? {
+                let prefix_path = prefix.path();
+                let prefix_name = prefix.file_name();
+                if !is_prefix(&prefix_name) || !safe_directory(&prefix_path)? {
+                    unknown.push(prefix_path);
+                    continue;
+                }
+                for entry in read_dir_sorted(&prefix_path)? {
+                    let path = entry.path();
+                    let Some(id) = id_from_entry(kind, &entry.file_name()) else {
+                        unknown.push(path);
+                        continue;
+                    };
+                    if !id.starts_with(prefix_name.to_string_lossy().as_ref()) {
+                        unknown.push(path);
+                        continue;
+                    }
+                    let key = match ObjectKey::new(kind, id) {
+                        Ok(key) => key,
+                        Err(_) => {
+                            unknown.push(path);
+                            continue;
+                        }
+                    };
+                    if !self.is_published(&key)? {
+                        unknown.push(path);
+                        continue;
+                    }
+                    let metadata =
+                        fs::symlink_metadata(&path).map_err(|source| io_error(&path, source))?;
+                    let published_at = modified_timestamp(&metadata)?;
+                    let size_bytes = logical_size(&path)?;
+                    let graph_id = if kind == ObjectKind::Plan {
+                        plan_graph_id(&path)?
+                    } else {
+                        None
+                    };
+                    if kind == ObjectKind::Plan && graph_id.is_none() {
+                        unknown.push(path.clone());
+                        continue;
+                    }
+                    // For graphs, read the durable inventory. A graph whose
+                    // volume metadata lacks a complete inventory stays
+                    // `None` (incomplete/protected) rather than guessed.
+                    let graph_inventory = if kind == ObjectKind::Graph {
+                        crate::volume::read_graph_inventory(&path)
+                    } else {
+                        None
+                    };
+                    records.push(ScannedObject {
+                        record: ObjectRecord {
+                            key,
+                            size_bytes,
+                            published_at,
+                        },
+                        plan_graph_id: graph_id,
+                        graph_inventory,
+                    });
+                }
+            }
+        }
+        records.sort_by(|left, right| left.record.key.cmp(&right.record.key));
+        Ok(records)
+    }
+
+    fn ensure_published(&self, key: &ObjectKey) -> Result<(), MetadataError> {
+        if self.is_published(key)? {
+            Ok(())
+        } else {
+            Err(MetadataError::MissingObject {
+                kind: key.kind().as_str(),
+                id: key.id().to_owned(),
+            })
+        }
+    }
+
+    fn is_published(&self, key: &ObjectKey) -> Result<bool, MetadataError> {
+        let path = self.store_root.join(key.relative_path());
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(value) => value,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(source) => return Err(io_error(&path, source)),
+        };
+        if metadata.file_type().is_symlink() {
+            return Ok(false);
+        }
+        Ok(match key.kind() {
+            ObjectKind::Artifact | ObjectKind::Plan => metadata.is_file(),
+            ObjectKind::Image => {
+                metadata.is_dir()
+                    && self
+                        .store_root
+                        .join(ObjectKey::Artifact(key.id().to_owned()).relative_path())
+                        .is_file()
+            }
+            ObjectKind::Derived | ObjectKind::Graph => metadata.is_dir(),
+        })
+    }
+}
+
+/// SQLite-backed [`DerivedMetadata`] adapter.
+///
+/// The derived store is filesystem-authoritative: a database row can never
+/// manufacture a cache hit, and a valid on-disk image must always be able to
+/// repair its row. `publish_derived` upserts the record; `access_derived`
+/// transactionally repairs the row (in case the filesystem image exists but
+/// its row is missing) and bumps the `access_log` access timestamp so the
+/// future GC/LRU integration can consume it.
+///
+/// `source_artifact_id` is only linked when it is a valid 128-hex artifact id
+/// (matching the artifacts FK); an empty or invalid value is stored as `NULL`,
+/// exactly as the generic `upsert_object` Derived arm does, so a derived image
+/// whose source artifact is unknown (or not yet published) still records.
+impl DerivedMetadata for MetadataRepository {
+    fn publish_derived(&self, record: &DerivedRecord) -> Result<(), String> {
+        validate_id(ObjectKind::Derived, &record.id).map_err(|e| e.to_string())?;
+        let size = sqlite_u64(record.size_bytes).map_err(|e| e.to_string())?;
+        let published = sqlite_u64(record.published_at_ms).map_err(|e| e.to_string())?;
+        let mut connection = self.connection().map_err(|e| e.to_string())?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        // `source_artifact_id` is deliberately stored as NULL, matching the
+        // generic `upsert_object` Derived arm: the artifacts FK would reject a
+        // source id whose artifact row is not (yet) published. The source link
+        // remains recorded in the derived store's own filesystem metadata
+        // (PersistedMetadata), which is authoritative.
+        transaction
+            .execute(
+                "INSERT INTO derived_artifacts(id,source_artifact_id,rel_path,size_bytes,published_at_ms)
+                 VALUES (?1,NULL,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET
+                   rel_path=excluded.rel_path,size_bytes=excluded.size_bytes,
+                   published_at_ms=min(derived_artifacts.published_at_ms,excluded.published_at_ms)",
+                params![record.id, record.rel_path, size, published],
+            )
+            .map_err(|e| e.to_string())?;
+        transaction.commit().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    fn access_derived(&self, record: &DerivedRecord, accessed_at_ms: u64) -> Result<(), String> {
+        validate_id(ObjectKind::Derived, &record.id).map_err(|e| e.to_string())?;
+        let size = sqlite_u64(record.size_bytes).map_err(|e| e.to_string())?;
+        let published = sqlite_u64(record.published_at_ms).map_err(|e| e.to_string())?;
+        let accessed = sqlite_u64(accessed_at_ms).map_err(|e| e.to_string())?;
+        let mut connection = self.connection().map_err(|e| e.to_string())?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        // Repair/upsert the row so a valid filesystem image can re-establish
+        // its metadata even if the row was lost (filesystem is authoritative).
+        transaction
+            .execute(
+                "INSERT INTO derived_artifacts(id,source_artifact_id,rel_path,size_bytes,published_at_ms)
+                 VALUES (?1,NULL,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET
+                   rel_path=excluded.rel_path,size_bytes=excluded.size_bytes,
+                   published_at_ms=min(derived_artifacts.published_at_ms,excluded.published_at_ms)",
+                params![record.id, record.rel_path, size, published],
+            )
+            .map_err(|e| e.to_string())?;
+        // Bump the access timestamp (max preserves the most-recent value).
+        transaction
+            .execute(
+                "INSERT INTO access_log(object_kind,object_id,accessed_at_ms) VALUES ('derived',?1,?2)
+                 ON CONFLICT(object_kind,object_id) DO UPDATE SET
+                   accessed_at_ms=max(access_log.accessed_at_ms,excluded.accessed_at_ms)",
+                params![record.id, accessed],
+            )
+            .map_err(|e| e.to_string())?;
+        transaction.commit().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
+/// Return the source artifact id if it is a valid 128-hex artifact id, else
+/// `None` (stored as SQL `NULL`). Kept for future use once the artifacts row
+/// existence is guaranteed at publish time; currently unused because the
+/// generic upsert path writes NULL to avoid FK violations for not-yet-
+/// published sources.
+#[allow(dead_code)]
+fn valid_source_artifact_id(value: &str) -> Option<&str> {
+    (!value.is_empty() && validate_id(ObjectKind::Artifact, value).is_ok()).then_some(value)
+}
+fn remove_stale_rows(
+    transaction: &Transaction<'_>,
+    stale: &[(ObjectKind, &'static str, String)],
+) -> Result<usize, MetadataError> {
+    let mut removed = 0;
+    for (kind, table, id) in stale {
+        if *kind == ObjectKind::Graph {
+            transaction.execute("DELETE FROM project_graph_refs WHERE graph_id=?1", [id])?;
+        }
+        removed += transaction.execute(&format!("DELETE FROM {table} WHERE id=?1"), [id])?;
+        transaction.execute(
+            "DELETE FROM access_log WHERE object_kind=?1 AND object_id=?2",
+            params![kind.as_str(), id],
+        )?;
+        transaction.execute(
+            "DELETE FROM leases WHERE object_kind=?1 AND object_id=?2",
+            params![kind.as_str(), id],
+        )?;
+    }
+    Ok(removed)
+}
+
+/// Renewable lease guard. Dropping it stops the heartbeat before deleting only
+/// rows whose owner token still matches.
+pub struct LeaseGuard {
+    repository: MetadataRepository,
+    lease_id: String,
+    owner_token: String,
+    keys: Vec<ObjectKey>,
+    ttl: Duration,
+    stop: Arc<(Mutex<bool>, Condvar)>,
+    lost: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
+    released: bool,
+}
+
+impl LeaseGuard {
+    pub fn keys(&self) -> &[ObjectKey] {
+        &self.keys
+    }
+
+    /// Extend this lease to cover additional objects published after the
+    /// initial acquisition (for example, a graph or derived images published
+    /// mid-install). The new rows share this guard's lease id and owner token,
+    /// so the existing heartbeat renews them; each new object's canonical lock
+    /// is held across its publication check + insert so GC cannot delete it
+    /// between publication and lease recording.
+    pub fn extend(&mut self, keys: &[ObjectKey]) -> Result<(), MetadataError> {
+        let new_keys = canonical_keys(keys)
+            .into_iter()
+            .filter(|key| !self.keys.contains(key))
+            .collect::<Vec<_>>();
+        if new_keys.is_empty() {
+            return Ok(());
+        }
+        let _locks =
+            store_lock::acquire_all(&self.repository.store_root, &new_keys).map_err(|source| {
+                io_error(&store_lock::lock_dir(&self.repository.store_root), source)
+            })?;
+        for key in &new_keys {
+            self.repository.ensure_published(key)?;
+        }
+        let now = Timestamp::now()?;
+        let expires = checked_add_duration(now, self.ttl)?;
+        self.repository
+            .insert_lease(&self.lease_id, &self.owner_token, &new_keys, now, expires)?;
+        self.keys.extend(new_keys);
+        Ok(())
+    }
+
+    pub fn check(&self) -> Result<(), MetadataError> {
+        if self.lost.load(Ordering::Acquire) {
+            Err(MetadataError::LeaseLost)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn release(mut self) -> Result<(), MetadataError> {
+        self.stop_worker();
+        self.repository
+            .release_lease(&self.lease_id, &self.owner_token)?;
+        self.released = true;
+        Ok(())
+    }
+
+    fn stop_worker(&mut self) {
+        let (mutex, condition) = &*self.stop;
+        *mutex.lock().unwrap_or_else(|poison| poison.into_inner()) = true;
+        condition.notify_all();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for LeaseGuard {
+    fn drop(&mut self) {
+        self.stop_worker();
+        if !self.released {
+            let _ = self
+                .repository
+                .release_lease(&self.lease_id, &self.owner_token);
+        }
+    }
+}
+
+fn upsert_object(
+    transaction: &Transaction<'_>,
+    record: &ObjectRecord,
+    plan_graph_id: Option<&str>,
+    graph_complete: Option<bool>,
+) -> Result<usize, MetadataError> {
+    let size = sqlite_u64(record.size_bytes)?;
+    let published = sqlite_u64(record.published_at.as_millis())?;
+    let rel_path = path_to_slashes(&record.key.relative_path());
+    let changed = match record.key.kind() {
+        ObjectKind::Artifact => transaction.execute(
+            "INSERT INTO artifacts(id,rel_path,size_bytes,published_at_ms) VALUES (?1,?2,?3,?4)
+             ON CONFLICT(id) DO UPDATE SET rel_path=excluded.rel_path,size_bytes=excluded.size_bytes,
+               published_at_ms=min(artifacts.published_at_ms,excluded.published_at_ms)",
+            params![record.key.id(), rel_path, size, published],
+        )?,
+        ObjectKind::Image => transaction.execute(
+            "INSERT INTO images(id,artifact_id,rel_path,size_bytes,published_at_ms) VALUES (?1,?1,?2,?3,?4)
+             ON CONFLICT(id) DO UPDATE SET rel_path=excluded.rel_path,size_bytes=excluded.size_bytes,
+               published_at_ms=min(images.published_at_ms,excluded.published_at_ms)",
+            params![record.key.id(), rel_path, size, published],
+        )?,
+        ObjectKind::Derived => transaction.execute(
+            "INSERT INTO derived_artifacts(id,source_artifact_id,rel_path,size_bytes,published_at_ms)
+             VALUES (?1,NULL,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET rel_path=excluded.rel_path,
+               size_bytes=excluded.size_bytes,published_at_ms=min(derived_artifacts.published_at_ms,excluded.published_at_ms)",
+            params![record.key.id(), rel_path, size, published],
+        )?,
+        ObjectKind::Graph => transaction.execute(
+            "INSERT INTO graphs(id,rel_path,size_bytes,published_at_ms,complete) VALUES (?1,?2,?3,?4,?5)
+             ON CONFLICT(id) DO UPDATE SET rel_path=excluded.rel_path,size_bytes=excluded.size_bytes,
+               published_at_ms=min(graphs.published_at_ms,excluded.published_at_ms)",
+            // `complete` is set on insert only; conflict leaves the existing
+            // value untouched. Authoritative callers (graph publication and
+            // repair_index) set it explicitly via [`set_graph_complete`] so
+            // the filesystem-derived value always wins.
+            params![record.key.id(), rel_path, size, published, i64::from(graph_complete.unwrap_or(false))],
+        )?,
+        ObjectKind::Plan => {
+            let graph_id = plan_graph_id.ok_or_else(|| MetadataError::InvalidId {
+                kind: "plan graph",
+                id: record.key.id().to_owned(),
+            })?;
+            validate_id(ObjectKind::Graph, graph_id)?;
+            transaction.execute(
+                "INSERT INTO plans(id,graph_id,rel_path,size_bytes,published_at_ms) VALUES (?1,?2,?3,?4,?5)
+                 ON CONFLICT(id) DO UPDATE SET graph_id=excluded.graph_id,rel_path=excluded.rel_path,
+                   size_bytes=excluded.size_bytes,published_at_ms=min(plans.published_at_ms,excluded.published_at_ms)",
+                params![record.key.id(), graph_id, rel_path, size, published],
+            )?
+        }
+    };
+    Ok(changed)
+}
+
+/// Authoritatively set a graph's completeness marker. Called by graph
+/// publication (`complete=true`) and `repair_index` (derived from durable
+/// inventory + observed referenced objects) so the filesystem-derived value
+/// always overrides any prior guess.
+fn set_graph_complete(
+    transaction: &Transaction<'_>,
+    graph_id: &str,
+    complete: bool,
+) -> Result<(), MetadataError> {
+    transaction.execute(
+        "UPDATE graphs SET complete=?2 WHERE id=?1",
+        params![graph_id, i64::from(complete)],
+    )?;
+    Ok(())
+}
+
+/// Reconstruct `graph_artifacts`/`graph_derived` edges for one complete graph
+/// from its durable inventory, replacing any prior edges. Callers must have
+/// already verified every referenced artifact and derived object is published;
+/// the `ON DELETE RESTRICT` foreign keys enforce that invariant here.
+/// Upsert one project root and atomically replace its sole graph reference,
+/// using the monotonic-timestamp convergence rule shared by the live install
+/// path ([`MetadataRepository::replace_project_graph_ref`]) and the
+/// filesystem rebuild ([`MetadataRepository::repair_index`]).
+fn upsert_project_ref(
+    transaction: &Transaction<'_>,
+    root: &Path,
+    graph_id: &str,
+    at: Timestamp,
+) -> Result<(), MetadataError> {
+    let encoded_path = path_key(root);
+    let display = root.display().to_string();
+    let at = sqlite_u64(at.as_millis())?;
+    transaction.execute(
+        "INSERT INTO projects(path_key,path_display,last_seen_at_ms) VALUES (?1,?2,?3)
+         ON CONFLICT(path_key) DO UPDATE SET path_display=excluded.path_display,
+           last_seen_at_ms=max(projects.last_seen_at_ms,excluded.last_seen_at_ms)",
+        params![encoded_path, display, at],
+    )?;
+    let project_id: i64 = transaction.query_row(
+        "SELECT id FROM projects WHERE path_key=?1",
+        [path_key(root)],
+        |row| row.get(0),
+    )?;
+    transaction.execute(
+        "INSERT INTO project_graph_refs(project_id,graph_id,observed_at_ms) VALUES (?1,?2,?3)
+         ON CONFLICT(project_id) DO UPDATE SET
+           graph_id=CASE WHEN excluded.observed_at_ms > project_graph_refs.observed_at_ms
+                         THEN excluded.graph_id ELSE project_graph_refs.graph_id END,
+           observed_at_ms=max(project_graph_refs.observed_at_ms,excluded.observed_at_ms)",
+        params![project_id, graph_id, at],
+    )?;
+    Ok(())
+}
+
+/// One validated durable project registration discovered on disk.
+#[derive(Debug, Clone)]
+struct DurableRegistration {
+    root: PathBuf,
+    graph_id: String,
+    updated_at_ms: u64,
+}
+
+const REGISTRATION_VERSION: u32 = 1;
+const PROJECTS_DIR: &str = "projects";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct RegistrationFile {
+    version: u32,
+    root: PathBuf,
+    graph_id: String,
+    updated_at_ms: u64,
+}
+
+/// BLAKE3 hex filename key for a canonical project root.
+fn registration_key(canonical_root: &Path) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"bpm-project-registration-v1\0");
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        hasher.update(canonical_root.as_os_str().as_bytes());
+    }
+    #[cfg(not(unix))]
+    {
+        hasher.update(canonical_root.as_os_str().as_encoded_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+fn registration_path(store_root: &Path, canonical_root: &Path) -> PathBuf {
+    let key = registration_key(canonical_root);
+    let prefix = key.get(..2).unwrap_or("");
+    store_root.join(PROJECTS_DIR).join(prefix).join(&key)
+}
+
+/// Atomically publish one durable project registration file.
+fn write_registration_file(
+    store_root: &Path,
+    root: &Path,
+    graph_id: &str,
+) -> Result<(), MetadataError> {
+    let canonical = absolute_lexical(root)?;
+    if canonical != root {
+        return Err(MetadataError::InvalidProjectRoot(
+            root.display().to_string(),
+        ));
+    }
+    // Reject graph ids that are not valid 64-hex before writing a record that
+    // repair_index would otherwise have to distrust.
+    validate_id(ObjectKind::Graph, graph_id)?;
+    let now = Timestamp::now()?.as_millis();
+    let record = RegistrationFile {
+        version: REGISTRATION_VERSION,
+        root: canonical.clone(),
+        graph_id: graph_id.to_owned(),
+        updated_at_ms: now,
+    };
+    let body = serde_json::to_vec(&record)
+        .map_err(|_| MetadataError::InvalidProjectRoot("registration encode".to_owned()))?;
+    let target = registration_path(store_root, &canonical);
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent).map_err(|source| io_error(parent, source))?;
+    }
+    let tmp = store_root
+        .join("tmp")
+        .join(format!("project-reg-{}-{}", graph_id, now));
+    if let Some(parent) = tmp.parent() {
+        fs::create_dir_all(parent).map_err(|source| io_error(parent, source))?;
+    }
+    {
+        let mut file = fs::File::create(&tmp).map_err(|source| io_error(&tmp, source))?;
+        file.write_all(&body)
+            .map_err(|source| io_error(&tmp, source))?;
+        file.sync_all().map_err(|source| io_error(&tmp, source))?;
+    }
+    fs::rename(&tmp, &target).map_err(|source| io_error(&target, source))?;
+    Ok(())
+}
+
+/// Scan durable project registration files for `repair_index`. Only safe
+/// regular files whose stored root canonicalizes to the BLAKE3 filename key
+/// and whose graph id is valid 64-hex are trusted; everything else is skipped
+/// (never auto-deleted — a project may live on an unmounted filesystem).
+fn scan_registration_files(store_root: &Path) -> Result<Vec<DurableRegistration>, MetadataError> {
+    let base = store_root.join(PROJECTS_DIR);
+    let mut records = Vec::new();
+    let prefixes = match read_dir_sorted(&base) {
+        Ok(entries) => entries,
+        Err(error) => {
+            if let MetadataError::Io { source, .. } = &error {
+                if source.kind() == std::io::ErrorKind::NotFound {
+                    return Ok(Vec::new());
+                }
+            }
+            return Err(error);
+        }
+    };
+    for prefix in prefixes {
+        let prefix_path = prefix.path();
+        if !safe_directory(&prefix_path)? {
+            continue;
+        }
+        for entry in read_dir_sorted(&prefix_path)? {
+            let path = entry.path();
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(m) => m,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(source) => return Err(io_error(&path, source)),
+            };
+            // Never follow symlinks or trust non-regular files as authority.
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                continue;
+            }
+            let bytes = match fs::read(&path) {
+                Ok(b) => b,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(source) => return Err(io_error(&path, source)),
+            };
+            let Ok(record) = serde_json::from_slice::<RegistrationFile>(&bytes) else {
+                continue;
+            };
+            if record.version != REGISTRATION_VERSION {
+                continue;
+            }
+            // The stored root MUST canonicalize to exactly itself and its hash
+            // MUST equal the filename, else the record is untrusted.
+            let Ok(canonical) = absolute_lexical(&record.root) else {
+                continue;
+            };
+            if canonical != record.root {
+                continue;
+            }
+            if registration_key(&canonical) != entry.file_name().to_string_lossy().as_ref() {
+                continue;
+            }
+            if validate_id(ObjectKind::Graph, &record.graph_id).is_err() {
+                continue;
+            }
+            records.push(DurableRegistration {
+                root: canonical,
+                graph_id: record.graph_id,
+                updated_at_ms: record.updated_at_ms,
+            });
+        }
+    }
+    records.sort_by(|left, right| {
+        left.graph_id
+            .cmp(&right.graph_id)
+            .then(left.root.cmp(&right.root))
+    });
+    Ok(records)
+}
+
+fn upsert_graph_edges(
+    transaction: &Transaction<'_>,
+    graph_id: &str,
+    inventory: &crate::volume::GraphInventory,
+) -> Result<(), MetadataError> {
+    transaction.execute("DELETE FROM graph_artifacts WHERE graph_id=?1", [graph_id])?;
+    transaction.execute("DELETE FROM graph_derived WHERE graph_id=?1", [graph_id])?;
+    for (artifact_id, requires_image) in &inventory.artifacts {
+        transaction.execute(
+            "INSERT INTO graph_artifacts(graph_id,artifact_id,requires_image) VALUES (?1,?2,?3)",
+            params![graph_id, artifact_id, i64::from(*requires_image)],
+        )?;
+    }
+    for derived_id in &inventory.derived {
+        transaction.execute(
+            "INSERT INTO graph_derived(graph_id,derived_id) VALUES (?1,?2)",
+            params![graph_id, derived_id],
+        )?;
+    }
+    Ok(())
+}
+
+fn upsert_access(
+    transaction: &Transaction<'_>,
+    key: &ObjectKey,
+    at: Timestamp,
+) -> Result<(), MetadataError> {
+    transaction.execute(
+        "INSERT INTO access_log(object_kind,object_id,accessed_at_ms) VALUES (?1,?2,?3)
+         ON CONFLICT(object_kind,object_id) DO UPDATE SET
+           accessed_at_ms=max(access_log.accessed_at_ms,excluded.accessed_at_ms)",
+        params![key.kind().as_str(), key.id(), sqlite_u64(at.as_millis())?],
+    )?;
+    Ok(())
+}
+
+fn validate_id(kind: ObjectKind, id: &str) -> Result<(), MetadataError> {
+    let expected = match kind {
+        ObjectKind::Artifact | ObjectKind::Image => 128,
+        ObjectKind::Derived | ObjectKind::Graph | ObjectKind::Plan => 64,
+    };
+    if id.len() == expected
+        && id
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+    {
+        Ok(())
+    } else {
+        Err(MetadataError::InvalidId {
+            kind: kind.as_str(),
+            id: id.to_owned(),
+        })
+    }
+}
+
+fn canonical_keys(keys: &[ObjectKey]) -> Vec<ObjectKey> {
+    keys.iter()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn canonical_ids(kind: ObjectKind, ids: &[String]) -> Result<Vec<String>, MetadataError> {
+    let mut values = BTreeSet::new();
+    for id in ids {
+        validate_id(kind, id)?;
+        values.insert(id.clone());
+    }
+    Ok(values.into_iter().collect())
+}
+
+fn canonical_artifacts(values: &[(String, bool)]) -> Result<Vec<(String, bool)>, MetadataError> {
+    let mut canonical = std::collections::BTreeMap::new();
+    for (id, requires_image) in values {
+        validate_id(ObjectKind::Artifact, id)?;
+        canonical
+            .entry(id.clone())
+            .and_modify(|current| *current |= *requires_image)
+            .or_insert(*requires_image);
+    }
+    Ok(canonical.into_iter().collect())
+}
+
+fn validate_lease_options(options: LeaseOptions) -> Result<(), MetadataError> {
+    let minimum = options
+        .renew_every
+        .checked_mul(3)
+        .ok_or(MetadataError::InvalidLeaseOptions)?;
+    if options.renew_every.is_zero() || options.ttl < minimum {
+        Err(MetadataError::InvalidLeaseOptions)
+    } else {
+        Ok(())
+    }
+}
+
+fn checked_add_duration(at: Timestamp, duration: Duration) -> Result<Timestamp, MetadataError> {
+    let millis = u64::try_from(duration.as_millis()).map_err(|_| MetadataError::TimeOverflow)?;
+    at.as_millis()
+        .checked_add(millis)
+        .map(Timestamp)
+        .ok_or(MetadataError::TimeOverflow)
+}
+
+fn sqlite_u64(value: u64) -> Result<i64, MetadataError> {
+    i64::try_from(value).map_err(|_| MetadataError::TimeOverflow)
+}
+
+fn nonce(domain: &str, store_root: &Path) -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_nanos())
+        .unwrap_or(0);
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"bpm-metadata-nonce-v1\0");
+    hasher.update(domain.as_bytes());
+    hasher.update(store_root.as_os_str().as_encoded_bytes());
+    hasher.update(&std::process::id().to_le_bytes());
+    hasher.update(&now.to_le_bytes());
+    hasher.update(&counter.to_le_bytes());
+    hasher.finalize().to_hex()[..32].to_owned()
+}
+
+fn absolute_lexical(path: &Path) -> Result<PathBuf, MetadataError> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|source| io_error(path, source))?
+            .join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str())
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err(MetadataError::InvalidProjectRoot(
+                        path.display().to_string(),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(normalized)
+}
+
+fn path_key(path: &Path) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let mut result = vec![1];
+        result.extend_from_slice(path.as_os_str().as_bytes());
+        result
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let mut result = vec![2];
+        for unit in path.as_os_str().encode_wide() {
+            result.extend_from_slice(&unit.to_le_bytes());
+        }
+        result
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let mut result = vec![3];
+        result.extend_from_slice(path.as_os_str().as_encoded_bytes());
+        result
+    }
+}
+
+fn namespace(kind: ObjectKind) -> &'static str {
+    match kind {
+        ObjectKind::Artifact => "artifacts/sha512",
+        ObjectKind::Image => "images/sha512",
+        ObjectKind::Derived => "derived/blake3",
+        ObjectKind::Graph => "graphs/blake3",
+        ObjectKind::Plan => "plans/blake3",
+    }
+}
+
+fn id_from_entry(kind: ObjectKind, name: &OsStr) -> Option<String> {
+    let name = name.to_str()?;
+    match kind {
+        ObjectKind::Artifact => name.strip_suffix(".tgz").map(str::to_owned),
+        ObjectKind::Plan => name.strip_suffix(".json").map(str::to_owned),
+        _ => Some(name.to_owned()),
+    }
+}
+
+fn is_prefix(value: &OsStr) -> bool {
+    value.to_str().is_some_and(|text| {
+        text.len() == 2
+            && text
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    })
+}
+
+fn safe_directory(path: &Path) -> Result<bool, MetadataError> {
+    let metadata = fs::symlink_metadata(path).map_err(|source| io_error(path, source))?;
+    Ok(metadata.is_dir() && !metadata.file_type().is_symlink())
+}
+
+fn read_dir_sorted(path: &Path) -> Result<Vec<fs::DirEntry>, MetadataError> {
+    let mut entries = fs::read_dir(path)
+        .map_err(|source| io_error(path, source))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| io_error(path, source))?;
+    entries.sort_by_key(fs::DirEntry::file_name);
+    Ok(entries)
+}
+
+fn logical_size(path: &Path) -> Result<u64, MetadataError> {
+    let metadata = fs::symlink_metadata(path).map_err(|source| io_error(path, source))?;
+    if metadata.file_type().is_symlink() {
+        return Ok(0);
+    }
+    if metadata.is_file() {
+        return Ok(metadata.len());
+    }
+    let mut size = 0_u64;
+    for entry in read_dir_sorted(path)? {
+        let child = entry.path();
+        size = size
+            .checked_add(logical_size(&child)?)
+            .ok_or(MetadataError::TimeOverflow)?;
+    }
+    Ok(size)
+}
+
+fn modified_timestamp(metadata: &fs::Metadata) -> Result<Timestamp, MetadataError> {
+    let modified = metadata.modified().map_err(|source| MetadataError::Io {
+        path: PathBuf::from("<metadata timestamp>"),
+        source,
+    })?;
+    let duration = modified
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| MetadataError::Clock)?;
+    u64::try_from(duration.as_millis())
+        .map(Timestamp)
+        .map_err(|_| MetadataError::TimeOverflow)
+}
+
+fn plan_graph_id(path: &Path) -> Result<Option<String>, MetadataError> {
+    let bytes = fs::read(path).map_err(|source| io_error(path, source))?;
+    let value: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    let Some(graph_id) = value
+        .get("graph_id_hex")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(None);
+    };
+    if validate_id(ObjectKind::Graph, graph_id).is_err() {
+        return Ok(None);
+    }
+    Ok(Some(graph_id.to_owned()))
+}
+
+fn path_to_slashes(path: &Path) -> String {
+    path.components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => Some(value.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn io_error(path: &Path, source: std::io::Error) -> MetadataError {
+    MetadataError::Io {
+        path: path.to_path_buf(),
+        source,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id(character: char, length: usize) -> String {
+        character.to_string().repeat(length)
+    }
+
+    fn publish(root: &Path, key: &ObjectKey, bytes: &[u8]) {
+        let path = root.join(key.relative_path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        match key.kind() {
+            ObjectKind::Artifact | ObjectKind::Plan => fs::write(path, bytes).unwrap(),
+            _ => {
+                fs::create_dir_all(&path).unwrap();
+                fs::write(path.join("payload"), bytes).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn publication_and_access_are_transactional_and_monotonic() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = MetadataRepository::open(temp.path()).unwrap();
+        let artifact = ObjectKey::artifact(id('a', 128)).unwrap();
+        publish(temp.path(), &artifact, b"artifact");
+        let record = ObjectRecord {
+            key: artifact.clone(),
+            size_bytes: 8,
+            published_at: Timestamp::from_millis(20),
+        };
+
+        repository.record_publication(&record).unwrap();
+        repository
+            .record_access(
+                &[artifact.clone(), artifact.clone()],
+                Timestamp::from_millis(50),
+            )
+            .unwrap();
+        repository
+            .record_access(&[artifact], Timestamp::from_millis(30))
+            .unwrap();
+
+        let connection = repository.connection().unwrap();
+        let access: i64 = connection
+            .query_row("SELECT accessed_at_ms FROM access_log", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(access, 50);
+    }
+
+    #[test]
+    fn graph_and_project_replacement_leave_complete_single_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = MetadataRepository::open(temp.path()).unwrap();
+        let artifact = ObjectKey::artifact(id('a', 128)).unwrap();
+        let derived = ObjectKey::derived(id('b', 64)).unwrap();
+        let graph_one = ObjectKey::graph(id('c', 64)).unwrap();
+        let graph_two = ObjectKey::graph(id('d', 64)).unwrap();
+        for key in [&artifact, &derived, &graph_one, &graph_two] {
+            publish(temp.path(), key, b"x");
+            repository
+                .record_publication(&ObjectRecord {
+                    key: key.clone(),
+                    size_bytes: 1,
+                    published_at: Timestamp::from_millis(1),
+                })
+                .unwrap();
+        }
+        repository
+            .record_graph_publication(&GraphRecord {
+                graph: ObjectRecord {
+                    key: graph_one,
+                    size_bytes: 1,
+                    published_at: Timestamp::from_millis(1),
+                },
+                artifacts: vec![
+                    (artifact.id().to_owned(), true),
+                    (artifact.id().to_owned(), false),
+                ],
+                derived: vec![derived.id().to_owned(), derived.id().to_owned()],
+            })
+            .unwrap();
+        let project = temp.path().join("project");
+        fs::create_dir(&project).unwrap();
+        repository
+            .replace_project_graph_ref(
+                &ProjectRegistration {
+                    root: project.clone(),
+                    graph_id: id('c', 64),
+                },
+                Timestamp::from_millis(2),
+            )
+            .unwrap();
+        repository
+            .replace_project_graph_ref(
+                &ProjectRegistration {
+                    root: project.clone(),
+                    graph_id: id('d', 64),
+                },
+                Timestamp::from_millis(3),
+            )
+            .unwrap();
+        repository
+            .replace_project_graph_ref(
+                &ProjectRegistration {
+                    root: project,
+                    graph_id: id('c', 64),
+                },
+                Timestamp::from_millis(1),
+            )
+            .unwrap();
+
+        let connection = repository.connection().unwrap();
+        let state: (i64, String) = connection
+            .query_row(
+                "SELECT count(*),min(graph_id) FROM project_graph_refs",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, (1, id('d', 64)));
+        let edges: (i64, i64) = connection
+            .query_row(
+                "SELECT (SELECT count(*) FROM graph_artifacts),(SELECT count(*) FROM graph_derived)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(edges, (1, 1));
+    }
+
+    #[test]
+    fn lease_deduplicates_keys_and_release_checks_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = MetadataRepository::open(temp.path()).unwrap();
+        let artifact = ObjectKey::artifact(id('a', 128)).unwrap();
+        publish(temp.path(), &artifact, b"x");
+        repository
+            .record_publication(&ObjectRecord {
+                key: artifact.clone(),
+                size_bytes: 1,
+                published_at: Timestamp::from_millis(1),
+            })
+            .unwrap();
+        let lease = repository
+            .acquire_lease(
+                &[artifact.clone(), artifact],
+                LeaseOptions {
+                    ttl: Duration::from_secs(3),
+                    renew_every: Duration::from_secs(1),
+                },
+            )
+            .unwrap();
+        assert_eq!(lease.keys().len(), 1);
+        repository
+            .connection()
+            .unwrap()
+            .execute("UPDATE leases SET owner_token='other'", [])
+            .unwrap();
+        lease.release().unwrap();
+        let remaining: i64 = repository
+            .connection()
+            .unwrap()
+            .query_row("SELECT count(*) FROM leases", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, 1);
+    }
+
+    #[test]
+    fn repair_adds_observed_and_removes_stale_without_following_symlinks() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = MetadataRepository::open(temp.path()).unwrap();
+        let present = ObjectKey::artifact(id('a', 128)).unwrap();
+        let stale = ObjectKey::artifact(id('b', 128)).unwrap();
+        publish(temp.path(), &present, b"present");
+        publish(temp.path(), &stale, b"stale");
+        repository
+            .record_publication(&ObjectRecord {
+                key: stale.clone(),
+                size_bytes: 5,
+                published_at: Timestamp::from_millis(1),
+            })
+            .unwrap();
+        fs::remove_file(temp.path().join(stale.relative_path())).unwrap();
+
+        let report = repository.repair_index().unwrap();
+
+        assert_eq!(report.observed, 1);
+        assert_eq!(report.removed_stale, 1);
+        let ids: Vec<String> = repository
+            .connection()
+            .unwrap()
+            .prepare("SELECT id FROM artifacts ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(ids, vec![present.id().to_owned()]);
+    }
+
+    // ── DerivedMetadata adapter ───────────────────────────────────────
+
+    fn derived_record(seed: char, published_at_ms: u64) -> crate::derived::DerivedRecord {
+        crate::derived::DerivedRecord {
+            id: id(seed, 64),
+            source_artifact_id: id('a', 128),
+            rel_path: format!(
+                "derived/blake3/{}/{}",
+                id(seed, 64).get(..2).unwrap(),
+                id(seed, 64)
+            ),
+            size_bytes: 4096,
+            published_at_ms,
+        }
+    }
+
+    #[test]
+    fn derived_metadata_publish_round_trips_into_sqlite() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = MetadataRepository::open(temp.path()).unwrap();
+
+        let record = derived_record('1', 1_000);
+        repository.publish_derived(&record).expect("publish ok");
+
+        let connection = repository.connection().unwrap();
+        let (size, rel_path, published_ms, source): (i64, String, i64, Option<String>) = connection
+            .query_row(
+                "SELECT size_bytes, rel_path, published_at_ms, source_artifact_id
+                     FROM derived_artifacts WHERE id=?1",
+                [&record.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(size, 4096);
+        assert_eq!(rel_path, record.rel_path);
+        assert_eq!(published_ms, 1_000);
+        // source_artifact_id is stored as NULL (matches the generic upsert
+        // Derived arm — the artifacts FK would reject an unknown source id).
+        assert!(source.is_none(), "source_artifact_id must be NULL");
+    }
+
+    #[test]
+    fn derived_metadata_access_updates_timestamp_and_repairs_missing_row() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = MetadataRepository::open(temp.path()).unwrap();
+
+        let record = derived_record('2', 1_000);
+        repository.publish_derived(&record).unwrap();
+
+        // Access at t1, then t2 > t1: timestamp must move forward.
+        repository.access_derived(&record, 2_000).unwrap();
+        repository.access_derived(&record, 5_000).unwrap();
+
+        let connection = repository.connection().unwrap();
+        let accessed: i64 = connection
+            .query_row(
+                "SELECT accessed_at_ms FROM access_log
+                 WHERE object_kind='derived' AND object_id=?1",
+                [&record.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(accessed, 5_000, "access timestamp should be the max");
+
+        // access_derived on a never-published id must REPAIR the row.
+        let new_record = derived_record('3', 1_000);
+        repository
+            .access_derived(&new_record, 5_000)
+            .expect("access repairs missing row");
+        let count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM derived_artifacts WHERE id=?1",
+                [&new_record.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "access_derived should upsert/repair the row");
+    }
+
+    #[test]
+    fn derived_metadata_access_keeps_max_not_overwrite() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = MetadataRepository::open(temp.path()).unwrap();
+        let record = derived_record('4', 1_000);
+        repository.publish_derived(&record).unwrap();
+
+        // Older access first, then a smaller value: max must win.
+        repository.access_derived(&record, 10_000).unwrap();
+        repository.access_derived(&record, 1_500).unwrap();
+
+        let connection = repository.connection().unwrap();
+        let accessed: i64 = connection
+            .query_row(
+                "SELECT accessed_at_ms FROM access_log
+                 WHERE object_kind='derived' AND object_id=?1",
+                [&record.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(accessed, 10_000, "access_log must keep the max timestamp");
+    }
+
+    #[test]
+    fn derived_metadata_empty_source_artifact_stored_as_null() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = MetadataRepository::open(temp.path()).unwrap();
+
+        let mut record = derived_record('5', 1_000);
+        record.source_artifact_id = String::new(); // empty → NULL
+        repository.publish_derived(&record).unwrap();
+
+        let connection = repository.connection().unwrap();
+        let source: Option<String> = connection
+            .query_row(
+                "SELECT source_artifact_id FROM derived_artifacts WHERE id=?1",
+                [&record.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(source.is_none(), "empty source_artifact_id must be NULL");
+    }
+
+    #[test]
+    fn derived_metadata_db_row_alone_is_not_a_filesystem_hit() {
+        // The trait contract (src/derived/store.rs): database-only state can
+        // never create a cache hit — a hit is still validated on disk. We only
+        // assert the repository makes no on-disk claim when publishing a row.
+        let temp = tempfile::tempdir().unwrap();
+        let repository = MetadataRepository::open(temp.path()).unwrap();
+
+        let record = derived_record('6', 1_000);
+        repository.publish_derived(&record).unwrap();
+
+        // The row exists, but no image directory was created on disk.
+        assert!(
+            !temp.path().join(&record.rel_path).exists(),
+            "publishing a metadata row must not materialize an image"
+        );
+    }
+}
