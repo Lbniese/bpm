@@ -85,6 +85,11 @@ pub struct InstallPlan {
     pub plan_version: u32,
     pub materializer_version: u32,
     pub graph_id_hex: String,
+    /// Package paths whose lifecycle scripts ran against the graph volume,
+    /// producing derived (isolated, non-hardlink) entries there. Their volume
+    /// entries are validated by existence rather than store-image identity.
+    #[serde(default)]
+    pub lifecycle_paths: Vec<String>,
     pub entries: Vec<PlanEntry>,
 }
 
@@ -230,7 +235,11 @@ pub fn graph_id_for_project(lockfile: &Lockfile, project_root: &Path) -> GraphId
 /// Build a compiled plan from a lockfile and the resolved artifact id for each
 /// fetchable package. `artifact_ids` is indexed by package position in
 /// `lockfile.packages` (the installer sorts outcomes back into this order).
-pub fn build_plan(lockfile: &Lockfile, artifact_ids: &[Option<ArtifactId>]) -> InstallPlan {
+pub fn build_plan(
+    lockfile: &Lockfile,
+    artifact_ids: &[Option<ArtifactId>],
+    lifecycle_paths: &[String],
+) -> InstallPlan {
     let entries = lockfile
         .packages
         .iter()
@@ -255,6 +264,7 @@ pub fn build_plan(lockfile: &Lockfile, artifact_ids: &[Option<ArtifactId>]) -> I
         plan_version: PLAN_VERSION,
         materializer_version: MATERIALIZER_VERSION,
         graph_id_hex: graph_id(lockfile).to_hex(),
+        lifecycle_paths: lifecycle_paths.to_vec(),
         entries,
     }
 }
@@ -352,6 +362,10 @@ pub fn validate_plan(
     if !volume_dir.join("node_modules").exists() {
         return Err(PlanInvalid::StateDrift);
     }
+    // Packages whose scripts ran in the volume hold derived (isolated) copies,
+    // not hardlinks of the store image; for them only require the entry exists.
+    let derived: std::collections::BTreeSet<&str> =
+        plan.lifecycle_paths.iter().map(String::as_str).collect();
     for e in &plan.entries {
         if e.link || e.resolved.is_empty() || e.artifact_hex.is_empty() {
             continue;
@@ -361,7 +375,11 @@ pub fn validate_plan(
         };
         let image = store.image_path(&digest);
         let entry = volume_dir.join(&e.path);
-        if !volume_entry_intact(&entry, &image) {
+        if derived.contains(e.path.as_str()) {
+            if !entry.join("package.json").exists() {
+                return Err(PlanInvalid::StateDrift);
+            }
+        } else if !volume_entry_intact(&entry, &image) {
             return Err(PlanInvalid::StateDrift);
         }
     }
@@ -475,7 +493,7 @@ mod tests {
         let path = dir.path().join(PLAN_FILE);
         let l = lf();
         let id = ArtifactId::from_bytes([0x9; 64]);
-        let plan = build_plan(&l, &[Some(id)]);
+        let plan = build_plan(&l, &[Some(id)], &[]);
         write_plan(&plan, &path).unwrap();
         let back = read_plan(&path).unwrap().unwrap();
         assert_eq!(plan, back);
@@ -492,7 +510,7 @@ mod tests {
         let l = lf();
         let dir = tempfile::tempdir().unwrap();
         let store = ArtifactStore::open(dir.path()).unwrap();
-        let mut plan = build_plan(&l, &[Some(ArtifactId::from_bytes([0x1; 64]))]);
+        let mut plan = build_plan(&l, &[Some(ArtifactId::from_bytes([0x1; 64]))], &[]);
         plan.plan_version = 999;
         assert_eq!(
             validate_plan(&plan, &l, dir.path(), &store).unwrap_err(),
@@ -505,7 +523,7 @@ mod tests {
         let l = lf();
         let dir = tempfile::tempdir().unwrap();
         let store = ArtifactStore::open(dir.path()).unwrap();
-        let mut plan = build_plan(&l, &[Some(ArtifactId::from_bytes([0x1; 64]))]);
+        let mut plan = build_plan(&l, &[Some(ArtifactId::from_bytes([0x1; 64]))], &[]);
         plan.graph_id_hex = "deadbeef".into();
         assert_eq!(
             validate_plan(&plan, &l, dir.path(), &store).unwrap_err(),
