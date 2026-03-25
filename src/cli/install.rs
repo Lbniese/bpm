@@ -277,16 +277,17 @@ pub(super) fn run(options: Options) -> anyhow::Result<()> {
             attach.relays_created + attach.relays_unchanged,
         )
     };
-    run_lifecycle_if_enabled(
+    let lifecycle = run_lifecycle_if_enabled(
         &project_root,
         &store,
         &lockfile,
         &artifact_ids,
+        volume.as_ref().map(|v| v.path.as_path()),
         options.ignore_scripts,
         &mut metrics,
     );
 
-    let mut plan = graph::build_plan(&lockfile, &artifact_ids);
+    let mut plan = graph::build_plan(&lockfile, &artifact_ids, &lifecycle.derived_paths);
     plan.graph_id_hex = graph::graph_id_for_project(&lockfile, &project_root).to_hex();
     if let Err(error) = graph::write_plan(&plan, &plan_path) {
         eprintln!(
@@ -344,12 +345,13 @@ fn run_lifecycle_if_enabled(
     store: &ArtifactStore,
     lockfile: &Lockfile,
     artifact_ids: &[Option<ArtifactId>],
+    volume_path: Option<&Path>,
     ignore_scripts: bool,
     metrics: &mut Metrics,
-) {
+) -> bpm::lifecycle::LifecycleStats {
     if ignore_scripts {
         metrics.record("lifecycle", std::time::Duration::ZERO);
-        return;
+        return bpm::lifecycle::LifecycleStats::default();
     }
     let policy = bpm::lifecycle::LifecyclePolicy {
         ignore_scripts: false,
@@ -359,6 +361,7 @@ fn run_lifecycle_if_enabled(
         store,
         lockfile,
         artifact_ids,
+        volume_path,
         policy,
         metrics,
     ) {
@@ -370,7 +373,7 @@ fn run_lifecycle_if_enabled(
                 result.phases_succeeded,
                 result.phases_failed
             );
-            for outcome in result.outcomes {
+            for outcome in &result.outcomes {
                 let marker = if outcome.exit_code == Some(0) {
                     "ok"
                 } else {
@@ -381,9 +384,13 @@ fn run_lifecycle_if_enabled(
                     outcome.package, outcome.phase, outcome.command
                 );
             }
+            result
         }
-        Ok(_) => {}
-        Err(error) => eprintln!("warning: lifecycle phase failed: {error}"),
+        Ok(result) => result,
+        Err(error) => {
+            eprintln!("warning: lifecycle phase failed: {error}");
+            bpm::lifecycle::LifecycleStats::default()
+        }
     }
 }
 
