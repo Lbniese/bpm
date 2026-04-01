@@ -131,7 +131,12 @@ pub fn materialize_with_backend(
             }
             MaterializeBackend::Hardlink => {
                 hardlink_tree(&image_dir, &target)?;
-                false
+                // A hardlinked executable loses the package-relative path that
+                // Node uses for relative requires (Next's bin is a concrete
+                // example: it requires ../server/require-hook). Keep .bin
+                // entries as relative symlinks into the hardlinked package
+                // tree; only package files themselves are hardlinked.
+                cfg!(unix)
             }
             MaterializeBackend::Auto => {
                 if let Err(error) = link_path(&target, &image_dir) {
@@ -163,7 +168,7 @@ pub fn materialize_with_backend(
     Ok(stats)
 }
 
-fn hardlink_tree(source: &Path, target: &Path) -> Result<(), MaterializeError> {
+pub(crate) fn hardlink_tree(source: &Path, target: &Path) -> Result<(), MaterializeError> {
     if target.exists() || symlink_exists(target) {
         remove_any(target)?;
     }
@@ -727,7 +732,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn hardlink_backend_uses_real_bin_files() {
+    fn hardlink_backend_keeps_bins_as_relative_symlinks() {
         let project = tempdir().unwrap();
         let store_dir = tempdir().unwrap();
         let src = tempdir().unwrap();
@@ -765,8 +770,8 @@ mod tests {
             .file_type()
             .is_symlink());
         let bin = project.path().join("node_modules/.bin/foocli");
+        assert_eq!(read_link_str(&bin), "../foo/bin/cli.js");
         assert!(bin.is_file());
-        assert!(!fs::symlink_metadata(&bin).unwrap().file_type().is_symlink());
     }
 
     #[cfg(unix)]

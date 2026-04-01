@@ -8,7 +8,60 @@ once a 1.0 release is cut.
 
 ## [Unreleased]
 
-No unreleased changes.
+### Fixed
+
+- `bpm import` now enriches imported npm lockfiles from the sibling
+  `package.json`, preserving root dev/optional declarations and supported
+  overrides so the generated `bpm.lock` passes `bpm ci` validation.
+- Graph-volume executable entries remain relative `.bin` symlinks when package
+  files are hardlinked. This preserves package-relative Node resolution for
+  CLIs such as Next.js instead of resolving relative requires from
+  `node_modules/.bin`.
+- Next.js projects automatically receive a project-local hardlink view after
+  lifecycle execution, keeping dependency realpaths inside the project for
+  Turbopack while retaining graph-volume reuse. `BPM_PROJECT_VIEW=relay|local`
+  can override the automatic choice.
+- The benchmark harness now exercises native BPM resolution in true-cold
+  scenarios instead of requiring a pre-generated npm lockfile.
+
+## [0.1.5] - 2026-07-17
+
+### Fixed
+
+- Self-referencing packages now resolve correctly. A package that requires
+  its own subpaths (for example `next` issuing `require('next/...')` from its
+  own code) previously failed because graph-volume packages were symlinked
+  into the content-addressed store, so Node's `realpath` resolved inside the
+  store, which has no `node_modules`. Graph-volume packages are now
+  materialized as hardlinks (real directories) whose `realpath` lands in the
+  volume, where the package's siblings are reachable.
+- Lifecycle scripts now run successfully. Postinstall scripts such as
+  `napi-postinstall` previously failed with `Cannot find module ...` and
+  discarded their output: scripts ran in a disposable sandbox holding only the
+  package image, so the package's own dependencies did not resolve and any
+  files a script wrote were thrown away. Scripts now execute in place against
+  the package's directory inside the graph volume, where they resolve through
+  the volume's complete `node_modules` tree (npm semantics), and derived
+  content persists in the install.
+
+### Changed
+
+- Graph volumes now materialize packages as hardlinks that share inodes with
+  the content-addressed store, instead of symlinks into the store. This is a
+  one-time, on-disk layout change: existing volumes and compiled install plans
+  are invalidated on upgrade, and the next `bpm install` rebuilds the volume by
+  hardlinking from the existing store images (no re-download).
+- Lifecycle scripts run against the graph volume and are isolated per-package
+  from the immutable store: each package's own files are copied to independent
+  inodes (with nested dependencies preserved) before its scripts run, so
+  postinstall mutations stay local and can never reach a store image. Re-runs
+  leave already-derived content intact, and a plan-cache hit skips lifecycle
+  entirely. Installs without a graph volume (npm workspaces) retain the
+  disposable-sandbox path.
+- `bpm doctor` now notes that dependency `overrides` are honored during
+  resolution.
+- Package version bumped to `0.1.5` so `bpm --version` reports the release
+  version.
 
 ## [0.1.4] - 2026-07-17
 
@@ -111,7 +164,8 @@ Initial release.
   into the graph id.
 - Install-timing benchmark harness with machine-stamped baselines.
 
-[Unreleased]: https://github.com/lbniese/bpm/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/lbniese/bpm/compare/v0.1.5...HEAD
+[0.1.5]: https://github.com/lbniese/bpm/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/lbniese/bpm/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/lbniese/bpm/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/lbniese/bpm/compare/v0.1.1...v0.1.2

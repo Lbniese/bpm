@@ -26,6 +26,8 @@ use thiserror::Error;
 use crate::graph::graph_id;
 use crate::integrity::ArtifactId;
 use crate::lockfile::Lockfile;
+#[cfg(unix)]
+use crate::materializer::hardlink_tree;
 use crate::materializer::{
     materialize_with_backend, MaterializeBackend, MaterializeError, MaterializeStats,
 };
@@ -50,7 +52,7 @@ const META_FILE: &str = "metadata.json";
 /// Bumped when the on-disk volume layout changes (e.g. symlink -> hardlink
 /// materialization of package images). A cached volume whose recorded layout
 /// differs is discarded and rebuilt so every project sees the current layout.
-const VOLUME_LAYOUT_VERSION: u32 = 2;
+const VOLUME_LAYOUT_VERSION: u32 = 3;
 
 #[derive(Debug, Error)]
 pub enum VolumeError {
@@ -215,6 +217,49 @@ pub fn attach_project(
     ))
 }
 
+/// Attach a project with a local hardlink view of the graph volume.
+///
+/// Unlike relay attachment, every package file gets a project-local directory
+/// entry (hardlinked to the volume where possible, copied otherwise). This
+/// costs O(files) metadata work but keeps realpaths inside the project, which
+/// is required by tools such as Turbopack that reject dependency files outside
+/// the project root. Relative `.bin` symlinks are preserved, so Node resolves
+/// bin scripts relative to their package rather than the `.bin` directory.
+#[cfg(unix)]
+pub fn attach_project_local(
+    project_root: &Path,
+    volume: &VolumeRef,
+) -> Result<AttachStats, VolumeError> {
+    let vol_nm = volume.path.join("node_modules");
+    let proj_nm = project_root.join("node_modules");
+    fs::create_dir_all(&proj_nm).map_err(|source| io_err(&proj_nm, source))?;
+
+    let mut entries = fs::read_dir(&vol_nm)
+        .map_err(|source| io_err(&vol_nm, source))?
+        .filter_map(Result::ok)
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.file_name());
+
+    let mut stats = AttachStats::default();
+    for entry in entries {
+        let source = entry.path();
+        let target = proj_nm.join(entry.file_name());
+        hardlink_tree(&source, &target).map_err(VolumeError::Materialize)?;
+        stats.relays_created += 1;
+    }
+    Ok(stats)
+}
+
+#[cfg(not(unix))]
+pub fn attach_project_local(
+    _project_root: &Path,
+    _volume: &VolumeRef,
+) -> Result<AttachStats, VolumeError> {
+    Err(VolumeError::Materialize(
+        MaterializeError::SymlinksUnsupported,
+    ))
+}
+
 /// Whether a project's `node_modules` still correctly relays into a graph
 /// volume. Every top-level entry in the volume's `node_modules` must have a
 /// matching symlink under the project (`<project>/node_modules/<entry>` →
@@ -238,7 +283,13 @@ pub fn project_attached(project_root: &Path, volume_path: &Path) -> bool {
         let proj_link = proj_nm.join(entry.file_name());
         match fs::read_link(&proj_link) {
             Ok(t) if t == vol_target => {}
-            _ => return false,
+            Ok(_) => return false,
+            Err(_) if proj_link.is_dir() || proj_link.is_file() => {
+                // A local compatibility view is also valid. Its package files
+                // are hardlinked/copied from the volume, while `.bin` entries
+                // remain relative symlinks inside the project tree.
+            }
+            Err(_) => return false,
         }
     }
     seen > 0
@@ -253,5 +304,54 @@ fn io_err(path: &Path, source: std::io::Error) -> VolumeError {
     VolumeError::Io {
         path: path.display().to_string(),
         source,
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::{symlink, MetadataExt};
+    use tempfile::tempdir;
+
+    #[test]
+    fn local_attachment_keeps_realpaths_inside_project_and_bins_relative() {
+        let volume_root = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        let volume = volume_root.path().join("node_modules");
+        fs::create_dir_all(volume.join("foo")).unwrap();
+        fs::create_dir_all(volume.join(".bin")).unwrap();
+        fs::write(
+            volume.join("foo/package.json"),
+            br#"{"name":"foo","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        fs::write(volume.join("foo/cli.js"), b"#!/usr/bin/env node\n").unwrap();
+        symlink("../foo/cli.js", volume.join(".bin/foo")).unwrap();
+
+        let volume_ref = VolumeRef {
+            path: volume_root.path().to_path_buf(),
+            cached: false,
+            stats: MaterializeStats::default(),
+        };
+        let stats = attach_project_local(project.path(), &volume_ref).unwrap();
+        assert_eq!(stats.relays_created, 2);
+
+        let project_pkg = project.path().join("node_modules/foo");
+        assert!(project_pkg.is_dir());
+        assert!(!fs::symlink_metadata(&project_pkg)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            fs::metadata(project_pkg.join("package.json"))
+                .unwrap()
+                .ino(),
+            fs::metadata(volume.join("foo/package.json")).unwrap().ino()
+        );
+        assert_eq!(
+            fs::read_link(project.path().join("node_modules/.bin/foo")).unwrap(),
+            PathBuf::from("../foo/cli.js")
+        );
+        assert!(project_attached(project.path(), volume_root.path()));
     }
 }

@@ -17,8 +17,8 @@ the commit history wins.
 | 2 — Package-lock frozen installer | `package-lock.json` v3 import, graph construction, basic `node_modules` materialization, bin linking | ✅ Done — `bpm import`, `bpm install --frozen` |
 | 3 — Graph-plan cache | canonical graph hashing, compiled plan format, graph cache lookup, project state validation | ✅ Done — `.bpm-state` |
 | 4 — Reusable graph volumes | graph-volume creation, graph-volume reuse across projects, safe project attachment | ✅ Done — `node_modules` attaches via shallow relays |
-| 5 — Lifecycle support | npm-compatible script environment, derived artifact store, native-addon fixture coverage | ✅ Done — lifecycle sandbox runner, `bpm run` |
-| 6 — Workspaces and optimization | basic npm workspaces, filesystem capability detection, reflink/clone optimization, adaptive concurrency | ✅ Done — workspace discovery in graph id, fs capability probe |
+| 5 — Lifecycle support | npm-compatible script environment, derived artifact store, native-addon fixture coverage | ✅ Mostly done — sandbox runner, graph-volume lifecycle, `bpm run`; derived-store wiring remains open |
+| 6 — Workspaces and optimization | basic npm workspaces, filesystem capability detection, reflink/clone optimization, adaptive concurrency | ✅ Mostly done — workspaces, capability probe, adaptive concurrency, local hardlink compatibility view; general reflink/clone attachment remains open |
 
 ### Post-M6 — registry name resolution (not in the original plan)
 
@@ -27,14 +27,24 @@ the commit history wins.
 `npm`/`bun` UX, while exact-URL/`file://` targets keep working unchanged.
 Delivered: `src/registry.rs` (packument fetch + version selection via `semver`),
 `fetch` CLI `--registry` / `BPM_REGISTRY`, and offline integration tests. The
-immutable store layer is unchanged — resolution only produces a
-`(tarball_url, integrity)` pair that the existing store consumes. Full graph
-dependency resolution is still deferred.
+immutable store layer is unchanged — resolution produces a
+`(tarball_url, integrity)` pair that the existing store consumes. Full native
+graph resolution is now integrated into non-frozen `bpm install`; this section
+is retained as historical context for the earlier single-package resolver.
 
-Note: the project's actual **Milestone 0** (benchmark harness) has not been
-built yet. Earlier CLI-bootstrapping work (doctor/manifest/project-root) is
-foundational scaffolding, not a substitute for it — no installer
-optimization work should be evaluated without a real benchmark baseline
+The benchmark harness is implemented and has a checked-in reference baseline.
+Refresh it whenever the materialization or lifecycle strategy changes, and do
+not compare results across different toolchain/version maps.
+
+## Native resolver — delivered
+
+The resolver foundation described by the M2 brief is now implemented in
+`src/resolver/` and wired into non-frozen `bpm install`. It resolves registry
+ranges/tags/exact versions, strict or legacy peer modes, supported root
+overrides, platform constraints, optional reachability, cycles, and local
+workspaces, then writes canonical `bpm.lock` v2 metadata. `bpm install --frozen`
+and `bpm ci` remain resolution-free and validate the manifest against the
+lockfile.
 
 ## Milestone 1 — done
 
@@ -150,16 +160,16 @@ filesystem work.**
 
 Delivered: `src/volume.rs` — reusable graph volumes. A graph volume is an
 immutable, complete `node_modules` projection held in the store at
-`graphs/blake3/<prefix>/<graph-id>/`, keyed by the graph id. Building it is a
-one-time, graph-keyed, idempotent operation (a `metadata.json` marker records
-completeness); any project that shares the graph id reuses it unchanged.
+`graphs/blake3/<prefix>/<graph-id>/`, keyed by the graph id. Package files are
+hardlinked to store images and `.bin` entries remain relative symlinks, so Node
+keeps package-relative bin semantics. Building it is a one-time, graph-keyed,
+idempotent operation; any project that shares the graph id reuses it.
 
-Project attachment is **shallow and safe**: the project's `node_modules` becomes
-a set of top-level relays, one per top-level entry in the volume's
-`node_modules`, each pointing into the volume (never a wholesale `node_modules`
-symlink, which would make the immutable store writable through project paths).
-Nested package paths resolve transitively through the top-level relays, so
-project-relative module resolution keeps working.
+Project attachment is shallow and safe by default: the project's `node_modules`
+gets top-level relays into the volume, never a wholesale `node_modules` symlink.
+Projects depending on Next.js automatically use a project-local hardlink view
+because Turbopack rejects dependency realpaths outside the project; the relay
+or local view can be selected with `BPM_PROJECT_VIEW`.
 
 Verified by:
 
@@ -177,16 +187,14 @@ Verified by:
 ## Milestone 5 — done
 
 Delivered: `src/lifecycle.rs` — lifecycle script execution. Permitted scripts
-(`preinstall`, `install`, `postinstall`) for installed packages run in
-**isolated temp sandboxes** (copies of the store image), so scripts can never
-mutate the immutable store or the shared graph volume. An npm-compatible
-environment (`npm_lifecycle_event`, `npm_package_name`, `npm_package_version`,
-`npm_config_user_agent`, `npm_execpath`, `INIT_CWD`, `NODE`, `PATH` with
-`node_modules/.bin`) is populated. A summary of packages that execute scripts
-is printed. `--ignore-scripts` skips the phase entirely. `bpm run <script>`
-executes a root `package.json` script with the same environment. The
-derived-artifact store (publishing build output keyed by build inputs) is
-deferred to a future hardening pass.
+(`preinstall`, `install`, `postinstall`) run with an npm-compatible environment
+and `--ignore-scripts`. Graph-volume installs isolate each script-bearing
+package from its immutable store image, execute in the complete volume tree,
+and persist derived output in the graph volume; workspace/compatible installs
+retain the disposable sandbox. A summary is printed and `bpm run <script>`
+uses the same environment. `src/derived/store.rs` implements the longer-term
+content-addressed derived-artifact model but is not yet the active graph
+lifecycle backend.
 
 ## Milestone 6 — done
 
