@@ -39,7 +39,9 @@ If the Rust toolchain is not available, download a pre-built binary from the
 Most package managers cache individual packages. BPM caches **complete
 dependency graphs** — when two projects resolve the same graph, the second
 install reuses every byte of the first. No re-downloading, no re-extracting,
-no re-resolving.
+no re-resolving. Ordinary projects attach through shallow graph-volume relays;
+Next.js projects automatically receive a local hardlink compatibility view so
+Turbopack can keep dependency realpaths inside the project.
 
 - **Immutable by design** — downloaded archives, extracted images, and
   dependency graphs are never mutated; they are built, verified, and published
@@ -57,8 +59,11 @@ no re-resolving.
 |---|---|
 | `bpm doctor` | Inspect the nearest `package.json` and report diagnostics |
 | `bpm fetch <spec\|url>` | Resolve a package by spec (`lodash`, `lodash@4.17.21`) or fetch a tarball by exact URL, then verify, store, and extract |
-| `bpm install [<spec\|url>]` | Install from `bpm.lock`, or fetch a package and link its bins globally (`bpm install cowsay`) |
-| `bpm import` | Convert npm `package-lock.json` v3 to `bpm.lock` |
+| `bpm install [<spec\|url>]` | Resolve `package.json` and install, or install an existing `bpm.lock`; package arguments install/link bins globally |
+| `bpm ci` | Reproducible frozen install from `bpm.lock` (npm `ci` compatibility) |
+| `bpm import` | Convert npm `package-lock.json` v3 to `bpm.lock` and preserve root manifest metadata |
+| `bpm exec <command>` | Execute a local dependency binary with the project bin path |
+| `bpm run <script>` | Execute a root package script with npm-compatible environment variables |
 | `bpm bench` | Run performance benchmark scenarios and emit timing results |
 
 ## Documentation

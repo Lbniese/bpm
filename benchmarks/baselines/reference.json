@@ -7,74 +7,73 @@
       "operating_system": "26.5",
       "kernel": "25.5.0",
       "runtime_versions": {
-        "bpm": "bpm 0.1.0",
-        "bun": "1.2.17",
+        "bpm": "bpm 0.1.5",
         "node": "v26.0.0",
-        "npm": "11.12.1",
-        "pnpm": "10.12.4",
-        "yarn": "1.22.22"
+        "npm": "11.12.1"
       }
     },
     "versions": {
-      "bpm": "bpm 0.1.0",
+      "bpm": "bpm 0.1.5",
+      "bun": "1.3.14",
       "node": "v26.0.0",
-      "npm": "11.12.1",
-      "pnpm": "10.12.4",
-      "yarn": "1.22.22",
-      "bun": "1.2.17"
+      "npm": "11.12.1"
     },
     "cache_state": "hot",
     "number_of_runs": 3,
     "tools": [
       {
-        "tool": "bpm",
-        "wall_clock_ms": {
-          "values": [6.836416, 11.902125, 7.990458],
-          "median": 7.990458,
-          "p95": 11.902125,
-          "stddev": 2.167803786973094
-        },
-        "exit_codes": [0, 0, 0]
-      },
-      {
         "tool": "npm",
         "wall_clock_ms": {
-          "values": [392.81, 374.24, 381.09],
-          "median": 381.09,
-          "p95": 392.81,
-          "stddev": 7.659269546056888
+          "values": [
+            490.83829099999997,
+            549.476583,
+            491.082042
+          ],
+          "median": 491.082042,
+          "p95": 549.476583,
+          "stddev": 27.58508276794211
         },
-        "exit_codes": [0, 0, 0]
-      },
-      {
-        "tool": "pnpm",
-        "wall_clock_ms": {
-          "values": [164.72, 151.63, 155.48],
-          "median": 155.48,
-          "p95": 164.72,
-          "stddev": 5.496948647202221
-        },
-        "exit_codes": [0, 0, 0]
-      },
-      {
-        "tool": "yarn",
-        "wall_clock_ms": {
-          "values": [241.28, 233.42, 238.73],
-          "median": 238.73,
-          "p95": 241.28,
-          "stddev": 3.274836468513996
-        },
-        "exit_codes": [0, 0, 0]
+        "exit_codes": [
+          0,
+          0,
+          0
+        ]
       },
       {
         "tool": "bun",
         "wall_clock_ms": {
-          "values": [85.41, 82.19, 83.04],
-          "median": 83.04,
-          "p95": 85.41,
-          "stddev": 1.363221446783253
+          "values": [
+            8.291667,
+            7.970375,
+            7.897417
+          ],
+          "median": 7.970375,
+          "p95": 8.291667,
+          "stddev": 0.1712647338440309
         },
-        "exit_codes": [0, 0, 0]
+        "exit_codes": [
+          0,
+          0,
+          0
+        ]
+      },
+      {
+        "tool": "bpm",
+        "wall_clock_ms": {
+          "values": [
+            10.949416999999999,
+            8.863207999999998,
+            8.178125
+          ],
+          "median": 8.863207999999998,
+          "p95": 10.949416999999999,
+          "stddev": 1.1785898380802369
+        },
+        "exit_codes": [
+          0,
+          0,
+          0
+        ]
       }
     ]
   },
@@ -82,54 +81,77 @@
     "scenario": "resolved_cold",
     "fixture": "small",
     "system": {
-      "machine": "x86_64",
-      "operating_system": "ubuntu-24.04",
-      "kernel": "6.8.0",
+      "machine": "arm64",
+      "operating_system": "26.5",
+      "kernel": "25.5.0",
       "runtime_versions": {
-        "bpm": "bpm 0.1.0",
-        "node": "v22.4.0",
-        "npm": "10.8.1",
-        "pnpm": "9.4.0"
+        "bpm": "bpm 0.1.5",
+        "node": "v26.0.0",
+        "npm": "11.12.1"
       }
     },
     "versions": {
-      "bpm": "bpm 0.1.0",
-      "node": "v22.4.0",
-      "npm": "10.8.1",
-      "pnpm": "9.4.0"
+      "bpm": "bpm 0.1.5",
+      "bun": "1.3.14",
+      "node": "v26.0.0",
+      "npm": "11.12.1"
     },
     "cache_state": "cold",
     "number_of_runs": 3,
     "tools": [
       {
-        "tool": "bpm",
-        "wall_clock_ms": {
-          "values": [73.2, 69.4, 70.1],
-          "median": 70.1,
-          "p95": 73.2,
-          "stddev": 1.6505891208497665
-        },
-        "exit_codes": [0, 0, 0]
-      },
-      {
         "tool": "npm",
         "wall_clock_ms": {
-          "values": [812.4, 796.7, 805.6],
-          "median": 805.6,
-          "p95": 812.4,
-          "stddev": 6.428843858332818
+          "values": [
+            481.558292,
+            501.34341699999993,
+            617.806958
+          ],
+          "median": 501.34341699999993,
+          "p95": 617.806958,
+          "stddev": 60.109997819094474
         },
-        "exit_codes": [0, 0, 0]
+        "exit_codes": [
+          0,
+          0,
+          0
+        ]
       },
       {
-        "tool": "pnpm",
+        "tool": "bun",
         "wall_clock_ms": {
-          "values": [334.2, 329.5, 331.8],
-          "median": 331.8,
-          "p95": 334.2,
-          "stddev": 1.9189115175220695
+          "values": [
+            11.322333,
+            10.53125,
+            10.302541999999999
+          ],
+          "median": 10.53125,
+          "p95": 11.322333,
+          "stddev": 0.4369201994051347
         },
-        "exit_codes": [0, 0, 0]
+        "exit_codes": [
+          0,
+          0,
+          0
+        ]
+      },
+      {
+        "tool": "bpm",
+        "wall_clock_ms": {
+          "values": [
+            175.5315,
+            16.4395,
+            16.478375
+          ],
+          "median": 16.478375,
+          "p95": 175.5315,
+          "stddev": 74.9875267757773
+        },
+        "exit_codes": [
+          0,
+          0,
+          0
+        ]
       }
     ]
   },
@@ -138,53 +160,76 @@
     "fixture": "medium",
     "system": {
       "machine": "arm64",
-      "operating_system": "macos-15",
-      "kernel": "24.0.0",
+      "operating_system": "26.5",
+      "kernel": "25.5.0",
       "runtime_versions": {
-        "bpm": "bpm 0.1.0",
-        "node": "v22.4.0",
-        "npm": "10.8.1",
-        "bun": "1.2.17"
+        "bpm": "bpm 0.1.5",
+        "node": "v26.0.0",
+        "npm": "11.12.1"
       }
     },
     "versions": {
-      "bpm": "bpm 0.1.0",
-      "node": "v22.4.0",
-      "npm": "10.8.1",
-      "bun": "1.2.17"
+      "bpm": "bpm 0.1.5",
+      "bun": "1.3.14",
+      "node": "v26.0.0",
+      "npm": "11.12.1"
     },
     "cache_state": "warm",
     "number_of_runs": 3,
     "tools": [
       {
-        "tool": "bpm",
-        "wall_clock_ms": {
-          "values": [28.3, 26.9, 27.4],
-          "median": 27.4,
-          "p95": 28.3,
-          "stddev": 0.5792715879374592
-        },
-        "exit_codes": [0, 0, 0]
-      },
-      {
         "tool": "npm",
         "wall_clock_ms": {
-          "values": [521.6, 509.4, 514.2],
-          "median": 514.2,
-          "p95": 521.6,
-          "stddev": 5.017742854565056
+          "values": [
+            544.3992920000001,
+            477.5235,
+            486.2515
+          ],
+          "median": 486.2515,
+          "p95": 544.3992920000001,
+          "stddev": 29.682982880398995
         },
-        "exit_codes": [0, 0, 0]
+        "exit_codes": [
+          0,
+          0,
+          0
+        ]
       },
       {
         "tool": "bun",
         "wall_clock_ms": {
-          "values": [118.5, 112.7, 114.6],
-          "median": 114.6,
-          "p95": 118.5,
-          "stddev": 2.414310670603008
+          "values": [
+            8.631958000000001,
+            8.378209,
+            9.840958
+          ],
+          "median": 8.631958000000001,
+          "p95": 9.840958,
+          "stddev": 0.6382009603392963
         },
-        "exit_codes": [0, 0, 0]
+        "exit_codes": [
+          0,
+          0,
+          0
+        ]
+      },
+      {
+        "tool": "bpm",
+        "wall_clock_ms": {
+          "values": [
+            15.359584,
+            15.036417,
+            14.118542
+          ],
+          "median": 15.036417,
+          "p95": 15.359584,
+          "stddev": 0.5256865005006947
+        },
+        "exit_codes": [
+          0,
+          0,
+          0
+        ]
       }
     ]
   },
@@ -192,42 +237,77 @@
     "scenario": "monorepo_incremental",
     "fixture": "monorepo",
     "system": {
-      "machine": "x86_64",
-      "operating_system": "windows-2022",
-      "kernel": "10.0.20348",
+      "machine": "arm64",
+      "operating_system": "26.5",
+      "kernel": "25.5.0",
       "runtime_versions": {
-        "bpm": "bpm 0.1.0",
-        "node": "v22.4.0",
-        "npm": "10.8.1"
+        "bpm": "bpm 0.1.5",
+        "node": "v26.0.0",
+        "npm": "11.12.1"
       }
     },
     "versions": {
-      "bpm": "bpm 0.1.0",
-      "node": "v22.4.0",
-      "npm": "10.8.1"
+      "bpm": "bpm 0.1.5",
+      "bun": "1.3.14",
+      "node": "v26.0.0",
+      "npm": "11.12.1"
     },
-    "cache_state": "incremental",
+    "cache_state": "warm",
     "number_of_runs": 3,
     "tools": [
       {
-        "tool": "bpm",
-        "wall_clock_ms": {
-          "values": [41.8, 39.6, 40.2],
-          "median": 40.2,
-          "p95": 41.8,
-          "stddev": 0.929157323386257
-        },
-        "exit_codes": [0, 0, 0]
-      },
-      {
         "tool": "npm",
         "wall_clock_ms": {
-          "values": [663.2, 648.4, 651.9],
-          "median": 651.9,
-          "p95": 663.2,
-          "stddev": 6.306433218991743
+          "values": [
+            505.38633300000004,
+            516.770583,
+            554.8898330000001
+          ],
+          "median": 516.770583,
+          "p95": 554.8898330000001,
+          "stddev": 21.169356471809824
         },
-        "exit_codes": [0, 0, 0]
+        "exit_codes": [
+          0,
+          0,
+          0
+        ]
+      },
+      {
+        "tool": "bun",
+        "wall_clock_ms": {
+          "values": [
+            14.085833000000001,
+            13.797958000000001,
+            13.920458
+          ],
+          "median": 13.920458,
+          "p95": 14.085833000000001,
+          "stddev": 0.1179581640761766
+        },
+        "exit_codes": [
+          0,
+          0,
+          0
+        ]
+      },
+      {
+        "tool": "bpm",
+        "wall_clock_ms": {
+          "values": [
+            13.139833999999999,
+            14.391917000000001,
+            14.760875
+          ],
+          "median": 14.391917000000001,
+          "p95": 14.760875,
+          "stddev": 0.6937511376033925
+        },
+        "exit_codes": [
+          0,
+          0,
+          0
+        ]
       }
     ]
   }

@@ -213,6 +213,29 @@ impl PackageManifest {
         Ok(manifest)
     }
 
+    /// Merge all root dependency declarations using npm's precedence rules.
+    /// Optional dependencies replace a same-name regular dependency; peer and
+    /// dev declarations only fill names not already declared by a stronger
+    /// root dependency group. This is the canonical root declaration set used
+    /// by native resolution, import enrichment, and frozen drift validation.
+    pub fn root_dependency_declarations(&self) -> BTreeMap<String, String> {
+        let mut declarations = self.dependencies.clone();
+        for (name, spec) in &self.optional_dependencies {
+            declarations.insert(name.clone(), spec.clone());
+        }
+        for (name, spec) in &self.peer_dependencies {
+            declarations
+                .entry(name.clone())
+                .or_insert_with(|| spec.clone());
+        }
+        for (name, spec) in &self.dev_dependencies {
+            declarations
+                .entry(name.clone())
+                .or_insert_with(|| spec.clone());
+        }
+        declarations
+    }
+
     /// Total count of non-workspace dependencies across all sections.
     pub fn dependency_count(&self) -> usize {
         self.dependencies.len()
