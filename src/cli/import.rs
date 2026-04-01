@@ -3,7 +3,8 @@
 use std::{fs, path::PathBuf};
 
 use bpm::lockfile::{Lockfile, BPM_LOCK_FILE};
-use bpm::npm_lock::{import as import_lock, ImportReport};
+use bpm::manifest::PackageManifest;
+use bpm::npm_lock::{apply_manifest_root_metadata, import as import_lock, ImportReport};
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -21,9 +22,19 @@ pub(super) fn run(path: Option<PathBuf>, out: Option<PathBuf>, json: bool) -> an
             let text = fs::read_to_string(&input)
                 .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", input.display()))?;
             let ImportReport {
-                lockfile,
+                mut lockfile,
                 diagnostics,
             } = import_lock(&text)?;
+            let manifest_path = input
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join("package.json");
+            if manifest_path.is_file() {
+                let manifest = PackageManifest::from_path(&manifest_path)
+                    .map_err(|error| anyhow::anyhow!("cannot enrich imported lockfile: {error}"))?;
+                apply_manifest_root_metadata(&mut lockfile, &manifest)
+                    .map_err(|error| anyhow::anyhow!("cannot enrich imported lockfile: {error}"))?;
+            }
             (lockfile, diagnostics)
         } else {
             (

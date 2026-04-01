@@ -3,6 +3,13 @@
 
 use std::collections::BTreeMap;
 
+#[cfg(unix)]
+use std::fs;
+#[cfg(unix)]
+use std::process::Command;
+#[cfg(unix)]
+use tempfile::tempdir;
+
 use bpm::lockfile::Lockfile;
 use bpm::npm_lock::{import, package_name_from_path, NpmLockError};
 
@@ -154,6 +161,46 @@ fn reports_link_and_platform_constructs_with_codes() {
     let codes: Vec<&str> = report.diagnostics.iter().map(|d| d.code).collect();
     assert!(codes.contains(&"PLATFORM_CONSTRAINT"));
     assert!(codes.contains(&"LINK_PACKAGE_UNSUPPORTED"));
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_import_metadata_roundtrips_through_ci() {
+    let project = tempdir().unwrap();
+    let store = tempdir().unwrap();
+    fs::write(
+        project.path().join("package.json"),
+        r#"{"name":"app","devDependencies":{"tool":"1.0.0"},"overrides":{"transitive":"^2.0.0"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        project.path().join("package-lock.json"),
+        r#"{"name":"app","lockfileVersion":3,"packages":{"":{"name":"app","dependencies":{"tool":"1.0.0"},"devDependencies":{"tool":"1.0.0"}}}}"#,
+    )
+    .unwrap();
+
+    let import = Command::new(env!("CARGO_BIN_EXE_bpm"))
+        .args(["import", "package-lock.json"])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(
+        import.status.success(),
+        "import failed: {}",
+        String::from_utf8_lossy(&import.stderr)
+    );
+
+    let ci = Command::new(env!("CARGO_BIN_EXE_bpm"))
+        .args(["ci", "--store"])
+        .arg(store.path())
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(
+        ci.status.success(),
+        "ci rejected imported lock: {}",
+        String::from_utf8_lossy(&ci.stderr)
+    );
 }
 
 #[test]
