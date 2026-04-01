@@ -170,23 +170,12 @@ pub fn resolve_manifest_with_options_and_target(
     peer_mode: crate::resolver::peer::PeerMode,
     target: TargetPlatform,
 ) -> Result<Lockfile, ResolveError> {
-    let mut root_deps = manifest.dependencies.clone();
     // npm's optionalDependencies take precedence over dependencies with the
     // same name. Peer dependencies are root requests too: npm installs a
-    // missing root peer so that packages below the root can bind to it.
-    for (name, spec) in &manifest.optional_dependencies {
-        root_deps.insert(name.clone(), spec.clone());
-    }
-    for (name, spec) in &manifest.peer_dependencies {
-        root_deps
-            .entry(name.clone())
-            .or_insert_with(|| spec.clone());
-    }
-    for (name, spec) in &manifest.dev_dependencies {
-        root_deps
-            .entry(name.clone())
-            .or_insert_with(|| spec.clone());
-    }
+    // missing root peer so that packages below the root can bind to it. Keep
+    // this merge in one manifest helper so frozen validation and imported
+    // lockfiles use exactly the same declaration set.
+    let root_deps = manifest.root_dependency_declarations();
     let overrides = crate::resolver::overrides::OverrideSet::from_manifest(
         &manifest.overrides,
         &root_deps,

@@ -15,6 +15,8 @@ use thiserror::Error;
 
 use crate::diagnostic::{Diagnostic, Severity};
 use crate::lockfile::{Lockfile, PackageEntry, RootEntry};
+use crate::manifest::PackageManifest;
+use crate::resolver::overrides::{OverrideOrigin, OverrideSet};
 
 /// The npm lockfile version this importer supports.
 pub const SUPPORTED_LOCKFILE_VERSION: u32 = 3;
@@ -41,6 +43,8 @@ pub enum NpmLockError {
     NoPackages,
     #[error("package \"{path}\" has invalid \"bin\": {reason}")]
     InvalidBin { path: String, reason: String },
+    #[error("cannot record package.json root resolution metadata: {0}")]
+    ManifestMetadata(String),
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -77,10 +81,42 @@ struct RawPkg {
     /// production and dev declarations.
     #[serde(default, rename = "devDependencies")]
     dev_dependencies: BTreeMap<String, String>,
+    #[serde(default, rename = "optionalDependencies")]
+    optional_dependencies: BTreeMap<String, String>,
     #[serde(default)]
     os: Vec<String>,
     #[serde(default)]
     cpu: Vec<String>,
+}
+
+/// Enrich an imported lockfile with root metadata that npm stores in the
+/// project's `package.json` rather than in `package-lock.json`.
+///
+/// Without this step, `bpm import` produces a lockfile whose root dependency
+/// keys may be correct but whose v2 resolution metadata is empty. A subsequent
+/// `bpm ci` then (correctly) sees dev/optional/override declarations missing
+/// from the lockfile and rejects the file that import just generated.
+pub fn apply_manifest_root_metadata(
+    lockfile: &mut Lockfile,
+    manifest: &PackageManifest,
+) -> Result<(), NpmLockError> {
+    let root_declarations = manifest.root_dependency_declarations();
+    let overrides = OverrideSet::from_manifest(
+        &manifest.overrides,
+        &root_declarations,
+        OverrideOrigin::Root,
+    )
+    .map_err(|error| NpmLockError::ManifestMetadata(error.to_string()))?;
+
+    // The imported npm table remains authoritative for root declarations,
+    // physical placements, and exact artifacts. Do not replace its dependency
+    // map with the manifest: preserving that map lets `bpm ci` detect stale or
+    // incomplete package-lock input. The manifest supplies the v2 metadata
+    // fields that npm stores outside the lockfile.
+    lockfile.resolution.root.dev_dependencies = manifest.dev_dependencies.clone();
+    lockfile.resolution.root.optional_dependencies = manifest.optional_dependencies.clone();
+    lockfile.resolution.root.overrides = overrides.as_map().clone();
+    Ok(())
 }
 
 /// Derive a package name from its `node_modules/...` path key.
@@ -164,6 +200,9 @@ pub fn import(json: &str) -> Result<ImportReport, NpmLockError> {
         // (A name declared in both resolves to its `dependencies` spec.)
         let mut root_deps = root_raw.dev_dependencies.clone();
         for (name, spec) in &root_raw.dependencies {
+            root_deps.insert(name.clone(), spec.clone());
+        }
+        for (name, spec) in &root_raw.optional_dependencies {
             root_deps.insert(name.clone(), spec.clone());
         }
         lockfile.root = RootEntry {
@@ -258,6 +297,7 @@ fn format_constraints(os: &[String], cpu: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn minimal_v3() -> &'static str {
         r#"{
@@ -386,6 +426,53 @@ mod tests {
         assert_eq!(
             package_name_from_path("node_modules/foo/node_modules/bar"),
             "bar"
+        );
+    }
+
+    #[test]
+    fn imported_lock_can_record_manifest_metadata_for_frozen_validation() {
+        let json = r#"{
+          "name": "app",
+          "lockfileVersion": 3,
+          "packages": {
+            "": {
+              "version": "1.0.0",
+              "dependencies": { "foo": "1.0.0", "native": "^3.0.0" },
+              "devDependencies": { "tool": "^2.0.0" }
+            },
+            "node_modules/foo": { "version": "1.0.0", "resolved": "https://example/foo.tgz", "integrity": "sha512-A" }
+          }
+        }"#;
+        let mut lock = import(json).unwrap().lockfile;
+        let manifest = PackageManifest::from_json(
+            r#"{
+              "name": "app",
+              "dependencies": { "foo": "1.0.0" },
+              "devDependencies": { "tool": "^2.0.0" },
+              "optionalDependencies": { "native": "^3.0.0" },
+              "overrides": { "transitive": "^4.0.0" }
+            }"#,
+            Path::new("package.json"),
+        )
+        .unwrap();
+
+        apply_manifest_root_metadata(&mut lock, &manifest).unwrap();
+
+        assert_eq!(
+            lock.root.dependencies.keys().collect::<Vec<_>>(),
+            vec!["foo", "native", "tool"]
+        );
+        assert_eq!(
+            lock.resolution.root.dev_dependencies.get("tool"),
+            Some(&"^2.0.0".to_string())
+        );
+        assert_eq!(
+            lock.resolution.root.optional_dependencies.get("native"),
+            Some(&"^3.0.0".to_string())
+        );
+        assert_eq!(
+            lock.resolution.root.overrides.get("transitive"),
+            Some(&"^4.0.0".to_string())
         );
     }
 

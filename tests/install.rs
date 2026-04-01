@@ -162,9 +162,10 @@ fn frozen_install_materializes_node_modules_and_bins() {
     let nm = project.path().join("node_modules");
     // Top-level relay: a symlink into the shared graph volume.
     assert_resolves(&nm.join("greet"));
-    // Nested packages and bins live inside the volume as hardlinked real
-    // files/dirs (not symlinks), reached transitively through the top-level
-    // relay. They must still be reachable and correct from the project view.
+    // Nested packages live inside the volume as hardlinked real files/dirs
+    // (not symlinks), reached transitively through the top-level relay. Bins
+    // intentionally remain relative symlinks so Node preserves package-relative
+    // resolution when launching a CLI.
     assert!(nm.join("greet/node_modules/dep").exists());
     assert!(nm.join("greet/package.json").exists());
     assert!(nm.join("greet/node_modules/dep/package.json").exists());
@@ -184,6 +185,11 @@ fn frozen_install_materializes_node_modules_and_bins() {
     let bin = nm.join(".bin").join("hello");
     assert!(bin.exists(), "bin must be reachable through the relay");
     assert!(is_executable(&bin), "bin must keep its executable bit");
+    assert_eq!(
+        fs::read_link(&bin).unwrap(),
+        PathBuf::from("../greet/cli.js"),
+        "volume bins must preserve package-relative resolution",
+    );
 }
 
 #[test]

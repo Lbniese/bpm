@@ -474,41 +474,47 @@ fn run_tool(
             .stderr(std::process::Stdio::null())
             .status()
             .map_err(|e| anyhow::anyhow!("failed to run pnpm: {e}"))?),
-        // bpm: convert the real npm package-lock.json to bpm.lock, then run the
-        // frozen installer against the per-scenario store. Like npm/pnpm, this
-        // hits the registry on cold runs and reuses the store on warm/repeat.
+        // Prefer the frozen imported lockfile when the scenario provides one,
+        // so comparisons use the same resolved graph. True-cold scenarios do
+        // not have a lockfile by design; native BPM resolution now handles
+        // that path directly and should be benchmarked rather than rejected.
         Tool::Bpm => {
             let bpm_bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("bpm"));
             let pkg_lock = work_dir.join("package-lock.json");
-            if !pkg_lock.exists() {
-                anyhow::bail!(
-                    "bpm tool requires a package-lock.json in {} (scenario produced none)",
-                    work_dir.display()
-                );
-            }
-            let import = Command::new(&bpm_bin)
-                .arg("import")
-                .arg(&pkg_lock)
-                .arg("--out")
-                .arg(work_dir.join("bpm.lock"))
-                .current_dir(work_dir)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .map_err(|e| anyhow::anyhow!("failed to run `bpm import`: {e}"))?;
-            if !import.success() {
-                return Ok(import);
+            if pkg_lock.exists() {
+                let import = Command::new(&bpm_bin)
+                    .arg("import")
+                    .arg(&pkg_lock)
+                    .arg("--out")
+                    .arg(work_dir.join("bpm.lock"))
+                    .current_dir(work_dir)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .map_err(|e| anyhow::anyhow!("failed to run `bpm import`: {e}"))?;
+                if !import.success() {
+                    return Ok(import);
+                }
+                return Command::new(&bpm_bin)
+                    .arg("install")
+                    .arg("--frozen")
+                    .arg("--store")
+                    .arg(bpm_store)
+                    .current_dir(work_dir)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .map_err(|e| anyhow::anyhow!("failed to run `bpm install --frozen`: {e}"));
             }
             Ok(Command::new(&bpm_bin)
                 .arg("install")
-                .arg("--frozen")
                 .arg("--store")
                 .arg(bpm_store)
                 .current_dir(work_dir)
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status()
-                .map_err(|e| anyhow::anyhow!("failed to run `bpm install --frozen`: {e}"))?)
+                .map_err(|e| anyhow::anyhow!("failed to run native `bpm install`: {e}"))?)
         }
         Tool::Yarn => Ok(Command::new("yarn")
             .arg("install")
