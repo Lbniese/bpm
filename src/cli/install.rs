@@ -259,7 +259,12 @@ pub(super) fn run(options: Options) -> anyhow::Result<()> {
     }
 
     let has_workspace_links = lockfile.packages.iter().any(|package| package.link);
-    let (volume, relay_count) = if has_workspace_links {
+    // Turbopack and similar bundlers enforce that dependency realpaths remain
+    // inside the project. Keep the O(top-level) relay fast path for ordinary
+    // projects, but use a local hardlink view automatically for Next projects;
+    // callers can override this with BPM_PROJECT_VIEW=relay|local.
+    let local_project_view = !has_workspace_links && use_local_project_view(&lockfile);
+    let (volume, mut view_entry_count) = if has_workspace_links {
         bpm::materializer::materialize_lockfile(
             &project_root,
             &store,
@@ -286,6 +291,12 @@ pub(super) fn run(options: Options) -> anyhow::Result<()> {
         options.ignore_scripts,
         &mut metrics,
     );
+    if local_project_view {
+        if let Some(volume) = volume.as_ref() {
+            let attached = bpm::volume::attach_project_local(&project_root, volume)?;
+            view_entry_count = attached.relays_created + attached.relays_unchanged;
+        }
+    }
 
     let mut plan = graph::build_plan(&lockfile, &artifact_ids, &lifecycle.derived_paths);
     plan.graph_id_hex = graph::graph_id_for_project(&lockfile, &project_root).to_hex();
@@ -301,7 +312,7 @@ pub(super) fn run(options: Options) -> anyhow::Result<()> {
         .filter(|package| !package.link && !package.resolved.is_empty())
         .count();
     println!(
-        "installed {} package(s) into {} ({} cached, {} fetched; graph volume {}, {} relay(s))",
+        "installed {} package(s) into {} ({} cached, {} fetched; graph volume {}, {} project-view entry(s))",
         package_count,
         project_root.join("node_modules").display(),
         cached,
@@ -313,9 +324,23 @@ pub(super) fn run(options: Options) -> anyhow::Result<()> {
         } else {
             "direct"
         },
-        relay_count
+        view_entry_count
     );
     write_metrics(&metrics, options.json_metrics)
+}
+
+fn use_local_project_view(lockfile: &Lockfile) -> bool {
+    match env::var("BPM_PROJECT_VIEW").as_deref() {
+        Ok("local") => true,
+        Ok("relay") => false,
+        Ok(value) if !value.is_empty() => {
+            eprintln!(
+                "warning: unsupported BPM_PROJECT_VIEW={value:?}; expected relay or local; using auto"
+            );
+            lockfile.root.dependencies.contains_key("next")
+        }
+        _ => lockfile.root.dependencies.contains_key("next"),
+    }
 }
 
 fn adaptive_workers(requested: usize, work_items: usize, project_root: &Path) -> usize {
@@ -576,27 +601,9 @@ fn enforce_frozen(project_root: &Path, lockfile: &Lockfile) -> anyhow::Result<()
             return Ok(());
         }
     };
-    let mut declared = BTreeSet::new();
-    declared.extend(manifest.dependencies.keys().cloned());
-    declared.extend(manifest.dev_dependencies.keys().cloned());
-    declared.extend(manifest.optional_dependencies.keys().cloned());
-    declared.extend(manifest.peer_dependencies.keys().cloned());
+    let root_declarations = manifest.root_dependency_declarations();
+    let declared: BTreeSet<String> = root_declarations.keys().cloned().collect();
     let locked: BTreeSet<String> = lockfile.root.dependencies.keys().cloned().collect();
-
-    let mut root_declarations = manifest.dependencies.clone();
-    for (name, spec) in &manifest.optional_dependencies {
-        root_declarations.insert(name.clone(), spec.clone());
-    }
-    for (name, spec) in &manifest.peer_dependencies {
-        root_declarations
-            .entry(name.clone())
-            .or_insert_with(|| spec.clone());
-    }
-    for (name, spec) in &manifest.dev_dependencies {
-        root_declarations
-            .entry(name.clone())
-            .or_insert_with(|| spec.clone());
-    }
     let expected_overrides = resolver::overrides::OverrideSet::from_manifest(
         &manifest.overrides,
         &root_declarations,
