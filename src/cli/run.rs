@@ -1,6 +1,11 @@
 //! `package.json` lifecycle-script command orchestration.
 
-use std::{env, ffi::OsString, path::MAIN_SEPARATOR, process::Command};
+use std::{
+    env,
+    ffi::OsString,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use bpm::manifest::PackageManifest;
 
@@ -30,12 +35,7 @@ pub(super) fn run(script: &str) -> anyhow::Result<()> {
     child.env("npm_execpath", "bpm");
     child.env("INIT_CWD", &cwd);
     child.env("NODE", which("node").unwrap_or_else(|| "node".into()));
-    if let Some(path) = env::var_os("PATH") {
-        let mut new_path = OsString::from(&bin);
-        new_path.push(MAIN_SEPARATOR.to_string());
-        new_path.push(path);
-        child.env("PATH", new_path);
-    }
+    child.env("PATH", path_with_bin(&bin, env::var_os("PATH"))?);
     let status = child
         .status()
         .map_err(|e| anyhow::anyhow!("failed to run script: {e}"))?;
@@ -43,6 +43,15 @@ pub(super) fn run(script: &str) -> anyhow::Result<()> {
         anyhow::bail!("script '{script}' exited with status {:?}", status.code());
     }
     Ok(())
+}
+
+fn path_with_bin(bin: &Path, inherited: Option<OsString>) -> anyhow::Result<OsString> {
+    let mut paths = vec![PathBuf::from(bin)];
+    if let Some(inherited) = inherited {
+        paths.extend(env::split_paths(&inherited));
+    }
+    env::join_paths(paths)
+        .map_err(|error| anyhow::anyhow!("could not construct PATH for lifecycle script: {error}"))
 }
 
 fn which(tool: &str) -> Option<String> {
@@ -54,4 +63,30 @@ fn which(tool: &str) -> Option<String> {
         .filter(|output| output.status.success())
         .and_then(|output| String::from_utf8(output.stdout).ok())
         .map(|value| value.trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{env, path::PathBuf};
+
+    use super::path_with_bin;
+
+    #[test]
+    fn prepends_bin_using_platform_path_separator() {
+        let inherited = env::join_paths([PathBuf::from("first"), PathBuf::from("second")]).unwrap();
+        let joined = path_with_bin(
+            PathBuf::from("node_modules/.bin").as_path(),
+            Some(inherited),
+        )
+        .unwrap();
+
+        assert_eq!(
+            env::split_paths(&joined).collect::<Vec<_>>(),
+            vec![
+                PathBuf::from("node_modules/.bin"),
+                PathBuf::from("first"),
+                PathBuf::from("second")
+            ]
+        );
+    }
 }

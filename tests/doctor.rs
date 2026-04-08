@@ -199,7 +199,7 @@ fn text_output_contains_version_and_roots() {
     write(root, "package.json", r#"{"name":"app","version":"1.0.0"}"#);
     let report = run(root);
     let text = report.render_text();
-    assert!(text.contains("bpm 0.1.5"));
+    assert!(text.contains("bpm 0.1.6"));
     assert!(text.contains("repository root:"));
     assert!(text.contains("project root:"));
 }
