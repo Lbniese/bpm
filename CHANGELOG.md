@@ -10,6 +10,14 @@ once a 1.0 release is cut.
 
 ### Fixed
 
+- `bpm run` now prepends `node_modules/.bin` using the platform PATH-list
+  separator, so script commands such as `next` and `eslint` resolve on Unix
+  and Windows just as they do through `bpm exec`.
+
+## [0.1.6] - 2026-07-17
+
+### Fixed
+
 - `bpm import` now enriches imported npm lockfiles from the sibling
   `package.json`, preserving root dev/optional declarations and supported
   overrides so the generated `bpm.lock` passes `bpm ci` validation.
@@ -164,7 +172,8 @@ Initial release.
   into the graph id.
 - Install-timing benchmark harness with machine-stamped baselines.
 
-[Unreleased]: https://github.com/lbniese/bpm/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/lbniese/bpm/compare/v0.1.6...HEAD
+[0.1.6]: https://github.com/Lbniese/bpm/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/lbniese/bpm/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/lbniese/bpm/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/lbniese/bpm/compare/v0.1.2...v0.1.3
