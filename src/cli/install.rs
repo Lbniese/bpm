@@ -1,0 +1,2696 @@
+//! Lockfile and global-bin install orchestration.
+
+/// Number of tokio worker threads for the async resolver runtime. The resolver
+/// launches best-effort background packument prefetches via `tokio::spawn`
+/// (best-effort background fan-out); a multi-threaded runtime lets those fetches overlap on
+/// real worker threads instead of cooperatively sharing one current-thread
+/// task. Placement stays serial and deterministic — only HTTP I/O moves to
+/// worker threads. Bounded to avoid overwhelming the registry connection pool.
+const ASYNC_RESOLVER_WORKERS: usize = 8;
+
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::env;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Instant;
+
+use bpm::config::NpmConfig;
+use bpm::graph;
+use bpm::http::{redact_url, HttpClient};
+use bpm::integrity::{ArtifactId, Integrity};
+use bpm::lockfile::{LockSource, Lockfile};
+use bpm::manifest::PackageManifest;
+use bpm::metrics::Metrics;
+use bpm::path_safety::{validate_bin_name, validate_bin_target};
+use bpm::project_lock::{find_project_lock, validate_npm_direct_install, ProjectLockKind};
+use bpm::resolution_cache::{key_for as resolution_snapshot_key, ResolutionSnapshotCache};
+use bpm::resolver;
+use bpm::resolver::model::PlatformConstraints;
+use bpm::resolver::platform::{check_package_platform, PackageReachability, PlatformDisposition};
+use bpm::store::{ArtifactStore, StoreError};
+
+use super::fetch::{
+    name_of_spec, open_metadata_cache, open_registry_client, store_root, write_metrics,
+};
+
+pub(super) struct Options {
+    pub targets: Vec<String>,
+    pub frozen: bool,
+    pub registry: Option<String>,
+    pub store: Option<PathBuf>,
+    pub concurrency: usize,
+    pub json_metrics: Option<PathBuf>,
+    pub global: bool,
+    pub ignore_scripts: bool,
+    /// Explicit `--omit=dev` request. `NODE_ENV=production` is evaluated at
+    /// install time so callers that construct these options internally retain
+    /// the same npm-compatible default.
+    pub omit_dev: bool,
+    /// Explicit `--include=dev` request, which wins over either omit source.
+    pub include_dev: bool,
+    /// Experimental per-package lifecycle-derived image cache (`--derived-store` / `BPM_DERIVED_STORE`).
+    pub derived_store: bool,
+    /// Run Git package build-context prepare scripts and consume their images.
+    pub git_prepare: bool,
+    pub legacy_peer_deps: bool,
+    pub cache_mode: bpm::metadata_cache::CacheMode,
+    /// Optional verified remote artifact cache endpoint.
+    pub remote_cache: Option<String>,
+    /// `bpm install -D` / `bpm add --save-dev`: write added packages into
+    /// `devDependencies` and remove them from `dependencies`.
+    pub save_dev: bool,
+    /// `bpm install -E` / `bpm add --save-exact`: save the resolved version as
+    /// an exact `X.Y.Z` rather than the default `^X.Y.Z`.
+    pub save_exact: bool,
+}
+
+impl Options {
+    /// `NODE_ENV` has one bounded compatibility meaning in this slice: only
+    /// the exact production value selects npm's production profile. Other
+    /// ambient values do not leak into lifecycle/cache identity.
+    fn ambient_production_mode() -> bool {
+        matches!(env::var("NODE_ENV").as_deref(), Ok("production"))
+    }
+
+    /// Effective npm-compatible dev omission. Explicit inclusion always wins
+    /// regardless of argv order.
+    fn effective_omit_dev(&self) -> bool {
+        self.install_profile().omits_dev()
+    }
+
+    fn install_profile(&self) -> graph::InstallProfile {
+        let ambient_production = Self::ambient_production_mode();
+        let omit_dev = (self.omit_dev || ambient_production) && !self.include_dev;
+        if omit_dev {
+            graph::InstallProfile::dev_omitted()
+        } else if ambient_production {
+            // `--include=dev` restores the physical tree but not the
+            // lifecycle environment inherited from production mode. Its
+            // distinct profile prevents reuse of normal lifecycle output.
+            graph::InstallProfile::production_full_tree()
+        } else {
+            graph::InstallProfile::default_profile()
+        }
+    }
+}
+
+pub(super) fn run(mut options: Options) -> anyhow::Result<()> {
+    if options.remote_cache.is_none() {
+        options.remote_cache = env::var_os("BPM_REMOTE_CACHE")
+            .map(PathBuf::from)
+            .map(|p| p.to_string_lossy().into_owned());
+    }
+    // `--derived-store` and `BPM_DERIVED_STORE=1` are equivalent. Honor the
+    // env var so callers (and tests) can opt in without a CLI flag, mirroring
+    // `BPM_STREAM_INSTALL` / `BPM_PROJECT_VIEW`.
+    if !options.derived_store {
+        options.derived_store =
+            matches!(env::var("BPM_DERIVED_STORE").as_deref(), Ok("1" | "true"));
+    }
+    if !options.git_prepare {
+        // Default-on: BPM_GIT_PREPARE=0 to disable, any other value or absent = enabled.
+        options.git_prepare = !matches!(env::var("BPM_GIT_PREPARE").as_deref(), Ok("0"));
+    }
+    // Global bin linking retains the pre-mutation single-target behavior. Do
+    // not silently discard additional targets: users must invoke global
+    // installs once per package until multi-package bin ownership exists.
+    if options.global {
+        match options.targets.as_slice() {
+            [] => anyhow::bail!(
+                "global install (`-g`) requires a package target; \
+                 omit `-g` to install the project lockfile"
+            ),
+            [target] => {
+                return run_global_install(
+                    target,
+                    options.registry.clone(),
+                    options.store.clone(),
+                    options.cache_mode,
+                    options.remote_cache.as_deref(),
+                )
+            }
+            _ => anyhow::bail!(
+                "global install (`-g`) accepts exactly one package target; \
+                 run one command per global package"
+            ),
+        }
+    }
+
+    // Local dependency mutation: `bpm install foo` / `bpm add foo` edits
+    // package.json, resolves the whole edited graph, writes the selected lock,
+    // and installs. Save flags are only meaningful here.
+    if !options.targets.is_empty() {
+        return super::mutate::run_add(&options);
+    }
+
+    let store_root_path = store_root(options.store.clone())?;
+    let cwd = env::current_dir()?;
+    let (lockfile_path, lockfile, project_root, lock_kind) = match find_project_lock(&cwd)? {
+        Some(project_lock) => {
+            if project_lock.kind == ProjectLockKind::NpmV3 {
+                validate_npm_direct_install(&project_lock.diagnostics)?;
+                render_import_diagnostics(&project_lock.diagnostics);
+            }
+            (
+                project_lock.path,
+                project_lock.lockfile,
+                project_lock.project_root,
+                project_lock.kind,
+            )
+        }
+        None if options.frozen => anyhow::bail!(
+            "frozen install requires bpm.lock or supported package-lock.json v2/v3 in {} or an ancestor",
+            cwd.display()
+        ),
+        None => {
+            let root = bpm::project::find_project_root(&cwd).unwrap_or(cwd.clone());
+            let manifest = PackageManifest::from_path(&root.join("package.json"))
+                .map_err(|error| anyhow::anyhow!("cannot resolve dependencies: {error}"))?;
+            let config = effective_npm_config(&root, options.registry.as_deref())?;
+            let http = HttpClient::new(config.clone());
+            let client =
+                open_registry_client(&store_root_path, config.clone(), http.clone(), options.cache_mode)?;
+            let workspace_layout = bpm::workspace::discover(&root);
+            let workspace_index = bpm::resolver::workspaces::WorkspaceIndex::from_project_root(
+                &root,
+                &workspace_layout,
+            )
+            .map_err(|error| anyhow::anyhow!("workspace resolution failed: {error}"))?;
+            let peer_mode = if options.legacy_peer_deps {
+                bpm::resolver::peer::PeerMode::LegacyIgnore
+            } else {
+                bpm::resolver::peer::PeerMode::Strict
+            };
+            let target = bpm::resolver::current_target_platform();
+            let snapshot_cache = ResolutionSnapshotCache::new(&store_root_path);
+            let snapshot_key = resolution_snapshot_key(
+                &manifest,
+                &workspace_index,
+                &config,
+                peer_mode,
+                &target,
+            );
+            if options.cache_mode.serves_stale() {
+                if let Some(lockfile) = snapshot_cache.load(&snapshot_key) {
+                    let path = root.join(bpm::lockfile::BPM_LOCK_FILE);
+                    lockfile.write_to(&path)?;
+                    eprintln!(
+                        "reused cached resolution for {} package(s) and wrote {}",
+                        lockfile.packages.len(),
+                        path.display()
+                    );
+                    return install_resolved_lockfile(
+                        &root,
+                        &path,
+                        lockfile,
+                        ProjectLockKind::Bpm,
+                        &options,
+                        &store_root_path,
+                    );
+                }
+            }
+            let store = ArtifactStore::open(&store_root_path)?;
+            let mut metrics = Metrics::new();
+            // Async resolve (default since Phase 4); the blocking resolver is the BPM_ASYNC_RESOLVE=0 kill-switch path.
+            // Fresh-install resolver/streaming mode matrix. Every row honors the
+            // CLI-selected peer_mode (strict unless --legacy-peer-deps) so a
+            // legacy install never fails on a peer conflict legacy mode exists
+            // to ignore:
+            //   streaming + async     -> async resolver + download pipeline sink
+            //   streaming + blocking  -> blocking resolver + download pipeline sink
+            //   non-streaming + async -> async resolver, then install pipeline
+            //   non-streaming + blocking -> blocking resolver, then install
+            //   pipeline. The two non-streaming rows share the lockfile write +
+            //   install_resolved_lockfile handoff below.
+            // Omitted-dev installation must classify the complete resolved
+            // graph before any artifact is fetched. Keep normal installs on
+            // the established streaming path, but force this profile through
+            // the resolve -> authoritative-lock write -> projection handoff.
+            if !options.effective_omit_dev() && streaming_install_enabled() && async_resolve_enabled() {
+                return run_streaming_async_install(
+                    &root,
+                    &manifest,
+                    &workspace_index,
+                    peer_mode,
+                    options.concurrency,
+                    &store,
+                    &http,
+                    &mut metrics,
+                    &options,
+                    &snapshot_cache,
+                    &snapshot_key,
+                );
+            }
+            if !options.effective_omit_dev() && streaming_install_enabled() {
+                return run_streaming_install(
+                    &root,
+                    &manifest,
+                    &client,
+                    &workspace_index,
+                    peer_mode,
+                    options.concurrency,
+                    &store,
+                    &http,
+                    &mut metrics,
+                    &options,
+                    &snapshot_cache,
+                    &snapshot_key,
+                );
+            }
+            // Non-streaming: resolve the whole graph before downloading. Route
+            // on the async kill-switch so BPM_ASYNC_RESOLVE=0 selects the
+            // blocking resolver instead of silently using async. Both rows
+            // share the lockfile write + install_resolved_lockfile handoff.
+            let async_mode = async_resolve_enabled();
+            let lockfile = if async_mode {
+                resolve_fresh_manifest_async(
+                    &manifest,
+                    &workspace_index,
+                    peer_mode,
+                    &store,
+                    config,
+                    options.cache_mode,
+                    &mut metrics,
+                    &snapshot_cache,
+                    &snapshot_key,
+                )?
+            } else {
+                resolve_fresh_manifest_blocking(
+                    &manifest,
+                    &client,
+                    &workspace_index,
+                    peer_mode,
+                    &http,
+                    &mut metrics,
+                    &snapshot_cache,
+                    &snapshot_key,
+                )?
+            };
+            let path = root.join(bpm::lockfile::BPM_LOCK_FILE);
+            lockfile.write_to(&path)?;
+            eprintln!(
+                "resolved {} package(s){} and wrote {}",
+                lockfile.packages.len(),
+                if async_mode { " (async)" } else { "" },
+                path.display()
+            );
+            (path, lockfile, root, ProjectLockKind::Bpm)
+        }
+    };
+    install_resolved_lockfile(
+        &project_root,
+        &lockfile_path,
+        lockfile,
+        lock_kind,
+        &options,
+        &store_root_path,
+    )
+}
+
+/// Install an already-resolved lockfile: enforce frozen drift, check the graph
+/// plan cache, run the download→extract pipeline, materialize, run lifecycle,
+/// and write the install plan. Shared by lockfile-present install and by
+/// [`crate::cli::mutate`] (add/remove), which resolve an edited manifest and
+/// then hand the resulting graph to this function. Never recursively invokes
+/// the BPM binary and never writes a throwaway lock to pass data around.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn install_resolved_lockfile(
+    project_root: &Path,
+    lockfile_path: &Path,
+    lockfile: Lockfile,
+    lock_kind: ProjectLockKind,
+    options: &Options,
+    store_root_path: &Path,
+) -> anyhow::Result<()> {
+    let store = ArtifactStore::open(store_root_path)?;
+    let mut metrics = Metrics::new();
+    if options.frozen {
+        // Drift truth is always the complete lock, never the install-only
+        // omitted-dev projection below.
+        enforce_frozen(project_root, &lockfile, lock_kind.filename())?;
+    }
+    let profile = options.install_profile();
+    let lockfile = if profile.omits_dev() {
+        project_lockfile_omitting_dev(&lockfile)
+    } else {
+        lockfile
+    };
+
+    let config = effective_npm_config(project_root, options.registry.as_deref())?;
+    let http = HttpClient::new(config.clone());
+    let registry = open_registry_client(store_root_path, config, http.clone(), options.cache_mode)?;
+    let remote = if options.cache_mode.allows_network() {
+        options
+            .remote_cache
+            .as_deref()
+            .map(|base| {
+                let token = env::var("BPM_REMOTE_CACHE_TOKEN").ok();
+                bpm::remote_cache::RemoteCacheConfig::new(base, token)
+                    .map_err(|error| anyhow::anyhow!("invalid remote cache configuration: {error}"))
+                    .and_then(|config| {
+                        bpm::remote_cache::RemoteCacheClient::new(config).map_err(|error| {
+                            anyhow::anyhow!("invalid remote cache configuration: {error}")
+                        })
+                    })
+            })
+            .transpose()?
+    } else {
+        None
+    };
+
+    let plan_path = graph::plan_path_for(lockfile_path);
+    let cached_plan = graph::read_plan(&plan_path)?;
+    let git_prepare_enabled = options.git_prepare
+        && lockfile
+            .resolution
+            .packages
+            .values()
+            .any(|resolution| matches!(resolution.source, LockSource::Git { .. }));
+    let plan_valid = !git_prepare_enabled
+        && cached_plan.as_ref().is_some_and(|plan| {
+            graph::validate_plan_with_profile(plan, &lockfile, project_root, &store, profile)
+                .is_ok()
+        });
+    if plan_valid {
+        metrics.record("plan_cache_hit", std::time::Duration::ZERO);
+        let plan = cached_plan.as_ref().expect("validated cached plan exists");
+        let materialized = plan
+            .entries
+            .iter()
+            .filter(|entry| {
+                !entry.link && !entry.resolved.is_empty() && !entry.artifact_hex.is_empty()
+            })
+            .count();
+        let bins = plan
+            .entries
+            .iter()
+            .map(|entry| entry.bin.len())
+            .sum::<usize>();
+        // A plan-cache hit performs no fetch/materialization, but it must still
+        // refresh ownership so a concurrent `bpm gc` cannot age out the cached
+        // graph or its dependencies: re-lease the graph's durable inventory,
+        // record access, and rewrite the durable project registration + SQLite
+        // reference. A legacy/incomplete cached volume returns an error here so
+        // the caller retries a full install to avoid a false no-op success.
+        let graph_id = graph::graph_id_for_project_with_profile(&lockfile, project_root, profile);
+        let graph_hex = graph_id.to_hex();
+        let graph_hex_short = graph_id.to_hex_short();
+        let graph_path = store.graph_volume_path(&graph_hex);
+        let refreshed = bpm::metadata::InstallSession::open(store.root())
+            .and_then(|mut session| session.refresh_cached_graph(project_root, &graph_hex));
+        match refreshed {
+            Ok(()) => {
+                println!(
+                    "nothing to install — graph {} unchanged ({} package(s), {} bin(s) already materialized)",
+                    graph_hex_short,
+                    materialized,
+                    bins
+                );
+                metrics.add_requests(http.request_count());
+                return write_metrics(&metrics, options.json_metrics.clone());
+            }
+            Err(error) => {
+                let clear_cache =
+                    matches!(&error, bpm::metadata::MetadataError::MissingObject { .. });
+                eprintln!(
+                    "warning: could not refresh graph ownership for {graph_hex_short}, rebuilding from lockfile: {error}",
+                );
+                if clear_cache && graph_path.exists() {
+                    if let Err(error) = fs::remove_dir_all(&graph_path) {
+                        eprintln!(
+                            "warning: failed to clear stale graph cache at {}: {error}",
+                            graph_path.display(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    metrics.record("plan_cache_miss", std::time::Duration::ZERO);
+
+    let work = build_install_work(&lockfile, options.frozen, lock_kind.filename())?;
+    let workers = adaptive_workers(options.concurrency, work.len(), project_root);
+    let outcomes = std::thread::scope(|scope| -> anyhow::Result<Vec<FetchOutcome>> {
+        let (unit_tx, unit_rx) = std::sync::mpsc::sync_channel::<InstallWork>(workers.max(1) * 2);
+        let unit_rx = std::sync::Arc::new(std::sync::Mutex::new(unit_rx));
+        let (downloaders, extractors, clock) =
+            spawn_fetch_pipeline(scope, &store, &http, remote.as_ref(), unit_rx, workers);
+        for item in work {
+            if unit_tx.send(item).is_err() {
+                break;
+            }
+        }
+        drop(unit_tx);
+        join_pipeline(downloaders, extractors, &mut metrics, &clock)
+    })?;
+
+    let cached = outcomes
+        .iter()
+        .filter(|outcome| outcome.artifact_cached && outcome.image_cached)
+        .count();
+    let fetched = outcomes.len() - cached;
+    let artifact_ids = outcomes_to_artifact_ids(&outcomes, &lockfile);
+    metrics.add_requests(http.request_count());
+    finalize_install(
+        project_root,
+        &store,
+        &lockfile,
+        &artifact_ids,
+        cached,
+        fetched,
+        &mut metrics,
+        options,
+        lockfile_path,
+        &registry,
+        cached_plan.as_ref(),
+        profile,
+    )
+}
+
+/// Build the install-only projection used by effective `--omit=dev` installs.
+///
+/// The authoritative lock remains complete on disk. We begin with every
+/// package that is not marked dev-only, then retain the fixed-point runtime
+/// closure of their normal, optional, and required peer/provider edges. Native
+/// locks provide exact targets in `resolution.packages`; direct npm package
+/// tables do not, so their declared dependencies use a conservative Node-style
+/// placement lookup. Ambiguous legacy provenance retains rather than prunes.
+fn project_lockfile_omitting_dev(authoritative: &Lockfile) -> Lockfile {
+    let all_paths: BTreeSet<String> = authoritative
+        .packages
+        .iter()
+        .map(|package| package.path.clone())
+        .collect();
+    let package_by_path: HashMap<&str, &bpm::lockfile::PackageEntry> = authoritative
+        .packages
+        .iter()
+        .map(|package| (package.path.as_str(), package))
+        .collect();
+    let mut retained: BTreeSet<String> = authoritative
+        .packages
+        .iter()
+        .filter(|package| !package.dev)
+        .map(|package| package.path.clone())
+        .collect();
+    let mut pending: VecDeque<String> = retained.iter().cloned().collect();
+
+    while let Some(path) = pending.pop_front() {
+        let Some(package) = package_by_path.get(path.as_str()).copied() else {
+            // The authoritative input may already contain a dangling edge. Do
+            // not turn it into a different omission error by inventing a
+            // package record; only filter real records below.
+            continue;
+        };
+        for target in runtime_dependency_targets(authoritative, package, &all_paths) {
+            if all_paths.contains(&target) && retained.insert(target.clone()) {
+                pending.push_back(target);
+            }
+        }
+    }
+
+    let mut projected = authoritative.clone();
+    projected
+        .packages
+        .retain(|package| retained.contains(&package.path));
+    projected
+        .resolution
+        .packages
+        .retain(|path, _| retained.contains(path));
+    projected
+        .resolution
+        .registry_names
+        .retain(|path, _| retained.contains(path));
+    prune_omitted_optional_peer_metadata(&mut projected, &retained);
+    projected.sort_packages();
+    projected
+}
+
+/// Return every runtime target that must survive dev omission for a package.
+///
+/// Exact resolver metadata is authoritative when available. When an imported
+/// npm package table lacks it, only undeclared metadata entries fall back to a
+/// Node lookup through known physical placements; this can retain more than a
+/// fully annotated native lock, but never removes a required edge on guesswork.
+fn runtime_dependency_targets(
+    lockfile: &Lockfile,
+    package: &bpm::lockfile::PackageEntry,
+    all_paths: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let mut targets = BTreeSet::new();
+    let mut metadata_names = BTreeSet::new();
+    if let Some(metadata) = lockfile.resolution.packages.get(&package.path) {
+        for (name, dependency) in metadata
+            .dependencies
+            .iter()
+            .chain(metadata.optional_dependencies.iter())
+        {
+            metadata_names.insert(name.as_str());
+            targets.insert(dependency.target.clone());
+        }
+        for (name, dependency) in &metadata.peer_dependencies {
+            metadata_names.insert(name.as_str());
+            if !metadata.optional_peers.contains(name) {
+                targets.insert(dependency.target.clone());
+            }
+        }
+        for (name, provider) in &metadata.peer_context {
+            if !metadata.optional_peers.contains(name) {
+                targets.insert(provider.path.clone());
+            }
+        }
+    }
+
+    // Imported package-lock tables retain dependency specs but do not carry
+    // BPM's resolved target metadata. Fall back only for names not covered by
+    // metadata so a native explicit target is never second-guessed.
+    for name in package.dependencies.keys() {
+        if metadata_names.contains(name.as_str()) {
+            continue;
+        }
+        if let Some(target) = node_style_dependency_target(&package.path, name, all_paths) {
+            targets.insert(target);
+        }
+    }
+    targets
+}
+
+/// Resolve one legacy package-table dependency by the Node module lookup
+/// sequence, restricted to the complete lock's known physical placements.
+fn node_style_dependency_target(
+    package_path: &str,
+    dependency_name: &str,
+    all_paths: &BTreeSet<String>,
+) -> Option<String> {
+    let mut owner = Some(package_path);
+    while let Some(current) = owner {
+        let candidate = format!("{current}/node_modules/{dependency_name}");
+        if all_paths.contains(&candidate) {
+            return Some(candidate);
+        }
+        owner = parent_package_path(current);
+    }
+    let root_candidate = format!("node_modules/{dependency_name}");
+    all_paths
+        .contains(&root_candidate)
+        .then_some(root_candidate)
+}
+
+/// Package path of the containing physical package, if any. Root placements
+/// have no `/node_modules/` prefix before their own final placement segment.
+fn parent_package_path(path: &str) -> Option<&str> {
+    path.rsplit_once("/node_modules/").map(|(parent, _)| parent)
+}
+
+/// Optional peers are intentionally not retained solely for omission. If their
+/// target/provider was omitted, remove only that stale optional metadata while
+/// preserving every remaining declaration and all required/dangling edges.
+fn prune_omitted_optional_peer_metadata(lockfile: &mut Lockfile, retained: &BTreeSet<String>) {
+    for metadata in lockfile.resolution.packages.values_mut() {
+        let optional_peers: Vec<String> = metadata.optional_peers.iter().cloned().collect();
+        for name in optional_peers {
+            let peer_target_omitted = metadata
+                .peer_dependencies
+                .get(&name)
+                .is_some_and(|dependency| !retained.contains(&dependency.target));
+            let provider_omitted = metadata
+                .peer_context
+                .get(&name)
+                .is_some_and(|provider| !retained.contains(&provider.path));
+
+            if peer_target_omitted {
+                metadata.peer_dependencies.remove(&name);
+            }
+            if provider_omitted {
+                metadata.peer_context.remove(&name);
+            }
+            if !metadata.peer_dependencies.contains_key(&name)
+                && !metadata.peer_context.contains_key(&name)
+            {
+                metadata.optional_peers.remove(&name);
+            }
+        }
+    }
+}
+
+/// The project's `node_modules` attachment shape, resolved from
+/// `BPM_PROJECT_VIEW` or auto-detected from the resolved graph.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProjectView {
+    /// Project-local independent tree per package (realpaths stay project-local).
+    Local,
+    /// Project-local copy-on-write reflink tree per package; isolated from the
+    /// store image on supporting filesystems, hardlink fallback otherwise.
+    Reflink,
+}
+
+fn resolve_project_view(lockfile: &Lockfile, project_root: &Path) -> ProjectView {
+    let override_view = env::var("BPM_PROJECT_VIEW")
+        .ok()
+        .filter(|value| !value.is_empty());
+    resolve_project_view_with(lockfile, project_root, override_view.as_deref())
+}
+
+fn resolve_project_view_with(
+    _lockfile: &Lockfile,
+    _project_root: &Path,
+    view: Option<&str>,
+) -> ProjectView {
+    let auto = || ProjectView::Reflink;
+    match view {
+        Some("reflink") => ProjectView::Reflink,
+        Some("local") => ProjectView::Local,
+        Some("relay") => {
+            eprintln!(
+                "warning: BPM_PROJECT_VIEW=relay is unsafe; using isolated reflink/copy view"
+            );
+            ProjectView::Reflink
+        }
+        Some(value) => {
+            eprintln!(
+                "warning: unsupported BPM_PROJECT_VIEW={value:?}; expected relay, local, or reflink; using auto"
+            );
+            auto()
+        }
+        None => auto(),
+    }
+}
+
+/// Packages whose presence in a resolved graph marks the project as needing
+/// a local (non-relay) view. These are tools that canonicalize dependency
+/// realpaths themselves and reject symlinked `node_modules` entries; Next.js
+/// is the canonical example (Turbopack resolves its toolchain from the project
+/// and requires those realpaths to remain project-local).
+///
+/// The default set preserves prior behavior (`["next"]` only). Operators can
+/// extend it without code changes via `BPM_LOCAL_VIEW_PACKAGES`, a
+/// comma-separated list of package names that is merged with the built-in
+/// `next` default; the built-in `next` entry is always retained so existing
+/// Next.js installs never regress even if the env list omits it.
+#[cfg(test)]
+fn local_view_fragile_packages() -> Vec<String> {
+    let mut packages = vec!["next".to_string()];
+    if let Ok(value) = env::var("BPM_LOCAL_VIEW_PACKAGES") {
+        for name in value
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            if !packages.iter().any(|existing| existing == name) {
+                packages.push(name.to_string());
+            }
+        }
+    }
+    packages
+}
+
+#[cfg(test)]
+fn auto_local_project_view(lockfile: &Lockfile) -> bool {
+    // Check the resolved graph rather than only root declarations. Imported
+    // lockfiles and workspace layouts can represent the app's Next package as
+    // a transitive placement, but Next still resolves its toolchain from the
+    // project and requires those realpaths to remain project-local.
+    let fragile = local_view_fragile_packages();
+    auto_local_project_view_with_fragile(lockfile, &fragile)
+}
+
+#[cfg(test)]
+fn auto_local_project_view_with_fragile(lockfile: &Lockfile, fragile: &[String]) -> bool {
+    lockfile
+        .packages
+        .iter()
+        .any(|package| fragile.iter().any(|name| &package.name == name))
+}
+
+fn adaptive_workers(requested: usize, work_items: usize, project_root: &Path) -> usize {
+    if requested > 0 {
+        return requested.min(work_items.max(1));
+    }
+    let cpu = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1);
+    let fs_limit = bpm::workspace::probe_fs_capabilities(project_root)
+        .ok()
+        .map(|caps| {
+            if caps.atomic_directory_rename.is_supported() {
+                8
+            } else {
+                2
+            }
+        })
+        .unwrap_or(4);
+    cpu.saturating_mul(2)
+        .clamp(1, fs_limit)
+        .min(work_items.max(1))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_lifecycle_if_enabled(
+    project_root: &Path,
+    store: &ArtifactStore,
+    lockfile: &Lockfile,
+    artifact_ids: &[Option<ArtifactId>],
+    volume_path: Option<&Path>,
+    ignore_scripts: bool,
+    skip_execution: bool,
+    derived_store: bool,
+    profile: graph::InstallProfile,
+    metrics: &mut Metrics,
+) -> anyhow::Result<bpm::lifecycle::LifecycleStats> {
+    if ignore_scripts {
+        metrics.record("lifecycle", std::time::Duration::ZERO);
+        return Ok(bpm::lifecycle::LifecycleStats::default());
+    }
+    let policy = bpm::lifecycle::LifecyclePolicy {
+        ignore_scripts: false,
+        skip_execution,
+        use_derived_store: derived_store,
+    };
+    let result = bpm::lifecycle::run_lifecycle_with_profile(
+        project_root,
+        store,
+        lockfile,
+        artifact_ids,
+        volume_path,
+        policy,
+        profile,
+        metrics,
+    )?;
+    if result.skipped {
+        // Cached volume: nothing ran, so there is no per-phase summary to
+        // print. `run_lifecycle` already recorded the skip metric.
+        Ok(result)
+    } else if result.packages_with_scripts > 0 {
+        eprintln!(
+            "lifecycle: {} package(s) with scripts ({} phase(s) executed, {} succeeded, {} failed)",
+            result.packages_with_scripts,
+            result.phases_executed,
+            result.phases_succeeded,
+            result.phases_failed
+        );
+        for outcome in &result.outcomes {
+            let marker = if outcome.exit_code == Some(0) {
+                "ok"
+            } else {
+                "FAIL"
+            };
+            eprintln!(
+                "  [{marker}] {}.{}) {}",
+                outcome.package, outcome.phase, outcome.command
+            );
+        }
+        Ok(result)
+    } else {
+        Ok(result)
+    }
+}
+
+fn run_global_install(
+    target: &str,
+    registry: Option<String>,
+    store: Option<PathBuf>,
+    cache_mode: bpm::metadata_cache::CacheMode,
+    remote_cache: Option<&str>,
+) -> anyhow::Result<()> {
+    let store_root_path = store_root(store)?;
+    let store = ArtifactStore::open(&store_root_path)?;
+    let mut metrics = Metrics::new();
+    let cwd = env::current_dir()?;
+    let project_root = bpm::project::find_project_root(&cwd).unwrap_or(cwd);
+    let config = effective_npm_config(&project_root, registry.as_deref())?;
+    let http = HttpClient::new(config.clone());
+    let registry_client = open_registry_client(&store_root_path, config, http.clone(), cache_mode)?;
+
+    let (url, integrity) = if bpm::registry::is_valid_npm_name(name_of_spec(target)) {
+        let spec = bpm::registry::parse_spec(target)?;
+        let resolved = metrics
+            .measure("metadata_fetch", || registry_client.resolve(&spec))
+            .map_err(|error| anyhow::anyhow!("failed to resolve '{target}': {error}"))?;
+        eprintln!(
+            "resolved {}@{} -> {}",
+            resolved.name,
+            resolved.version,
+            redact_url(&resolved.tarball_url)
+        );
+        let integrity = Integrity::parse(&resolved.integrity)?;
+        (resolved.tarball_url, Some(integrity))
+    } else {
+        (target.to_string(), None)
+    };
+    let remote = if cache_mode.allows_network() {
+        remote_cache
+            .map(|base| {
+                let token = env::var("BPM_REMOTE_CACHE_TOKEN").ok();
+                let config =
+                    bpm::remote_cache::RemoteCacheConfig::new(base, token).map_err(|error| {
+                        anyhow::anyhow!("invalid remote cache configuration: {error}")
+                    })?;
+                bpm::remote_cache::RemoteCacheClient::new(config)
+                    .map_err(|error| anyhow::anyhow!("invalid remote cache configuration: {error}"))
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    let artifact = if let Some(remote) = remote.as_ref() {
+        store
+            .ensure_artifact_with_remote(&http, remote, &url, integrity.as_ref(), &mut metrics)?
+            .artifact
+    } else {
+        store.ensure_artifact_with_client(&http, &url, integrity.as_ref(), &mut metrics)?
+    };
+    let image = store.ensure_image(&artifact.id, &mut metrics)?;
+    println!(
+        "fetched {} ({}) -> {}",
+        artifact.id,
+        if artifact.cached { "cached" } else { "stored" },
+        image.path.display()
+    );
+
+    let manifest_path = image.path.join("package.json");
+    let manifest = PackageManifest::from_path(&manifest_path)
+        .map_err(|error| anyhow::anyhow!("could not read {}: {error}", manifest_path.display()))?;
+    let bins: Vec<(String, String)> = match &manifest.bin {
+        Some(bpm::manifest::BinField::Map(entries)) => entries
+            .iter()
+            .map(|(name, path)| (name.clone(), path.clone()))
+            .collect(),
+        Some(bpm::manifest::BinField::One(path)) => vec![(
+            manifest.name.clone().unwrap_or_else(|| target.to_string()),
+            path.clone(),
+        )],
+        None => Vec::new(),
+    };
+    if bins.is_empty() {
+        anyhow::bail!(
+            "package {} declares no `bin` executables; nothing to link",
+            manifest.name.as_deref().unwrap_or(target)
+        );
+    }
+    // Validate all bin names and targets before creating directories or linking.
+    for (name, relpath) in &bins {
+        validate_bin_name(name)
+            .map_err(|e| anyhow::anyhow!("invalid bin name {name:?} in global install: {e}"))?;
+        let normalized = relpath.strip_prefix("./").unwrap_or(relpath);
+        validate_bin_target(normalized).map_err(|e| {
+            anyhow::anyhow!("invalid bin target {normalized:?} in global install: {e}")
+        })?;
+    }
+
+    let bin_dir = bin_dir()?;
+    fs::create_dir_all(&bin_dir)
+        .map_err(|error| anyhow::anyhow!("could not create {}: {error}", bin_dir.display()))?;
+    let mut linked = Vec::new();
+    for (name, relative_path) in bins {
+        let relative_path = relative_path.strip_prefix("./").unwrap_or(&relative_path);
+        let target_file = image.path.join(relative_path);
+        if !target_file.exists() {
+            eprintln!(
+                "warning: bin '{}' points at missing file {}; skipping",
+                name,
+                target_file.display()
+            );
+            continue;
+        }
+        set_executable(&target_file);
+        link_bin(&bin_dir.join(&name), &target_file)?;
+        linked.push(name);
+    }
+    if linked.is_empty() {
+        anyhow::bail!("no bins were linked for {target}");
+    }
+    println!(
+        "linked {} bin(s) into {}: {}",
+        linked.len(),
+        bin_dir.display(),
+        linked.join(", ")
+    );
+    if !bin_dir_on_path() {
+        eprintln!(
+            "note: {} is not on your PATH; add it (e.g. `export PATH=\"{}:$PATH\"`)",
+            bin_dir.display(),
+            bin_dir.display()
+        );
+    }
+    Ok(())
+}
+
+pub(super) fn effective_npm_config(
+    project_root: &Path,
+    registry: Option<&str>,
+) -> anyhow::Result<NpmConfig> {
+    let home = env::var_os("HOME").map(PathBuf::from);
+    let mut config = NpmConfig::load(project_root, home.as_deref())
+        .map_err(|e| anyhow::anyhow!("failed to load npm config: {e}"))?;
+    if let Some(registry) = registry {
+        config = config
+            .with_registry_override(registry)
+            .map_err(|e| anyhow::anyhow!("invalid registry override: {e}"))?;
+    }
+    Ok(config)
+}
+
+pub(super) fn bin_dir() -> anyhow::Result<PathBuf> {
+    if let Some(path) = env::var_os("BPM_BIN") {
+        return Ok(PathBuf::from(path));
+    }
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("$HOME is unset; cannot choose a bin dir"))?;
+    let local = home.join(".local").join("bin");
+    if local.is_dir() {
+        return Ok(local);
+    }
+    Ok(home.join("bin"))
+}
+
+fn bin_dir_on_path() -> bool {
+    let Ok(bin_dir) = bin_dir() else {
+        return false;
+    };
+    env::var_os("PATH")
+        .map(|path| env::split_paths(&path).any(|entry| entry == bin_dir))
+        .unwrap_or(false)
+}
+
+fn link_bin(link: &Path, target: &Path) -> anyhow::Result<()> {
+    if let Some(parent) = link.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| anyhow::anyhow!("could not create {}: {error}", parent.display()))?;
+    }
+    if fs::read_link(link).is_ok_and(|existing| existing.components().eq(target.components())) {
+        return Ok(());
+    }
+    let _ = fs::remove_file(link);
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link).map_err(|error| {
+            anyhow::anyhow!(
+                "could not symlink {} -> {}: {error}",
+                link.display(),
+                target.display()
+            )
+        })?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        anyhow::bail!("bin linking is only supported on Unix-like systems");
+    }
+}
+
+#[cfg(unix)]
+fn set_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(metadata) = fs::metadata(path) {
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(permissions.mode() | 0o111);
+        let _ = fs::set_permissions(path, permissions);
+    }
+}
+
+#[cfg(not(unix))]
+fn set_executable(_path: &Path) {}
+
+fn render_import_diagnostics(diagnostics: &[bpm::Diagnostic]) {
+    for diagnostic in diagnostics {
+        let package = diagnostic
+            .package
+            .as_deref()
+            .map(|value| format!(" (in {value})"))
+            .unwrap_or_default();
+        eprintln!(
+            "{}[{}] {}{}",
+            diagnostic.severity.as_str(),
+            diagnostic.code,
+            diagnostic.message,
+            package
+        );
+    }
+}
+
+fn enforce_frozen(
+    project_root: &Path,
+    lockfile: &Lockfile,
+    lock_label: &str,
+) -> anyhow::Result<()> {
+    let manifest_path = project_root.join("package.json");
+    let manifest = match PackageManifest::from_path(&manifest_path) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            eprintln!(
+                "warning: --frozen given but no readable package.json at {} ({error}); skipping drift check",
+                project_root.display()
+            );
+            return Ok(());
+        }
+    };
+    let root_declarations = manifest.root_dependency_declarations();
+    let locked = &lockfile.root.dependencies;
+    let expected_overrides = resolver::overrides::OverrideSet::from_manifest(
+        &manifest.overrides,
+        &root_declarations,
+        resolver::overrides::OverrideOrigin::Root,
+    )
+    .map_err(|error| anyhow::anyhow!("frozen install refused: invalid overrides: {error}"))?
+    .as_map()
+    .clone();
+    let root_resolution = &lockfile.resolution.root;
+    // Frozen mode compares the complete canonical root declaration map
+    // (`name -> spec`), not just dependency names. Editing `"greet": "^1.0.0"`
+    // to `"greet": "^2.0.0"` keeps the name set unchanged but must be rejected
+    // because the lockfile records the exact declared specification.
+    if root_declarations == *locked
+        && root_resolution.dev_dependencies == manifest.dev_dependencies
+        && root_resolution.optional_dependencies == manifest.optional_dependencies
+        && root_resolution.overrides == expected_overrides
+    {
+        return Ok(());
+    }
+    let only_manifest = root_declarations
+        .keys()
+        .filter(|name| !locked.contains_key(*name))
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let only_lock = locked
+        .keys()
+        .filter(|name| !root_declarations.contains_key(*name))
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    // Shared names whose declared specification changed. BTreeMap iteration is
+    // sorted by key, so this list is deterministic. Comparison is textual only:
+    // frozen drift is declared-input drift, so `1.0.0` and `=1.0.0` are
+    // different declarations even if semantically equivalent.
+    let changed_specs = root_declarations
+        .iter()
+        .filter_map(|(name, manifest_spec)| {
+            let locked_spec = locked.get(name)?;
+            if manifest_spec == locked_spec {
+                None
+            } else {
+                Some(format!(
+                    "{name} (package.json: {manifest_spec}, {lock_label}: {locked_spec})"
+                ))
+            }
+        })
+        .collect::<Vec<_>>();
+    anyhow::bail!(
+        "frozen install refused: package.json and {lock_label} disagree on root dependencies\n  \
+         in package.json but not {lock_label}: {}\n  \
+         in {lock_label} but not package.json: {}\n  \
+         changed specifications: {}\n  \
+         re-run `bpm import` after editing package.json",
+        if only_manifest.is_empty() {
+            "(none)".to_string()
+        } else {
+            only_manifest.join(", ")
+        },
+        if only_lock.is_empty() {
+            "(none)".to_string()
+        } else {
+            only_lock.join(", ")
+        },
+        if changed_specs.is_empty() {
+            "(none)".to_string()
+        } else {
+            changed_specs.join(", ")
+        }
+    );
+}
+
+struct InstallWork {
+    path: String,
+    name: String,
+    url: String,
+    integrity: Option<Integrity>,
+}
+
+struct FetchOutcome {
+    path: String,
+    id: ArtifactId,
+    artifact_cached: bool,
+    image_cached: bool,
+}
+
+struct PendingArtifact {
+    path: String,
+    name: String,
+    url: String,
+    artifact: bpm::store::ArtifactRef,
+}
+
+#[derive(Debug)]
+struct FetchFail {
+    name: String,
+    url: String,
+    source: Box<StoreError>,
+}
+
+/// Adapts the resolver's [`ResolveSink`] to the install download pipeline's
+/// bounded unit channel. `emit` blocks when the pipeline is full (natural
+/// backpressure on resolution) and ignores a disconnected receiver so a failed
+/// install still yields a complete lockfile.
+struct ChannelSink(std::sync::mpsc::SyncSender<InstallWork>);
+
+impl resolver::ResolveSink for ChannelSink {
+    fn emit(&self, unit: resolver::ResolvedDownloadUnit) {
+        let _ = self.0.send(InstallWork {
+            path: unit.path,
+            name: unit.name,
+            url: unit.url,
+            integrity: unit.integrity,
+        });
+    }
+}
+
+/// Join handle for a download worker thread.
+type DownloaderHandle<'scope> = std::thread::ScopedJoinHandle<'scope, Result<Metrics, FetchFail>>;
+/// Join handle for an extract worker thread.
+type ExtractorHandle<'scope> =
+    std::thread::ScopedJoinHandle<'scope, Result<(Vec<FetchOutcome>, Metrics), FetchFail>>;
+
+/// Wall-clock lifetime of the concurrent fetch/extract pipeline. Per-worker
+/// metrics sum durations, which cannot show how much work overlapped. This
+/// clock measures the actual critical-path lifetime from the first worker to
+/// the last worker.
+struct PipelineClock {
+    start: std::sync::Mutex<Option<Instant>>,
+    end: std::sync::Mutex<Option<Instant>>,
+}
+
+impl PipelineClock {
+    fn new() -> Self {
+        Self {
+            start: std::sync::Mutex::new(None),
+            end: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn mark_start(&self) {
+        let mut start = self.start.lock().expect("pipeline clock start lock");
+        if start.is_none() {
+            *start = Some(Instant::now());
+        }
+    }
+
+    fn mark_end(&self) {
+        *self.end.lock().expect("pipeline clock end lock") = Some(Instant::now());
+    }
+
+    fn elapsed(&self) -> Option<std::time::Duration> {
+        let start = *self.start.lock().expect("pipeline clock start lock");
+        let end = *self.end.lock().expect("pipeline clock end lock");
+        start.zip(end).map(|(start, end)| end.duration_since(start))
+    }
+}
+
+/// Spawn the download→extract worker pipeline consuming resolved install units
+/// from `unit_rx`. Returns the downloader and extractor join handles; the
+/// caller joins them via [`join_pipeline`] after the unit producer finishes.
+///
+/// Downloaders always drain `unit_rx` to completion (stopping only fetch work,
+/// never receiving, once the extract stage has gone away) so a streaming
+/// producer can never block on a full bounded channel.
+#[allow(clippy::too_many_arguments)]
+fn spawn_fetch_pipeline<'scope, 'env>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    store: &'env ArtifactStore,
+    http: &'env HttpClient,
+    remote: Option<&'env bpm::remote_cache::RemoteCacheClient>,
+    unit_rx: std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<InstallWork>>>,
+    workers: usize,
+) -> (
+    Vec<DownloaderHandle<'scope>>,
+    Vec<ExtractorHandle<'scope>>,
+    Arc<PipelineClock>,
+) {
+    use std::sync::mpsc::sync_channel;
+    let workers = workers.max(1);
+    let clock = Arc::new(PipelineClock::new());
+    let (send, receive) = sync_channel::<Result<PendingArtifact, FetchFail>>(workers * 2);
+    let receive = std::sync::Arc::new(std::sync::Mutex::new(receive));
+    let mut downloaders = Vec::with_capacity(workers);
+    for _ in 0..workers {
+        let unit_rx = unit_rx.clone();
+        let send = send.clone();
+        let http = http.clone();
+        let remote = remote.cloned();
+        let clock = Arc::clone(&clock);
+        downloaders.push(scope.spawn(move || -> Result<Metrics, FetchFail> {
+            clock.mark_start();
+            let mut local = Metrics::new();
+            let mut extraction_gone = false;
+            loop {
+                // Keep the receiver mutex held only for the blocking recv.
+                // Binding the result separately is important: the temporary
+                // mutex guard must be dropped before this worker performs
+                // network I/O, otherwise all downloaders serialize on recv.
+                let received = unit_rx.lock().expect("unit receiver lock").recv();
+                let Ok(item) = received else {
+                    break;
+                };
+                if extraction_gone {
+                    continue;
+                }
+                let result = if let Some(remote) = remote.as_ref() {
+                    store
+                        .ensure_artifact_with_remote(
+                            &http,
+                            remote,
+                            &item.url,
+                            item.integrity.as_ref(),
+                            &mut local,
+                        )
+                        .map(|result| result.artifact)
+                } else {
+                    store.ensure_artifact_with_client(
+                        &http,
+                        &item.url,
+                        item.integrity.as_ref(),
+                        &mut local,
+                    )
+                }
+                .map(|artifact| PendingArtifact {
+                    path: item.path.clone(),
+                    name: item.name.clone(),
+                    url: item.url.clone(),
+                    artifact,
+                })
+                .map_err(|source| FetchFail {
+                    name: item.name.clone(),
+                    url: item.url.clone(),
+                    source: Box::new(source),
+                });
+                if send.send(result).is_err() {
+                    // Extractors all exited (fatal error). Keep draining unit_rx
+                    // so a streaming producer never blocks on a full channel;
+                    // just stop doing fetch work.
+                    extraction_gone = true;
+                }
+            }
+            clock.mark_end();
+            Ok(local)
+        }));
+    }
+    drop(send);
+    let mut extractors = Vec::with_capacity(workers);
+    for _ in 0..workers {
+        let receive = receive.clone();
+        let clock = Arc::clone(&clock);
+        extractors.push(
+            scope.spawn(move || -> Result<(Vec<FetchOutcome>, Metrics), FetchFail> {
+                clock.mark_start();
+                let mut local = Metrics::new();
+                let mut outcomes = Vec::new();
+                let mut first_error: Option<FetchFail> = None;
+                loop {
+                    let message = receive.lock().expect("pipeline receiver lock").recv();
+                    let Ok(message) = message else {
+                        break;
+                    };
+                    let Ok(pending) = message else {
+                        // Keep draining the bounded channel after one worker
+                        // fails. Returning immediately would strand downloaders
+                        // blocked on send and turn a fetch error into a hang.
+                        if first_error.is_none() {
+                            first_error = message.err();
+                        }
+                        continue;
+                    };
+                    if first_error.is_some() {
+                        continue;
+                    }
+                    match store.ensure_image(&pending.artifact.id, &mut local) {
+                        Ok(image) => outcomes.push(FetchOutcome {
+                            path: pending.path.clone(),
+                            id: pending.artifact.id,
+                            artifact_cached: pending.artifact.cached,
+                            image_cached: image.cached,
+                        }),
+                        Err(source) => {
+                            first_error = Some(FetchFail {
+                                name: pending.name,
+                                url: pending.url,
+                                source: Box::new(source),
+                            });
+                        }
+                    }
+                }
+                if let Some(error) = first_error {
+                    clock.mark_end();
+                    Err(error)
+                } else {
+                    clock.mark_end();
+                    Ok((outcomes, local))
+                }
+            }),
+        );
+    }
+    (downloaders, extractors, clock)
+}
+
+/// Join the pipeline handles, merging per-worker metrics and surfacing the
+/// first fetch/extract error.
+fn join_pipeline(
+    downloaders: Vec<DownloaderHandle<'_>>,
+    extractors: Vec<ExtractorHandle<'_>>,
+    metrics: &mut Metrics,
+    clock: &PipelineClock,
+) -> anyhow::Result<Vec<FetchOutcome>> {
+    for handle in downloaders {
+        metrics.extend(
+            &handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("download worker panicked"))??,
+        );
+    }
+    let mut outcomes = Vec::new();
+    for handle in extractors {
+        let (mut values, local) = handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("extract worker panicked"))??;
+        metrics.extend(&local);
+        outcomes.append(&mut values);
+    }
+    if let Some(elapsed) = clock.elapsed() {
+        metrics.record("artifact_pipeline_wall", elapsed);
+    }
+    Ok(outcomes)
+}
+
+/// Map path-keyed fetch outcomes back onto the lockfile's positional index
+/// for the materializer and lifecycle phases.
+fn outcomes_to_artifact_ids(
+    outcomes: &[FetchOutcome],
+    lockfile: &Lockfile,
+) -> Vec<Option<ArtifactId>> {
+    let path_to_index: HashMap<&str, usize> = lockfile
+        .packages
+        .iter()
+        .enumerate()
+        .map(|(index, package)| (package.path.as_str(), index))
+        .collect();
+    let mut artifact_ids = vec![None; lockfile.packages.len()];
+    for outcome in outcomes {
+        if let Some(&index) = path_to_index.get(outcome.path.as_str()) {
+            artifact_ids[index] = Some(outcome.id);
+        }
+    }
+    artifact_ids
+}
+
+/// Whether a fresh install overlaps downloads with resolution (Phase 3
+/// streaming). Enabled by default; set `BPM_STREAM_INSTALL=0` to resolve the
+/// whole graph before downloading (the pre-Phase-3 behavior) for benchmarking
+/// or to isolate a streaming-related regression.
+fn streaming_install_enabled() -> bool {
+    !matches!(
+        std::env::var("BPM_STREAM_INSTALL").as_deref(),
+        Ok("0") | Ok("false")
+    )
+}
+
+/// Whether the async resolver is enabled (default: yes since Phase 5).
+///
+/// Async resolution is the default; set `BPM_ASYNC_RESOLVE=0` or
+/// `BPM_ASYNC_RESOLVE=false` to force the blocking resolver (the kill-switch
+/// path — not retired). The four-case fresh-install matrix that consumes this
+/// flag lives in `run`.
+fn async_resolve_enabled() -> bool {
+    !matches!(
+        std::env::var("BPM_ASYNC_RESOLVE").as_deref(),
+        Ok("0") | Ok("false")
+    )
+}
+
+/// Maximum number of async registry request bodies allowed concurrently.
+/// Benchmarking and unusual registries can tune this without changing the
+/// deterministic placement algorithm; the bound prevents accidental request
+/// storms while keeping the default wide enough to hide HTTP/1.1 latency.
+fn async_resolver_max_in_flight() -> u32 {
+    env::var("BPM_RESOLVER_MAX_IN_FLIGHT")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .map(|value| value.clamp(1, 64))
+        .unwrap_or(32)
+}
+
+/// Diagnostic counters threaded back from the async resolve runtime.
+/// Mirrors the blocking resolver's `ResolverDiagnosticsSnapshot`.
+type ResolveDiags = bpm::async_resolver::AsyncResolverDiagnostics;
+
+/// Resolve a fresh manifest with the async resolver (non-streaming) on a
+/// multi-threaded tokio runtime (so background prefetches overlap on worker
+/// threads). Honors the CLI-selected `peer_mode`; the
+/// resulting lockfile is byte-identical to the blocking resolver's output for
+/// the same manifest/peer-mode (see the `tests/network_pipeline.rs` parity
+/// corpus). Records packument-cache diagnostics.
+#[allow(clippy::too_many_arguments)]
+fn resolve_fresh_manifest_async(
+    manifest: &PackageManifest,
+    workspace_index: &bpm::resolver::workspaces::WorkspaceIndex,
+    peer_mode: bpm::resolver::peer::PeerMode,
+    store: &ArtifactStore,
+    config: NpmConfig,
+    cache_mode: bpm::metadata_cache::CacheMode,
+    metrics: &mut Metrics,
+    snapshot_cache: &ResolutionSnapshotCache,
+    snapshot_key: &str,
+) -> anyhow::Result<Lockfile> {
+    metrics
+        .measure(
+            "dependency_resolution",
+            || -> anyhow::Result<(Lockfile, ResolveDiags)> {
+                let diag_cell =
+                    std::cell::Cell::new(bpm::async_resolver::AsyncResolverDiagnostics::default());
+                let result = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(ASYNC_RESOLVER_WORKERS)
+                    .enable_all()
+                    .build()
+                    .expect("failed to build tokio runtime")
+                    .block_on(async {
+                        let async_cache = open_metadata_cache(store.root(), cache_mode)?;
+                        let mut async_registry =
+                            bpm::async_resolver::AsyncRegistryClient::new(config)
+                                .with_max_in_flight(async_resolver_max_in_flight());
+                        if let Some(cache) = async_cache {
+                            async_registry = async_registry.with_metadata_cache(cache, cache_mode);
+                        }
+                        let result =
+                            bpm::async_resolver::resolve_manifest_with_options_and_target_async(
+                                manifest,
+                                &async_registry,
+                                "bpm",
+                                Some(workspace_index),
+                                peer_mode,
+                                bpm::resolver::current_target_platform(),
+                            )
+                            .await?;
+                        diag_cell.set(async_registry.take_diagnostics());
+                        Ok::<_, anyhow::Error>(result)
+                    })?;
+                let diag = diag_cell.into_inner();
+                Ok((result, diag))
+            },
+        )
+        .map(|(lockfile, diag)| {
+            metrics.record_resolver_diagnostics(
+                diag.cache_hits,
+                diag.cache_waits,
+                diag.inline_fetches,
+                diag.prefetch_fetches + diag.batch_prefetch_fetches,
+                diag.fetch_bytes,
+                diag.network_wait_ns,
+            );
+            metrics.record(
+                "resolver_network_wait",
+                std::time::Duration::from_nanos(diag.network_wait_ns),
+            );
+            metrics
+                .record_resolver_http_diagnostics(diag.peak_http_concurrency, diag.observed_http2);
+            if let Err(error) = snapshot_cache.store(snapshot_key, &lockfile) {
+                eprintln!("warning: could not persist resolution snapshot: {error}");
+            }
+            lockfile
+        })
+        .map_err(|error| anyhow::anyhow!("dependency resolution failed: {error}"))
+}
+
+/// Resolve a fresh manifest with the blocking resolver (non-streaming) — the
+/// `BPM_ASYNC_RESOLVE=0` kill-switch path. Honors the CLI-selected `peer_mode`.
+/// Records the same resolver-diagnostic vocabulary as the blocking streaming
+/// path so metrics stay comparable across all four matrix rows.
+#[allow(clippy::too_many_arguments)]
+fn resolve_fresh_manifest_blocking(
+    manifest: &PackageManifest,
+    client: &bpm::registry::RegistryClient,
+    workspace_index: &bpm::resolver::workspaces::WorkspaceIndex,
+    peer_mode: bpm::resolver::peer::PeerMode,
+    http: &HttpClient,
+    metrics: &mut Metrics,
+    snapshot_cache: &ResolutionSnapshotCache,
+    snapshot_key: &str,
+) -> anyhow::Result<Lockfile> {
+    let lockfile = metrics
+        .measure("dependency_resolution", || {
+            bpm::resolver::resolve_manifest_with_options(
+                manifest,
+                client,
+                "bpm",
+                Some(workspace_index),
+                peer_mode,
+            )
+        })
+        .map_err(|error| anyhow::anyhow!("dependency resolution failed: {error}"))?;
+    let diag = client.take_diagnostics();
+    metrics.record(
+        "resolver_network_wait",
+        std::time::Duration::from_nanos(diag.resolver_fetch_nanos),
+    );
+    metrics.record_resolver_diagnostics(
+        diag.cache_hits,
+        diag.cache_waits,
+        diag.inline_fetches,
+        diag.prefetch_fetches,
+        diag.fetch_bytes,
+        diag.resolver_fetch_nanos,
+    );
+    metrics.record_batch_prefetch(diag.batch_prefetch_fetches);
+    metrics.record_http_diagnostics(http.max_concurrent_requests(), http.observed_http2());
+    if let Err(error) = snapshot_cache.store(snapshot_key, &lockfile) {
+        eprintln!("warning: could not persist resolution snapshot: {error}");
+    }
+    Ok(lockfile)
+}
+
+/// A non-blocking variant of [`ChannelSink`] that uses `try_send` instead of
+/// `send`, so the async resolver's tokio runtime thread never blocks on
+/// pipeline backpressure. Units that cannot be delivered immediately (channel
+/// full, or the receiver disconnected because a worker failed) are retained in
+/// a thread-safe overflow vector owned by the caller, which drains them through
+/// the original concurrent pipeline after async resolution completes — they
+/// are never silently dropped and never fall back to an origin-only path.
+struct TryChannelSink {
+    tx: std::sync::mpsc::SyncSender<InstallWork>,
+    overflow: std::sync::Arc<std::sync::Mutex<Vec<InstallWork>>>,
+}
+
+impl resolver::ResolveSink for TryChannelSink {
+    fn emit(&self, unit: resolver::ResolvedDownloadUnit) {
+        let work = InstallWork {
+            path: unit.path,
+            name: unit.name,
+            url: unit.url,
+            integrity: unit.integrity,
+        };
+        if let Err(err) = self.tx.try_send(work) {
+            // Retain the unit exactly once in emission order. A `Full` channel
+            // is drained by the caller after resolution; a `Disconnected`
+            // channel means a worker already failed and `join_pipeline` will
+            // surface that failure (the completeness invariant catches any
+            // remaining gap).
+            let work = match err {
+                std::sync::mpsc::TrySendError::Full(work)
+                | std::sync::mpsc::TrySendError::Disconnected(work) => work,
+            };
+            if let Ok(mut buffer) = self.overflow.lock() {
+                buffer.push(work);
+            }
+        }
+    }
+}
+
+/// Resolve a fresh manifest with the async resolver while the download/extract
+/// pipeline fetches each package via the non-blocking sink. Units that
+/// overflow the live channel are retained and drained through the same
+/// concurrent, remote-cache-aware pipeline after resolution completes; there
+/// is no sequential origin-only recovery path.
+#[allow(clippy::too_many_arguments)]
+fn run_streaming_async_install(
+    root: &Path,
+    manifest: &PackageManifest,
+    workspace_index: &bpm::resolver::workspaces::WorkspaceIndex,
+    peer_mode: bpm::resolver::peer::PeerMode,
+    concurrency: usize,
+    store: &ArtifactStore,
+    http: &HttpClient,
+    metrics: &mut Metrics,
+    options: &Options,
+    snapshot_cache: &ResolutionSnapshotCache,
+    snapshot_key: &str,
+) -> anyhow::Result<()> {
+    let config = effective_npm_config(root, options.registry.as_deref())?;
+    let remote = if options.cache_mode.allows_network() {
+        options
+            .remote_cache
+            .as_deref()
+            .map(|base| {
+                let token = env::var("BPM_REMOTE_CACHE_TOKEN").ok();
+                bpm::remote_cache::RemoteCacheConfig::new(base, token)
+                    .map_err(|error| anyhow::anyhow!("invalid remote cache configuration: {error}"))
+                    .and_then(|config| {
+                        bpm::remote_cache::RemoteCacheClient::new(config).map_err(|error| {
+                            anyhow::anyhow!("invalid remote cache configuration: {error}")
+                        })
+                    })
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    let workers = adaptive_workers(concurrency, usize::MAX, root);
+    let overflow = std::sync::Arc::new(std::sync::Mutex::new(Vec::<InstallWork>::new()));
+    let (lockfile, outcomes) = std::thread::scope(
+        |scope| -> anyhow::Result<(Lockfile, Vec<FetchOutcome>)> {
+            let (unit_tx, unit_rx) =
+                std::sync::mpsc::sync_channel::<InstallWork>(workers.max(1) * 2);
+            let unit_rx = std::sync::Arc::new(std::sync::Mutex::new(unit_rx));
+            let (downloaders, extractors, clock) =
+                spawn_fetch_pipeline(scope, store, http, remote.as_ref(), unit_rx, workers);
+            // Run async resolution on a tokio runtime, emitting placed nodes
+            // to the non-blocking TryChannelSink. Units that overflow the live
+            // channel are retained in `overflow` rather than dropped.
+            let config_clone = config.clone();
+            let diag_cell =
+                std::cell::Cell::new(bpm::async_resolver::AsyncResolverDiagnostics::default());
+            let lockfile = metrics
+                .measure("dependency_resolution", || {
+                    tokio::runtime::Builder::new_multi_thread()
+                        .worker_threads(ASYNC_RESOLVER_WORKERS)
+                        .enable_all()
+                        .build()
+                        .expect("failed to build tokio runtime")
+                        .block_on(async {
+                            let sink = TryChannelSink {
+                                tx: unit_tx.clone(),
+                                overflow: std::sync::Arc::clone(&overflow),
+                            };
+                            let async_cache = open_metadata_cache(store.root(), options.cache_mode)?;
+                            let mut registry = bpm::async_resolver::AsyncRegistryClient::new(
+                                config_clone,
+                            )
+                            .with_max_in_flight(async_resolver_max_in_flight());
+                            if let Some(cache) = async_cache {
+                                registry = registry.with_metadata_cache(cache, options.cache_mode);
+                            }
+                            let result =
+                                bpm::async_resolver::resolve_manifest_with_options_and_target_async_sink(
+                                    manifest,
+                                    &registry,
+                                    "bpm",
+                                    Some(workspace_index),
+                                    peer_mode,
+                                    bpm::resolver::current_target_platform(),
+                                    Some(&sink as &dyn resolver::ResolveSink),
+                                )
+                                .await?;
+                            let diag = registry.take_diagnostics();
+                            diag_cell.set(diag);
+                            Ok::<_, anyhow::Error>(result)
+                        })
+                })
+                .map_err(|error| anyhow::anyhow!("dependency resolution failed: {error}"))?;
+            // Record async resolver diagnostics.
+            let diag = diag_cell.into_inner();
+            metrics.record_resolver_diagnostics(
+                diag.cache_hits,
+                diag.cache_waits,
+                diag.inline_fetches,
+                diag.prefetch_fetches + diag.batch_prefetch_fetches,
+                diag.fetch_bytes,
+                diag.network_wait_ns,
+            );
+            metrics.record(
+                "resolver_network_wait",
+                std::time::Duration::from_nanos(diag.network_wait_ns),
+            );
+            metrics
+                .record_resolver_http_diagnostics(diag.peak_http_concurrency, diag.observed_http2);
+            // Async resolution is complete and we are off the tokio runtime, so
+            // it is safe to block while draining every overflowed unit through
+            // the original concurrent pipeline (workers drain concurrently).
+            // This keeps overflow on the same remote-cache-aware path as
+            // immediate units — there is no sequential origin-only fallback.
+            let overflowed: Vec<InstallWork> = std::mem::take(&mut *overflow.lock().unwrap());
+            let overflow_count = overflowed.len();
+            for work in overflowed {
+                // A `Disconnected` send means a worker already failed;
+                // `join_pipeline` surfaces that failure and the completeness
+                // invariant below catches any remaining gap.
+                let _ = unit_tx.send(work);
+            }
+            drop(unit_tx);
+            let outcomes = join_pipeline(downloaders, extractors, metrics, &clock)?;
+            metrics.record_http_diagnostics(http.max_concurrent_requests(), http.observed_http2());
+            if overflow_count > 0 {
+                metrics.record(
+                    "post_resolution_fetches",
+                    std::time::Duration::from_nanos(overflow_count as u64),
+                );
+            }
+            // Completeness invariant: every downloadable lockfile package must
+            // have an outcome. A gap is an internal pipeline error, not a
+            // reason to start a behaviorally different sequential pass.
+            assert_outcomes_complete(&lockfile, &outcomes)?;
+            if let Err(error) = snapshot_cache.store(snapshot_key, &lockfile) {
+                eprintln!("warning: could not persist resolution snapshot: {error}");
+            }
+            Ok((lockfile, outcomes))
+        },
+    )?;
+    let path = root.join(bpm::lockfile::BPM_LOCK_FILE);
+    lockfile.write_to(&path)?;
+    eprintln!(
+        "resolved {} package(s) (async+streaming) and wrote {}",
+        lockfile.packages.len(),
+        path.display()
+    );
+    metrics.record("plan_cache_miss", std::time::Duration::ZERO);
+    let cached = outcomes
+        .iter()
+        .filter(|outcome| outcome.artifact_cached && outcome.image_cached)
+        .count();
+    let fetched = outcomes.len() - cached;
+    let artifact_ids = outcomes_to_artifact_ids(&outcomes, &lockfile);
+    metrics.add_requests(http.request_count());
+    finalize_install(
+        root,
+        store,
+        &lockfile,
+        &artifact_ids,
+        cached,
+        fetched,
+        metrics,
+        options,
+        &path,
+        &bpm::registry::RegistryClient::new(config),
+        None,
+        options.install_profile(),
+    )
+}
+
+/// Completeness invariant for the streaming pipeline: every lockfile package
+/// that is actually downloadable (non-link, non-empty `resolved`) must have a
+/// corresponding fetch outcome. Duplicates do not satisfy a missing different
+/// path. A gap is an internal pipeline error (worker failure or dropped unit),
+/// reported with sorted, redacted package paths/names — never credential URLs.
+fn assert_outcomes_complete(lockfile: &Lockfile, outcomes: &[FetchOutcome]) -> anyhow::Result<()> {
+    let present: BTreeSet<&str> = outcomes.iter().map(|o| o.path.as_str()).collect();
+    let mut missing: Vec<String> = lockfile
+        .packages
+        .iter()
+        .filter(|package| !package.link && !package.resolved.is_empty())
+        .filter(|package| !present.contains(package.path.as_str()))
+        .map(|package| format!("{} ({})", package.name, package.path))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    missing.sort();
+    anyhow::bail!(
+        "internal pipeline error: {} package(s) missing fetch outcome: {}",
+        missing.len(),
+        missing.join(", ")
+    )
+}
+
+/// Resolve a fresh manifest while the download/extract pipeline fetches each
+/// package the instant the resolver places it, so downloads overlap with the
+/// rest of resolution. The returned lockfile is byte-identical to a sequential
+/// resolve (the sink only observes placement); downloads are integrity-keyed
+/// and idempotent, so streaming never changes the installed graph.
+#[allow(clippy::too_many_arguments)]
+fn run_streaming_install(
+    root: &Path,
+    manifest: &PackageManifest,
+    client: &bpm::registry::RegistryClient,
+    workspace_index: &bpm::resolver::workspaces::WorkspaceIndex,
+    peer_mode: bpm::resolver::peer::PeerMode,
+    concurrency: usize,
+    store: &ArtifactStore,
+    http: &HttpClient,
+    metrics: &mut Metrics,
+    options: &Options,
+    snapshot_cache: &ResolutionSnapshotCache,
+    snapshot_key: &str,
+) -> anyhow::Result<()> {
+    let remote = if options.cache_mode.allows_network() {
+        options
+            .remote_cache
+            .as_deref()
+            .map(|base| {
+                let token = env::var("BPM_REMOTE_CACHE_TOKEN").ok();
+                bpm::remote_cache::RemoteCacheConfig::new(base, token)
+                    .map_err(|error| anyhow::anyhow!("invalid remote cache configuration: {error}"))
+                    .and_then(|config| {
+                        bpm::remote_cache::RemoteCacheClient::new(config).map_err(|error| {
+                            anyhow::anyhow!("invalid remote cache configuration: {error}")
+                        })
+                    })
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    // Work count is unknown until resolution completes, so do not clamp the
+    // worker count to it (usize::MAX makes adaptive_workers' clamp a no-op).
+    let workers = adaptive_workers(concurrency, usize::MAX, root);
+    let (lockfile, outcomes) =
+        std::thread::scope(|scope| -> anyhow::Result<(Lockfile, Vec<FetchOutcome>)> {
+            let (unit_tx, unit_rx) =
+                std::sync::mpsc::sync_channel::<InstallWork>(workers.max(1) * 2);
+            let unit_rx = std::sync::Arc::new(std::sync::Mutex::new(unit_rx));
+            let (downloaders, extractors, clock) =
+                spawn_fetch_pipeline(scope, store, http, remote.as_ref(), unit_rx, workers);
+            // Run resolution on this thread, emitting each placed node to the
+            // sink; dropping `sink` closes the unit channel so downloaders (and
+            // then extractors) drain and finish before we join them below.
+            let lockfile = {
+                let sink = ChannelSink(unit_tx);
+                metrics
+                    .measure("dependency_resolution", || {
+                        resolver::resolve_manifest_with_options_sink(
+                            manifest,
+                            client,
+                            "bpm",
+                            Some(workspace_index),
+                            peer_mode,
+                            Some(&sink),
+                        )
+                    })
+                    .map_err(|error| anyhow::anyhow!("dependency resolution failed: {error}"))?
+            };
+            // Of the `dependency_resolution` wall time, how much the resolver
+            // thread blocked on network (packument fetches + waiting on
+            // in-flight prefetches). The remainder is CPU: parse, placement,
+            // peer backtracking, lockfile generation.
+            let diag = client.take_diagnostics();
+            metrics.record(
+                "resolver_network_wait",
+                std::time::Duration::from_nanos(diag.resolver_fetch_nanos),
+            );
+            metrics.record_resolver_diagnostics(
+                diag.cache_hits,
+                diag.cache_waits,
+                diag.inline_fetches,
+                diag.prefetch_fetches,
+                diag.fetch_bytes,
+                diag.resolver_fetch_nanos,
+            );
+            // Record batch-prefetch closure count (packuments fetched before
+            // DFS started, separate from inline and pool prefetches).
+            metrics.record_batch_prefetch(diag.batch_prefetch_fetches);
+            let outcomes = join_pipeline(downloaders, extractors, metrics, &clock)?;
+            // Record transport diagnostics after the streaming bodies have
+            // drained; the HTTP guard spans each full artifact response.
+            metrics.record_http_diagnostics(http.max_concurrent_requests(), http.observed_http2());
+            if let Err(error) = snapshot_cache.store(snapshot_key, &lockfile) {
+                eprintln!("warning: could not persist resolution snapshot: {error}");
+            }
+            Ok((lockfile, outcomes))
+        })?;
+    let path = root.join(bpm::lockfile::BPM_LOCK_FILE);
+    lockfile.write_to(&path)?;
+    eprintln!(
+        "resolved {} package(s) and wrote {}",
+        lockfile.packages.len(),
+        path.display()
+    );
+    // Fresh resolve: no prior lockfile, so no prior plan — always install.
+    metrics.record("plan_cache_miss", std::time::Duration::ZERO);
+    let cached = outcomes
+        .iter()
+        .filter(|outcome| outcome.artifact_cached && outcome.image_cached)
+        .count();
+    let fetched = outcomes.len() - cached;
+    let artifact_ids = outcomes_to_artifact_ids(&outcomes, &lockfile);
+    metrics.add_requests(http.request_count());
+    finalize_install(
+        root,
+        store,
+        &lockfile,
+        &artifact_ids,
+        cached,
+        fetched,
+        metrics,
+        options,
+        &path,
+        client,
+        None,
+        options.install_profile(),
+    )
+}
+
+/// Materialize the resolved graph, run lifecycle, write the install plan, and
+/// print the summary. Shared by the lockfile-present and fresh-resolve install
+/// paths; both produce a `lockfile` and its `artifact_ids` before calling this.
+#[allow(clippy::too_many_arguments)]
+fn finalize_install(
+    project_root: &Path,
+    store: &ArtifactStore,
+    lockfile: &Lockfile,
+    artifact_ids: &[Option<ArtifactId>],
+    cached: usize,
+    fetched: usize,
+    metrics: &mut Metrics,
+    options: &Options,
+    lockfile_path: &Path,
+    registry: &bpm::registry::RegistryClient,
+    prior_plan: Option<&bpm::graph::InstallPlan>,
+    profile: graph::InstallProfile,
+) -> anyhow::Result<()> {
+    // Prior ownership for stale-entry reconciliation. A pre-fix (version-2)
+    // plan persists `owned_entries` empty; in that one case conservatively
+    // infer ownership from the live prior graph volume so a single generation
+    // of stale entries still clears, claiming only entries whose live state
+    // exactly matches the prior volume.
+    let ownership_start = Instant::now();
+    let prior_owned_vec: Vec<bpm::graph::ManagedEntry> = match prior_plan {
+        Some(plan) if plan.owned_entries.is_empty() => bpm::volume::infer_prior_ownership(
+            project_root,
+            &store.graph_volume_path(&plan.graph_id_hex),
+        ),
+        Some(plan) => plan.owned_entries.clone(),
+        None => Vec::new(),
+    };
+    metrics.record("ownership_reconciliation", ownership_start.elapsed());
+    let prior_owned = prior_owned_vec.as_slice();
+    let git_prepare_enabled = options.git_prepare
+        && lockfile
+            .resolution
+            .packages
+            .values()
+            .any(|resolution| matches!(resolution.source, LockSource::Git { .. }));
+    let has_workspace_links = lockfile.packages.iter().any(|package| package.link);
+    // Nested `file:` dependencies need a graph volume: direct symlink
+    // materialization cannot place a child under an immutable package image.
+    // The volume copies those source links into its image. Top-level workspace
+    // links retain the existing direct-materialization path.
+    let has_nested_links = lockfile
+        .packages
+        .iter()
+        .any(|package| package.link && package.path.contains("/node_modules/"));
+    let direct_materialization = has_workspace_links && !has_nested_links;
+    let prepared = if git_prepare_enabled && !options.ignore_scripts && !direct_materialization {
+        bpm::lifecycle::prepare_git_packages_with_profile(
+            project_root,
+            store,
+            lockfile,
+            artifact_ids,
+            registry,
+            profile,
+            metrics,
+        )?
+    } else {
+        BTreeMap::new()
+    };
+    // Open the metadata ownership/lease session for this install. It records
+    // publication of every store object the install reads, holds a renewable
+    // lease over them so a concurrent `bpm gc` cannot reclaim them mid-install,
+    // records the graph's inventory edges, and publishes the durable project
+    // registration after attachment. Failures propagate with `?` so an install
+    // never reports success with an unprotected graph.
+    let metadata_open_start = Instant::now();
+    let mut session = bpm::metadata::InstallSession::open(store.root())
+        .map_err(|error| anyhow::anyhow!("open metadata index failed: {error}"))?;
+    metrics.record("metadata_open", metadata_open_start.elapsed());
+    let lease_artifacts: Vec<ArtifactId> = artifact_ids
+        .iter()
+        .zip(lockfile.packages.iter())
+        .filter_map(|(maybe_id, pkg)| if pkg.link { None } else { *maybe_id })
+        .collect();
+    let prepared_derived: Vec<String> = prepared.values().map(|image| image.key.to_hex()).collect();
+    let metadata_lease_start = Instant::now();
+    session
+        .lease_objects(&lease_artifacts, &prepared_derived)
+        .map_err(|error| anyhow::anyhow!("lease store objects failed: {error}"))?;
+    metrics.record("metadata_lease", metadata_lease_start.elapsed());
+    // Turbopack and similar bundlers enforce that dependency realpaths remain
+    // inside the project. Keep the O(top-level) relay fast path for ordinary
+    // projects, but use a local hardlink view automatically for Next projects;
+    // callers can override this with BPM_PROJECT_VIEW=relay|local.
+    let project_view = resolve_project_view(lockfile, project_root);
+    // Graph attachment is always an isolated local view; the selected project
+    // view only chooses the direct-materialization backend.
+    // `final_ownership` is the sorted `ManagedEntry` set BPM actually created
+    // this install, used both as the reconciliation desired set and persisted
+    // into the next plan. For graph-volume views it is the final attachment
+    // result (the local-view outcome supersedes the transient relay set when
+    // local/reflink is selected). Direct materialization synthesizes no
+    // graph-volume ownership.
+    let mut final_ownership: Vec<bpm::graph::ManagedEntry> = Vec::new();
+    let mut graph_hex: Option<String> = None;
+    let materialization_start = Instant::now();
+    let (volume, view_entry_count, lifecycle) = if direct_materialization {
+        bpm::materializer::materialize_lockfile_with_backend(
+            project_root,
+            store,
+            lockfile,
+            artifact_ids,
+            bpm::materializer::MaterializeMode::Compatible,
+            match project_view {
+                ProjectView::Reflink => bpm::materializer::MaterializeBackend::Reflink,
+                ProjectView::Local => bpm::materializer::MaterializeBackend::IsolatedCopy,
+            },
+        )?;
+        (
+            None,
+            0usize,
+            run_lifecycle_if_enabled(
+                project_root,
+                store,
+                lockfile,
+                artifact_ids,
+                None,
+                options.ignore_scripts,
+                false,
+                options.derived_store,
+                profile,
+                metrics,
+            )?,
+        )
+    } else {
+        let ensured = bpm::volume::ensure_graph_volume_with_prepared_and_profile(
+            store,
+            lockfile,
+            artifact_ids,
+            &prepared,
+            profile,
+            metrics,
+        )?;
+        let (volume, lifecycle) = match ensured {
+            bpm::volume::EnsuredVolume::Ready(volume) => {
+                let lifecycle = run_lifecycle_if_enabled(
+                    project_root,
+                    store,
+                    lockfile,
+                    artifact_ids,
+                    Some(&volume.path),
+                    options.ignore_scripts,
+                    true,
+                    options.derived_store,
+                    profile,
+                    metrics,
+                )?;
+                (volume, lifecycle)
+            }
+            bpm::volume::EnsuredVolume::Building(pending) => {
+                let lifecycle = run_lifecycle_if_enabled(
+                    project_root,
+                    store,
+                    lockfile,
+                    artifact_ids,
+                    Some(pending.path()),
+                    options.ignore_scripts,
+                    false,
+                    options.derived_store,
+                    profile,
+                    metrics,
+                )?;
+                let volume = pending.publish()?;
+                (volume, lifecycle)
+            }
+        };
+        let attach = bpm::volume::attach_project(project_root, &volume)?;
+        final_ownership.clone_from(&attach.owned);
+        let hex = volume
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("")
+            .to_string();
+        graph_hex = Some(hex);
+        (
+            Some(volume),
+            attach.stats.relays_created + attach.stats.relays_unchanged,
+            lifecycle,
+        )
+    };
+    metrics.record("materialization", materialization_start.elapsed());
+    let local_view_start = Instant::now();
+    metrics.record("project_local_view", local_view_start.elapsed());
+
+    // Overlap the independent post-materialization work:
+    // project-view reconciliation and plan writing run concurrently,
+    // while record_graph runs in the main thread. This overlaps
+    // the serial tail with itself, reducing wall-clock time.
+    let overlap_start = Instant::now();
+    let has_volume = volume.is_some();
+
+    // Collect data needed by both concurrent operations up front so
+    // the scoped threads only hold shared references.
+    let new_desired: std::collections::BTreeSet<String> = if !prior_owned.is_empty() && has_volume {
+        final_ownership.iter().map(|e| e.path.clone()).collect()
+    } else {
+        std::collections::BTreeSet::new()
+    };
+    let plan_derived_paths = lifecycle.derived_paths.clone();
+    let plan_final_ownership = final_ownership.clone();
+    let plan_prepared_keys = prepared
+        .iter()
+        .map(|(path, image)| (path.clone(), *image.key.as_bytes()))
+        .collect::<BTreeMap<_, _>>();
+
+    let (reconciliation_outcome, plan_result) = std::thread::scope(|scope| {
+        let r = scope.spawn(move || {
+            if !prior_owned.is_empty() && has_volume {
+                bpm::volume::reconcile_project_view(project_root, prior_owned, &new_desired)
+                    .map_err(|error| anyhow::anyhow!("project-view reconciliation failed: {error}"))
+            } else {
+                Ok(bpm::volume::ReconcileOutcome::default())
+            }
+        });
+
+        let p = scope.spawn(move || {
+            let plan_path = graph::plan_path_for(lockfile_path);
+            let mut plan = graph::build_plan_with_profile(
+                lockfile,
+                artifact_ids,
+                &plan_derived_paths,
+                plan_final_ownership.clone(),
+                profile,
+            );
+            plan.graph_id_hex = graph::graph_id_for_project_with_prepared_and_profile(
+                lockfile,
+                project_root,
+                &plan_prepared_keys,
+                profile,
+            )
+            .to_hex();
+            graph::write_plan(&plan, &plan_path).map_err(|error| {
+                anyhow::anyhow!("failed to write plan {}: {error}", plan_path.display())
+            })
+        });
+
+        (r.join().unwrap(), p.join().unwrap())
+    });
+
+    // Reconcile stale project-view entries from the prior install AFTER the
+    // final view is attached, using the final ownership set as the desired set.
+    // Propagate filesystem errors; warn (do not fail) on entries BPM could not
+    // prove it still owned — they are preserved, never deleted on assumption.
+    // For direct materialization (`volume == None`) there is no new graph-
+    // volume ownership to reconcile against; a prior graph-volume owner that we
+    // cannot safely attribute is preserved rather than deleted.
+    let reconciliation_start = Instant::now();
+    if let Ok(outcome) = reconciliation_outcome {
+        for path in &outcome.preserved {
+            eprintln!(
+                "warning: preserved project-view entry {} (identity no longer matches; not removed)",
+                path
+            );
+        }
+    }
+    metrics.record("project_reconciliation", reconciliation_start.elapsed());
+
+    let graph_record_start = Instant::now();
+    if let Some(hex) = &graph_hex {
+        session
+            .record_graph(
+                hex,
+                bpm::volume::read_graph_inventory(&store.graph_volume_path(hex)).as_ref(),
+            )
+            .map_err(|error| anyhow::anyhow!("record graph ownership failed: {error}"))?;
+    }
+    metrics.record("metadata_graph_record", graph_record_start.elapsed());
+
+    let plan_start = Instant::now();
+    if let Err(error) = plan_result {
+        eprintln!("warning: {error}");
+    }
+    metrics.record("plan_write", plan_start.elapsed());
+
+    let overlap_ms = overlap_start.elapsed().as_millis() as u64;
+    metrics.add_overlap(overlap_ms);
+
+    // Persist durable project ownership now that the graph is attached and
+    // `.bpm-state`/plan are written. The lease is checked before and after;
+    // a lost lease fails the install rather than leaving an unprotected graph.
+    // Direct workspace materialization (no graph volume) does not register a
+    // nonexistent graph; any prior registration is preserved conservatively.
+    let metadata_finalize_start = Instant::now();
+    if let Some(hex) = &graph_hex {
+        session
+            .finalize_project(project_root, hex)
+            .map_err(|error| anyhow::anyhow!("persist project ownership failed: {error}"))?;
+    } else {
+        session
+            .check()
+            .map_err(|error| anyhow::anyhow!("metadata lease lost before completion: {error}"))?;
+    }
+    metrics.record("metadata_finalize", metadata_finalize_start.elapsed());
+    let package_count = lockfile
+        .packages
+        .iter()
+        .filter(|package| !package.link && !package.resolved.is_empty())
+        .count();
+    println!(
+        "installed {} package(s) into {} ({} cached, {} fetched; graph volume {}, {} project-view entry(s))",
+        package_count,
+        project_root.join("node_modules").display(),
+        cached,
+        fetched,
+        if volume.as_ref().is_some_and(|volume| volume.cached) {
+            "reused"
+        } else if volume.is_some() {
+            "built"
+        } else {
+            "direct"
+        },
+        view_entry_count
+    );
+    write_metrics(metrics, options.json_metrics.clone())
+}
+
+fn build_install_work(
+    lockfile: &Lockfile,
+    frozen: bool,
+    lock_label: &str,
+) -> anyhow::Result<Vec<InstallWork>> {
+    let mut work = Vec::new();
+    let target = resolver::current_target_platform();
+    for package in lockfile.packages.iter() {
+        if package.link || package.resolved.is_empty() {
+            continue;
+        }
+        let constraints = PlatformConstraints {
+            os: package.os.iter().cloned().collect(),
+            cpu: package.cpu.iter().cloned().collect(),
+            libc: lockfile
+                .resolution
+                .packages
+                .get(&package.path)
+                .map(|resolution| resolution.libc.iter().cloned().collect())
+                .unwrap_or_default(),
+        };
+        match check_package_platform(
+            &format!("{}@{}", package.name, package.version),
+            &constraints,
+            &target,
+            if package.optional {
+                PackageReachability::OptionalOnly
+            } else {
+                PackageReachability::Required
+            },
+        )
+        .map_err(|error| anyhow::anyhow!("platform filtering failed: {error}"))?
+        {
+            PlatformDisposition::Compatible => {}
+            PlatformDisposition::SkipOptional(diagnostic) => {
+                eprintln!("platform: {}", diagnostic.message);
+                continue;
+            }
+        }
+        let integrity = match package.integrity.as_deref() {
+            Some(value) => Some(Integrity::parse(value).map_err(|error| {
+                anyhow::anyhow!(
+                    "package '{}' at {} has invalid integrity \"{value}\": {error}",
+                    package.name,
+                    package.path
+                )
+            })?),
+            None if frozen => anyhow::bail!(
+                "package '{}' at {} in {lock_label} has no integrity; cannot verify a frozen install",
+                package.name,
+                package.path
+            ),
+            None => None,
+        };
+        work.push(InstallWork {
+            path: package.path.clone(),
+            name: package.name.clone(),
+            url: package.resolved.clone(),
+            integrity,
+        });
+    }
+    Ok(work)
+}
+
+impl std::fmt::Display for FetchFail {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "install failed for package '{}' from {}: {}",
+            self.name,
+            redact_url(&self.url),
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for FetchFail {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        assert_outcomes_complete, auto_local_project_view, auto_local_project_view_with_fragile,
+        project_lockfile_omitting_dev, resolve_project_view_with, FetchOutcome, InstallWork,
+        ProjectView, TryChannelSink,
+    };
+    use bpm::integrity::ArtifactId;
+    use bpm::lockfile::{
+        LockDependency, LockSource, Lockfile, PackageEntry, PackageResolution, PeerProvider,
+    };
+    use bpm::resolver::{ResolveSink, ResolvedDownloadUnit};
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::{mpsc::sync_channel, Arc, Mutex};
+
+    fn unit(path: &str) -> ResolvedDownloadUnit {
+        ResolvedDownloadUnit {
+            path: path.to_owned(),
+            name: path.to_owned(),
+            url: format!("https://example.test/{path}.tgz"),
+            integrity: None,
+        }
+    }
+
+    #[test]
+    fn try_channel_sink_retains_overflow_in_emission_order_without_panic() {
+        // Capacity-1 channel with no active consumer: the first unit occupies
+        // the slot, the next two must overflow exactly once and in order.
+        let (tx, rx) = sync_channel::<InstallWork>(1);
+        let overflow = Arc::new(Mutex::new(Vec::new()));
+        let sink = TryChannelSink {
+            tx: tx.clone(),
+            overflow: Arc::clone(&overflow),
+        };
+        sink.emit(unit("node_modules/p0"));
+        sink.emit(unit("node_modules/p1"));
+        sink.emit(unit("node_modules/p2"));
+        {
+            let buffered = overflow.lock().unwrap();
+            assert_eq!(
+                buffered.len(),
+                2,
+                "two units must overflow a capacity-1 channel"
+            );
+            assert_eq!(buffered[0].path, "node_modules/p1");
+            assert_eq!(buffered[1].path, "node_modules/p2");
+            // No URL/name/path field is lost in ResolvedDownloadUnit -> InstallWork.
+            assert_eq!(buffered[0].url, "https://example.test/node_modules/p1.tgz");
+            assert_eq!(buffered[0].name, "node_modules/p1");
+        }
+        // Dropping the receiver must not panic or change resolver semantics;
+        // the unit is retained so the caller can surface the worker failure.
+        drop(rx);
+        sink.emit(unit("node_modules/p3"));
+        assert_eq!(overflow.lock().unwrap().len(), 3);
+    }
+
+    fn outcome(path: &str) -> FetchOutcome {
+        FetchOutcome {
+            path: path.to_owned(),
+            id: ArtifactId::from_bytes([0; 64]),
+            artifact_cached: true,
+            image_cached: true,
+        }
+    }
+
+    fn downloadable(path: &str) -> PackageEntry {
+        let mut entry = PackageEntry {
+            path: path.to_owned(),
+            name: path.to_owned(),
+            ..Default::default()
+        };
+        entry.resolved = format!("https://example.test/{path}.tgz");
+        entry
+    }
+
+    #[test]
+    fn completeness_accepts_full_and_duplicate_coverage() {
+        let mut lockfile = Lockfile::new("test");
+        lockfile.packages.push(downloadable("node_modules/a"));
+        lockfile.packages.push(downloadable("node_modules/b"));
+        // Links and empty-resolved entries are not downloadable; ignored.
+        lockfile.packages.push(PackageEntry {
+            path: "node_modules/ws".into(),
+            name: "ws".into(),
+            link: true,
+            ..Default::default()
+        });
+        let outcomes = [
+            outcome("node_modules/a"),
+            outcome("node_modules/b"),
+            outcome("node_modules/a"),
+        ];
+        assert_outcomes_complete(&lockfile, &outcomes).unwrap();
+    }
+
+    #[test]
+    fn completeness_rejects_missing_paths_and_duplicates_do_not_satisfy() {
+        let mut lockfile = Lockfile::new("test");
+        lockfile.packages.push(downloadable("node_modules/a"));
+        lockfile.packages.push(downloadable("node_modules/b"));
+        // A duplicate of `a` does not cover the missing `b`.
+        let outcomes = [outcome("node_modules/a"), outcome("node_modules/a")];
+        let error = assert_outcomes_complete(&lockfile, &outcomes).unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("missing fetch outcome"), "{text}");
+        assert!(text.contains("node_modules/b"), "{text}");
+    }
+
+    #[test]
+    fn auto_view_detects_next_anywhere_in_the_resolved_graph() {
+        let mut lockfile = Lockfile::new("test");
+        lockfile.packages.push(PackageEntry {
+            path: "node_modules/tools/node_modules/next".into(),
+            name: "next".into(),
+            version: "15.0.0".into(),
+            ..Default::default()
+        });
+
+        assert!(auto_local_project_view(&lockfile));
+    }
+
+    #[test]
+    fn auto_view_stays_relay_for_non_next_graphs() {
+        let mut lockfile = Lockfile::new("test");
+        lockfile.packages.push(PackageEntry {
+            path: "node_modules/vite".into(),
+            name: "vite".into(),
+            version: "5.4.0".into(),
+            ..Default::default()
+        });
+
+        assert!(!auto_local_project_view(&lockfile));
+    }
+
+    #[test]
+    fn auto_view_detects_configured_fragile_package() {
+        // Exercise the configuration result without mutating a process-global
+        // environment variable: Rust's unit-test harness runs tests in
+        // parallel, so changing BPM_LOCAL_VIEW_PACKAGES here races unrelated
+        // view-selection tests.
+        let fragile = vec![
+            "next".to_string(),
+            "turbopack".to_string(),
+            "vite".to_string(),
+        ];
+        let mut lockfile = Lockfile::new("test");
+        lockfile.packages.push(PackageEntry {
+            path: "node_modules/turbopack".into(),
+            name: "turbopack".into(),
+            version: "1.0.0".into(),
+            ..Default::default()
+        });
+        // Env-added package triggers the local view.
+        assert!(auto_local_project_view_with_fragile(&lockfile, &fragile));
+
+        let mut lockfile = Lockfile::new("test");
+        lockfile.packages.push(PackageEntry {
+            path: "node_modules/next".into(),
+            name: "next".into(),
+            version: "15.0.0".into(),
+            ..Default::default()
+        });
+        // Built-in `next` still triggers even though the env list omitted it.
+        assert!(auto_local_project_view_with_fragile(&lockfile, &fragile));
+
+        let mut lockfile = Lockfile::new("test");
+        lockfile.packages.push(PackageEntry {
+            path: "node_modules/express".into(),
+            name: "express".into(),
+            version: "4.0.0".into(),
+            ..Default::default()
+        });
+        // A package neither built-in nor env-listed does not trigger.
+        assert!(!auto_local_project_view_with_fragile(&lockfile, &fragile));
+    }
+
+    #[test]
+    fn resolve_project_view_maps_env_values() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let project_root = tmp.path();
+        let lockfile = Lockfile::new("test");
+        assert_eq!(
+            resolve_project_view_with(&lockfile, project_root, Some("reflink")),
+            ProjectView::Reflink
+        );
+        assert_eq!(
+            resolve_project_view_with(&lockfile, project_root, Some("local")),
+            ProjectView::Local
+        );
+        assert_eq!(
+            resolve_project_view_with(&lockfile, project_root, Some("relay")),
+            ProjectView::Reflink
+        );
+        // Automatic and unsupported values always select an isolated view.
+        assert_eq!(
+            resolve_project_view_with(&lockfile, project_root, None),
+            ProjectView::Reflink
+        );
+        assert_eq!(
+            resolve_project_view_with(&lockfile, project_root, Some("bogus")),
+            ProjectView::Reflink
+        );
+    }
+
+    fn projection_package(path: &str, dev: bool) -> PackageEntry {
+        PackageEntry {
+            path: path.to_owned(),
+            name: path.rsplit('/').next().unwrap_or(path).to_owned(),
+            version: "1.0.0".into(),
+            resolved: format!("https://example.test/{path}.tgz"),
+            integrity: Some("sha512-test".into()),
+            dev,
+            ..Default::default()
+        }
+    }
+
+    fn projection_resolution() -> PackageResolution {
+        PackageResolution {
+            source: LockSource::Registry {
+                registry: "https://registry.npmjs.org".into(),
+            },
+            dev_optional: false,
+            peer: false,
+            libc: Vec::new(),
+            dependencies: BTreeMap::new(),
+            optional_dependencies: BTreeMap::new(),
+            peer_dependencies: BTreeMap::new(),
+            optional_peers: BTreeSet::new(),
+            peer_context: BTreeMap::new(),
+            workspace_target: None,
+            has_install_script: false,
+        }
+    }
+
+    fn target(path: &str) -> LockDependency {
+        LockDependency {
+            spec: "^1.0.0".into(),
+            target: path.into(),
+        }
+    }
+
+    #[test]
+    fn omit_dev_projection_retains_runtime_closure_and_prunes_optional_peer_metadata() {
+        let mut full = Lockfile::new("test");
+        for (path, dev) in [
+            ("node_modules/runtime", false),
+            ("node_modules/runtime-child", true),
+            ("node_modules/optional-child", true),
+            ("node_modules/required-provider", true),
+            ("node_modules/optional-provider", true),
+            ("node_modules/dev-only", true),
+        ] {
+            full.packages.push(projection_package(path, dev));
+        }
+        let mut runtime = projection_resolution();
+        runtime
+            .dependencies
+            .insert("runtime-child".into(), target("node_modules/runtime-child"));
+        runtime.optional_dependencies.insert(
+            "optional-child".into(),
+            target("node_modules/optional-child"),
+        );
+        runtime.peer_dependencies.insert(
+            "required-provider".into(),
+            target("node_modules/required-provider"),
+        );
+        runtime.peer_context.insert(
+            "required-provider".into(),
+            PeerProvider {
+                name: "required-provider".into(),
+                version: "1.0.0".into(),
+                source: LockSource::Registry {
+                    registry: "https://registry.npmjs.org".into(),
+                },
+                path: "node_modules/required-provider".into(),
+            },
+        );
+        runtime.peer_dependencies.insert(
+            "optional-provider".into(),
+            target("node_modules/optional-provider"),
+        );
+        runtime.optional_peers.insert("optional-provider".into());
+        runtime.peer_context.insert(
+            "optional-provider".into(),
+            PeerProvider {
+                name: "optional-provider".into(),
+                version: "1.0.0".into(),
+                source: LockSource::Registry {
+                    registry: "https://registry.npmjs.org".into(),
+                },
+                path: "node_modules/optional-provider".into(),
+            },
+        );
+        full.resolution
+            .packages
+            .insert("node_modules/runtime".into(), runtime);
+        for path in [
+            "node_modules/runtime-child",
+            "node_modules/optional-child",
+            "node_modules/required-provider",
+            "node_modules/optional-provider",
+            "node_modules/dev-only",
+        ] {
+            full.resolution
+                .packages
+                .insert(path.into(), projection_resolution());
+        }
+        full.resolution
+            .registry_names
+            .insert("node_modules/dev-only".into(), "dev-only".into());
+        full.sort_packages();
+        let authoritative_before = full.clone();
+
+        let projected = project_lockfile_omitting_dev(&full);
+        let paths = projected
+            .packages
+            .iter()
+            .map(|package| package.path.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            paths,
+            BTreeSet::from([
+                "node_modules/runtime",
+                "node_modules/runtime-child",
+                "node_modules/optional-child",
+                "node_modules/required-provider",
+            ])
+        );
+        let runtime = &projected.resolution.packages["node_modules/runtime"];
+        assert!(runtime.peer_dependencies.contains_key("required-provider"));
+        assert!(runtime.peer_context.contains_key("required-provider"));
+        assert!(!runtime.peer_dependencies.contains_key("optional-provider"));
+        assert!(!runtime.peer_context.contains_key("optional-provider"));
+        assert!(!runtime.optional_peers.contains("optional-provider"));
+        assert!(!projected
+            .resolution
+            .registry_names
+            .contains_key("node_modules/dev-only"));
+        assert_eq!(
+            full, authoritative_before,
+            "the projection must never mutate authoritative lock truth"
+        );
+    }
+
+    #[test]
+    fn omit_dev_projection_uses_node_lookup_for_unannotated_package_locks() {
+        let mut full = Lockfile::new("test");
+        let mut host = projection_package("node_modules/host", false);
+        host.dependencies.insert("nested".into(), "^1.0.0".into());
+        full.packages.push(host);
+        full.packages.push(projection_package(
+            "node_modules/host/node_modules/nested",
+            true,
+        ));
+        full.packages
+            .push(projection_package("node_modules/dev-only", true));
+        full.sort_packages();
+
+        let projected = project_lockfile_omitting_dev(&full);
+        let paths = projected
+            .packages
+            .iter()
+            .map(|package| package.path.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(paths.contains("node_modules/host"));
+        assert!(paths.contains("node_modules/host/node_modules/nested"));
+        assert!(!paths.contains("node_modules/dev-only"));
+    }
+}
