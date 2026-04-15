@@ -24,8 +24,10 @@ bpm bench --fixture minimal --save-baseline benchmarks/baselines
 
 Results record the exact toolchain versions (`node`, `npm`, `pnpm`, `bpm`) under
 `versions`, so a result is only comparable to another with the same versions
-map. Tools not installed on the machine are skipped with a warning rather than
-failing the run.
+map. Each tool receives an isolated temporary cache root; warm scenarios reuse
+that root, while cold scenarios cannot accidentally benefit from the
+operator's global cache. Tools not installed on the machine are skipped with a
+warning rather than failing the run.
 
 ## Baselines
 
@@ -48,8 +50,10 @@ checked in. Regenerate on a given machine with the command above.
 
 ## Fixtures
 
-`minimal`, `small`, and `medium` are small dependency graphs. Additional
-fixtures cover `large-frontend`, `many-small-files`, `monorepo`, `lifecycle`,
-and `native-addon`; list them with `bpm bench --list`. A real
-`package-lock.json` is generated per run where the selected tool needs one, so
-every tool installs from an identical, integrity-bearing lockfile.
+`minimal`, `small`, and `medium` are small dependency graphs. The M7
+comparison set uses `large-frontend`, `many-small-files`, `monorepo`, and
+`native-addon` to expose frontend, filesystem, workspace, and native-addon
+behavior. `lifecycle` remains a lifecycle-focused correctness fixture; list
+all fixtures with `bpm bench --list`. A real `package-lock.json` is generated
+per run where the selected tool needs one, so every tool installs from an
+identical, integrity-bearing lockfile.

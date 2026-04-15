@@ -362,7 +362,9 @@ pub fn run_scenario(
     num_runs: usize,
 ) -> anyhow::Result<ToolResults> {
     let temp_base = tempfile::tempdir()?;
-    // A stable per-scenario store dir for bpm so warm/repeat runs reuse it.
+    // Stable per-scenario cache roots make warm/repeat runs reuse each tool's
+    // cache while keeping cold comparisons isolated from the developer's
+    // global npm/pnpm/Bun stores.
     let bpm_store = temp_base.path().join("bpm-store");
     fs::create_dir_all(&bpm_store)?;
 
@@ -460,20 +462,20 @@ fn run_tool(
     bpm_store: &Path,
 ) -> anyhow::Result<std::process::ExitStatus> {
     match tool {
-        Tool::Npm => Ok(Command::new("npm")
-            .args(["install", "--prefer-offline"])
-            .current_dir(work_dir)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map_err(|e| anyhow::anyhow!("failed to run npm: {e}"))?),
-        Tool::Pnpm => Ok(Command::new("pnpm")
-            .args(["install", "--prefer-offline"])
-            .current_dir(work_dir)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map_err(|e| anyhow::anyhow!("failed to run pnpm: {e}"))?),
+        Tool::Npm => {
+            let mut command = Command::new("npm");
+            command
+                .args(["install", "--prefer-offline"])
+                .current_dir(work_dir);
+            run_external(&mut command, Tool::Npm, bpm_store)
+        }
+        Tool::Pnpm => {
+            let mut command = Command::new("pnpm");
+            command
+                .args(["install", "--prefer-offline"])
+                .current_dir(work_dir);
+            run_external(&mut command, Tool::Pnpm, bpm_store)
+        }
         // Prefer the frozen imported lockfile when the scenario provides one,
         // so comparisons use the same resolved graph. True-cold scenarios do
         // not have a lockfile by design; native BPM resolution now handles
@@ -516,20 +518,53 @@ fn run_tool(
                 .status()
                 .map_err(|e| anyhow::anyhow!("failed to run native `bpm install`: {e}"))?)
         }
-        Tool::Yarn => Ok(Command::new("yarn")
-            .arg("install")
-            .current_dir(work_dir)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map_err(|e| anyhow::anyhow!("failed to run yarn: {e}"))?),
-        Tool::Bun => Ok(Command::new("bun")
-            .args(["install", "--no-progress"])
-            .current_dir(work_dir)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map_err(|e| anyhow::anyhow!("failed to run bun: {e}"))?),
+        Tool::Yarn => {
+            let mut command = Command::new("yarn");
+            command.arg("install").current_dir(work_dir);
+            run_external(&mut command, Tool::Yarn, bpm_store)
+        }
+        Tool::Bun => {
+            let mut command = Command::new("bun");
+            command
+                .args(["install", "--no-progress"])
+                .current_dir(work_dir);
+            run_external(&mut command, Tool::Bun, bpm_store)
+        }
+    }
+}
+
+fn run_external(
+    command: &mut Command,
+    tool: Tool,
+    bpm_store: &Path,
+) -> anyhow::Result<std::process::ExitStatus> {
+    configure_tool_cache(command, tool, bpm_store);
+    command
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|e| anyhow::anyhow!("failed to run {}: {e}", tool.name()))
+}
+
+fn configure_tool_cache(command: &mut Command, tool: Tool, bpm_store: &Path) {
+    let cache = bpm_store
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!("{}-cache", tool.name()));
+    match tool {
+        Tool::Npm => {
+            command.env("npm_config_cache", cache);
+        }
+        Tool::Pnpm => {
+            command.env("pnpm_config_store_dir", cache);
+        }
+        Tool::Yarn => {
+            command.env("YARN_CACHE_FOLDER", cache);
+        }
+        Tool::Bun => {
+            command.env("BUN_INSTALL_CACHE_DIR", cache);
+        }
+        Tool::Bpm => {}
     }
 }
 
