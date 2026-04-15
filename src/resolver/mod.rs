@@ -489,7 +489,7 @@ impl<'a> GraphResolver<'a> {
             .to_owned();
         let packument =
             self.registry
-                .packument(&registry_name)
+                .packument_for(&parsed)
                 .map_err(|source| ResolveError::Registry {
                     package: name.to_owned(),
                     spec: spec.clone(),
@@ -723,7 +723,7 @@ impl<'a> GraphResolver<'a> {
             .to_owned();
         let packument = self
             .registry
-            .packument(&registry_name)
+            .packument_for(&parsed)
             .map_err(|error| error.to_string())?;
         let resolved = resolve_packument(&parsed, &packument, &registry_base)
             .map_err(|error| error.to_string())?;
