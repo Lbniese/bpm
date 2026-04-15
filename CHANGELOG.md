@@ -8,6 +8,25 @@ once a 1.0 release is cut.
 
 ## [Unreleased]
 
+### Added
+
+- M7 benchmark runs now isolate npm, pnpm, Bun, Yarn, and BPM caches, making
+  cold-path comparisons fair instead of reusing the developer's global stores.
+  Native installs also report dependency-resolution time in JSON metrics.
+
+### Fixed
+
+- Native registry resolution uses abbreviated install metadata for ranges and
+  tags, and exact-version endpoints for exact dependencies, avoiding full
+  multi-megabyte packuments when they are unnecessary.
+- npm disjunctive semver ranges such as `^3.0.0 || ^4.0.0` are now accepted by
+  registry, peer, and workspace resolution.
+- Scoped packages with a single `bin` declaration now use npm's unscoped
+  command name (for example `@scope/tool` exposes `tool`).
+- Lifecycle scripts construct PATH with the platform path-list separator.
+
+## [0.1.7] - 2026-07-17
+
 ### Fixed
 
 - `bpm run` now prepends `node_modules/.bin` using the platform PATH-list
@@ -172,7 +191,8 @@ Initial release.
   into the graph id.
 - Install-timing benchmark harness with machine-stamped baselines.
 
-[Unreleased]: https://github.com/lbniese/bpm/compare/v0.1.6...HEAD
+[Unreleased]: https://github.com/lbniese/bpm/compare/v0.1.7...HEAD
+[0.1.7]: https://github.com/Lbniese/bpm/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/Lbniese/bpm/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/lbniese/bpm/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/lbniese/bpm/compare/v0.1.3...v0.1.4

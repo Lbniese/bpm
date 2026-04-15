@@ -51,11 +51,23 @@ impl HttpClient {
 
     /// Execute a GET request and return its response for string/JSON handling.
     pub fn get(&self, url: &str) -> Result<ureq::Response, HttpError> {
+        self.get_with_headers(url, &[])
+    }
+
+    /// Execute a GET request with additional request headers.
+    pub fn get_with_headers(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+    ) -> Result<ureq::Response, HttpError> {
         let display_url = redact_url(url);
         let attempts = self.config.network.retries.saturating_add(1);
 
         for attempt in 0..attempts {
             let mut request = self.agent.get(url);
+            for (name, value) in headers {
+                request = request.set(name, value);
+            }
             if let Some(token) = self.config.auth_token_for_url(url) {
                 request = request.set(AUTHORIZATION, &format!("Bearer {token}"));
             }

@@ -27,6 +27,43 @@ use crate::config::NpmConfig;
 use crate::http::HttpClient;
 
 /// How a spec asks for a version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionRange(Vec<VersionReq>);
+
+impl VersionRange {
+    pub fn parse(value: &str) -> Result<Self, semver::Error> {
+        let mut ranges = Vec::new();
+        for part in value.split("||") {
+            let part = part.trim();
+            if part.is_empty() {
+                return Err(VersionReq::parse(part).unwrap_err());
+            }
+            ranges.push(VersionReq::parse(part)?);
+        }
+        Ok(Self(ranges))
+    }
+
+    pub fn matches(&self, version: &Version) -> bool {
+        self.0.iter().any(|range| range.matches(version))
+    }
+
+    pub fn requirements(&self) -> &[VersionReq] {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for VersionRange {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let joined = self
+            .0
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(" || ");
+        formatter.write_str(&joined)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum VersionRequest {
     /// No version given: use `dist-tags.latest`.
@@ -34,7 +71,7 @@ pub enum VersionRequest {
     /// An exact version (`lodash@4.17.21`).
     Exact(Version),
     /// A semver range (`lodash@^4.17.0`).
-    Range(VersionReq),
+    Range(VersionRange),
 }
 
 /// A parsed package spec: a name plus a version request.
@@ -152,46 +189,9 @@ impl<'de> Deserialize<'de> for Packument {
         let package_name = wire.name;
         let mut versions = BTreeMap::new();
         for (version_key, metadata) in wire.versions {
-            let version_text = if metadata.version.is_empty() {
-                version_key.as_str()
-            } else {
-                metadata.version.as_str()
-            };
-            let Ok(version) = Version::parse(version_text) else {
-                continue;
-            };
-            let name = if metadata.name.is_empty() {
-                package_name.clone()
-            } else {
-                metadata.name
-            };
-            let mut bin = match metadata.bin {
-                WireBin::Missing => BTreeMap::new(),
-                WireBin::Single(path) => BTreeMap::from([(name.clone(), path)]),
-                WireBin::Map(bin) => bin,
-            };
-            bin.retain(|command, path| !command.is_empty() && !path.is_empty());
-
-            versions.insert(
-                version_key,
-                VersionMetadata {
-                    name,
-                    version,
-                    deprecated: metadata.deprecated,
-                    dependencies: metadata.dependencies,
-                    optional_dependencies: metadata.optional_dependencies,
-                    peer_dependencies: metadata.peer_dependencies,
-                    peer_dependencies_meta: metadata.peer_dependencies_meta,
-                    bin,
-                    dist: metadata.dist,
-                    engines: metadata.engines,
-                    os: normalize_list(metadata.os),
-                    cpu: normalize_list(metadata.cpu),
-                    libc: normalize_list(metadata.libc),
-                    has_install_script: metadata.has_install_script,
-                    has_shrinkwrap: metadata.has_shrinkwrap,
-                },
-            );
+            if let Some(metadata) = version_metadata(&package_name, &version_key, metadata) {
+                versions.insert(version_key, metadata);
+            }
         }
         Ok(Self {
             name: package_name,
@@ -223,6 +223,50 @@ fn normalize_list(mut values: Vec<String>) -> Vec<String> {
     values.sort();
     values.dedup();
     values
+}
+
+fn version_metadata(
+    package_name: &str,
+    version_key: &str,
+    metadata: WireVersionMetadata,
+) -> Option<VersionMetadata> {
+    let version_text = if metadata.version.is_empty() {
+        version_key
+    } else {
+        metadata.version.as_str()
+    };
+    let version = Version::parse(version_text).ok()?;
+    let name = if metadata.name.is_empty() {
+        package_name.to_owned()
+    } else {
+        metadata.name
+    };
+    let mut bin = match metadata.bin {
+        WireBin::Missing => BTreeMap::new(),
+        WireBin::Single(path) => {
+            BTreeMap::from([(name.rsplit('/').next().unwrap_or(&name).to_owned(), path)])
+        }
+        WireBin::Map(bin) => bin,
+    };
+    bin.retain(|command, path| !command.is_empty() && !path.is_empty());
+
+    Some(VersionMetadata {
+        name,
+        version,
+        deprecated: metadata.deprecated,
+        dependencies: metadata.dependencies,
+        optional_dependencies: metadata.optional_dependencies,
+        peer_dependencies: metadata.peer_dependencies,
+        peer_dependencies_meta: metadata.peer_dependencies_meta,
+        bin,
+        dist: metadata.dist,
+        engines: metadata.engines,
+        os: normalize_list(metadata.os),
+        cpu: normalize_list(metadata.cpu),
+        libc: normalize_list(metadata.libc),
+        has_install_script: metadata.has_install_script,
+        has_shrinkwrap: metadata.has_shrinkwrap,
+    })
 }
 
 /// A fully resolved single package and all metadata needed by the resolver.
@@ -287,8 +331,24 @@ impl RegistryClient {
     /// Fetch the configured scoped/default registry and resolve one package.
     pub fn resolve(&self, spec: &PackageSpec) -> Result<ResolvedArtifact, RegistryError> {
         let registry = self.config.registry_for_package(&spec.name);
-        let packument = self.packument(&spec.name)?;
+        let packument = self.packument_for(spec)?;
         resolve_packument(spec, &packument, registry)
+    }
+
+    /// Fetch the smallest metadata document that can resolve `spec`.
+    ///
+    /// Exact versions have a dedicated registry endpoint and do not need the
+    /// package's complete multi-megabyte version history. Ranges and tags use
+    /// the abbreviated install metadata packument so dependency fields remain
+    /// available without downloading npm's publish-time metadata.
+    pub fn packument_for(&self, spec: &PackageSpec) -> Result<Packument, RegistryError> {
+        match &spec.req {
+            VersionRequest::Exact(version) => {
+                let registry = self.config.registry_for_package(&spec.name);
+                fetch_version_packument(&self.http, &spec.name, version, registry)
+            }
+            VersionRequest::Latest | VersionRequest::Range(_) => self.packument(&spec.name),
+        }
     }
 
     /// Fetch a typed packument for use by dependency-graph resolution.
@@ -365,7 +425,7 @@ pub fn parse_spec(spec: &str) -> Result<PackageSpec, RegistryError> {
     let req = match req_str.map(str::trim) {
         None | Some("") | Some("latest") => VersionRequest::Latest,
         Some(s) if s.starts_with(['^', '~', '>', '<', '=', '*']) => {
-            VersionRequest::Range(VersionReq::parse(s).map_err(|e| {
+            VersionRequest::Range(VersionRange::parse(s).map_err(|e| {
                 RegistryError::InvalidSpec(spec.to_string(), format!("bad range '{s}': {e}"))
             })?)
         }
@@ -374,7 +434,7 @@ pub fn parse_spec(spec: &str) -> Result<PackageSpec, RegistryError> {
             // is treated as a range.
             match Version::parse(s) {
                 Ok(v) => VersionRequest::Exact(v),
-                Err(_) => VersionRequest::Range(VersionReq::parse(s).map_err(|e| {
+                Err(_) => VersionRequest::Range(VersionRange::parse(s).map_err(|e| {
                     RegistryError::InvalidSpec(spec.to_string(), format!("bad version '{s}': {e}"))
                 })?),
             }
@@ -456,6 +516,31 @@ fn fetch_packument(
     let encoded = name.replace('/', "%2F");
     let url = format!("{base}/{encoded}");
 
+    let resp = http
+        .get_with_headers(&url, &[("Accept", "application/vnd.npm.install-v1+json")])
+        .map_err(|source| RegistryError::Network {
+            package: name.to_string(),
+            source: Box::new(source),
+        })?;
+    let body = resp.into_string().map_err(|e| RegistryError::Network {
+        package: name.to_string(),
+        source: Box::new(e),
+    })?;
+    serde_json::from_str(&body).map_err(|source| RegistryError::BadJson {
+        package: name.to_string(),
+        source,
+    })
+}
+
+fn fetch_version_packument(
+    http: &HttpClient,
+    name: &str,
+    version: &Version,
+    registry: &str,
+) -> Result<Packument, RegistryError> {
+    let base = registry.trim_end_matches('/');
+    let encoded = name.replace('/', "%2F");
+    let url = format!("{base}/{encoded}/{version}");
     let resp = http.get(&url).map_err(|source| RegistryError::Network {
         package: name.to_string(),
         source: Box::new(source),
@@ -464,9 +549,20 @@ fn fetch_packument(
         package: name.to_string(),
         source: Box::new(e),
     })?;
-    serde_json::from_str(&body).map_err(|source| RegistryError::BadJson {
-        package: name.to_string(),
-        source,
+    let wire: WireVersionMetadata =
+        serde_json::from_str(&body).map_err(|source| RegistryError::BadJson {
+            package: name.to_string(),
+            source,
+        })?;
+    let metadata = version_metadata(name, &version.to_string(), wire).ok_or_else(|| {
+        RegistryError::NoVersions {
+            package: name.to_string(),
+        }
+    })?;
+    Ok(Packument {
+        name: name.to_string(),
+        dist_tags: BTreeMap::new(),
+        versions: BTreeMap::from([(version.to_string(), metadata)]),
     })
 }
 
@@ -613,6 +709,30 @@ mod tests {
     }
 
     #[test]
+    fn scoped_single_bin_uses_unscoped_command_name() {
+        let packument = packument(serde_json::json!({
+            "name": "@scope/pkg",
+            "versions": {
+                "1.0.0": { "version": "1.0.0", "bin": "cli.js" }
+            }
+        }));
+        let metadata = packument.versions.get("1.0.0").unwrap();
+        assert_eq!(metadata.bin.keys().collect::<Vec<_>>(), vec!["pkg"]);
+    }
+
+    #[test]
+    fn disjunctive_ranges_match_any_requirement() {
+        let spec = parse_spec("js-tokens@^3.0.0 || ^4.0.0").unwrap();
+        let VersionRequest::Range(range) = spec.req else {
+            panic!("expected range");
+        };
+        assert!(range.matches(&Version::new(3, 0, 2)));
+        assert!(range.matches(&Version::new(4, 0, 1)));
+        assert!(!range.matches(&Version::new(2, 0, 0)));
+        assert_eq!(range.to_string(), "^3.0.0 || ^4.0.0");
+    }
+
+    #[test]
     fn rejects_empty_spec() {
         assert!(parse_spec("").is_err());
         assert!(parse_spec("   ").is_err());
@@ -658,7 +778,7 @@ mod tests {
             "name": "lodash",
             "versions": { "1.0.0": {}, "4.0.0": {}, "4.17.20": {}, "4.17.21": {}, "5.0.0": {} }
         }));
-        let req = VersionRequest::Range(VersionReq::parse("^4.0.0").unwrap());
+        let req = VersionRequest::Range(VersionRange::parse("^4.0.0").unwrap());
         let v = select_version("lodash", &req, &packument).unwrap();
         assert_eq!(v, Version::parse("4.17.21").unwrap());
     }
@@ -692,6 +812,42 @@ mod tests {
         let resolved = resolve_packument(&spec, &packument, "https://example.test/").unwrap();
         assert_eq!(resolved.tarball_url, "https://example.test/p/-/p-1.2.3.tgz");
         assert_eq!(resolved.integrity, "sha512-abc");
+    }
+
+    #[test]
+    fn exact_resolution_uses_version_endpoint() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let registry = format!("http://{address}");
+        let (request_tx, request_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let read = stream.read(&mut request).unwrap();
+            request_tx
+                .send(String::from_utf8_lossy(&request[..read]).into_owned())
+                .unwrap();
+            let body = r#"{"name":"p","version":"1.2.3","dist":{"tarball":"https://example.test/p.tgz","integrity":"sha512-abc"}}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+
+        let config = NpmConfig::default()
+            .with_registry_override(&registry)
+            .unwrap();
+        let client = RegistryClient::new(config);
+        let resolved = client.resolve(&parse_spec("p@1.2.3").unwrap()).unwrap();
+        server.join().unwrap();
+
+        assert_eq!(resolved.version, Version::new(1, 2, 3));
+        assert!(request_rx
+            .recv()
+            .unwrap()
+            .starts_with("GET /p/1.2.3 HTTP/1.1"));
     }
 
     #[test]
@@ -739,5 +895,6 @@ mod tests {
 
         assert_eq!(resolved.version, Version::new(1, 0, 0));
         assert!(request.contains("Authorization: Bearer configured-token\r\n"));
+        assert!(request.contains("Accept: application/vnd.npm.install-v1+json\r\n"));
     }
 }
