@@ -18,11 +18,13 @@ page records the architecture that is currently shipped.
    from the sibling manifest so `bpm ci` validates dev, optional, peer, and
    override declarations.
 2. **Native resolver** — `src/resolver/` resolves registry ranges, tags, and
-   exact versions into a deterministic physical graph. It handles supported
-   root overrides, strict or legacy peer modes, npm platform filtering,
-   optional reachability, cycles, and local workspaces. Non-frozen `bpm install`
-   resolves `package.json` and writes `bpm.lock`; frozen installs are
-   resolution-free.
+   exact versions into a deterministic physical graph. Exact requests use the
+   registry's version endpoint; ranges and tags use abbreviated install
+   metadata, avoiding unnecessary full packument downloads. npm disjunctive
+   ranges are supported. It handles supported root overrides, strict or legacy
+   peer modes, npm platform filtering, optional reachability, cycles, and local
+   workspaces. Non-frozen `bpm install` resolves `package.json` and writes
+   `bpm.lock`; frozen installs are resolution-free.
 3. **Artifact and metadata stores** — `src/store.rs`, `src/download.rs`,
    `src/archive.rs`, and `src/integrity.rs` provide immutable, verified
    tarballs and extracted package images. `src/metadata/` records artifacts,

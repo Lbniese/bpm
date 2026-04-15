@@ -230,9 +230,14 @@ fn run_script(
     // Project node_modules/.bin should be reachable for scripts; prepend it.
     if let Some(path) = std::env::var_os("PATH") {
         let bin = project_root.join("node_modules").join(".bin");
-        let mut new_path = std::ffi::OsString::from(&bin);
-        new_path.push(std::path::MAIN_SEPARATOR.to_string());
-        new_path.push(&path);
+        let mut paths = vec![bin];
+        paths.extend(std::env::split_paths(&path));
+        let new_path = std::env::join_paths(paths).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("could not construct lifecycle PATH: {error}"),
+            )
+        })?;
         cmd.env("PATH", new_path);
     }
     cmd.status()

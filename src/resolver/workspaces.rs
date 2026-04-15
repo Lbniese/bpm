@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use semver::{Version, VersionReq};
+use semver::Version;
 use thiserror::Error;
 
 use crate::manifest::{PackageManifest, WorkspaceSpec};
@@ -195,7 +195,7 @@ impl WorkspaceIndex {
         let Some(workspace) = self.by_name.get(name) else {
             return Ok(registry(spec));
         };
-        let Ok(requirement) = VersionReq::parse(spec) else {
+        let Ok(requirement) = crate::registry::VersionRange::parse(spec) else {
             return Ok(registry(spec));
         };
         if requirement.matches(&workspace.version) {
@@ -238,9 +238,10 @@ impl WorkspaceIndex {
                         "expected `*`, `^`, `~`, or a semver range",
                     ));
                 }
-                let requirement = VersionReq::parse(&range).map_err(|error| {
-                    invalid_workspace_spec(name, original_spec, &error.to_string())
-                })?;
+                let requirement =
+                    crate::registry::VersionRange::parse(&range).map_err(|error| {
+                        invalid_workspace_spec(name, original_spec, &error.to_string())
+                    })?;
                 if !requirement.matches(&workspace.version) {
                     return Err(WorkspaceError::VersionMismatch {
                         name: name.to_owned(),

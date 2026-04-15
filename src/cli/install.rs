@@ -39,6 +39,7 @@ pub(super) fn run(options: Options) -> anyhow::Result<()> {
     }
 
     let store = ArtifactStore::open(&store_root(options.store)?)?;
+    let mut metrics = Metrics::new();
     let cwd = env::current_dir()?;
     let (lockfile_path, lockfile, project_root) = match find_lockfile(&cwd)? {
         Some((path, lockfile)) => {
@@ -65,18 +66,21 @@ pub(super) fn run(options: Options) -> anyhow::Result<()> {
                 &workspace_layout,
             )
             .map_err(|error| anyhow::anyhow!("workspace resolution failed: {error}"))?;
-            let lockfile = resolver::resolve_manifest_with_options(
-                &manifest,
-                &client,
-                "bpm",
-                Some(&workspace_index),
-                if options.legacy_peer_deps {
-                    bpm::resolver::peer::PeerMode::LegacyIgnore
-                } else {
-                    bpm::resolver::peer::PeerMode::Strict
-                },
-            )
-            .map_err(|error| anyhow::anyhow!("dependency resolution failed: {error}"))?;
+            let lockfile = metrics
+                .measure("dependency_resolution", || {
+                    resolver::resolve_manifest_with_options(
+                        &manifest,
+                        &client,
+                        "bpm",
+                        Some(&workspace_index),
+                        if options.legacy_peer_deps {
+                            bpm::resolver::peer::PeerMode::LegacyIgnore
+                        } else {
+                            bpm::resolver::peer::PeerMode::Strict
+                        },
+                    )
+                })
+                .map_err(|error| anyhow::anyhow!("dependency resolution failed: {error}"))?;
             let path = root.join(bpm::lockfile::BPM_LOCK_FILE);
             lockfile.write_to(&path)?;
             eprintln!(
@@ -94,7 +98,6 @@ pub(super) fn run(options: Options) -> anyhow::Result<()> {
     let config = effective_npm_config(&project_root, options.registry.as_deref())?;
     let http = HttpClient::new(config);
 
-    let mut metrics = Metrics::new();
     let plan_path = graph::plan_path_for(&lockfile_path);
     let cached_plan = graph::read_plan(&plan_path)?;
     let plan_valid = cached_plan

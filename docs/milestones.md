@@ -19,6 +19,7 @@ the commit history wins.
 | 4 — Reusable graph volumes | graph-volume creation, graph-volume reuse across projects, safe project attachment | ✅ Done — `node_modules` attaches via shallow relays |
 | 5 — Lifecycle support | npm-compatible script environment, derived artifact store, native-addon fixture coverage | ✅ Mostly done — sandbox runner, graph-volume lifecycle, `bpm run`; derived-store wiring remains open |
 | 6 — Workspaces and optimization | basic npm workspaces, filesystem capability detection, reflink/clone optimization, adaptive concurrency | ✅ Mostly done — workspaces, capability probe, adaptive concurrency, local hardlink compatibility view; general reflink/clone attachment remains open |
+| 7 — Cold-path performance | representative benchmark corpus, persistent metadata efficiency, native-resolution profiling, derived lifecycle decision | 🚧 In progress — realistic fixture measurements and cold resolver hardening landed; derived-artifact integration and persistent metadata cache remain |
 
 ### Post-M6 — registry name resolution (not in the original plan)
 
@@ -210,3 +211,26 @@ canonical-bytes stability/mutation, capability probe).
 
 - `cargo fmt --all --check`, `cargo clippy --workspace --all-targets
   --all-features -- -D warnings`, `cargo test --workspace` all green (126 tests)
+
+## Milestone 7 — in progress
+
+The first M7 measurements cover `large-frontend`, `many-small-files`,
+`native-addon`, and `monorepo` across cold, warm, repeat, graph-reuse, and
+incremental scenarios. They confirm BPM's graph-volume path is already highly
+competitive after the graph exists, while cold native resolution and first-time
+artifact extraction are the current bottlenecks. The existing synthetic
+baseline is not sufficient to claim broad superiority over npm or pnpm; future
+comparisons must retain toolchain versions and include these representative
+fixtures.
+
+Cold-path hardening now:
+
+- requests npm's abbreviated install metadata for range/tag resolution;
+- fetches exact versions from the registry's version endpoint instead of the
+  full package history;
+- accepts npm disjunctive semver ranges such as `^3.0.0 || ^4.0.0`;
+- records native dependency-resolution time in `--json-metrics`.
+
+Next M7 work is to add persistent packument/metadata reuse, profile extraction
+and project attachment separately, and decide whether lifecycle output becomes
+content-addressed through `src/derived/store.rs` or remains graph-keyed.

@@ -34,7 +34,20 @@ impl RegistryMock {
 
         let server = MiniServer::start_routed(move |path| {
             let base = base_c.lock().unwrap().clone();
-            if path == "/lodash" {
+            if path == "/lodash/1.0.0" {
+                let metadata = serde_json::json!({
+                    "name": "lodash",
+                    "version": "1.0.0",
+                    "dist": {
+                        "tarball": format!("{base}lodash/-/lodash-1.0.0.tgz"),
+                        "integrity": &*integ,
+                    }
+                });
+                Some(RouteBody(
+                    serde_json::to_vec(&metadata).unwrap(),
+                    "application/json",
+                ))
+            } else if path == "/lodash" {
                 let packument = serde_json::json!({
                     "dist-tags": { "latest": "4.17.21" },
                     "versions": {

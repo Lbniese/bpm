@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use semver::{Version, VersionReq};
+use semver::Version;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -192,12 +192,14 @@ pub fn bind_peer_context(
             });
         };
 
-        let requirement = VersionReq::parse(range).map_err(|error| PeerConflict::InvalidRange {
-            consumer: candidate.name.clone(),
-            consumer_version: candidate.version.to_string(),
-            peer: peer.clone(),
-            range: range.clone(),
-            reason: error.to_string(),
+        let requirement = crate::registry::VersionRange::parse(range).map_err(|error| {
+            PeerConflict::InvalidRange {
+                consumer: candidate.name.clone(),
+                consumer_version: candidate.version.to_string(),
+                peer: peer.clone(),
+                range: range.clone(),
+                reason: error.to_string(),
+            }
         })?;
         let provider_version = Version::parse(&provider.identity.version).ok();
         if provider_version

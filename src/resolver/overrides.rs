@@ -368,9 +368,14 @@ fn request_matches_selector(selector_req: Option<&str>, requested: &str) -> bool
             |exact| exact == version,
         ),
         crate::registry::VersionRequest::Latest => true,
-        crate::registry::VersionRequest::Range(request) => selector
-            .as_ref()
-            .is_some_and(|selector| ranges_intersect(selector, &request)),
+        crate::registry::VersionRequest::Range(request) => {
+            selector.as_ref().is_some_and(|selector| {
+                request
+                    .requirements()
+                    .iter()
+                    .any(|request| ranges_intersect(selector, request))
+            })
+        }
     }
 }
 
