@@ -1,0 +1,1053 @@
+//! Local dependency mutation: `bpm install foo`, `bpm add foo`, and
+//! `bpm remove foo` / `bpm uninstall foo`.
+//!
+//! Mutation is a single staged transaction. Every target is parsed and the
+//! full graph is resolved *before* any project file is written. The manifest
+//! is edited losslessly through [`bpm::manifest_edit`], reparsed into a typed
+//! [`bpm::manifest::PackageManifest`] for resolution, and published alongside
+//! its lock through the crash-bounded two-file publisher. A failure in
+//! parsing, target resolution, graph resolution, export, or publishing leaves
+//! the source files byte-identical; a later download/materialization/lifecycle
+//! failure may leave the already-resolved manifest+lock in place, matching
+//! package-manager retry semantics.
+//!
+//! This first slice supports registry specs only. Git, URL/tarball, `file:`,
+//! `link:`, workspace, patch, optional, and peer mutation require separate
+//! compatibility work and are rejected before any file is touched.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::env;
+use std::path::{Path, PathBuf};
+
+use bpm::http::HttpClient;
+use bpm::lockfile::{Lockfile, LockfileError, BPM_LOCK_FILE};
+use bpm::manifest_edit::{self, DependencySection, ManifestDocument, PublishPlan};
+use bpm::npm_lock;
+use bpm::project_lock::{find_project_lock, ProjectLockKind};
+use bpm::registry::{self, PackageSpec, RegistryError};
+
+use super::fetch::{open_registry_client, store_root};
+use super::install;
+
+/// Options for `bpm remove` / `bpm uninstall` / `bpm rm` / `bpm un`.
+pub(super) struct UninstallOptions {
+    pub names: Vec<String>,
+    pub registry: Option<String>,
+    pub store: Option<PathBuf>,
+    pub concurrency: usize,
+    pub json_metrics: Option<PathBuf>,
+    pub ignore_scripts: bool,
+    pub derived_store: bool,
+    pub git_prepare: bool,
+    pub legacy_peer_deps: bool,
+    pub cache_mode: bpm::metadata_cache::CacheMode,
+    /// Optional verified read-through cache endpoint.
+    pub remote_cache: Option<String>,
+    pub global: bool,
+}
+
+/// Run `bpm add`/`bpm install <targets>`: edit package.json, resolve the whole
+/// edited graph, write the selected lock, and install.
+pub(super) fn run_add(options: &install::Options) -> anyhow::Result<()> {
+    let cwd = env::current_dir()?;
+    let (project_root, lock_kind) = project_root_and_lock_kind(&cwd)?;
+
+    let manifest_path = project_root.join("package.json");
+    if !manifest_path.is_file() {
+        anyhow::bail!(
+            "no package.json found at {} to edit; `bpm add` mutates a local manifest",
+            manifest_path.display()
+        );
+    }
+
+    // 1. Parse and validate every target as a supported registry spec before
+    //    any network or file mutation.
+    let mut requests: Vec<TargetRequest> = Vec::with_capacity(options.targets.len());
+    for target in &options.targets {
+        requests.push(parse_registry_target(target)?);
+    }
+    reject_duplicate_targets(&requests)?;
+
+    // 2. Load effective npm config and one shared registry client.
+    let store_root_path = store_root(options.store.clone())?;
+    let config = install::effective_npm_config(&project_root, options.registry.as_deref())?;
+    let http = HttpClient::new(config.clone());
+    let client = open_registry_client(&store_root_path, config, http.clone(), options.cache_mode)?;
+
+    // 3. Resolve each target to a name/version and compute its save spec.
+    let mut additions: Vec<Addition> = Vec::with_capacity(requests.len());
+    for request in &requests {
+        let resolved = client.resolve(&request.spec).map_err(|error| {
+            anyhow::anyhow!(
+                "failed to resolve '{target}': {error}",
+                target = request.raw
+            )
+        })?;
+        additions.push(Addition {
+            name: resolved.name.clone(),
+            version: resolved.version.to_string(),
+            save_spec: save_spec(request, &resolved.version, options.save_exact),
+        });
+    }
+    reject_duplicate_additions(&additions)?;
+
+    // Serialize BPM writers from the first mutable-state read through
+    // resolution, publication, and the final installation handoff.
+    let _project_mutation_guard = manifest_edit::acquire_project_mutation_guard(&project_root)?;
+
+    // 4. Edit all requested dependency entries in memory.
+    let mut document = ManifestDocument::from_path(&manifest_path)?;
+    let section = if options.save_dev {
+        DependencySection::Dev
+    } else {
+        DependencySection::Production
+    };
+    for addition in &additions {
+        document.add_dependency(section, &addition.name, &addition.save_spec)?;
+    }
+    if !document.changed() {
+        eprintln!(
+            "nothing to change; package.json already declares {}",
+            additions
+                .iter()
+                .map(|addition| format!("{} {}", addition.name, addition.save_spec))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        return Ok(());
+    }
+
+    // 5. Reparse the rendered document and resolve the entire edited manifest.
+    let manifest = document
+        .to_manifest()
+        .map_err(|error| anyhow::anyhow!("edited package.json is invalid: {error}"))?;
+    let manifest_bytes = document.render();
+
+    let workspace_layout = bpm::workspace::discover(&project_root);
+    let workspace_index = bpm::resolver::workspaces::WorkspaceIndex::from_project_root(
+        &project_root,
+        &workspace_layout,
+    )
+    .map_err(|error| anyhow::anyhow!("workspace resolution failed: {error}"))?;
+    let peer_mode = if options.legacy_peer_deps {
+        bpm::resolver::peer::PeerMode::LegacyIgnore
+    } else {
+        bpm::resolver::peer::PeerMode::Strict
+    };
+    let lockfile = bpm::resolver::resolve_manifest_with_options(
+        &manifest,
+        &client,
+        "bpm",
+        Some(&workspace_index),
+        peer_mode,
+    )
+    .map_err(|error| anyhow::anyhow!("dependency resolution failed: {error}"))?;
+
+    // 6. Serialize the lock according to authority.
+    let (lock_path, lock_bytes, resolved_kind) =
+        serialize_lock(&project_root, lock_kind, &lockfile, &manifest)?;
+
+    // 7. Publish manifest + lock through the crash-bounded publisher. A
+    //    failure here restores both files to their pre-publish state.
+    let plan = PublishPlan {
+        manifest_path: manifest_path.clone(),
+        manifest_bytes,
+        lock_path: lock_path.clone(),
+        lock_bytes,
+    };
+    manifest_edit::publish(&plan).map_err(|error| publish_error(error, &lock_path))?;
+    eprintln!(
+        "added {} package(s) and wrote {}",
+        additions.len(),
+        lock_path.display()
+    );
+
+    // 8. Install the in-memory graph through the shared install path. A
+    //    failure here may leave the successfully published manifest+lock in
+    //    place; the help text below records that boundary.
+    let install_options = install::Options {
+        targets: Vec::new(),
+        frozen: false,
+        registry: options.registry.clone(),
+        store: options.store.clone(),
+        concurrency: options.concurrency,
+        json_metrics: options.json_metrics.clone(),
+        global: false,
+        ignore_scripts: options.ignore_scripts,
+        omit_dev: options.omit_dev,
+        include_dev: options.include_dev,
+        derived_store: options.derived_store,
+        git_prepare: options.git_prepare,
+        legacy_peer_deps: options.legacy_peer_deps,
+        cache_mode: options.cache_mode,
+        remote_cache: options.remote_cache.clone(),
+        save_dev: false,
+        save_exact: false,
+    };
+    install::install_resolved_lockfile(
+        &project_root,
+        &lock_path,
+        lockfile,
+        resolved_kind,
+        &install_options,
+        &store_root_path,
+    )
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "package.json and lock were updated, but installation failed: {error}\n\
+             re-run `bpm install` to retry; the manifest and lock are already written"
+        )
+    })
+}
+
+pub(super) struct LinkMutationOutcome {
+    pub changed: bool,
+}
+
+/// Consume one registered `file:` link through the same staged transaction as
+/// registry dependency mutations. The caller owns registration lookup and
+/// user-facing success output; this function does not publish partial state.
+pub(super) fn run_link_consume(
+    name: &str,
+    file_spec: &str,
+    options: &install::Options,
+) -> anyhow::Result<LinkMutationOutcome> {
+    let cwd = env::current_dir()?;
+    let (project_root, lock_kind) = project_root_and_lock_kind(&cwd)?;
+    let manifest_path = project_root.join("package.json");
+    if !manifest_path.is_file() {
+        anyhow::bail!(
+            "no package.json in {}; `bpm link <name>` consumes a link into a project",
+            project_root.display()
+        );
+    }
+
+    // Keep the project writer lock through resolution, two-file publication,
+    // and materialization so links participate in the same ordered project
+    // views as add/remove/upgrade/dedupe.
+    let _project_mutation_guard = manifest_edit::acquire_project_mutation_guard(&project_root)?;
+    let mut document = ManifestDocument::from_path(&manifest_path)?;
+    document.add_dependency(DependencySection::Production, name, file_spec)?;
+    let changed = document.changed();
+    let manifest = document
+        .to_manifest()
+        .map_err(|error| anyhow::anyhow!("edited package.json is invalid: {error}"))?;
+    let manifest_bytes = document.render();
+
+    let store_root_path = store_root(options.store.clone())?;
+    let config = install::effective_npm_config(&project_root, options.registry.as_deref())?;
+    let http = HttpClient::new(config.clone());
+    let client = open_registry_client(&store_root_path, config, http.clone(), options.cache_mode)?;
+    let workspace_layout = bpm::workspace::discover(&project_root);
+    let workspace_index = bpm::resolver::workspaces::WorkspaceIndex::from_project_root(
+        &project_root,
+        &workspace_layout,
+    )
+    .map_err(|error| anyhow::anyhow!("workspace resolution failed: {error}"))?;
+    let peer_mode = if options.legacy_peer_deps {
+        bpm::resolver::peer::PeerMode::LegacyIgnore
+    } else {
+        bpm::resolver::peer::PeerMode::Strict
+    };
+    let lockfile = bpm::resolver::resolve_manifest_with_options(
+        &manifest,
+        &client,
+        "bpm",
+        Some(&workspace_index),
+        peer_mode,
+    )
+    .map_err(|error| anyhow::anyhow!("dependency resolution failed: {error}"))?;
+    let (lock_path, lock_bytes, resolved_kind) =
+        serialize_lock(&project_root, lock_kind, &lockfile, &manifest)?;
+    let plan = PublishPlan {
+        manifest_path,
+        manifest_bytes,
+        lock_path: lock_path.clone(),
+        lock_bytes,
+    };
+    manifest_edit::publish(&plan).map_err(|error| publish_error(error, &lock_path))?;
+
+    install::install_resolved_lockfile(
+        &project_root,
+        &lock_path,
+        lockfile,
+        resolved_kind,
+        options,
+        &store_root_path,
+    )
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "package.json and lock were updated, but installation failed: {error}\n\
+             re-run `bpm install` to retry; the manifest and lock are already written"
+        )
+    })?;
+
+    Ok(LinkMutationOutcome { changed })
+}
+
+/// Run `bpm remove`/`bpm uninstall`: drop names from every dependency section,
+/// resolve, write the selected lock, and install.
+pub(super) fn run_uninstall(options: UninstallOptions) -> anyhow::Result<()> {
+    let remote_cache = options.remote_cache.clone().or_else(|| {
+        env::var_os("BPM_REMOTE_CACHE").map(|path| path.to_string_lossy().into_owned())
+    });
+    if options.global {
+        anyhow::bail!(
+            "`bpm remove --global` is not supported: BPM does not yet track which \
+             global bin shims it owns, so deleting by filename would be unsafe"
+        );
+    }
+    let cwd = env::current_dir()?;
+    let (project_root, lock_kind) = project_root_and_lock_kind(&cwd)?;
+
+    let manifest_path = project_root.join("package.json");
+    if !manifest_path.is_file() {
+        anyhow::bail!(
+            "no package.json found at {} to edit",
+            manifest_path.display()
+        );
+    }
+
+    // Validate every name as an npm package name before editing.
+    for name in &options.names {
+        if !bpm::manifest::is_valid_package_name(name) {
+            anyhow::bail!("'{name}' is not a valid npm package name");
+        }
+    }
+
+    // Intentionally held through resolution, publication, and installation.
+    let _project_mutation_guard = manifest_edit::acquire_project_mutation_guard(&project_root)?;
+    let mut document = ManifestDocument::from_path(&manifest_path)?;
+    let mut removed_any = false;
+    for name in &options.names {
+        removed_any |= document.remove_dependency(name);
+    }
+    if !removed_any {
+        eprintln!(
+            "nothing to remove; package.json does not declare {}",
+            options.names.join(", ")
+        );
+        return Ok(());
+    }
+
+    let manifest = document
+        .to_manifest()
+        .map_err(|error| anyhow::anyhow!("edited package.json is invalid: {error}"))?;
+    let manifest_bytes = document.render();
+
+    let store_root_path = store_root(options.store.clone())?;
+    let config = install::effective_npm_config(&project_root, options.registry.as_deref())?;
+    let http = HttpClient::new(config.clone());
+    let client = open_registry_client(&store_root_path, config, http.clone(), options.cache_mode)?;
+
+    let workspace_layout = bpm::workspace::discover(&project_root);
+    let workspace_index = bpm::resolver::workspaces::WorkspaceIndex::from_project_root(
+        &project_root,
+        &workspace_layout,
+    )
+    .map_err(|error| anyhow::anyhow!("workspace resolution failed: {error}"))?;
+    let peer_mode = if options.legacy_peer_deps {
+        bpm::resolver::peer::PeerMode::LegacyIgnore
+    } else {
+        bpm::resolver::peer::PeerMode::Strict
+    };
+    let lockfile = bpm::resolver::resolve_manifest_with_options(
+        &manifest,
+        &client,
+        "bpm",
+        Some(&workspace_index),
+        peer_mode,
+    )
+    .map_err(|error| anyhow::anyhow!("dependency resolution failed: {error}"))?;
+
+    let (lock_path, lock_bytes, resolved_kind) =
+        serialize_lock(&project_root, lock_kind, &lockfile, &manifest)?;
+
+    let plan = PublishPlan {
+        manifest_path: manifest_path.clone(),
+        manifest_bytes,
+        lock_path: lock_path.clone(),
+        lock_bytes,
+    };
+    manifest_edit::publish(&plan).map_err(|error| publish_error(error, &lock_path))?;
+    eprintln!("removed {} package(s)", options.names.len());
+
+    let install_options = install::Options {
+        targets: Vec::new(),
+        frozen: false,
+        registry: options.registry.clone(),
+        store: options.store.clone(),
+        concurrency: options.concurrency,
+        json_metrics: options.json_metrics.clone(),
+        global: false,
+        ignore_scripts: options.ignore_scripts,
+        omit_dev: false,
+        include_dev: false,
+        derived_store: options.derived_store,
+        git_prepare: options.git_prepare,
+        legacy_peer_deps: options.legacy_peer_deps,
+        cache_mode: options.cache_mode,
+        remote_cache,
+        save_dev: false,
+        save_exact: false,
+    };
+    install::install_resolved_lockfile(
+        &project_root,
+        &lock_path,
+        lockfile,
+        resolved_kind,
+        &install_options,
+        &store_root_path,
+    )
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "package.json and lock were updated, but installation failed: {error}\n\
+             re-run `bpm install` to retry; the manifest and lock are already written"
+        )
+    })
+}
+
+/// Locate the project root and the selected lock kind (lockfile precedence) for
+/// a mutation. Returns `(root, kind)` where `kind` is `None` when no lock
+/// exists yet (the mutation creates a `bpm.lock`).
+fn publish_error(error: manifest_edit::PublishError, lock_path: &Path) -> anyhow::Error {
+    if error.rollback_complete() {
+        anyhow::anyhow!("failed to publish manifest and lock; project files were restored: {error}")
+    } else {
+        anyhow::anyhow!(
+            "failed to publish manifest and lock; rollback incomplete; inspect package.json and {}: {error}",
+            lock_path.display()
+        )
+    }
+}
+
+fn project_root_and_lock_kind(cwd: &Path) -> anyhow::Result<(PathBuf, Option<ProjectLockKind>)> {
+    match find_project_lock(cwd)? {
+        Some(lock) => Ok((lock.project_root.clone(), Some(lock.kind))),
+        None => Ok((
+            bpm::project::find_project_root(cwd).unwrap_or_else(|_| cwd.to_path_buf()),
+            None,
+        )),
+    }
+}
+
+/// Serialize the resolved lockfile according to the project's lock authority.
+/// A `bpm.lock` project (or a project with no lock yet) gets canonical BPM
+/// bytes; an npm-authority `package-lock.json` project (whether imported as v2
+/// or v3) gets strict npm v3 export bytes.
+fn serialize_lock(
+    project_root: &Path,
+    lock_kind: Option<ProjectLockKind>,
+    lockfile: &Lockfile,
+    manifest: &bpm::manifest::PackageManifest,
+) -> anyhow::Result<(PathBuf, Vec<u8>, ProjectLockKind)> {
+    match lock_kind {
+        Some(ProjectLockKind::NpmV3) => {
+            let path = project_root.join(bpm::project_lock::NPM_PACKAGE_LOCK_FILE);
+            let bytes = npm_lock::export_v3(lockfile, manifest)
+                .map_err(|error| anyhow::anyhow!("cannot export package-lock.json v3: {error}"))?;
+            Ok((path, bytes, ProjectLockKind::NpmV3))
+        }
+        Some(ProjectLockKind::Bpm) | None => {
+            let path = project_root.join(BPM_LOCK_FILE);
+            let json = lockfile.to_json().map_err(|error| {
+                anyhow::anyhow!("cannot serialize bpm.lock: {}", lock_error(&error))
+            })?;
+            Ok((path, json.into_bytes(), ProjectLockKind::Bpm))
+        }
+    }
+}
+
+fn publish_lock_bytes(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    manifest_edit::publish_bytes(path, bytes)
+        .map_err(|error| anyhow::anyhow!("failed to publish lock {}: {error}", path.display()))
+}
+
+fn selective_upgrade_lock(
+    prior: &Lockfile,
+    fresh: &Lockfile,
+    selected: &BTreeSet<String>,
+) -> anyhow::Result<Lockfile> {
+    let old_roots = selected_root_paths(prior, selected);
+    if old_roots.is_empty() {
+        anyhow::bail!("named upgrade selection is absent from the current lock");
+    }
+    let new_roots = selected_root_paths(fresh, selected);
+    if new_roots.is_empty() {
+        anyhow::bail!("named upgrade selection could not be resolved");
+    }
+    let old_movable = lock_closure(prior, &old_roots);
+    let new_movable = lock_closure(fresh, &new_roots);
+
+    let mut result = prior.clone();
+    result
+        .packages
+        .retain(|package| !old_movable.contains(&package.path));
+    result.packages.extend(
+        fresh
+            .packages
+            .iter()
+            .filter(|package| new_movable.contains(&package.path))
+            .cloned(),
+    );
+    result.packages.sort_by(|a, b| a.path.cmp(&b.path));
+
+    result
+        .resolution
+        .packages
+        .retain(|path, _| !old_movable.contains(path));
+    for (path, resolution) in &fresh.resolution.packages {
+        if new_movable.contains(path) {
+            result
+                .resolution
+                .packages
+                .insert(path.clone(), resolution.clone());
+        }
+    }
+    result
+        .resolution
+        .registry_names
+        .retain(|path, _| !old_movable.contains(path));
+    for (path, name) in &fresh.resolution.registry_names {
+        if new_movable.contains(path) {
+            result
+                .resolution
+                .registry_names
+                .insert(path.clone(), name.clone());
+        }
+    }
+    result.resolution.root = fresh.resolution.root.clone();
+    Ok(result)
+}
+
+fn selected_root_paths(lock: &Lockfile, selected: &BTreeSet<String>) -> BTreeSet<String> {
+    selected
+        .iter()
+        .flat_map(|name| {
+            let direct = format!("node_modules/{name}");
+            lock.packages
+                .iter()
+                .filter(move |package| {
+                    package.path == direct
+                        || (package.name == *name
+                            && package.path.matches("node_modules").count() == 1)
+                })
+                .map(|package| package.path.clone())
+        })
+        .collect()
+}
+
+fn lock_closure(lock: &Lockfile, roots: &BTreeSet<String>) -> BTreeSet<String> {
+    let mut closure = roots.clone();
+    let mut pending = roots.iter().cloned().collect::<Vec<_>>();
+    while let Some(path) = pending.pop() {
+        let Some(resolution) = lock.resolution.packages.get(&path) else {
+            continue;
+        };
+        let targets = resolution
+            .dependencies
+            .values()
+            .chain(resolution.optional_dependencies.values())
+            .chain(resolution.peer_dependencies.values())
+            .map(|dependency| dependency.target.clone())
+            .chain(
+                resolution
+                    .peer_context
+                    .values()
+                    .map(|provider| provider.path.clone()),
+            );
+        for target in targets {
+            if !target.is_empty() && closure.insert(target.clone()) {
+                pending.push(target);
+            }
+        }
+    }
+    closure
+}
+
+fn lock_error(error: &LockfileError) -> String {
+    match error {
+        LockfileError::Write { source, .. } => source.to_string(),
+        other => other.to_string(),
+    }
+}
+
+struct TargetRequest {
+    raw: String,
+    spec: PackageSpec,
+    /// The user's literal version-request substring, when present. `None` for
+    /// a bare name or `@latest`.
+    raw_request: Option<String>,
+}
+
+/// Parse and validate one `add` target as a registry-only spec.
+fn parse_registry_target(target: &str) -> anyhow::Result<TargetRequest> {
+    let trimmed = target.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("cannot add an empty package spec");
+    }
+    if looks_non_registry(trimmed) {
+        anyhow::bail!(
+            "only registry package specs are supported for local add in this slice; \
+             '{target}' looks like a URL, path, Git, file, link, or workspace reference"
+        );
+    }
+    let spec = registry::parse_spec(trimmed).map_err(|error| {
+        anyhow::anyhow!(
+            "cannot add '{target}': only registry package specs are supported in this slice ({})",
+            registry_error(&error)
+        )
+    })?;
+    let raw_request = match trimmed.rfind('@') {
+        Some(0) | None => None,
+        Some(index) => {
+            let request = &trimmed[index + 1..];
+            if request.is_empty() || request == "latest" {
+                None
+            } else {
+                Some(request.to_string())
+            }
+        }
+    };
+    Ok(TargetRequest {
+        raw: target.to_string(),
+        spec,
+        raw_request,
+    })
+}
+
+fn looks_non_registry(target: &str) -> bool {
+    target.starts_with("http://")
+        || target.starts_with("https://")
+        || target.starts_with("file:")
+        || target.starts_with("git+")
+        || target.starts_with("git:")
+        || target.starts_with("link:")
+        || target.starts_with("workspace:")
+        || target.starts_with("./")
+        || target.starts_with("../")
+        || target.starts_with('/')
+        || target.contains("://")
+}
+
+/// Reject duplicate package names with conflicting requests before resolution.
+fn reject_duplicate_targets(requests: &[TargetRequest]) -> anyhow::Result<()> {
+    use std::collections::BTreeMap;
+    let mut by_name: BTreeMap<&str, &TargetRequest> = BTreeMap::new();
+    for request in requests {
+        if let Some(existing) = by_name.get(request.spec.name.as_str()) {
+            if existing.raw_request != request.raw_request {
+                anyhow::bail!(
+                    "conflicting requests for package '{}': '{}' vs '{}'",
+                    request.spec.name,
+                    existing.raw,
+                    request.raw
+                );
+            }
+        } else {
+            by_name.insert(request.spec.name.as_str(), request);
+        }
+    }
+    Ok(())
+}
+
+/// Reject two `add` targets that resolved to the same name with different
+/// resolved versions.
+fn reject_duplicate_additions(additions: &[Addition]) -> anyhow::Result<()> {
+    use std::collections::BTreeMap;
+    let mut by_name: BTreeMap<&str, &Addition> = BTreeMap::new();
+    for addition in additions {
+        if let Some(existing) = by_name.get(addition.name.as_str()) {
+            if existing.version != addition.version {
+                anyhow::bail!(
+                    "package '{}' resolved to two different versions ({} vs {})",
+                    addition.name,
+                    existing.version,
+                    addition.version
+                );
+            }
+        } else {
+            by_name.insert(addition.name.as_str(), addition);
+        }
+    }
+    Ok(())
+}
+
+struct Addition {
+    name: String,
+    version: String,
+    save_spec: String,
+}
+
+/// Apply the plan's save-spec rules to one resolved target:
+///   - `--save-exact` → `X.Y.Z`;
+///   - explicit supported range (`^`, `~`, `>`, `<`, `=`, `*`) → preserve;
+///   - bare name, `@latest`, or exact version without `--save-exact` → `^X.Y.Z`.
+fn save_spec(request: &TargetRequest, version: &semver::Version, save_exact: bool) -> String {
+    if save_exact {
+        return version.to_string();
+    }
+    if let Some(raw) = &request.raw_request {
+        if raw.starts_with(['^', '~', '>', '<', '=', '*']) {
+            return raw.clone();
+        }
+    }
+    format!("^{}", version)
+}
+
+fn registry_error(error: &RegistryError) -> String {
+    error.to_string()
+}
+
+/// Options for `bpm upgrade`.
+pub(super) struct UpgradeOptions {
+    /// Package names to upgrade (empty = upgrade all within their declared ranges).
+    pub names: Vec<String>,
+    pub registry: Option<String>,
+    pub store: Option<PathBuf>,
+    pub concurrency: usize,
+    pub json_metrics: Option<PathBuf>,
+    pub ignore_scripts: bool,
+    pub derived_store: bool,
+    pub git_prepare: bool,
+    pub legacy_peer_deps: bool,
+    pub cache_mode: bpm::metadata_cache::CacheMode,
+    pub remote_cache: Option<String>,
+}
+
+/// Run `bpm upgrade [pkg...]`: re-resolve the manifest within its declared
+/// ranges, bumping locked versions to the newest satisfying ones, and rewrite
+/// the lock. **Never edits `package.json` ranges** (npm default). Named packages
+/// are reported specifically; the whole graph is re-resolved because it must
+/// stay globally consistent. Unknown names warn and are skipped.
+pub(super) fn run_upgrade(options: UpgradeOptions) -> anyhow::Result<()> {
+    let cwd = env::current_dir()?;
+    let (project_root, lock_kind) = project_root_and_lock_kind(&cwd)?;
+
+    let manifest_path = project_root.join("package.json");
+    if !manifest_path.is_file() {
+        anyhow::bail!(
+            "no package.json found at {} to upgrade against",
+            manifest_path.display()
+        );
+    }
+    // Intentionally held through the lock snapshot, resolution, rewrite, and
+    // installation so a newer graph cannot be followed by an older view.
+    let _project_mutation_guard = manifest_edit::acquire_project_mutation_guard(&project_root)?;
+    let manifest = bpm::manifest::PackageManifest::from_path(&manifest_path)
+        .map_err(|error| anyhow::anyhow!("cannot read package.json for upgrade: {error}"))?;
+
+    // Validate and normalize named packages before opening a registry client.
+    // Unknown-only requests are true no-ops: no metadata, lock, or install
+    // work is allowed to occur.
+    let mut warnings = Vec::new();
+    let mut recognized = BTreeSet::new();
+    let mut unknown = BTreeSet::new();
+    for name in &options.names {
+        if !bpm::manifest::is_valid_package_name(name) {
+            anyhow::bail!("'{name}' is not a valid npm package name");
+        }
+        if declares_dependency(&manifest, name) {
+            recognized.insert(name.clone());
+        } else {
+            unknown.insert(name.clone());
+        }
+    }
+    for name in unknown {
+        warnings.push(format!(
+            "warning: '{name}' is not declared in package.json; skipping"
+        ));
+    }
+    if !options.names.is_empty() && recognized.is_empty() {
+        for warning in warnings {
+            eprintln!("{warning}");
+        }
+        eprintln!("upgraded 0 package(s); no declared packages selected");
+        return Ok(());
+    }
+
+    let prior_lock = find_project_lock(&cwd)?;
+    if !options.names.is_empty() {
+        let Some(prior) = prior_lock.as_ref() else {
+            anyhow::bail!("named upgrade requires a current lock; run bpm install or bpm upgrade without names first");
+        };
+        if prior.lockfile.root.dependencies != manifest.root_dependency_declarations() {
+            anyhow::bail!(
+                "named upgrade requires a lock matching package.json; run a full upgrade first"
+            );
+        }
+        if prior.lockfile.resolution.packages.is_empty() {
+            anyhow::bail!(
+                "named upgrade requires complete v2 lock metadata; run a full upgrade first"
+            );
+        }
+    }
+
+    // Snapshot the current locked versions for the upgrade report.
+    let before = prior_lock
+        .as_ref()
+        .map(|lock| {
+            lock.lockfile
+                .packages
+                .iter()
+                .map(|p| (p.name.clone(), p.version.clone()))
+                .collect::<BTreeMap<String, String>>()
+        })
+        .unwrap_or_default();
+
+    // Re-resolve the whole manifest within declared ranges.
+    let store_root_path = store_root(options.store.clone())?;
+    let config = install::effective_npm_config(&project_root, options.registry.as_deref())?;
+    let http = HttpClient::new(config.clone());
+    let client = open_registry_client(&store_root_path, config, http.clone(), options.cache_mode)?;
+    let workspace_layout = bpm::workspace::discover(&project_root);
+    let workspace_index = bpm::resolver::workspaces::WorkspaceIndex::from_project_root(
+        &project_root,
+        &workspace_layout,
+    )
+    .map_err(|error| anyhow::anyhow!("workspace resolution failed: {error}"))?;
+    let peer_mode = if options.legacy_peer_deps {
+        bpm::resolver::peer::PeerMode::LegacyIgnore
+    } else {
+        bpm::resolver::peer::PeerMode::Strict
+    };
+    let resolved_lockfile = bpm::resolver::resolve_manifest_with_options(
+        &manifest,
+        &client,
+        "bpm",
+        Some(&workspace_index),
+        peer_mode,
+    )
+    .map_err(|error| anyhow::anyhow!("dependency resolution failed: {error}"))?;
+    let lockfile = if options.names.is_empty() {
+        resolved_lockfile
+    } else {
+        let prior = prior_lock
+            .as_ref()
+            .expect("named upgrade lock preflight checked above");
+        selective_upgrade_lock(&prior.lockfile, &resolved_lockfile, &recognized)?
+    };
+
+    // package.json ranges are NEVER edited by upgrade (npm default).
+    let (lock_path, mut lock_bytes, resolved_kind) =
+        serialize_lock(&project_root, lock_kind, &lockfile, &manifest)?;
+    // Match Lockfile::write_to's canonical trailing newline.
+    if !lock_bytes.ends_with(b"\n") {
+        lock_bytes.push(b'\n');
+    }
+    publish_lock_bytes(&lock_path, &lock_bytes)?;
+
+    // Report only the requested packages (or all bumps if none named).
+    let filter = |name: &str| -> bool {
+        options.names.is_empty() || options.names.iter().any(|n| n == name)
+    };
+    let mut bumped = 0usize;
+    for package in &lockfile.packages {
+        if !filter(&package.name) {
+            continue;
+        }
+        if let Some(prior) = before.get(&package.name) {
+            if prior != &package.version {
+                eprintln!("upgraded {} {} -> {}", package.name, prior, package.version);
+                bumped += 1;
+            }
+        }
+    }
+    for warning in &warnings {
+        eprintln!("{warning}");
+    }
+    eprintln!(
+        "upgraded {bumped} package(s) and wrote {} (package.json ranges unchanged)",
+        lock_path.display()
+    );
+
+    // Install the re-resolved graph through the shared path.
+    let install_options = install::Options {
+        targets: Vec::new(),
+        frozen: false,
+        registry: options.registry.clone(),
+        store: options.store.clone(),
+        concurrency: options.concurrency,
+        json_metrics: options.json_metrics.clone(),
+        global: false,
+        ignore_scripts: options.ignore_scripts,
+        omit_dev: false,
+        include_dev: false,
+        derived_store: options.derived_store,
+        git_prepare: options.git_prepare,
+        legacy_peer_deps: options.legacy_peer_deps,
+        cache_mode: options.cache_mode,
+        remote_cache: options.remote_cache.clone(),
+        save_dev: false,
+        save_exact: false,
+    };
+    install::install_resolved_lockfile(
+        &project_root,
+        &lock_path,
+        lockfile,
+        resolved_kind,
+        &install_options,
+        &store_root_path,
+    )
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "lock was rewritten, but installation failed: {error}\n\
+             re-run `bpm install` to retry; the lock is already written"
+        )
+    })
+}
+
+/// Options for `bpm dedupe`.
+pub(super) struct DedupeOptions {
+    pub registry: Option<String>,
+    pub store: Option<PathBuf>,
+    pub concurrency: usize,
+    pub json_metrics: Option<PathBuf>,
+    pub ignore_scripts: bool,
+    pub derived_store: bool,
+    pub git_prepare: bool,
+    pub legacy_peer_deps: bool,
+    pub cache_mode: bpm::metadata_cache::CacheMode,
+    pub remote_cache: Option<String>,
+}
+
+/// Run `bpm dedupe`: re-resolve the manifest and rewrite the lock, reporting
+/// whether the duplicate count changed.
+///
+/// BPM's resolver already minimizes duplicates during initial resolution (it
+/// unifies versions wherever the declared ranges permit). So `dedupe` is
+/// effectively a re-resolve + lockfile rewrite that, on an already-minimal
+/// graph, produces byte-stable output. If it ever *reduces* duplicates, that
+/// indicates the lockfile had drifted from a clean resolve.
+pub(super) fn run_dedupe(options: DedupeOptions) -> anyhow::Result<()> {
+    let cwd = env::current_dir()?;
+    let (project_root, lock_kind) = project_root_and_lock_kind(&cwd)?;
+
+    let manifest_path = project_root.join("package.json");
+    if !manifest_path.is_file() {
+        anyhow::bail!(
+            "no package.json found at {} to dedupe against",
+            manifest_path.display()
+        );
+    }
+    // Intentionally held through the lock snapshot, resolution, rewrite, and
+    // installation so every writer publishes one complete project view.
+    let _project_mutation_guard = manifest_edit::acquire_project_mutation_guard(&project_root)?;
+    let manifest = bpm::manifest::PackageManifest::from_path(&manifest_path)
+        .map_err(|error| anyhow::anyhow!("cannot read package.json for dedupe: {error}"))?;
+
+    // Count duplicates before/after to report whether anything was deduped.
+    let before = find_project_lock(&cwd)?
+        .map(|lock| duplicate_version_count(&lock.lockfile))
+        .unwrap_or(0);
+
+    let store_root_path = store_root(options.store.clone())?;
+    let config = install::effective_npm_config(&project_root, options.registry.as_deref())?;
+    let http = HttpClient::new(config.clone());
+    let client = open_registry_client(&store_root_path, config, http.clone(), options.cache_mode)?;
+    let workspace_layout = bpm::workspace::discover(&project_root);
+    let workspace_index = bpm::resolver::workspaces::WorkspaceIndex::from_project_root(
+        &project_root,
+        &workspace_layout,
+    )
+    .map_err(|error| anyhow::anyhow!("workspace resolution failed: {error}"))?;
+    let peer_mode = if options.legacy_peer_deps {
+        bpm::resolver::peer::PeerMode::LegacyIgnore
+    } else {
+        bpm::resolver::peer::PeerMode::Strict
+    };
+    let lockfile = bpm::resolver::resolve_manifest_with_options(
+        &manifest,
+        &client,
+        "bpm",
+        Some(&workspace_index),
+        peer_mode,
+    )
+    .map_err(|error| anyhow::anyhow!("dependency resolution failed: {error}"))?;
+    let after = duplicate_version_count(&lockfile);
+
+    let (lock_path, mut lock_bytes, resolved_kind) =
+        serialize_lock(&project_root, lock_kind, &lockfile, &manifest)?;
+    // Match Lockfile::write_to's canonical trailing newline.
+    if !lock_bytes.ends_with(b"\n") {
+        lock_bytes.push(b'\n');
+    }
+    publish_lock_bytes(&lock_path, &lock_bytes)?;
+
+    if before == after {
+        eprintln!(
+            "dedupe: graph already minimal ({before} package(s) with multiple versions); \
+             rewrote {}",
+            lock_path.display()
+        );
+    } else if after < before {
+        eprintln!(
+            "dedupe: reduced multi-version packages {before} -> {after}; rewrote {}",
+            lock_path.display()
+        );
+    } else {
+        eprintln!(
+            "dedupe: re-resolved and rewrote {} (multi-version packages: {before} -> {after})",
+            lock_path.display()
+        );
+    }
+
+    let install_options = install::Options {
+        targets: Vec::new(),
+        frozen: false,
+        registry: options.registry.clone(),
+        store: options.store.clone(),
+        concurrency: options.concurrency,
+        json_metrics: options.json_metrics.clone(),
+        global: false,
+        ignore_scripts: options.ignore_scripts,
+        omit_dev: false,
+        include_dev: false,
+        derived_store: options.derived_store,
+        git_prepare: options.git_prepare,
+        legacy_peer_deps: options.legacy_peer_deps,
+        cache_mode: options.cache_mode,
+        remote_cache: options.remote_cache.clone(),
+        save_dev: false,
+        save_exact: false,
+    };
+    install::install_resolved_lockfile(
+        &project_root,
+        &lock_path,
+        lockfile,
+        resolved_kind,
+        &install_options,
+        &store_root_path,
+    )
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "lock was rewritten, but installation failed: {error}\n\
+             re-run `bpm install` to retry; the lock is already written"
+        )
+    })
+}
+
+/// Count how many distinct package names have more than one resolved version
+/// in the lockfile (a measure of duplication).
+fn duplicate_version_count(lockfile: &Lockfile) -> usize {
+    use std::collections::BTreeMap;
+    let mut versions: BTreeMap<&str, std::collections::BTreeSet<&str>> = BTreeMap::new();
+    for package in &lockfile.packages {
+        versions
+            .entry(package.name.as_str())
+            .or_default()
+            .insert(package.version.as_str());
+    }
+    versions
+        .into_iter()
+        .filter(|(_, set)| set.len() > 1)
+        .count()
+}
+
+/// Whether `manifest` declares `name` in any dependency section.
+fn declares_dependency(manifest: &bpm::manifest::PackageManifest, name: &str) -> bool {
+    manifest.dependencies.contains_key(name)
+        || manifest.dev_dependencies.contains_key(name)
+        || manifest.optional_dependencies.contains_key(name)
+        || manifest.peer_dependencies.contains_key(name)
+}
