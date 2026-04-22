@@ -94,7 +94,12 @@ pub fn extract(archive_path: &Path, image_root: &Path) -> Result<(), ExtractErro
                 }
                 let mut out = fs::File::create(&dest).map_err(|source| write_err(&dest, source))?;
                 io::copy(&mut entry, &mut out).map_err(|source| write_err(&dest, source))?;
-                let _ = out.sync_all();
+                // The image is built in a private temporary directory and
+                // published with one atomic rename by `ArtifactStore`.
+                // Fsyncing every file here serialized extraction on large
+                // packages without improving the all-or-nothing visibility
+                // guarantee; callers can safely retry an unpublished temp
+                // image after a crash.
                 let mode = entry.header().mode().unwrap_or(0o644);
                 apply_mode(&dest, mode).map_err(|source| write_err(&dest, source))?;
             }

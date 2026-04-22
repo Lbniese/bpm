@@ -374,13 +374,24 @@ pub fn run_scenario(
     for run in 0..num_runs {
         let work_dir = temp_base.path().join(format!("run-{run}"));
         fs::create_dir_all(&work_dir)?;
+        let run_store = if matches!(
+            scenario,
+            ScenarioKind::TrueCold | ScenarioKind::ResolvedCold | ScenarioKind::MonorepoCold
+        ) {
+            // A cold sample must not inherit artifacts from an earlier sample;
+            // otherwise the reported median silently becomes a warm install.
+            temp_base.path().join(format!("bpm-store-cold-{run}"))
+        } else {
+            bpm_store.clone()
+        };
+        fs::create_dir_all(&run_store)?;
 
         // Prepare fixture based on scenario
-        prepare_scenario(scenario, fixture, &work_dir, tool, &bpm_store)?;
+        prepare_scenario(scenario, fixture, &work_dir, tool, &run_store)?;
 
         // Measure
         let start = Instant::now();
-        let status = run_tool(tool, &work_dir, &bpm_store)?;
+        let status = run_tool(tool, &work_dir, &run_store)?;
         let elapsed = start.elapsed();
 
         wall_times.push(elapsed.as_secs_f64() * 1000.0);
@@ -547,10 +558,7 @@ fn run_external(
 }
 
 fn configure_tool_cache(command: &mut Command, tool: Tool, bpm_store: &Path) {
-    let cache = bpm_store
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(format!("{}-cache", tool.name()));
+    let cache = bpm_store.join(format!("{}-cache", tool.name()));
     match tool {
         Tool::Npm => {
             command.env("npm_config_cache", cache);
