@@ -8,6 +8,10 @@ once a 1.0 release is cut.
 
 ## [Unreleased]
 
+No unreleased changes.
+
+## [0.1.8] - 2026-07-17
+
 ### Added
 
 - M7 benchmark runs now isolate npm, pnpm, Bun, Yarn, and BPM caches, making
@@ -191,7 +195,8 @@ Initial release.
   into the graph id.
 - Install-timing benchmark harness with machine-stamped baselines.
 
-[Unreleased]: https://github.com/lbniese/bpm/compare/v0.1.7...HEAD
+[Unreleased]: https://github.com/lbniese/bpm/compare/v0.1.8...HEAD
+[0.1.8]: https://github.com/Lbniese/bpm/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/Lbniese/bpm/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/Lbniese/bpm/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/lbniese/bpm/compare/v0.1.4...v0.1.5

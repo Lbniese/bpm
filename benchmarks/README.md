@@ -48,6 +48,9 @@ checked in. Regenerate on a given machine with the command above.
 | `monorepo_cold` | empty | present | workspace-style |
 | `monorepo_incremental` | populated | present | workspace change |
 
+Cold samples receive a fresh project, package-manager cache, and BPM store;
+repeated samples therefore remain cold instead of silently becoming warm.
+
 ## Fixtures
 
 `minimal`, `small`, and `medium` are small dependency graphs. The M7
