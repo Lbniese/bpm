@@ -145,6 +145,16 @@ fn run_install(project: &Path, store: &Path) -> std::process::Output {
         .expect("failed to run bpm")
 }
 
+fn run_plain_install(project: &Path, store: &Path) -> std::process::Output {
+    Command::new(bpm_bin())
+        .arg("install")
+        .arg("--store")
+        .arg(store)
+        .current_dir(project)
+        .output()
+        .expect("failed to run bpm")
+}
+
 #[test]
 fn frozen_install_materializes_node_modules_and_bins() {
     let (project, store, _tgz) = setup_project();
@@ -405,6 +415,171 @@ fn plan_cache_invalidates_when_a_symlink_disappears() {
         "expected a full re-install after drift, stdout: {stdout}"
     );
     assert!(target.exists(), "package symlink should be restored");
+}
+
+#[test]
+fn next_build_uses_a_project_local_dependency_view() {
+    let project = tempdir().unwrap();
+    let store = tempdir().unwrap();
+    let tgz = tempdir().unwrap();
+    fs::create_dir_all(project.path().join("packages/app")).unwrap();
+    fs::write(
+        project.path().join("packages/app/package.json"),
+        r#"{"name":"app","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    fs::write(
+        project.path().join("package.json"),
+        r#"{"name":"next-app","version":"1.0.0","dependencies":{"next":"1.0.0"},"devDependencies":{"typescript":"1.0.0","@types/react":"1.0.0","@types/node":"1.0.0","eslint":"1.0.0"}}"#,
+    )
+    .unwrap();
+
+    let next_script = br##"#!/usr/bin/env node
+const fs = require('fs');
+const path = require('path');
+const Module = require('module');
+function resolveFrom(baseDir, moduleId) {
+  const realBase = fs.realpathSync(baseDir);
+  const from = path.join(realBase, 'noop.js');
+  return Module._resolveFilename(moduleId, {
+    id: from,
+    filename: from,
+    paths: Module._nodeModulePaths(realBase),
+  });
+}
+const required = [
+  ['typescript', 'typescript/lib/typescript.js'],
+  ['@types/react', '@types/react/index.d.ts'],
+  ['@types/node', '@types/node/index.d.ts'],
+  ['eslint', 'eslint/package.json'],
+];
+try {
+  for (const [pkg, file] of required) {
+    const packageJson = fs.realpathSync(resolveFrom(process.cwd(), `${pkg}/package.json`));
+    const relative = path.relative(pkg, file);
+    if (!fs.existsSync(path.join(path.dirname(packageJson), relative))) throw new Error(file);
+  }
+  console.log('next build ok');
+} catch (error) {
+  console.log('Installing devDependencies (npm):');
+  console.error(error.message);
+  process.exit(42);
+}
+"##;
+    let packages = vec![
+        (
+            "next",
+            br#"{"name":"next","version":"1.0.0"}"# as &[u8],
+            vec![("bin/next", next_script.as_slice(), 0o755)],
+        ),
+        (
+            "typescript",
+            br#"{"name":"typescript","version":"1.0.0"}"# as &[u8],
+            vec![(
+                "lib/typescript.js",
+                b"module.exports = { version: '1.0.0' };".as_slice(),
+                0o644,
+            )],
+        ),
+        (
+            "@types/react",
+            br#"{"name":"@types/react","version":"1.0.0"}"# as &[u8],
+            vec![("index.d.ts", b"export {};".as_slice(), 0o644)],
+        ),
+        (
+            "@types/node",
+            br#"{"name":"@types/node","version":"1.0.0"}"# as &[u8],
+            vec![("index.d.ts", b"export {};".as_slice(), 0o644)],
+        ),
+        (
+            "eslint",
+            br#"{"name":"eslint","version":"1.0.0"}"# as &[u8],
+            Vec::new(),
+        ),
+    ];
+    let mut lockfile = Lockfile::new("bpm-test");
+    lockfile.root = RootEntry {
+        name: Some("next-app".into()),
+        version: Some("1.0.0".into()),
+        dependencies: BTreeMap::from([
+            ("next".into(), "1.0.0".into()),
+            ("typescript".into(), "1.0.0".into()),
+            ("@types/react".into(), "1.0.0".into()),
+            ("@types/node".into(), "1.0.0".into()),
+            ("eslint".into(), "1.0.0".into()),
+        ]),
+    };
+    for (name, manifest, files) in packages {
+        let mut entries: Vec<(String, &[u8], u32)> =
+            vec![("package/package.json".into(), manifest, 0o644)];
+        entries.extend(
+            files
+                .into_iter()
+                .map(|(path, bytes, mode)| (format!("package/{path}"), bytes, mode)),
+        );
+        let archive_entries = entries
+            .iter()
+            .map(|(path, bytes, mode)| (path.as_str(), *bytes, *mode))
+            .collect::<Vec<_>>();
+        let archive = build_tgz(&archive_entries);
+        let archive_name = name.replace('/', "_");
+        let (path, integrity) = seed_tarball(tgz.path(), &format!("{archive_name}.tgz"), &archive);
+        let mut bin = BTreeMap::new();
+        if name == "next" {
+            bin.insert("next".into(), "bin/next".into());
+        }
+        lockfile.packages.push(PackageEntry {
+            path: format!("node_modules/{name}"),
+            name: name.into(),
+            version: "1.0.0".into(),
+            resolved: format!("file://{}", path.display()),
+            integrity: Some(integrity.to_npm_string()),
+            bin,
+            ..Default::default()
+        });
+    }
+    // Exercise the workspace materialization branch as well: it must use the
+    // same project-local backend for registry packages when Next is present.
+    lockfile.packages.push(PackageEntry {
+        path: "node_modules/app".into(),
+        name: "app".into(),
+        link: true,
+        workspace_target: Some("packages/app".into()),
+        ..Default::default()
+    });
+    lockfile.sort_packages();
+    lockfile.write_to(&project.path().join("bpm.lock")).unwrap();
+
+    let install = run_plain_install(project.path(), store.path());
+    assert!(
+        install.status.success(),
+        "install failed: {}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    assert!(
+        !fs::symlink_metadata(project.path().join("node_modules/next"))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "Next must receive a project-local dependency view"
+    );
+
+    let build = Command::new(bpm_bin())
+        .args(["exec", "next", "build"])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&build.stdout);
+    let stderr = String::from_utf8_lossy(&build.stderr);
+    assert!(
+        build.status.success(),
+        "next build failed: {stderr}\n{stdout}"
+    );
+    assert!(stdout.contains("next build ok"), "stdout: {stdout}");
+    assert!(
+        !stdout.contains("Installing devDependencies (npm)"),
+        "Next attempted its fallback installer: {stdout}"
+    );
 }
 
 #[test]

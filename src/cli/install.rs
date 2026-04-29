@@ -266,14 +266,19 @@ pub(super) fn run(options: Options) -> anyhow::Result<()> {
     // inside the project. Keep the O(top-level) relay fast path for ordinary
     // projects, but use a local hardlink view automatically for Next projects;
     // callers can override this with BPM_PROJECT_VIEW=relay|local.
-    let local_project_view = !has_workspace_links && use_local_project_view(&lockfile);
+    let local_project_view = use_local_project_view(&lockfile);
     let (volume, mut view_entry_count) = if has_workspace_links {
-        bpm::materializer::materialize_lockfile(
+        bpm::materializer::materialize_lockfile_with_backend(
             &project_root,
             &store,
             &lockfile,
             &artifact_ids,
             bpm::materializer::MaterializeMode::Compatible,
+            if local_project_view {
+                bpm::materializer::MaterializeBackend::Hardlink
+            } else {
+                bpm::materializer::MaterializeBackend::Auto
+            },
         )?;
         (None, 0usize)
     } else {
@@ -342,8 +347,19 @@ fn use_local_project_view(lockfile: &Lockfile) -> bool {
             );
             lockfile.root.dependencies.contains_key("next")
         }
-        _ => lockfile.root.dependencies.contains_key("next"),
+        _ => auto_local_project_view(lockfile),
     }
+}
+
+fn auto_local_project_view(lockfile: &Lockfile) -> bool {
+    // Check the resolved graph rather than only root declarations. Imported
+    // lockfiles and workspace layouts can represent the app's Next package as
+    // a transitive placement, but Next still resolves its toolchain from the
+    // project and requires those realpaths to remain project-local.
+    lockfile
+        .packages
+        .iter()
+        .any(|package| package.name == "next")
 }
 
 fn adaptive_workers(requested: usize, work_items: usize, project_root: &Path) -> usize {
@@ -750,5 +766,37 @@ impl std::fmt::Display for FetchFail {
 impl std::error::Error for FetchFail {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(self.source.as_ref())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::auto_local_project_view;
+    use bpm::lockfile::{Lockfile, PackageEntry};
+
+    #[test]
+    fn auto_view_detects_next_anywhere_in_the_resolved_graph() {
+        let mut lockfile = Lockfile::new("test");
+        lockfile.packages.push(PackageEntry {
+            path: "node_modules/tools/node_modules/next".into(),
+            name: "next".into(),
+            version: "15.0.0".into(),
+            ..Default::default()
+        });
+
+        assert!(auto_local_project_view(&lockfile));
+    }
+
+    #[test]
+    fn auto_view_stays_relay_for_non_next_graphs() {
+        let mut lockfile = Lockfile::new("test");
+        lockfile.packages.push(PackageEntry {
+            path: "node_modules/vite".into(),
+            name: "vite".into(),
+            version: "5.4.0".into(),
+            ..Default::default()
+        });
+
+        assert!(!auto_local_project_view(&lockfile));
     }
 }
