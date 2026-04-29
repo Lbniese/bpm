@@ -229,7 +229,11 @@ Cold-path hardening now:
 - fetches exact versions from the registry's version endpoint instead of the
   full package history;
 - accepts npm disjunctive semver ranges such as `^3.0.0 || ^4.0.0`;
-- records native dependency-resolution time in `--json-metrics`.
+- records native dependency-resolution time in `--json-metrics`;
+- isolates every cold benchmark sample with fresh per-tool caches and stores;
+- avoids per-file extraction fsyncs before atomic image publication;
+- uses project-local hardlink views for Next.js workspace installs, with an
+  end-to-end `bpm install` → `bpm exec next build` regression.
 
 Next M7 work is to add persistent packument/metadata reuse, profile extraction
 and project attachment separately, and decide whether lifecycle output becomes

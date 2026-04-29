@@ -41,8 +41,10 @@ page records the architecture that is currently shipped.
    symlinks so Node resolves bin scripts from their package directory. Ordinary
    projects use shallow top-level relays for the O(top-level) fast path.
    Projects depending on `next` automatically receive a project-local hardlink
-   view so tools such as Turbopack do not reject dependency realpaths outside
-   the project. `BPM_PROJECT_VIEW=relay|local` overrides that choice.
+   view so tools such as Turbopack and Next.js do not reject dependency
+   realpaths outside the project. Workspace-linked installs use the same
+   hardlink backend for registry packages. `BPM_PROJECT_VIEW=relay|local`
+   overrides that choice.
 6. **Materializer** — `src/materializer.rs` supports compatible npm-v3 layout
    and strict declared-edge validation. It has symlink, hardlink, and fallback
    copy backends; package files are never exposed as writable store symlinks
