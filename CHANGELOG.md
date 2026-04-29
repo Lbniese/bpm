@@ -8,7 +8,22 @@ once a 1.0 release is cut.
 
 ## [Unreleased]
 
-No unreleased changes.
+### Added
+
+- Cold benchmark samples now receive fresh per-run stores and tool caches, so
+  repeated samples cannot silently become warm installs.
+- Next.js projects with workspace links now receive the same project-local
+  dependency view as ordinary Next.js projects.
+
+### Fixed
+
+- Next.js dependency checks no longer fall back to `npm install` when the
+  required TypeScript, `@types`, and ESLint packages are installed through a
+  workspace materialization.
+- Package extraction no longer fsyncs every file individually before atomic
+  publication, substantially reducing first-install filesystem overhead while
+  preserving immutable temporary-image publication.
+
 
 ## [0.1.8] - 2026-07-17
 

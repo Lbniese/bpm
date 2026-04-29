@@ -261,6 +261,30 @@ pub fn materialize_lockfile(
     artifact_ids: &[Option<ArtifactId>],
     mode: MaterializeMode,
 ) -> Result<MaterializeStats, MaterializeError> {
+    materialize_lockfile_with_backend(
+        project_root,
+        store,
+        lockfile,
+        artifact_ids,
+        mode,
+        MaterializeBackend::Auto,
+    )
+}
+
+/// Materialize a lockfile with an explicit package-image backend.
+///
+/// Next.js and similar tools resolve dependency paths after Node canonicalizes
+/// symlinks. A hardlink view keeps those canonical paths inside the project,
+/// while the default backend preserves the cheaper symlink view for ordinary
+/// projects.
+pub fn materialize_lockfile_with_backend(
+    project_root: &Path,
+    store: &ArtifactStore,
+    lockfile: &Lockfile,
+    artifact_ids: &[Option<ArtifactId>],
+    mode: MaterializeMode,
+    backend: MaterializeBackend,
+) -> Result<MaterializeStats, MaterializeError> {
     if mode == MaterializeMode::Strict {
         validate_strict_layout(lockfile).map_err(|message| MaterializeError::Io {
             path: project_root.display().to_string(),
@@ -282,7 +306,7 @@ pub fn materialize_lockfile(
         .zip(&lockfile.packages)
         .filter_map(|(id, package)| id.map(|id| (package, id)))
         .collect::<Vec<_>>();
-    let mut stats = materialize(project_root, store, &resolved)?;
+    let mut stats = materialize_with_backend(project_root, store, &resolved, backend)?;
     stats.links_skipped += workspace_links;
     Ok(stats)
 }
