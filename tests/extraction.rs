@@ -288,6 +288,25 @@ fn strips_package_prefix_and_normalizes_root() {
     assert!(!tmp.path().join("package/package.json").exists());
 }
 
+#[test]
+fn strips_nonstandard_npm_archive_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tgz = build_tgz(|b| {
+        add_dir(b, "react", 0o755);
+        add_file(
+            b,
+            "react/package.json",
+            0o644,
+            br#"{"name":"@types/react"}"#,
+        );
+        add_file(b, "react/index.d.ts", 0o644, b"export {};");
+    });
+    extract_archive(&tgz, tmp.path()).unwrap();
+    assert!(tmp.path().join("package.json").is_file());
+    assert!(tmp.path().join("index.d.ts").is_file());
+    assert!(!tmp.path().join("react/index.d.ts").exists());
+}
+
 /// Extract a tgz into `image_root` via a uniquely-named temp archive.
 fn extract_archive(tgz: &[u8], image_root: &Path) -> Result<(), bpm::archive::ExtractError> {
     extract_tgz(tgz, image_root)
