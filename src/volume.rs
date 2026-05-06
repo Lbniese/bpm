@@ -52,7 +52,7 @@ const META_FILE: &str = "metadata.json";
 /// Bumped when the on-disk volume layout changes (e.g. symlink -> hardlink
 /// materialization of package images). A cached volume whose recorded layout
 /// differs is discarded and rebuilt so every project sees the current layout.
-const VOLUME_LAYOUT_VERSION: u32 = 3;
+const VOLUME_LAYOUT_VERSION: u32 = 4;
 
 #[derive(Debug, Error)]
 pub enum VolumeError {
