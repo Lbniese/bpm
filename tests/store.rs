@@ -62,6 +62,32 @@ fn atomic_reuse_skips_download_and_extraction() {
 }
 
 #[test]
+fn image_without_current_layout_marker_is_rebuilt() {
+    let tgz = fixture_tgz();
+    let integrity = integrity_of(&tgz);
+    let integ = Integrity::parse(&integrity).unwrap();
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = ArtifactStore::open(store_dir.path()).unwrap();
+    let archive = tempfile::NamedTempFile::new().unwrap();
+    fs::write(archive.path(), &tgz).unwrap();
+
+    let mut metrics = Metrics::new();
+    let artifact = store
+        .ensure_artifact(archive.path().to_str().unwrap(), Some(&integ), &mut metrics)
+        .unwrap();
+    let image = store.ensure_image(&artifact.id, &mut metrics).unwrap();
+    fs::remove_file(store.image_path(&artifact.id).with_extension("version")).unwrap();
+    fs::write(image.path.join("package.json"), b"stale").unwrap();
+
+    let rebuilt = store.ensure_image(&artifact.id, &mut metrics).unwrap();
+    assert!(!rebuilt.cached);
+    assert_eq!(
+        fs::read(rebuilt.path.join("package.json")).unwrap(),
+        br#"{"name":"app","version":"1.0.0"}"#
+    );
+}
+
+#[test]
 fn integrity_mismatch_is_rejected_and_tmp_cleaned() {
     let tgz = fixture_tgz();
     let server = MiniServer::start(tgz.clone());

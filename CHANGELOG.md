@@ -8,6 +8,18 @@ once a 1.0 release is cut.
 
 ## [Unreleased]
 
+No unreleased changes.
+
+## [0.1.10] - 2026-07-17
+
+### Fixed
+
+- Cached package images now invalidate when archive-root normalization changes,
+  rebuilding scoped packages such as `@types/react` and `@types/node` with
+  root-level `index.d.ts` files required by Next.js.
+
+## [0.1.9] - 2026-07-17
+
 ### Added
 
 - Cold benchmark samples now receive fresh per-run stores and tool caches, so
@@ -210,7 +222,9 @@ Initial release.
   into the graph id.
 - Install-timing benchmark harness with machine-stamped baselines.
 
-[Unreleased]: https://github.com/lbniese/bpm/compare/v0.1.8...HEAD
+[Unreleased]: https://github.com/lbniese/bpm/compare/v0.1.10...HEAD
+[0.1.10]: https://github.com/Lbniese/bpm/compare/v0.1.9...v0.1.10
+[0.1.9]: https://github.com/Lbniese/bpm/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/Lbniese/bpm/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/Lbniese/bpm/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/Lbniese/bpm/compare/v0.1.5...v0.1.6
