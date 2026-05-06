@@ -36,7 +36,7 @@ pub const PLAN_VERSION: u32 = 1;
 /// Bumped when the materializer's output semantics change (e.g. bin linking
 /// strategy, symlink vs hardlink volume layout). Incompatible materializer
 /// versions invalidate a cached plan even if the graph is identical.
-pub const MATERIALIZER_VERSION: u32 = 3;
+pub const MATERIALIZER_VERSION: u32 = 4;
 
 /// A 256-bit blake3 digest identifying a canonical dependency graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

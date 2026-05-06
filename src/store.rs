@@ -40,6 +40,7 @@ const IMAGES: &str = "images/sha512";
 const GRAPHS: &str = "graphs/blake3";
 const TMP: &str = "tmp";
 const LOCKS: &str = "locks";
+const IMAGE_LAYOUT_VERSION: &str = "2\n";
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -142,6 +143,10 @@ impl ArtifactStore {
     /// Path to the deterministic seekable package-image sidecar.
     pub fn image_index_path(&self, id: &ArtifactId) -> PathBuf {
         self.image_path(id).with_extension("bpi")
+    }
+
+    fn image_version_path(&self, id: &ArtifactId) -> PathBuf {
+        self.image_path(id).with_extension("version")
     }
 
     /// Absolute path of the reusable graph volume for `graph_hex` (a 64-char
@@ -315,7 +320,10 @@ impl ArtifactStore {
     ) -> Result<ImageRef, StoreError> {
         let _guard = self.acquire_lock(&format!("img-{}", id.to_hex()))?;
         let img = self.image_path(id);
-        if img.exists() {
+        let version = self.image_version_path(id);
+        if img.exists()
+            && fs::read_to_string(&version).ok().as_deref() == Some(IMAGE_LAYOUT_VERSION)
+        {
             let index = self.image_index_path(id);
             if !index.exists() {
                 let bytes = crate::package_image::from_directory(&img)
@@ -328,6 +336,15 @@ impl ArtifactStore {
                 path: img,
                 cached: true,
             });
+        }
+        if img.exists() {
+            // Rebuild images from older archive-root normalization rules. The
+            // npm tarballs for scoped @types packages can use roots such as
+            // `react/` and `node/`; retaining those roots makes Next.js miss
+            // the required `@types/*/index.d.ts` files.
+            fs::remove_dir_all(&img).map_err(|source| io_err(&img, source))?;
+            let _ = fs::remove_file(self.image_index_path(id));
+            let _ = fs::remove_file(&version);
         }
         let archive = self.artifact_path(id);
         if !archive.exists() {
@@ -350,6 +367,8 @@ impl ArtifactStore {
                 let bytes = crate::package_image::from_directory(&img)
                     .map_err(|error| io_err(&index, std::io::Error::other(error.to_string())))?;
                 fs::write(&index, bytes).map_err(|source| io_err(&index, source))?;
+                fs::write(&version, IMAGE_LAYOUT_VERSION)
+                    .map_err(|source| io_err(&version, source))?;
                 Ok(ImageRef {
                     id: *id,
                     path: img,
