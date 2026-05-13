@@ -55,6 +55,15 @@ pub(crate) enum Commands {
         /// Write phase metrics as canonical JSON to `PATH`.
         #[arg(long = "json-metrics")]
         json_metrics: Option<PathBuf>,
+        /// Never contact the registry; resolve only against cached metadata.
+        #[arg(long)]
+        offline: bool,
+        /// Prefer cached metadata without revalidation; fetch only on a miss.
+        #[arg(long)]
+        prefer_offline: bool,
+        /// Always revalidate cached metadata against the registry.
+        #[arg(long)]
+        prefer_online: bool,
     },
     /// Run benchmark scenarios and report timing statistics.
     Bench {
@@ -146,6 +155,15 @@ pub(crate) enum Commands {
         /// Ignore peer dependency conflicts.
         #[arg(long = "legacy-peer-deps")]
         legacy_peer_deps: bool,
+        /// Never contact the registry; resolve only against cached metadata.
+        #[arg(long)]
+        offline: bool,
+        /// Prefer cached metadata without revalidation; fetch only on a miss.
+        #[arg(long)]
+        prefer_offline: bool,
+        /// Always revalidate cached metadata against the registry.
+        #[arg(long)]
+        prefer_online: bool,
     },
     /// Clean install from `bpm.lock` (npm `ci` compatibility).
     Ci {
@@ -167,6 +185,15 @@ pub(crate) enum Commands {
         /// Ignore peer dependency conflicts.
         #[arg(long = "legacy-peer-deps")]
         legacy_peer_deps: bool,
+        /// Never contact the registry; resolve only against cached metadata.
+        #[arg(long)]
+        offline: bool,
+        /// Prefer cached metadata without revalidation; fetch only on a miss.
+        #[arg(long)]
+        prefer_offline: bool,
+        /// Always revalidate cached metadata against the registry.
+        #[arg(long)]
+        prefer_online: bool,
     },
     /// Print the directory where global executable shims are linked.
     Bin {

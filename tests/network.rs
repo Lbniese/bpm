@@ -270,7 +270,7 @@ fn retryable_body_drain_keeps_connection_reusable_after_retry() {
 }
 
 #[test]
-fn oversized_retryable_body_forces_next_attempt_to_use_new_connection() {
+fn oversized_retryable_body_does_not_break_the_retry() {
     let (url, requests) = start_scripted_retry_server(vec![
         ScriptedResponse {
             status: 503,
@@ -300,8 +300,13 @@ fn oversized_retryable_body_forces_next_attempt_to_use_new_connection() {
 
     assert_eq!(body, "done");
     let requests = requests.lock().unwrap();
+    // The bounded drain reads at most the retry limit, then drops the rest so a
+    // pathological error body can never block the retry loop. reqwest manages
+    // the pooled connection itself from there \u2014 it may background-drain and
+    // reuse it or close it \u2014 so the retry is not required to open a fresh
+    // connection the way ureq did. What matters is exactly one retry attempt
+    // reaches the server and the final body is intact.
     assert_eq!(requests.len(), 2);
-    assert_ne!(requests[0].connection_id, requests[1].connection_id);
 }
 
 #[test]
@@ -394,7 +399,9 @@ fn redirect_does_not_forward_authorization_across_origins() {
 
     assert_eq!(text, "redirect target");
     let origin_request = String::from_utf8(origin_seen.lock().unwrap().clone()).unwrap();
-    assert!(origin_request.contains("Authorization: Bearer origin-token"));
+    assert!(origin_request
+        .to_ascii_lowercase()
+        .contains("authorization: bearer origin-token"));
     assert_eq!(target.requests()[0].header("authorization"), None);
 }
 

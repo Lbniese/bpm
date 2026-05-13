@@ -535,10 +535,12 @@ mod tests {
         assert_eq!(fs::read(&artifact.path).expect("read artifact"), body);
         assert!(metrics.to_json().contains("artifact_download"));
         assert!(metrics.to_json().contains("integrity_verify"));
+        // reqwest/hyper lowercases header field names on the wire.
         assert!(request
             .join()
             .expect("join server")
-            .contains("Authorization: Bearer artifact-secret\r\n"));
+            .to_ascii_lowercase()
+            .contains("authorization: bearer artifact-secret\r\n"));
         assert_eq!(
             fs::read_dir(store.root().join(TMP))
                 .expect("read temp directory")
@@ -565,7 +567,8 @@ mod tests {
         assert!(request
             .join()
             .expect("join server")
-            .contains("Authorization: Bearer artifact-secret\r\n"));
+            .to_ascii_lowercase()
+            .contains("authorization: bearer artifact-secret\r\n"));
 
         let local_body = b"local artifact";
         let local_source = store_dir.path().join("local.tgz");

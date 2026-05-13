@@ -33,6 +33,7 @@ pub mod lockfile;
 pub mod manifest;
 pub mod materializer;
 pub mod metadata;
+pub mod metadata_cache;
 pub mod metrics;
 pub mod npm_lock;
 pub mod package_image;
