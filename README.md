@@ -50,6 +50,8 @@ Turbopack can keep dependency realpaths inside the project.
   locks. Multiple installs run safely in parallel.
 - **Deterministic output** — byte-for-byte reproducible lockfiles and metrics,
   independent of hash-map ordering, thread scheduling, or network timing.
+  Cached metadata is revalidated with `ETag`/`Last-Modified` and a `304` reuses
+  the stored body verbatim, so cache hits and misses resolve identically.
 - **Measured performance** — every phase is instrumented. Benchmarks compare
   against npm and pnpm with median/p95/standard deviation reporting.
 
@@ -58,8 +60,8 @@ Turbopack can keep dependency realpaths inside the project.
 | Command | Description |
 |---|---|
 | `bpm doctor` | Inspect the nearest `package.json` and report diagnostics |
-| `bpm fetch <spec\|url>` | Resolve a package by spec (`lodash`, `lodash@4.17.21`) or fetch a tarball by exact URL, then verify, store, and extract |
-| `bpm install [<spec\|url>]` | Resolve `package.json` and install, or install an existing `bpm.lock`; package arguments install/link bins globally |
+| `bpm fetch <spec\|url>` | Resolve a package by spec (`lodash`, `lodash@4.17.21`) or fetch a tarball by exact URL, then verify, store, and extract. Supports `--offline`, `--prefer-offline`, `--prefer-online` |
+| `bpm install [<spec\|url>]` | Resolve `package.json` and install, or install an existing `bpm.lock`; package arguments install/link bins globally. Supports `--offline`, `--prefer-offline`, `--prefer-online` |
 | `bpm ci` | Reproducible frozen install from `bpm.lock` (npm `ci` compatibility) |
 | `bpm import` | Convert npm `package-lock.json` v3 to `bpm.lock` and preserve root manifest metadata |
 | `bpm exec <command>` | Execute a local dependency binary with the project bin path |

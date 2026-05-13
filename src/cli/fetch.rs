@@ -10,6 +10,7 @@ use std::{env, fs, io, path::PathBuf};
 use bpm::config::NpmConfig;
 use bpm::http::HttpClient;
 use bpm::integrity::Integrity;
+use bpm::metadata_cache::{CacheMode, MetadataCache};
 use bpm::metrics::Metrics;
 use bpm::registry::RegistryClient;
 use bpm::store::ArtifactStore;
@@ -21,6 +22,7 @@ pub(super) fn run(
     store: Option<PathBuf>,
     no_extract: bool,
     json_metrics: Option<PathBuf>,
+    cache_mode: CacheMode,
 ) -> anyhow::Result<()> {
     let store_root = store_root(store)?;
     let store = ArtifactStore::open(&store_root)?;
@@ -52,7 +54,7 @@ pub(super) fn run(
     // artifact download so auth tokens, retry/backoff, timeouts, and the
     // underlying connection pool apply uniformly.
     let http = HttpClient::new(config.clone());
-    let registry_client = RegistryClient::with_client(config, http.clone());
+    let registry_client = open_registry_client(&store_root, config, http.clone(), cache_mode)?;
 
     let (url, integrity): (String, Option<Integrity>) =
         if bpm::registry::is_valid_npm_name(name_of_spec(target)) {
@@ -98,6 +100,53 @@ pub(super) fn name_of_spec(target: &str) -> &str {
     match target.rfind('@') {
         Some(0) | None => target,
         Some(index) => &target[..index],
+    }
+}
+
+/// Resolve the metadata cache mode from CLI flags, falling back to the
+/// `BPM_OFFLINE` / `BPM_PREFER_OFFLINE` / `BPM_PREFER_ONLINE` environment
+/// variables (npm-compatible behavior) and finally [`CacheMode::Default`].
+///
+/// `offline` wins over `prefer_offline`, which wins over `prefer_online`,
+/// matching npm's mutual-exclusion of these options.
+pub(super) fn resolve_cache_mode(
+    offline: bool,
+    prefer_offline: bool,
+    prefer_online: bool,
+) -> CacheMode {
+    if offline || truthy_env("BPM_OFFLINE") {
+        CacheMode::Offline
+    } else if prefer_offline || truthy_env("BPM_PREFER_OFFLINE") {
+        CacheMode::PreferOffline
+    } else if prefer_online || truthy_env("BPM_PREFER_ONLINE") {
+        CacheMode::PreferOnline
+    } else {
+        CacheMode::Default
+    }
+}
+
+fn truthy_env(name: &str) -> bool {
+    matches!(env::var(name).ok().as_deref(), Some("1") | Some("true"))
+}
+
+/// Build a registry client with the persistent packument cache attached when
+/// it can be opened. A cache that cannot be opened is reported but never fatal:
+/// the client falls back to the uncached path rather than blocking the install.
+pub(super) fn open_registry_client(
+    store_root: &std::path::Path,
+    config: NpmConfig,
+    http: HttpClient,
+    cache_mode: CacheMode,
+) -> anyhow::Result<RegistryClient> {
+    let client = RegistryClient::with_client(config, http);
+    match MetadataCache::open(store_root) {
+        Ok(cache) => Ok(client.with_metadata_cache(std::sync::Arc::new(cache), cache_mode)),
+        Err(error) => {
+            // The cache is a performance optimization only. Surface the issue
+            // so users can repair the database, but continue without it.
+            eprintln!("warn: metadata cache unavailable, continuing uncached: {error}");
+            Ok(client)
+        }
     }
 }
 
