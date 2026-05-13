@@ -25,6 +25,12 @@ use thiserror::Error;
 
 use crate::config::NpmConfig;
 use crate::http::HttpClient;
+use crate::metadata_cache::{CacheMode, MetadataCache};
+
+/// The abbreviated install-metadata media type npm negotiates for graph
+/// resolution. Requesting it avoids downloading each packument's full
+/// publish-time history (multi-megabyte for popular packages).
+const ABBREV_ACCEPT: &str = "application/vnd.npm.install-v1+json";
 
 /// How a spec asks for a version.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -281,7 +287,7 @@ pub struct ResolvedArtifact {
 }
 
 /// Configured registry facade sharing one pooled HTTP client across requests.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RegistryClient {
     config: NpmConfig,
     http: HttpClient,
@@ -289,6 +295,23 @@ pub struct RegistryClient {
     /// this small cache avoids fetching the same transitive package once per
     /// physical placement (common with peer and nested dependency graphs).
     packument_cache: Arc<Mutex<BTreeMap<String, Packument>>>,
+    /// Optional persistent response cache shared across runs. When present,
+    /// packument fetches revalidate over the network with conditional
+    /// requests (`If-None-Match` / `If-Modified-Since`) and reuse the stored
+    /// body verbatim on a `304`. `None` preserves the legacy uncached path.
+    metadata_cache: Option<Arc<MetadataCache>>,
+    cache_mode: CacheMode,
+}
+
+impl std::fmt::Debug for RegistryClient {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RegistryClient")
+            .field("config", &self.config)
+            .field("cache_mode", &self.cache_mode)
+            .field("persistent_cache", &self.metadata_cache.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl RegistryClient {
@@ -313,6 +336,8 @@ impl RegistryClient {
             config,
             http,
             packument_cache: Arc::new(Mutex::new(BTreeMap::new())),
+            metadata_cache: None,
+            cache_mode: CacheMode::Default,
         }
     }
 
@@ -325,7 +350,24 @@ impl RegistryClient {
             config,
             http,
             packument_cache: Arc::new(Mutex::new(BTreeMap::new())),
+            metadata_cache: None,
+            cache_mode: CacheMode::Default,
         }
+    }
+
+    /// Attach a persistent packument cache and select how it may be reused.
+    ///
+    /// When `cache_mode` forbids network access ([`CacheMode::Offline`]) the
+    /// client resolves only against bodies already present in `cache`.
+    pub fn with_metadata_cache(mut self, cache: Arc<MetadataCache>, cache_mode: CacheMode) -> Self {
+        self.metadata_cache = Some(cache);
+        self.cache_mode = cache_mode;
+        self
+    }
+
+    /// The active cache reuse policy (`Default` when no cache is attached).
+    pub fn cache_mode(&self) -> CacheMode {
+        self.cache_mode
     }
 
     /// Fetch the configured scoped/default registry and resolve one package.
@@ -345,7 +387,14 @@ impl RegistryClient {
         match &spec.req {
             VersionRequest::Exact(version) => {
                 let registry = self.config.registry_for_package(&spec.name);
-                fetch_version_packument(&self.http, &spec.name, version, registry)
+                fetch_version_packument(
+                    &self.http,
+                    &spec.name,
+                    version,
+                    registry,
+                    self.metadata_cache.as_deref(),
+                    self.cache_mode,
+                )
             }
             VersionRequest::Latest | VersionRequest::Range(_) => self.packument(&spec.name),
         }
@@ -360,7 +409,13 @@ impl RegistryClient {
                 return Ok(packument.clone());
             }
         }
-        let packument = fetch_packument(&self.http, name, registry)?;
+        let packument = fetch_packument(
+            &self.http,
+            name,
+            registry,
+            self.metadata_cache.as_deref(),
+            self.cache_mode,
+        )?;
         if let Ok(mut cache) = self.packument_cache.lock() {
             cache.insert(key, packument.clone());
         }
@@ -392,6 +447,8 @@ pub enum RegistryError {
     VersionNotFound { package: String, req: String },
     #[error("packument for {package}@{version} is missing a tarball URL or integrity")]
     MissingDist { package: String, version: String },
+    #[error("no cached metadata for {url}; --offline refused to contact the registry")]
+    OfflineMiss { url: String },
 }
 
 /// Parse a package spec string into a name + version request.
@@ -455,7 +512,7 @@ pub fn parse_spec(spec: &str) -> Result<PackageSpec, RegistryError> {
 /// so metadata and artifact retrieval share one caller-owned pool.
 pub fn resolve(spec: &PackageSpec, registry: &str) -> Result<ResolvedArtifact, RegistryError> {
     let http = HttpClient::new(NpmConfig::default());
-    let packument = fetch_packument(&http, &spec.name, registry)?;
+    let packument = fetch_packument(&http, &spec.name, registry, None, CacheMode::Default)?;
     resolve_packument(spec, &packument, registry)
 }
 
@@ -510,22 +567,15 @@ fn fetch_packument(
     http: &HttpClient,
     name: &str,
     registry: &str,
+    cache: Option<&MetadataCache>,
+    mode: CacheMode,
 ) -> Result<Packument, RegistryError> {
     let base = registry.trim_end_matches('/');
     // npm encodes scoped names so the whole name is one path segment.
     let encoded = name.replace('/', "%2F");
     let url = format!("{base}/{encoded}");
 
-    let resp = http
-        .get_with_headers(&url, &[("Accept", "application/vnd.npm.install-v1+json")])
-        .map_err(|source| RegistryError::Network {
-            package: name.to_string(),
-            source: Box::new(source),
-        })?;
-    let body = resp.into_string().map_err(|e| RegistryError::Network {
-        package: name.to_string(),
-        source: Box::new(e),
-    })?;
+    let body = fetch_with_cache(http, &url, name, cache, mode, true)?;
     serde_json::from_str(&body).map_err(|source| RegistryError::BadJson {
         package: name.to_string(),
         source,
@@ -537,18 +587,13 @@ fn fetch_version_packument(
     name: &str,
     version: &Version,
     registry: &str,
+    cache: Option<&MetadataCache>,
+    mode: CacheMode,
 ) -> Result<Packument, RegistryError> {
     let base = registry.trim_end_matches('/');
     let encoded = name.replace('/', "%2F");
     let url = format!("{base}/{encoded}/{version}");
-    let resp = http.get(&url).map_err(|source| RegistryError::Network {
-        package: name.to_string(),
-        source: Box::new(source),
-    })?;
-    let body = resp.into_string().map_err(|e| RegistryError::Network {
-        package: name.to_string(),
-        source: Box::new(e),
-    })?;
+    let body = fetch_with_cache(http, &url, name, cache, mode, false)?;
     let wire: WireVersionMetadata =
         serde_json::from_str(&body).map_err(|source| RegistryError::BadJson {
             package: name.to_string(),
@@ -564,6 +609,101 @@ fn fetch_version_packument(
         dist_tags: BTreeMap::new(),
         versions: BTreeMap::from([(version.to_string(), metadata)]),
     })
+}
+
+/// Retrieve the response body for `url`, consulting and updating the optional
+/// persistent cache according to `mode`.
+///
+/// Revalidation is npm-compatible: a cached entry's `ETag` / `Last-Modified`
+/// are sent as `If-None-Match` / `If-Modified-Since`, a `304 Not Modified`
+/// reuses the stored body verbatim, and a `200` refreshes the cache. The
+/// stored body is byte-for-byte what the registry last sent, so resolution
+/// output stays deterministic regardless of whether a request was served from
+/// the cache or the network.
+///
+/// `send_abbreviated_accept` negotiates npm's abbreviated install-metadata
+/// media type for packuments; per-version endpoints omit it.
+fn fetch_with_cache(
+    http: &HttpClient,
+    url: &str,
+    package: &str,
+    cache: Option<&MetadataCache>,
+    mode: CacheMode,
+    send_abbreviated_accept: bool,
+) -> Result<String, RegistryError> {
+    // A persistent-cache read failure degrades to a miss for every mode: the
+    // online modes fall back to a network fetch, and offline mode fails on the
+    // resulting missing entry below.
+    let cached = cache.and_then(|store| store.get(url).ok()).flatten();
+
+    if !mode.allows_network() {
+        return cached
+            .map(|entry| entry.body)
+            .map(|bytes| String::from_utf8(bytes).unwrap_or_default())
+            .ok_or_else(|| RegistryError::OfflineMiss {
+                url: url.to_string(),
+            });
+    }
+
+    // PreferOffline may serve a still-cached body without any round-trip.
+    if mode.serves_stale() {
+        if let Some(entry) = cached.as_ref() {
+            return Ok(String::from_utf8_lossy(&entry.body).into_owned());
+        }
+    }
+
+    let mut headers: Vec<(&str, &str)> = Vec::new();
+    if send_abbreviated_accept {
+        headers.push(("Accept", ABBREV_ACCEPT));
+    }
+    if let Some(entry) = cached.as_ref() {
+        if let Some(etag) = entry.etag.as_deref() {
+            headers.push(("If-None-Match", etag));
+        }
+        if let Some(last_modified) = entry.last_modified.as_deref() {
+            headers.push(("If-Modified-Since", last_modified));
+        }
+    }
+
+    let response =
+        http.get_with_headers(url, &headers)
+            .map_err(|source| RegistryError::Network {
+                package: package.to_string(),
+                source: Box::new(source),
+            })?;
+
+    if response.status() == 304 {
+        // The registry confirmed the cached body is still current. A validator
+        // must have been sent for the registry to answer 304, so a cached entry
+        // exists; otherwise treat the unexpected 304 as a protocol error.
+        return cached
+            .map(|entry| String::from_utf8_lossy(&entry.body).into_owned())
+            .ok_or_else(|| RegistryError::BadStatus {
+                package: package.to_string(),
+                code: 304,
+            });
+    }
+
+    let etag = response.header("ETag").map(str::to_owned);
+    let last_modified = response.header("Last-Modified").map(str::to_owned);
+    let body = response
+        .into_string()
+        .map_err(|error| RegistryError::Network {
+            package: package.to_string(),
+            source: Box::new(error),
+        })?;
+
+    // Best-effort refresh: a write failure must never fail an install.
+    if let Some(store) = cache {
+        let _ = store.put(
+            url,
+            body.as_bytes(),
+            etag.as_deref(),
+            last_modified.as_deref(),
+        );
+    }
+
+    Ok(body)
 }
 
 /// Pick the target version string from a packument for a version request.
@@ -657,6 +797,9 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::mpsc;
+    use std::sync::Arc;
+
+    use crate::metadata_cache::{CacheMode, MetadataCache};
 
     fn packument(value: serde_json::Value) -> Packument {
         serde_json::from_value(value).unwrap()
@@ -894,7 +1037,134 @@ mod tests {
         let request = request_rx.recv().unwrap();
 
         assert_eq!(resolved.version, Version::new(1, 0, 0));
-        assert!(request.contains("Authorization: Bearer configured-token\r\n"));
-        assert!(request.contains("Accept: application/vnd.npm.install-v1+json\r\n"));
+        // reqwest/hyper lowercases header field names on the wire; HTTP header
+        // names are case-insensitive, so assert against a lowercased capture.
+        let request_lc = request.to_ascii_lowercase();
+        assert!(request_lc.contains("authorization: bearer configured-token\r\n"));
+        assert!(request_lc.contains("accept: application/vnd.npm.install-v1+json\r\n"));
+    }
+
+    /// A minimal HTTP/1.1 test server returning 200 + `ETag` for an
+    /// unconditional request and `304` for a request carrying `If-None-Match`.
+    /// It records every request line over `requests` for assertion.
+    fn conditional_server(
+        body: &'static str,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let registry = format!("http://{address}");
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let recorded = requests.clone();
+        let server = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut buf = [0_u8; 8192];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+                recorded.lock().unwrap().push(request.clone());
+                if request.to_ascii_lowercase().contains("if-none-match:") {
+                    write!(
+                        stream,
+                        "HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .unwrap();
+                } else {
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .unwrap();
+                }
+            }
+        });
+        (registry, requests, server)
+    }
+
+    #[test]
+    fn persistent_cache_revalidates_and_serves_identical_packument() {
+        let body = r#"{"name":"p","dist-tags":{"latest":"1.4.0"},"versions":{"1.4.0":{"dist":{"tarball":"https://example.test/p.tgz","integrity":"sha512-abc"}}}}"#;
+        let (registry, requests, _server) = conditional_server(body);
+        let config = NpmConfig::default()
+            .with_registry_override(&registry)
+            .unwrap();
+        let cache = Arc::new(MetadataCache::open_in_memory().unwrap());
+
+        // First resolve: uncached, so an unconditional GET answered with 200.
+        let client1 = RegistryClient::with_client(config.clone(), HttpClient::new(config.clone()))
+            .with_metadata_cache(cache.clone(), CacheMode::Default);
+        let first = client1.resolve(&parse_spec("p").unwrap()).unwrap();
+        assert_eq!(first.version, Version::new(1, 4, 0));
+
+        // Second resolve with a brand-new client sharing only the persistent
+        // cache: a conditional GET (`If-None-Match`) answered with 304, which
+        // must reuse the stored body byte-for-byte (identical resolution).
+        let client2 = RegistryClient::with_client(config.clone(), HttpClient::new(config.clone()))
+            .with_metadata_cache(cache.clone(), CacheMode::Default);
+        let second = client2.resolve(&parse_spec("p").unwrap()).unwrap();
+        assert_eq!(second.version, Version::new(1, 4, 0));
+        assert_eq!(second.tarball_url, first.tarball_url);
+        assert_eq!(second.integrity, first.integrity);
+
+        let captured = requests.lock().unwrap().clone();
+        assert_eq!(captured.len(), 2);
+        assert!(!captured[0].to_ascii_lowercase().contains("if-none-match:"));
+        assert!(captured[1]
+            .to_ascii_lowercase()
+            .contains("if-none-match: \"v1\""));
+    }
+
+    #[test]
+    fn prefer_offline_serves_stale_without_revalidation() {
+        let body = r#"{"name":"p","dist-tags":{"latest":"2.0.0"},"versions":{"2.0.0":{"dist":{"tarball":"https://example.test/p.tgz","integrity":"sha512-xyz"}}}}"#;
+        let (registry, requests, _server) = conditional_server(body);
+        let config = NpmConfig::default()
+            .with_registry_override(&registry)
+            .unwrap();
+        let cache = Arc::new(MetadataCache::open_in_memory().unwrap());
+
+        // Warm the cache with one full fetch.
+        RegistryClient::with_client(config.clone(), HttpClient::new(config.clone()))
+            .with_metadata_cache(cache.clone(), CacheMode::Default)
+            .resolve(&parse_spec("p").unwrap())
+            .unwrap();
+
+        // PreferOffline must serve the cached body without any network contact.
+        let resolved = RegistryClient::with_client(config.clone(), HttpClient::new(config.clone()))
+            .with_metadata_cache(cache, CacheMode::PreferOffline)
+            .resolve(&parse_spec("p").unwrap())
+            .unwrap();
+        assert_eq!(resolved.version, Version::new(2, 0, 0));
+
+        // Exactly one request reached the server (the warm-up fetch).
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn offline_mode_errors_on_a_cache_miss_without_network_contact() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let registry = format!("http://{address}");
+        // Drop the listener so nothing is listening; offline mode must never
+        // attempt a connection anyway.
+        drop(listener);
+
+        let config = NpmConfig::default()
+            .with_registry_override(&registry)
+            .unwrap();
+        let cache = Arc::new(MetadataCache::open_in_memory().unwrap());
+        let client = RegistryClient::with_client(config.clone(), HttpClient::new(config.clone()))
+            .with_metadata_cache(cache, CacheMode::Offline);
+
+        let error = client.resolve(&parse_spec("absent").unwrap()).unwrap_err();
+        assert!(
+            matches!(error, RegistryError::OfflineMiss { .. }),
+            "expected OfflineMiss, got {error:?}"
+        );
     }
 }
