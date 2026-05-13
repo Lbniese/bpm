@@ -8,7 +8,35 @@ once a 1.0 release is cut.
 
 ## [Unreleased]
 
-No unreleased changes.
+### Changed
+
+- HTTP transport switched from blocking `ureq` (HTTP/1.1) to
+  `reqwest::blocking` over a shared connection pool with HTTP/2 negotiated via
+  TLS ALPN. The `HttpClient`/`HttpResponse` API is unchanged, but concurrent
+  requests from cloned clients \u2014 notably the install/download worker pool
+  \u2014 now multiplex over a single HTTP/2 stream per host instead of opening one
+  HTTP/1.1 connection per request. Registry credentials are still applied only
+  to the configured host and are marked sensitive so `reqwest` strips them on a
+  cross-host redirect (matching browser/curl/npm behavior; previously `ureq`
+  never forwarded auth on any redirect). All HTTP header field names are now
+  emitted lower-cased on the wire, as HTTP requires, which is invisible to the
+  npm registry.
+
+### Added
+
+- Persistent registry-metadata cache (`<store>/.bpm` store now also holds
+  `metadata-cache.db`): packument and per-version metadata responses are
+  stored durably and revalidated with `ETag` / `Last-Modified` conditional
+  requests, so overlapping dependency graphs reuse metadata across runs and
+  `304 Not Modified` responses are free. Resolution output stays byte-for-byte
+  deterministic regardless of whether a response came from the cache or the
+  network.
+- npm-compatible metadata cache modes on `bpm fetch`, `bpm install`, and
+  `bpm ci`: `--offline` (cache-only, error on miss), `--prefer-offline`
+  (serve cached metadata without revalidation), and `--prefer-online`
+  (always revalidate). The same modes are honored via `BPM_OFFLINE`,
+  `BPM_PREFER_OFFLINE`, and `BPM_PREFER_ONLINE`. This directly closes the
+  cold-path "persistent packument/metadata reuse" gap from M7.
 
 ## [0.1.10] - 2026-07-17
 

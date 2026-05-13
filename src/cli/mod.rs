@@ -43,6 +43,9 @@ pub(crate) fn run() -> ExitCode {
             store,
             no_extract,
             json_metrics,
+            offline,
+            prefer_offline,
+            prefer_online,
         } => fetch::run(
             &target,
             integrity,
@@ -50,6 +53,7 @@ pub(crate) fn run() -> ExitCode {
             store,
             no_extract,
             json_metrics,
+            fetch::resolve_cache_mode(offline, prefer_offline, prefer_online),
         ),
         Commands::Bench {
             fixture,
@@ -91,6 +95,9 @@ pub(crate) fn run() -> ExitCode {
             global,
             ignore_scripts,
             legacy_peer_deps,
+            offline,
+            prefer_offline,
+            prefer_online,
         } => install::run(install::Options {
             target,
             frozen,
@@ -101,6 +108,7 @@ pub(crate) fn run() -> ExitCode {
             global,
             ignore_scripts,
             legacy_peer_deps,
+            cache_mode: fetch::resolve_cache_mode(offline, prefer_offline, prefer_online),
         }),
         Commands::Ci {
             registry,
@@ -109,6 +117,9 @@ pub(crate) fn run() -> ExitCode {
             json_metrics,
             ignore_scripts,
             legacy_peer_deps,
+            offline,
+            prefer_offline,
+            prefer_online,
         } => install::run(install::Options {
             target: None,
             frozen: true,
@@ -119,6 +130,7 @@ pub(crate) fn run() -> ExitCode {
             global: false,
             ignore_scripts,
             legacy_peer_deps,
+            cache_mode: fetch::resolve_cache_mode(offline, prefer_offline, prefer_online),
         }),
         Commands::Bin { global: _ } => (|| -> anyhow::Result<()> {
             println!("{}", install::bin_dir()?.display());

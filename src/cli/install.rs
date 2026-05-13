@@ -13,13 +13,12 @@ use bpm::integrity::{ArtifactId, Integrity};
 use bpm::lockfile::{find_lockfile, Lockfile};
 use bpm::manifest::PackageManifest;
 use bpm::metrics::Metrics;
-use bpm::registry::RegistryClient;
 use bpm::resolver;
 use bpm::resolver::model::PlatformConstraints;
 use bpm::resolver::platform::{check_package_platform, PackageReachability, PlatformDisposition};
 use bpm::store::{ArtifactStore, StoreError};
 
-use super::fetch::{name_of_spec, store_root, write_metrics};
+use super::fetch::{name_of_spec, open_registry_client, store_root, write_metrics};
 
 pub(super) struct Options {
     pub target: Option<String>,
@@ -31,14 +30,22 @@ pub(super) struct Options {
     pub global: bool,
     pub ignore_scripts: bool,
     pub legacy_peer_deps: bool,
+    pub cache_mode: bpm::metadata_cache::CacheMode,
 }
 
 pub(super) fn run(options: Options) -> anyhow::Result<()> {
     if let Some(target) = options.target {
-        return run_install_bin(&target, options.registry, options.store, options.global);
+        return run_install_bin(
+            &target,
+            options.registry,
+            options.store,
+            options.global,
+            options.cache_mode,
+        );
     }
 
-    let store = ArtifactStore::open(&store_root(options.store)?)?;
+    let store_root_path = store_root(options.store.clone())?;
+    let store = ArtifactStore::open(&store_root_path)?;
     let mut metrics = Metrics::new();
     let cwd = env::current_dir()?;
     let (lockfile_path, lockfile, project_root) = match find_lockfile(&cwd)? {
@@ -59,7 +66,7 @@ pub(super) fn run(options: Options) -> anyhow::Result<()> {
                 .map_err(|error| anyhow::anyhow!("cannot resolve dependencies: {error}"))?;
             let config = effective_npm_config(&root, options.registry.as_deref())?;
             let http = HttpClient::new(config.clone());
-            let client = RegistryClient::with_client(config, http);
+            let client = open_registry_client(&store_root_path, config, http, options.cache_mode)?;
             let workspace_layout = bpm::workspace::discover(&root);
             let workspace_index = bpm::resolver::workspaces::WorkspaceIndex::from_project_root(
                 &root,
@@ -443,14 +450,16 @@ fn run_install_bin(
     registry: Option<String>,
     store: Option<PathBuf>,
     _global: bool,
+    cache_mode: bpm::metadata_cache::CacheMode,
 ) -> anyhow::Result<()> {
-    let store = ArtifactStore::open(&store_root(store)?)?;
+    let store_root_path = store_root(store)?;
+    let store = ArtifactStore::open(&store_root_path)?;
     let mut metrics = Metrics::new();
     let cwd = env::current_dir()?;
     let project_root = bpm::project::find_project_root(&cwd).unwrap_or(cwd);
     let config = effective_npm_config(&project_root, registry.as_deref())?;
     let http = HttpClient::new(config.clone());
-    let registry_client = RegistryClient::with_client(config, http.clone());
+    let registry_client = open_registry_client(&store_root_path, config, http.clone(), cache_mode)?;
 
     let (url, integrity) = if bpm::registry::is_valid_npm_name(name_of_spec(target)) {
         let spec = bpm::registry::parse_spec(target)?;

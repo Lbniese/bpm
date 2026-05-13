@@ -545,14 +545,15 @@ mod tests {
 
     #[test]
     fn observes_keep_alive_connection_reuse() {
+        use bpm::config::NpmConfig;
+        use bpm::http::HttpClient;
         let server =
             MiniServer::start_keep_alive_routed(|_| Some(RouteBody(b"ok".to_vec(), "text/plain")));
-        let agent = ureq::AgentBuilder::new().build();
+        let client = HttpClient::new(NpmConfig::default());
 
         for path in ["one", "two"] {
-            agent
+            client
                 .get(&server.url(path))
-                .call()
                 .expect("request")
                 .into_string()
                 .expect("response body");

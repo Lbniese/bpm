@@ -19,7 +19,7 @@ the commit history wins.
 | 4 — Reusable graph volumes | graph-volume creation, graph-volume reuse across projects, safe project attachment | ✅ Done — `node_modules` attaches via shallow relays |
 | 5 — Lifecycle support | npm-compatible script environment, derived artifact store, native-addon fixture coverage | ✅ Mostly done — sandbox runner, graph-volume lifecycle, `bpm run`; derived-store wiring remains open |
 | 6 — Workspaces and optimization | basic npm workspaces, filesystem capability detection, reflink/clone optimization, adaptive concurrency | ✅ Mostly done — workspaces, capability probe, adaptive concurrency, local hardlink compatibility view; general reflink/clone attachment remains open |
-| 7 — Cold-path performance | representative benchmark corpus, persistent metadata efficiency, native-resolution profiling, derived lifecycle decision | 🚧 In progress — realistic fixture measurements and cold resolver hardening landed; derived-artifact integration and persistent metadata cache remain |
+| 7 — Cold-path performance | representative benchmark corpus, persistent metadata efficiency, native-resolution profiling, derived lifecycle decision | 🚧 In progress — realistic fixture measurements and cold resolver hardening landed; persistent packument metadata cache with ETag revalidation (Step 1A) and HTTP/2 transport via reqwest (Step 1B) landed; concurrent/streaming resolution and derived-artifact integration remain |
 
 ### Post-M6 — registry name resolution (not in the original plan)
 
@@ -237,6 +237,33 @@ Cold-path hardening now:
 - invalidates cached package images and graph volumes after archive-root layout
   changes, covering scoped `@types` packages used by Next.js.
 
-Next M7 work is to add persistent packument/metadata reuse, profile extraction
-and project attachment separately, and decide whether lifecycle output becomes
-content-addressed through `src/derived/store.rs` or remains graph-keyed.
+Next M7 work is to make resolution concurrent (so packument fetches during
+graph expansion overlap instead of running one blocking round-trip per
+package), profile extraction and project attachment separately, and decide
+whether lifecycle output becomes content-addressed through
+`src/derived/store.rs` or remains graph-keyed.
+
+### HTTP/2 transport — delivered (Step 1B)
+
+The blocking `ureq` (HTTP/1.1) transport was replaced with `reqwest::blocking`
+over a shared connection pool, negotiating HTTP/2 over TLS via ALPN. The
+`HttpClient`/`HttpResponse` surface is unchanged, so the resolver, registry,
+download, publish, and audit call sites are untouched. Because the install /
+download worker pool shares one pooled client, concurrent tarball fetches now
+multiplex over a single HTTP/2 stream per host instead of opening one HTTP/1.1
+connection per request, reducing TLS handshake and connection overhead on the
+cold path. Retry semantics (transient-status and connect/timeout backoff,
+bounded error-body draining, `Retry-After`) are preserved.
+
+### Persistent metadata cache — delivered
+
+Packument and per-version metadata responses are now cached durably in
+`<store>/metadata-cache.db` and revalidated with `ETag` / `Last-Modified`
+conditional requests (`If-None-Match` / `If-Modified-Since`). A `304 Not
+Modified` reuses the stored body verbatim, so resolution is deterministic
+whether served from cache or network. Delivered: `src/metadata_cache.rs`
+(`MetadataCache`, `CacheMode`), `RegistryClient::with_metadata_cache`, and
+npm-compatible `--offline` / `--prefer-offline` / `--prefer-online` flags on
+`bpm fetch`, `bpm install`, and `bpm ci` (plus `BPM_OFFLINE` /
+`BPM_PREFER_OFFLINE` / `BPM_PREFER_ONLINE`). The cache is best-effort for
+online modes and fails the install only in `--offline` mode on a genuine miss.

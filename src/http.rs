@@ -1,8 +1,11 @@
 //! Shared blocking HTTP client for registry metadata and artifact streams.
 //!
-//! A client owns one clonable [`ureq::Agent`], so cloned clients share its
-//! connection pool. Requests apply npmrc authentication only to the exact
-//! host/path selected by [`NpmConfig`], never forward authorization across a
+//! A client wraps one clonable [`reqwest::blocking::Client`], so cloned clients
+//! share its connection pool and negotiate HTTP/2 over TLS (ALPN). Concurrent
+//! requests from cloned clients — for example the download worker pool —
+//! therefore multiplex over a single connection per host. Requests apply npmrc
+//! authentication only to the exact host/path selected by [`NpmConfig`], mark
+//! the credential sensitive so reqwest never forwards it across a cross-host
 //! redirect, and retry only transient failures within configured bounds.
 
 use std::cmp;
@@ -11,17 +14,21 @@ use std::io::{self, Read};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
+use reqwest::blocking::{Client, ClientBuilder, Response};
+use reqwest::header::RETRY_AFTER;
+
 use crate::config::{NetworkConfig, NpmConfig};
 
 const USER_AGENT: &str = concat!("bpm/", env!("CARGO_PKG_VERSION"));
-const AUTHORIZATION: &str = "Authorization";
-const RETRY_AFTER: &str = "Retry-After";
 const RETRY_BODY_DRAIN_LIMIT: usize = 64 * 1024;
 
 /// A pooled, configured HTTP client suitable for cloning between consumers.
+///
+/// Cloned clients share the same underlying [`reqwest::blocking::Client`] and
+/// therefore the same connection pool and HTTP/2 stream concurrency.
 #[derive(Clone)]
 pub struct HttpClient {
-    agent: ureq::Agent,
+    client: Client,
     config: NpmConfig,
 }
 
@@ -37,78 +44,51 @@ impl fmt::Debug for HttpClient {
 impl HttpClient {
     /// Build a client from effective npm configuration.
     ///
-    /// `ureq`'s default redirect policy is retained, while authorization
-    /// propagation is explicitly disabled. This allows public redirects but
-    /// prevents a registry credential from reaching another origin.
+    /// The default redirect policy is retained (follow up to ten redirects),
+    /// and any `Authorization` header set on a request is marked sensitive, so
+    /// reqwest strips it on a cross-host redirect rather than leaking a
+    /// registry credential to another origin.
     pub fn new(config: NpmConfig) -> Self {
-        let agent = ureq::AgentBuilder::new()
-            .timeout(config.network.fetch_timeout)
-            .redirect_auth_headers(ureq::RedirectAuthHeaders::Never)
-            .user_agent(USER_AGENT)
-            .build();
-        Self { agent, config }
+        Self {
+            client: build_client(config.network.fetch_timeout),
+            config,
+        }
     }
 
     /// Execute a GET request and return its response for string/JSON handling.
-    pub fn get(&self, url: &str) -> Result<ureq::Response, HttpError> {
+    pub fn get(&self, url: &str) -> Result<HttpResponse, HttpError> {
         self.get_with_headers(url, &[])
     }
 
     /// Execute a GET request with additional request headers.
+    ///
+    /// The body is read eagerly into [`HttpResponse`], which is appropriate for
+    /// registry metadata (small JSON). Use [`HttpClient::stream`] for large
+    /// bodies such as tarballs.
     pub fn get_with_headers(
         &self,
         url: &str,
         headers: &[(&str, &str)],
-    ) -> Result<ureq::Response, HttpError> {
-        let display_url = redact_url(url);
-        let attempts = self.config.network.retries.saturating_add(1);
-
-        for attempt in 0..attempts {
-            let mut request = self.agent.get(url);
-            for (name, value) in headers {
-                request = request.set(name, value);
-            }
-            if let Some(token) = self.config.auth_token_for_url(url) {
-                request = request.set(AUTHORIZATION, &format!("Bearer {token}"));
-            }
-
-            match request.call() {
-                Ok(response) => return Ok(response),
-                Err(ureq::Error::Status(code, response)) => {
-                    let completed = attempt + 1;
-                    if is_retryable_status(code) && completed < attempts {
-                        let retry_after = retry_after_delay(&response);
-                        drain_response_for_retry(response);
-                        thread::sleep(retry_delay(&self.config.network, attempt, retry_after));
-                        continue;
-                    }
-                    return Err(HttpError::Status {
-                        url: display_url,
-                        code,
-                        attempts: completed,
-                    });
-                }
-                Err(ureq::Error::Transport(error)) => {
-                    let completed = attempt + 1;
-                    if is_retryable_transport(error.kind()) && completed < attempts {
-                        thread::sleep(retry_delay(&self.config.network, attempt, None));
-                        continue;
-                    }
-                    return Err(HttpError::Transport {
-                        url: display_url,
-                        kind: format!("{:?}", error.kind()),
-                        attempts: completed,
-                    });
-                }
-            }
-        }
-
-        unreachable!("the configured attempt count is always at least one")
+    ) -> Result<HttpResponse, HttpError> {
+        let response = self.execute_get(url, headers)?;
+        let status = response.status().as_u16();
+        let collected = collect_headers(response.headers());
+        let body = response.bytes().map_err(|error| HttpError::Transport {
+            url: redact_url(url),
+            kind: format!("response read failed: {error}"),
+            attempts: 1,
+        })?;
+        Ok(HttpResponse {
+            status,
+            headers: collected,
+            body: body.to_vec(),
+        })
     }
 
     /// Execute a GET request and expose its body as a streaming reader.
     pub fn stream(&self, url: &str) -> Result<Box<dyn Read + Send + Sync + 'static>, HttpError> {
-        self.get(url).map(ureq::Response::into_reader)
+        let response = self.execute_get(url, &[])?;
+        Ok(Box::new(response))
     }
 
     /// POST a JSON request body and return the response body as bytes.
@@ -141,6 +121,67 @@ impl HttpClient {
         self.request_json("PUT", url, body, headers)
     }
 
+    /// Send a GET (following redirects) honoring the retry policy.
+    ///
+    /// The returned [`Response`] is for any terminal status below 400
+    /// (including `304 Not Modified`). Statuses at or above 400 are retried
+    /// when transient and otherwise become [`HttpError::Status`].
+    fn execute_get(&self, url: &str, headers: &[(&str, &str)]) -> Result<Response, HttpError> {
+        let display_url = redact_url(url);
+        let network = &self.config.network;
+        let attempts = network.retries.saturating_add(1);
+
+        for attempt in 0..attempts {
+            let request = self.build_get(url, headers);
+            match request.send() {
+                Ok(response) => {
+                    let status = response.status().as_u16();
+                    if status < 400 {
+                        return Ok(response);
+                    }
+                    let completed = attempt + 1;
+                    if is_retryable_status(status) && completed < attempts {
+                        let retry_after = retry_after_from(&response);
+                        drain_response(response);
+                        thread::sleep(retry_delay(network, attempt, retry_after));
+                        continue;
+                    }
+                    return Err(HttpError::Status {
+                        url: display_url,
+                        code: status,
+                        attempts: completed,
+                    });
+                }
+                Err(error) => {
+                    let completed = attempt + 1;
+                    if is_retryable_transport(&error) && completed < attempts {
+                        thread::sleep(retry_delay(network, attempt, None));
+                        continue;
+                    }
+                    return Err(HttpError::Transport {
+                        url: display_url,
+                        kind: transport_kind(&error),
+                        attempts: completed,
+                    });
+                }
+            }
+        }
+
+        unreachable!("the configured attempt count is always at least one")
+    }
+
+    /// Build a GET request with npmrc auth and the caller's headers applied.
+    fn build_get(&self, url: &str, headers: &[(&str, &str)]) -> reqwest::blocking::RequestBuilder {
+        let mut request = self.client.get(url);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        if let Some(token) = self.config.auth_token_for_url(url) {
+            request = request.bearer_auth(token);
+        }
+        request
+    }
+
     fn request_json(
         &self,
         method: &str,
@@ -149,63 +190,103 @@ impl HttpClient {
         headers: &[(&str, &str)],
     ) -> Result<Vec<u8>, HttpError> {
         let display_url = redact_url(url);
-        let attempts = self.config.network.retries.saturating_add(1);
+        let network = &self.config.network;
+        let attempts = network.retries.saturating_add(1);
         for attempt in 0..attempts {
             let request = match method {
-                "POST" => self.agent.post(url),
-                "PUT" => self.agent.put(url),
+                "POST" => self.client.post(url),
+                "PUT" => self.client.put(url),
                 _ => unreachable!(),
             }
-            .set("Content-Type", "application/json")
-            .set("Accept", "application/json");
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .body(body.to_vec());
             let mut request = if let Some(token) = self.config.auth_token_for_url(url) {
-                request.set(AUTHORIZATION, &format!("Bearer {token}"))
+                request.bearer_auth(token)
             } else {
                 request
             };
             for (name, value) in headers {
-                request = request.set(name, value);
+                request = request.header(*name, *value);
             }
-            match request.send_bytes(body) {
-                Ok(response) => {
-                    let mut out = Vec::new();
-                    response.into_reader().read_to_end(&mut out).map_err(|_| {
-                        HttpError::Transport {
-                            url: display_url.clone(),
-                            kind: "response read failed".into(),
-                            attempts: attempt + 1,
-                        }
-                    })?;
-                    return Ok(out);
-                }
-                Err(ureq::Error::Status(code, response))
-                    if is_retryable_status(code) && attempt + 1 < attempts =>
-                {
-                    drain_response_for_retry(response);
-                    thread::sleep(retry_delay(&self.config.network, attempt, None));
-                }
-                Err(ureq::Error::Status(code, _)) => {
+            match request.send() {
+                Ok(mut response) => {
+                    let status = response.status().as_u16();
+                    if status < 400 {
+                        let mut out = Vec::new();
+                        response
+                            .read_to_end(&mut out)
+                            .map_err(|_| HttpError::Transport {
+                                url: display_url.clone(),
+                                kind: "response read failed".into(),
+                                attempts: attempt + 1,
+                            })?;
+                        return Ok(out);
+                    }
+                    let completed = attempt + 1;
+                    if is_retryable_status(status) && completed < attempts {
+                        drain_response(response);
+                        thread::sleep(retry_delay(network, attempt, None));
+                        continue;
+                    }
                     return Err(HttpError::Status {
                         url: display_url,
-                        code,
-                        attempts: attempt + 1,
-                    })
+                        code: status,
+                        attempts: completed,
+                    });
                 }
-                Err(ureq::Error::Transport(error))
-                    if is_retryable_transport(error.kind()) && attempt + 1 < attempts =>
-                {
-                    thread::sleep(retry_delay(&self.config.network, attempt, None));
-                }
-                Err(ureq::Error::Transport(error)) => {
+                Err(error) => {
+                    let completed = attempt + 1;
+                    if is_retryable_transport(&error) && completed < attempts {
+                        thread::sleep(retry_delay(network, attempt, None));
+                        continue;
+                    }
                     return Err(HttpError::Transport {
                         url: display_url,
-                        kind: format!("{:?}", error.kind()),
-                        attempts: attempt + 1,
-                    })
+                        kind: transport_kind(&error),
+                        attempts: completed,
+                    });
                 }
             }
         }
         unreachable!()
+    }
+}
+
+/// A completed HTTP response owned by bpm, decoupled from the HTTP transport.
+///
+/// The body is read eagerly; headers are stored as owned strings so callers
+/// never depend on `reqwest` types.
+#[derive(Debug)]
+pub struct HttpResponse {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+impl HttpResponse {
+    /// The response status code.
+    pub fn status(&self) -> u16 {
+        self.status
+    }
+
+    /// The first header value matching `name` (case-insensitive).
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .rev()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+
+    /// Consume the response and return its body as a UTF-8 string.
+    pub fn into_string(self) -> Result<String, std::string::FromUtf8Error> {
+        String::from_utf8(self.body)
+    }
+
+    /// Consume the response and return its buffered body as an in-memory reader.
+    pub fn into_reader(self) -> std::io::Cursor<Vec<u8>> {
+        std::io::Cursor::new(self.body)
     }
 }
 
@@ -249,31 +330,94 @@ impl fmt::Display for HttpError {
 
 impl std::error::Error for HttpError {}
 
+/// Build a pooled client with the bpm user agent and request timeout.
+///
+/// A static user agent and a valid timeout never produce an invalid builder in
+/// practice, so a build failure falls back to the default client rather than
+/// hard-failing configuration.
+fn build_client(timeout: Duration) -> Client {
+    ClientBuilder::new()
+        .user_agent(USER_AGENT)
+        .timeout(timeout)
+        .build()
+        .unwrap_or_else(|_| ClientBuilder::new().build().expect("default client builds"))
+}
+
 fn is_retryable_status(code: u16) -> bool {
     matches!(code, 408 | 429 | 500..=599)
 }
 
-fn is_retryable_transport(kind: ureq::ErrorKind) -> bool {
-    use ureq::ErrorKind;
+/// Coarse classification of a reqwest transport failure, for retry decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransportKind {
+    /// Connection establishment failure (refused, reset, DNS, TLS handshake).
+    Connect,
+    /// Request or response timeout.
+    Timeout,
+    /// Builder/URL error — never retried.
+    Builder,
+    /// Request construction error — never retried.
+    Request,
+    /// Body transfer error.
+    Body,
+    /// Response decode error.
+    Decode,
+    /// Redirect policy error (too many redirects).
+    Redirect,
+    /// Anything else.
+    Other,
+}
 
-    match kind {
-        ErrorKind::ConnectionFailed | ErrorKind::Io | ErrorKind::ProxyConnect => true,
-        ErrorKind::InvalidUrl
-        | ErrorKind::UnknownScheme
-        | ErrorKind::Dns
-        | ErrorKind::InsecureRequestHttpsOnly
-        | ErrorKind::TooManyRedirects
-        | ErrorKind::BadStatus
-        | ErrorKind::BadHeader
-        | ErrorKind::InvalidProxyUrl
-        | ErrorKind::ProxyUnauthorized
-        | ErrorKind::HTTP => false,
+impl TransportKind {
+    fn from_error(error: &reqwest::Error) -> Self {
+        if error.is_connect() {
+            Self::Connect
+        } else if error.is_timeout() {
+            Self::Timeout
+        } else if error.is_builder() {
+            Self::Builder
+        } else if error.is_request() {
+            Self::Request
+        } else if error.is_body() {
+            Self::Body
+        } else if error.is_decode() {
+            Self::Decode
+        } else if error.is_redirect() {
+            Self::Redirect
+        } else {
+            Self::Other
+        }
+    }
+
+    fn is_retryable(self) -> bool {
+        matches!(self, Self::Connect | Self::Timeout)
     }
 }
 
-fn retry_after_delay(response: &ureq::Response) -> Option<Duration> {
+fn is_retryable_transport(error: &reqwest::Error) -> bool {
+    TransportKind::from_error(error).is_retryable()
+}
+
+fn transport_kind(error: &reqwest::Error) -> String {
+    let kind = TransportKind::from_error(error);
+    match kind {
+        TransportKind::Connect => "connection failed",
+        TransportKind::Timeout => "timeout",
+        TransportKind::Builder => "invalid request",
+        TransportKind::Request => "request failed",
+        TransportKind::Body => "body transfer failed",
+        TransportKind::Decode => "response decode failed",
+        TransportKind::Redirect => "too many redirects",
+        TransportKind::Other => "transport failed",
+    }
+    .to_string()
+}
+
+fn retry_after_from(response: &Response) -> Option<Duration> {
     response
-        .header(RETRY_AFTER)
+        .headers()
+        .get(RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
         .and_then(|value| parse_retry_after_at(value, SystemTime::now()))
 }
 
@@ -288,16 +432,17 @@ fn parse_retry_after_at(value: &str, now: SystemTime) -> Option<Duration> {
         .map(|date| date.duration_since(now).unwrap_or(Duration::ZERO))
 }
 
-fn drain_response_for_retry(response: ureq::Response) {
-    let mut body = response.into_reader();
-    let _ = drain_reader_for_retry(&mut body);
+/// Drain a retryable-status response so its connection may return to the pool.
+fn drain_response(response: Response) {
+    let mut reader = response;
+    let _ = drain_reader_for_retry(&mut reader);
 }
 
 /// Drain a retry response only while it remains small enough to pool safely.
 ///
 /// Reading one byte beyond the limit distinguishes a complete 64 KiB body
 /// from an oversized body without allowing unbounded work. Dropping an
-/// oversized reader leaves bytes unread, causing ureq to close the connection.
+/// oversized reader leaves bytes unread, causing the connection to close.
 fn drain_reader_for_retry(reader: &mut dyn Read) -> io::Result<bool> {
     let limit = u64::try_from(RETRY_BODY_DRAIN_LIMIT).expect("drain limit fits in u64");
     let mut bounded = reader.take(limit + 1);
@@ -317,6 +462,17 @@ fn retry_delay(network: &NetworkConfig, retry: usize, retry_after: Option<Durati
         .unwrap_or(network.retry_max_timeout);
     let requested = cmp::max(exponential, retry_after.unwrap_or_default());
     cmp::min(requested, network.retry_max_timeout)
+}
+
+/// Collect response headers into owned `(name, value)` pairs, skipping any
+/// header whose value is not valid UTF-8.
+fn collect_headers(map: &reqwest::header::HeaderMap) -> Vec<(String, String)> {
+    map.iter()
+        .filter_map(|(name, value)| {
+            let value = value.to_str().ok()?;
+            Some((name.as_str().to_owned(), value.to_owned()))
+        })
+        .collect()
 }
 
 /// Remove user information, query, and fragment from URLs included in errors.
@@ -341,28 +497,22 @@ mod tests {
     use std::time::UNIX_EPOCH;
 
     #[test]
-    fn transport_retry_policy_exhaustively_whitelists_transient_kinds() {
-        use ureq::ErrorKind::*;
-
+    fn transport_retry_policy_retries_only_connect_and_timeout_kinds() {
+        // Every TransportKind is enumerated so adding a new variant forces a
+        // deliberate decision about its retry behavior.
         let cases = [
-            (InvalidUrl, false),
-            (UnknownScheme, false),
-            (Dns, false),
-            (InsecureRequestHttpsOnly, false),
-            (ConnectionFailed, true),
-            (TooManyRedirects, false),
-            (BadStatus, false),
-            (BadHeader, false),
-            (Io, true),
-            (InvalidProxyUrl, false),
-            (ProxyConnect, true),
-            (ProxyUnauthorized, false),
-            (HTTP, false),
+            (TransportKind::Connect, true),
+            (TransportKind::Timeout, true),
+            (TransportKind::Builder, false),
+            (TransportKind::Request, false),
+            (TransportKind::Body, false),
+            (TransportKind::Decode, false),
+            (TransportKind::Redirect, false),
+            (TransportKind::Other, false),
         ];
-
-        assert_eq!(cases.len(), 13);
+        assert_eq!(cases.len(), 8);
         for (kind, expected) in cases {
-            assert_eq!(is_retryable_transport(kind), expected, "{kind:?}");
+            assert_eq!(kind.is_retryable(), expected, "{kind:?}");
         }
     }
 
@@ -381,7 +531,7 @@ mod tests {
         );
         assert_eq!(
             parse_retry_after_at(&httpdate::fmt_http_date(now - Duration::from_secs(23)), now),
-            Some(Duration::ZERO)
+            Duration::ZERO.into()
         );
         assert_eq!(parse_retry_after_at("not-a-date", now), None);
     }
@@ -424,5 +574,22 @@ mod tests {
             retry_delay(&network, 0, Some(Duration::from_secs(2))),
             Duration::from_millis(50)
         );
+    }
+
+    #[test]
+    fn http_response_header_lookup_is_case_insensitive() {
+        let response = HttpResponse {
+            status: 200,
+            headers: vec![
+                ("ETag".to_string(), "\"v1\"".to_string()),
+                ("Content-Type".to_string(), "application/json".to_string()),
+            ],
+            body: b"{}".to_vec(),
+        };
+        assert_eq!(response.header("etag"), Some("\"v1\""));
+        assert_eq!(response.header("ETAG"), Some("\"v1\""));
+        assert_eq!(response.header("content-type"), Some("application/json"));
+        assert_eq!(response.header("last-modified"), None);
+        assert_eq!(response.into_string().unwrap(), "{}");
     }
 }
