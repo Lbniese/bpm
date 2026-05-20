@@ -17,7 +17,9 @@
 //! expects (`/` -> `%2F`) so the whole name is one path segment.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::thread::JoinHandle;
 
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Deserializer};
@@ -286,6 +288,34 @@ pub struct ResolvedArtifact {
     pub metadata: VersionMetadata,
 }
 
+/// State of an in-process packument cache slot.
+///
+/// `Ready` holds an immutable packument shared across every placement that
+/// needs the same package. `InFlight` marks a fetch (prefetched or inline)
+/// already underway so concurrent callers deduplicate to a single network
+/// request instead of racing a double fetch.
+enum PackumentEntry {
+    Ready(Packument),
+    InFlight,
+}
+
+/// In-process packument memoization shared by the resolver and an optional
+/// prefetch worker pool. The condvar wakes callers that arrived while a fetch
+/// was `InFlight`.
+struct PackumentCache {
+    map: Mutex<BTreeMap<String, PackumentEntry>>,
+    cv: Condvar,
+}
+
+impl PackumentCache {
+    fn new() -> Self {
+        PackumentCache {
+            map: Mutex::new(BTreeMap::new()),
+            cv: Condvar::new(),
+        }
+    }
+}
+
 /// Configured registry facade sharing one pooled HTTP client across requests.
 #[derive(Clone)]
 pub struct RegistryClient {
@@ -294,13 +324,22 @@ pub struct RegistryClient {
     /// Packuments are immutable for the lifetime of one resolution. Sharing
     /// this small cache avoids fetching the same transitive package once per
     /// physical placement (common with peer and nested dependency graphs).
-    packument_cache: Arc<Mutex<BTreeMap<String, Packument>>>,
+    /// Slots are either `Ready` or `InFlight` so concurrent prefetchers dedup.
+    packument_cache: Arc<PackumentCache>,
     /// Optional persistent response cache shared across runs. When present,
     /// packument fetches revalidate over the network with conditional
     /// requests (`If-None-Match` / `If-Modified-Since`) and reuse the stored
     /// body verbatim on a `304`. `None` preserves the legacy uncached path.
     metadata_cache: Option<Arc<MetadataCache>>,
     cache_mode: CacheMode,
+    /// Number of background prefetch worker threads. `0` disables prefetching
+    /// entirely (the historical behavior); the resolver's trigger calls become
+    /// cheap no-ops. When `> 0`, a lazily-started [`PrefetchPool`] overlaps
+    /// sibling packument fetches during graph expansion over the shared
+    /// HTTP/2 connection pool.
+    prefetch_workers: usize,
+    /// Lazily-started worker pool, shared across clones of this client.
+    prefetch_pool: Arc<OnceLock<PrefetchPool>>,
 }
 
 impl std::fmt::Debug for RegistryClient {
@@ -335,9 +374,11 @@ impl RegistryClient {
         Self {
             config,
             http,
-            packument_cache: Arc::new(Mutex::new(BTreeMap::new())),
+            packument_cache: Arc::new(PackumentCache::new()),
             metadata_cache: None,
             cache_mode: CacheMode::Default,
+            prefetch_workers: 0,
+            prefetch_pool: Arc::new(OnceLock::new()),
         }
     }
 
@@ -349,10 +390,22 @@ impl RegistryClient {
         Self {
             config,
             http,
-            packument_cache: Arc::new(Mutex::new(BTreeMap::new())),
+            packument_cache: Arc::new(PackumentCache::new()),
             metadata_cache: None,
             cache_mode: CacheMode::Default,
+            prefetch_workers: 0,
+            prefetch_pool: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// Enable background packument prefetching with `workers` threads.
+    ///
+    /// The pool starts lazily on the first prefetch request and is shared
+    /// across clones of this client. Passing `0` (the default) disables
+    /// prefetching, preserving the historical sequential fetch behavior.
+    pub fn with_prefetch(mut self, workers: usize) -> Self {
+        self.prefetch_workers = workers;
+        self
     }
 
     /// Attach a persistent packument cache and select how it may be reused.
@@ -401,25 +454,183 @@ impl RegistryClient {
     }
 
     /// Fetch a typed packument for use by dependency-graph resolution.
+    ///
+    /// Coordinates with the prefetch pool via the `InFlight` cache slot: if a
+    /// background worker is already fetching this packument, the caller blocks
+    /// on the condvar until it is `Ready` rather than issuing a duplicate
+    /// request. A miss claims the slot and fetches inline. On error the slot is
+    /// cleared so a later call (or prefetch) can retry.
     pub fn packument(&self, name: &str) -> Result<Packument, RegistryError> {
         let registry = self.config.registry_for_package(name);
         let key = format!("{}\0{name}", registry.trim_end_matches('/'));
-        if let Ok(cache) = self.packument_cache.lock() {
-            if let Some(packument) = cache.get(&key) {
-                return Ok(packument.clone());
+        // Claim the slot or wait for an in-flight fetch. We never hold the
+        // guard across the network fetch below.
+        loop {
+            let mut map = self.packument_cache.map.lock().unwrap();
+            match map.get(&key) {
+                Some(PackumentEntry::Ready(packument)) => return Ok(packument.clone()),
+                Some(PackumentEntry::InFlight) => {
+                    map = self.packument_cache.cv.wait(map).unwrap();
+                }
+                None => {
+                    map.insert(key.clone(), PackumentEntry::InFlight);
+                    break;
+                }
             }
         }
-        let packument = fetch_packument(
+        let result = fetch_packument(
             &self.http,
             name,
             registry,
             self.metadata_cache.as_deref(),
             self.cache_mode,
-        )?;
-        if let Ok(mut cache) = self.packument_cache.lock() {
-            cache.insert(key, packument.clone());
+        );
+        let mut map = self.packument_cache.map.lock().unwrap();
+        match result {
+            Ok(packument) => {
+                map.insert(key, PackumentEntry::Ready(packument.clone()));
+                self.packument_cache.cv.notify_all();
+                Ok(packument)
+            }
+            Err(error) => {
+                // Clear the in-flight marker so a subsequent attempt can retry;
+                // the inline path is the single source of error reporting.
+                map.remove(&key);
+                self.packument_cache.cv.notify_all();
+                Err(error)
+            }
         }
-        Ok(packument)
+    }
+
+    /// Best-effort, non-blocking prefetch of one package's packument.
+    ///
+    /// Called by the resolver as soon as a node's dependency list is known so
+    /// sibling packument fetches overlap during depth-first graph expansion.
+    /// Idempotent: a no-op when prefetching is disabled, when the slot is
+    /// already `Ready`, or when a fetch is already `InFlight`. Fetch failures
+    /// are swallowed here; the synchronous [`Self::packument`] path reports
+    /// the real error when the resolver reaches that package.
+    pub fn prefetch_packument(&self, name: &str) {
+        if self.prefetch_workers == 0 {
+            return;
+        }
+        let registry = self.config.registry_for_package(name).to_owned();
+        let key = format!("{}\0{name}", registry.trim_end_matches('/'));
+        let claimed = {
+            let mut map = self.packument_cache.map.lock().unwrap();
+            if map.contains_key(&key) {
+                false
+            } else {
+                map.insert(key.clone(), PackumentEntry::InFlight);
+                true
+            }
+        };
+        if !claimed {
+            return;
+        }
+        let pool = self.prefetch_pool.get_or_init(|| {
+            PrefetchPool::start(
+                self.prefetch_workers,
+                self.http.clone(),
+                self.metadata_cache.clone(),
+                self.packument_cache.clone(),
+                self.cache_mode,
+            )
+        });
+        if let Some(sender) = &pool.sender {
+            let _ = sender.send(PrefetchJob {
+                key,
+                name: name.to_owned(),
+                registry,
+            });
+        }
+    }
+}
+
+/// One unit of background packument work.
+struct PrefetchJob {
+    key: String,
+    name: String,
+    registry: String,
+}
+
+/// A fixed-size pool of worker threads that resolve prefetched packuments.
+///
+/// Workers share one `mpsc` receiver (guarded by a mutex, the standard
+/// `mpsc` multi-consumer pattern) and close over clones of the pooled HTTP
+/// client and the in-process cache, so prefetches multiplex over the same
+/// HTTP/2 connection pool as synchronous fetches. The pool is joined on drop,
+/// which happens when the last `RegistryClient` clone is dropped.
+struct PrefetchPool {
+    sender: Option<mpsc::Sender<PrefetchJob>>,
+    handles: Vec<JoinHandle<()>>,
+}
+
+impl PrefetchPool {
+    fn start(
+        workers: usize,
+        http: HttpClient,
+        metadata_cache: Option<Arc<MetadataCache>>,
+        cache: Arc<PackumentCache>,
+        cache_mode: CacheMode,
+    ) -> PrefetchPool {
+        let (sender, receiver) = mpsc::channel::<PrefetchJob>();
+        let receiver = Arc::new(Mutex::new(receiver));
+        let mut handles = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            let receiver = Arc::clone(&receiver);
+            let http = http.clone();
+            let metadata_cache = metadata_cache.clone();
+            let cache = Arc::clone(&cache);
+            handles.push(std::thread::spawn(move || {
+                loop {
+                    // Hold the receiver guard only long enough to dequeue, so
+                    // other workers are not blocked while this one fetches.
+                    let job = {
+                        let guard = receiver.lock().unwrap();
+                        match guard.recv() {
+                            Ok(job) => job,
+                            Err(_) => break, // channel closed: pool shutting down
+                        }
+                    };
+                    let result = fetch_packument(
+                        &http,
+                        &job.name,
+                        &job.registry,
+                        metadata_cache.as_deref(),
+                        cache_mode,
+                    );
+                    let mut map = cache.map.lock().unwrap();
+                    match result {
+                        Ok(packument) => {
+                            map.insert(job.key, PackumentEntry::Ready(packument));
+                        }
+                        Err(_) => {
+                            // Clear the in-flight marker; the synchronous path
+                            // will re-fetch and surface the real error.
+                            map.remove(&job.key);
+                        }
+                    }
+                    cache.cv.notify_all();
+                }
+            }));
+        }
+        PrefetchPool {
+            sender: Some(sender),
+            handles,
+        }
+    }
+}
+
+impl Drop for PrefetchPool {
+    fn drop(&mut self) {
+        // Drop the sender first so workers observe the closed channel and exit
+        // before we join. Join so no worker outlives the client (matters for
+        // deterministic test teardown).
+        self.sender.take();
+        for handle in self.handles.drain(..) {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -991,6 +1202,66 @@ mod tests {
             .recv()
             .unwrap()
             .starts_with("GET /p/1.2.3 HTTP/1.1"));
+    }
+
+    #[test]
+    fn concurrent_prefetch_and_packument_deduplicate_to_one_request() {
+        // A prefetch in flight for a package must make a concurrent packument()
+        // call wait for the same result instead of issuing a second request.
+        // The server counts accepted connections to prove the dedup.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let registry = format!("http://{address}");
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server_count = Arc::clone(&count);
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_shutdown = Arc::clone(&shutdown);
+        let server = std::thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            while !server_shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                server_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // Hold the response briefly so the prefetch is still in flight
+                // when the main thread calls packument().
+                std::thread::sleep(std::time::Duration::from_millis(40));
+                let mut request = [0_u8; 2048];
+                let _ = stream.read(&mut request);
+                let body = r#"{"name":"pkg","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"pkg","version":"1.0.0","dist":{"tarball":"/pkg.tgz","integrity":"sha512-x"}}}}"#;
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+        });
+
+        let config = NpmConfig::default()
+            .with_registry_override(&registry)
+            .unwrap();
+        let client = RegistryClient::new(config).with_prefetch(1);
+        client.prefetch_packument("pkg");
+        // Let the worker claim the slot and reach the in-flight fetch.
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        // This must wait on the in-flight prefetch instead of fetching again.
+        let packument = client.packument("pkg").unwrap();
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().unwrap();
+
+        assert_eq!(packument.name, "pkg");
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "prefetch and packument should deduplicate to a single request"
+        );
     }
 
     #[test]
