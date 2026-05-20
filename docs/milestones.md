@@ -19,7 +19,7 @@ the commit history wins.
 | 4 — Reusable graph volumes | graph-volume creation, graph-volume reuse across projects, safe project attachment | ✅ Done — `node_modules` attaches via shallow relays |
 | 5 — Lifecycle support | npm-compatible script environment, derived artifact store, native-addon fixture coverage | ✅ Mostly done — sandbox runner, graph-volume lifecycle, `bpm run`; derived-store wiring remains open |
 | 6 — Workspaces and optimization | basic npm workspaces, filesystem capability detection, reflink/clone optimization, adaptive concurrency | ✅ Mostly done — workspaces, capability probe, adaptive concurrency, local hardlink compatibility view; general reflink/clone attachment remains open |
-| 7 — Cold-path performance | representative benchmark corpus, persistent metadata efficiency, native-resolution profiling, derived lifecycle decision | 🚧 In progress — realistic fixture measurements and cold resolver hardening landed; persistent packument metadata cache with ETag revalidation (Step 1A) and HTTP/2 transport via reqwest (Step 1B) landed; concurrent/streaming resolution and derived-artifact integration remain |
+| 7 — Cold-path performance | representative benchmark corpus, persistent metadata efficiency, native-resolution profiling, derived lifecycle decision | 🚧 In progress — realistic fixture measurements and cold resolver hardening landed; persistent packument metadata cache with ETag revalidation (Step 1A), HTTP/2 transport via reqwest (Step 1B), and concurrent metadata prefetch (Phase 2) landed; streaming resolve→download and derived-artifact integration remain |
 
 ### Post-M6 — registry name resolution (not in the original plan)
 
@@ -237,11 +237,27 @@ Cold-path hardening now:
 - invalidates cached package images and graph volumes after archive-root layout
   changes, covering scoped `@types` packages used by Next.js.
 
-Next M7 work is to make resolution concurrent (so packument fetches during
-graph expansion overlap instead of running one blocking round-trip per
-package), profile extraction and project attachment separately, and decide
-whether lifecycle output becomes content-addressed through
-`src/derived/store.rs` or remains graph-keyed.
+Next M7 work is to profile extraction and project attachment separately,
+stream resolve→download→extract (Phase 3 in
+`docs/m7-concurrent-resolution-design.md`) so tarball downloads overlap with
+the tail of resolution, and decide whether lifecycle output becomes
+content-addressed through `src/derived/store.rs` or remains graph-keyed.
+
+### Concurrent metadata prefetch — delivered (Phase 2)
+
+Registry packument fetches during dependency-graph expansion now overlap.
+When the resolver places a node, it submits best-effort prefetches for that
+node's registry-typed children to a small background worker pool that shares
+the HTTP/2 client, so sibling packuments are already in flight (or cached)
+by the time depth-first placement reaches them. The placement algorithm and
+its ordering are unchanged, so `bpm.lock` stays byte-for-byte identical with
+prefetch on or off (covered by `prefetch_does_not_change_the_resolved_lockfile`),
+and `InFlight` cache slots deduplicate a prefetch and the synchronous fetch to
+one request. Default worker count is capped low (4) after benchmarking showed
+higher counts tripped registry rate-limiting on download-bound graphs;
+`BPM_PREFETCH_WORKERS` overrides or disables it. Cold-install benchmark wins:
+`many-small-files` resolved_cold ~39% faster median, `large-frontend`
+resolved_cold ~15% faster median with tail-latency outliers eliminated.
 
 ### HTTP/2 transport — delivered (Step 1B)
 

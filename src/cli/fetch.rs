@@ -138,7 +138,12 @@ pub(super) fn open_registry_client(
     http: HttpClient,
     cache_mode: CacheMode,
 ) -> anyhow::Result<RegistryClient> {
-    let client = RegistryClient::with_client(config, http);
+    // Prefetch overlaps sibling packument fetches during graph expansion over
+    // the shared HTTP/2 pool. It is pointless (and would spin failing
+    // offline-miss attempts) when network access is forbidden. The
+    // `BPM_PREFETCH_WORKERS` env var overrides the default (0 disables).
+    let workers = prefetch_worker_count(cache_mode);
+    let client = RegistryClient::with_client(config, http).with_prefetch(workers);
     match MetadataCache::open(store_root) {
         Ok(cache) => Ok(client.with_metadata_cache(std::sync::Arc::new(cache), cache_mode)),
         Err(error) => {
@@ -147,6 +152,33 @@ pub(super) fn open_registry_client(
             eprintln!("warn: metadata cache unavailable, continuing uncached: {error}");
             Ok(client)
         }
+    }
+}
+
+/// Default number of background packument prefetch threads: one per available
+/// core, capped low so concurrent metadata fetches do not burst hard enough
+/// to trip registry rate-limiting or stall the HTTP/2 stream. The pooled
+/// client multiplexes whatever count is chosen.
+fn default_prefetch_workers() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(4)
+}
+
+/// Resolve the prefetch worker count from the `BPM_PREFETCH_WORKERS` override
+/// (0 disables prefetch entirely) or the computed default. Forced to 0 when
+/// the cache mode forbids network access.
+fn prefetch_worker_count(cache_mode: CacheMode) -> usize {
+    if let Ok(raw) = std::env::var("BPM_PREFETCH_WORKERS") {
+        if let Ok(value) = raw.trim().parse::<usize>() {
+            return value;
+        }
+    }
+    if cache_mode.allows_network() {
+        default_prefetch_workers()
+    } else {
+        0
     }
 }
 

@@ -8,6 +8,20 @@ once a 1.0 release is cut.
 
 ## [Unreleased]
 
+### Added
+
+- Concurrent registry-metadata prefetch during dependency-graph resolution.
+  As soon as a package's dependency list is known, its registry-typed
+  children's packuments are fetched in the background over the shared HTTP/2
+  pool, so sibling fetches overlap instead of running one blocking round-trip
+  per package. The resolver's depth-first placement logic is unchanged, so the
+  resolved `bpm.lock` stays byte-for-byte identical with prefetch on or off;
+  in-process `InFlight` cache slots deduplicate a prefetch and the
+  synchronous fetch to a single network request. Default worker count is
+  capped low to avoid registry rate-limiting; override or disable with
+  `BPM_PREFETCH_WORKERS` (0 disables). Cold installs of wide, metadata-heavy
+  graphs improve the most.
+
 ### Changed
 
 - HTTP transport switched from blocking `ureq` (HTTP/1.1) to
