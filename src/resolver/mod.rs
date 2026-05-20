@@ -194,6 +194,9 @@ pub fn resolve_manifest_with_options_and_target(
         target: target.clone(),
     };
     let mut root_targets = BTreeMap::new();
+    // Prefetch the first wave of registry packuments so the root requests
+    // overlap instead of running strictly depth-first.
+    resolver.prefetch_children(&root_deps);
     for (name, spec) in &root_deps {
         let optional = manifest.optional_dependencies.contains_key(name);
         let dev = manifest.dev_dependencies.contains_key(name)
@@ -559,6 +562,9 @@ impl<'a> GraphResolver<'a> {
                 source_dir: None,
             },
         );
+        // Submit prefetches for this node's registry-typed children so sibling
+        // packument fetches overlap while depth-first placement proceeds.
+        self.prefetch_children(&dependencies);
         for (child, child_spec) in dependencies {
             let child_optional = self.nodes.get(&path).is_some_and(|node| {
                 optional || node.metadata.optional_dependencies.contains_key(&child)
@@ -572,6 +578,25 @@ impl<'a> GraphResolver<'a> {
             }
         }
         Ok(Some(path))
+    }
+
+    /// Submit best-effort packument prefetches for registry-typed children.
+    ///
+    /// Source (`file:`/`git:`/`tarball`) and workspace dependencies are skipped
+    /// so prefetch never issues a registry request the resolver would not make
+    /// itself. Idempotent and a no-op when prefetching is disabled on the
+    /// registry client.
+    fn prefetch_children(&self, dependencies: &BTreeMap<String, String>) {
+        for (child, child_spec) in dependencies {
+            if DependencySource::parse(child_spec).is_none()
+                && self
+                    .workspace
+                    .and_then(|workspace| workspace.get(child))
+                    .is_none()
+            {
+                self.registry.prefetch_packument(child);
+            }
+        }
     }
 
     fn resolve_source_dependency(
@@ -1542,6 +1567,106 @@ mod tests {
             "node_modules/a/node_modules/b"
         );
         assert!(lock.to_json().unwrap().contains("\"lockfileVersion\": 2"));
+    }
+
+    #[test]
+    fn prefetch_does_not_change_the_resolved_lockfile() {
+        // A small fan-out graph (root -> {a, c}; a -> {b, d}; c -> {b, d}) so
+        // the resolver's prefetch trigger fires for several registry siblings
+        // at once. Resolving it with prefetch disabled must yield a lockfile
+        // byte-identical to resolving it with prefetch enabled, run twice to
+        // also rule out nondeterminism within the prefetch path itself.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_shutdown = std::sync::Arc::clone(&shutdown);
+        let server = thread::spawn(move || {
+            // Non-blocking accept: prefetch makes the exact request count and
+            // arrival order unpredictable, so the server runs until the test
+            // sets the shutdown flag instead of accepting a fixed count.
+            listener.set_nonblocking(true).unwrap();
+            while !server_shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(std::time::Duration::from_millis(2));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let mut request = [0_u8; 2048];
+                let length = stream.read(&mut request).unwrap_or(0);
+                let request = String::from_utf8_lossy(&request[..length]);
+                let path = request.lines().next().and_then(|line| {
+                    line.strip_prefix("GET /")
+                        .and_then(|rest| rest.split(' ').next())
+                });
+                let body = match path {
+                    Some("a") => {
+                        r#"{"name":"a","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"a","version":"1.0.0","dependencies":{"b":"^1.0.0","d":"^1.0.0"},"dist":{"tarball":"/a.tgz","integrity":"sha512-a"}}}}"#
+                    }
+                    Some("b") => {
+                        r#"{"name":"b","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"b","version":"1.0.0","dist":{"tarball":"/b.tgz","integrity":"sha512-b"}}}}"#
+                    }
+                    Some("c") => {
+                        r#"{"name":"c","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"c","version":"1.0.0","dependencies":{"b":"^1.0.0","d":"^1.0.0"},"dist":{"tarball":"/c.tgz","integrity":"sha512-c"}}}}"#
+                    }
+                    Some("d") => {
+                        r#"{"name":"d","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"d","version":"1.0.0","dist":{"tarball":"/d.tgz","integrity":"sha512-d"}}}}"#
+                    }
+                    _ => continue,
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+        });
+
+        let config = crate::config::NpmConfig::default()
+            .with_registry_override(&format!("http://{}", address))
+            .unwrap();
+        let manifest = PackageManifest::from_json(
+            r#"{"name":"app","version":"1.0.0","dependencies":{"a":"*","c":"*"}}"#,
+            std::path::Path::new("package.json"),
+        )
+        .unwrap();
+
+        let baseline = resolve_manifest(&manifest, &RegistryClient::new(config.clone()), "test")
+            .unwrap()
+            .to_json()
+            .unwrap();
+        let with_prefetch_a = resolve_manifest(
+            &manifest,
+            &RegistryClient::new(config.clone()).with_prefetch(4),
+            "test",
+        )
+        .unwrap()
+        .to_json()
+        .unwrap();
+        let with_prefetch_b = resolve_manifest(
+            &manifest,
+            &RegistryClient::new(config.clone()).with_prefetch(4),
+            "test",
+        )
+        .unwrap()
+        .to_json()
+        .unwrap();
+
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().unwrap();
+
+        assert_eq!(
+            baseline, with_prefetch_a,
+            "enabling prefetch changed the resolved lockfile"
+        );
+        assert_eq!(
+            with_prefetch_a, with_prefetch_b,
+            "prefetch resolution was nondeterministic across runs"
+        );
     }
 
     #[test]
