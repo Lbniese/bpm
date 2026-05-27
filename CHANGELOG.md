@@ -10,6 +10,19 @@ once a 1.0 release is cut.
 
 ### Added
 
+- Streaming resolve→download on fresh installs. A first install (no
+  `bpm.lock`) now starts downloading each package the instant the resolver
+  places it, overlapping the download/extract pipeline with the rest of graph
+  resolution instead of waiting for the full graph. The resolver gained an
+  optional `ResolveSink` (`resolve_manifest_with_options_sink`) that emits
+  each resolved registry-typed node as it is placed; the install pipeline
+  consumes the stream over a bounded channel. The resolved `bpm.lock` is
+  byte-for-byte identical to a sequential resolve (the sink only observes
+  placement), and downloads stay integrity-keyed and idempotent. Set
+  `BPM_STREAM_INSTALL=0` to fall back to resolve-then-download for
+  benchmarking or regression isolation. Only the fresh-resolve path is
+  affected; lockfile-present installs are unchanged.
+
 - Concurrent registry-metadata prefetch during dependency-graph resolution.
   As soon as a package's dependency list is known, its registry-typed
   children's packuments are fetched in the background over the shared HTTP/2

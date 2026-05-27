@@ -1,9 +1,10 @@
 # M7 Phase 2/3 — Concurrent resolution (design / scope)
 
-Status: **Phase 2 delivered** (concurrent metadata prefetch); Phase 3
-(streaming resolve→download→extract) remains designed but not yet
-implemented. This document was the implementation spec; the Phase 2 section
-below is now historical/record, and Phase 3 is the outstanding scope.
+Status: **Phases 2 and 3 delivered.** Phase 2 overlaps packument
+(prefetch) fetches during graph expansion; Phase 3 overlaps tarball
+downloads with resolution by streaming each resolved package to the
+install pipeline the instant it is placed. This document was the
+implementation spec; the sections below are now historical/record.
 
 Phase 1 (Step 1A persistent metadata cache + Step 1B `reqwest` HTTP/2 transport)
 is landed in commit `90b7f2d`. Phase 2/3 is what turns that foundation into real

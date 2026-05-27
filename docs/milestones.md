@@ -19,7 +19,7 @@ the commit history wins.
 | 4 — Reusable graph volumes | graph-volume creation, graph-volume reuse across projects, safe project attachment | ✅ Done — `node_modules` attaches via shallow relays |
 | 5 — Lifecycle support | npm-compatible script environment, derived artifact store, native-addon fixture coverage | ✅ Mostly done — sandbox runner, graph-volume lifecycle, `bpm run`; derived-store wiring remains open |
 | 6 — Workspaces and optimization | basic npm workspaces, filesystem capability detection, reflink/clone optimization, adaptive concurrency | ✅ Mostly done — workspaces, capability probe, adaptive concurrency, local hardlink compatibility view; general reflink/clone attachment remains open |
-| 7 — Cold-path performance | representative benchmark corpus, persistent metadata efficiency, native-resolution profiling, derived lifecycle decision | 🚧 In progress — realistic fixture measurements and cold resolver hardening landed; persistent packument metadata cache with ETag revalidation (Step 1A), HTTP/2 transport via reqwest (Step 1B), and concurrent metadata prefetch (Phase 2) landed; streaming resolve→download and derived-artifact integration remain |
+| 7 — Cold-path performance | representative benchmark corpus, persistent metadata efficiency, native-resolution profiling, derived lifecycle decision | 🚧 In progress — realistic fixture measurements and cold resolver hardening landed; persistent packument metadata cache with ETag revalidation (Step 1A), HTTP/2 transport via reqwest (Step 1B), concurrent metadata prefetch (Phase 2), and streaming resolve→download (Phase 3) landed; derived-artifact integration remains |
 
 ### Post-M6 — registry name resolution (not in the original plan)
 
@@ -237,11 +237,9 @@ Cold-path hardening now:
 - invalidates cached package images and graph volumes after archive-root layout
   changes, covering scoped `@types` packages used by Next.js.
 
-Next M7 work is to profile extraction and project attachment separately,
-stream resolve→download→extract (Phase 3 in
-`docs/m7-concurrent-resolution-design.md`) so tarball downloads overlap with
-the tail of resolution, and decide whether lifecycle output becomes
-content-addressed through `src/derived/store.rs` or remains graph-keyed.
+Next M7 work is to profile extraction and project attachment separately and
+decide whether lifecycle output becomes content-addressed through
+`src/derived/store.rs` or remains graph-keyed.
 
 ### Concurrent metadata prefetch — delivered (Phase 2)
 
@@ -253,11 +251,35 @@ by the time depth-first placement reaches them. The placement algorithm and
 its ordering are unchanged, so `bpm.lock` stays byte-for-byte identical with
 prefetch on or off (covered by `prefetch_does_not_change_the_resolved_lockfile`),
 and `InFlight` cache slots deduplicate a prefetch and the synchronous fetch to
-one request. Default worker count is capped low (4) after benchmarking showed
-higher counts tripped registry rate-limiting on download-bound graphs;
-`BPM_PREFETCH_WORKERS` overrides or disables it. Cold-install benchmark wins:
-`many-small-files` resolved_cold ~39% faster median, `large-frontend`
-resolved_cold ~15% faster median with tail-latency outliers eliminated.
+one request. Default worker count is capped low (4); `BPM_PREFETCH_WORKERS`
+overrides or disables it.
+
+Prefetch only affects the **fresh-resolve** path (`true_cold`: no lockfile).
+The lockfile-present path (`resolved_cold`) reads the lockfile and skips
+resolution entirely, so prefetch is a no-op there. Measured on `true_cold`
+`large-frontend` (where resolution actually runs): prefetch-disabled ≈ 50.8s
+median vs prefetch-enabled ≈ 25.5s median — roughly a **2× speedup** of the
+resolve phase.
+
+### Streaming resolve → download — delivered (Phase 3)
+
+A fresh install now downloads each package the instant the resolver places it,
+overlapping the download/extract pipeline with the rest of graph resolution.
+The resolver gained an optional `ResolveSink`
+(`resolve_manifest_with_options_sink`) that emits each resolved registry-typed
+node `(path, url, integrity)` as it is placed; the install pipeline consumes the
+stream over a bounded channel (natural backpressure). Determinism is unchanged:
+the sink only *observes* placement, so `bpm.lock` is byte-for-byte identical to
+a sequential resolve
+(`streaming_sink_emits_every_downloadable_node_and_keeps_the_lockfile_identical`),
+and downloads are integrity-keyed and idempotent. `BPM_STREAM_INSTALL=0` falls
+back to resolve-then-download for benchmarking or regression isolation.
+
+Measured on `true_cold` `large-frontend`, same-binary A/B (6 runs each):
+streaming disabled ≈ 26.9s median vs streaming enabled ≈ 23.5s median — about
+**12% faster** (≈ 3.4s saved), min agreeing at ≈ 12%. The benefit is bounded by
+how much of the install is download vs resolution: once downloads are fully
+hidden behind resolution, the install becomes resolve-bound.
 
 ### HTTP/2 transport — delivered (Step 1B)
 

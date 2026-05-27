@@ -1,10 +1,9 @@
 //! Lockfile and global-bin install orchestration.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bpm::config::NpmConfig;
 use bpm::graph;
@@ -66,13 +65,35 @@ pub(super) fn run(options: Options) -> anyhow::Result<()> {
                 .map_err(|error| anyhow::anyhow!("cannot resolve dependencies: {error}"))?;
             let config = effective_npm_config(&root, options.registry.as_deref())?;
             let http = HttpClient::new(config.clone());
-            let client = open_registry_client(&store_root_path, config, http, options.cache_mode)?;
+            let client =
+                open_registry_client(&store_root_path, config, http.clone(), options.cache_mode)?;
             let workspace_layout = bpm::workspace::discover(&root);
             let workspace_index = bpm::resolver::workspaces::WorkspaceIndex::from_project_root(
                 &root,
                 &workspace_layout,
             )
             .map_err(|error| anyhow::anyhow!("workspace resolution failed: {error}"))?;
+            let peer_mode = if options.legacy_peer_deps {
+                bpm::resolver::peer::PeerMode::LegacyIgnore
+            } else {
+                bpm::resolver::peer::PeerMode::Strict
+            };
+            if streaming_install_enabled() {
+                return run_streaming_install(
+                    &root,
+                    &manifest,
+                    &client,
+                    &workspace_index,
+                    peer_mode,
+                    options.concurrency,
+                    &store,
+                    &http,
+                    &mut metrics,
+                    &options,
+                );
+            }
+            // Streaming disabled (BPM_STREAM_INSTALL=0): resolve the whole
+            // graph first, then let the shared download pipeline below run.
             let lockfile = metrics
                 .measure("dependency_resolution", || {
                     resolver::resolve_manifest_with_options(
@@ -80,11 +101,7 @@ pub(super) fn run(options: Options) -> anyhow::Result<()> {
                         &client,
                         "bpm",
                         Some(&workspace_index),
-                        if options.legacy_peer_deps {
-                            bpm::resolver::peer::PeerMode::LegacyIgnore
-                        } else {
-                            bpm::resolver::peer::PeerMode::Strict
-                        },
+                        peer_mode,
                     )
                 })
                 .map_err(|error| anyhow::anyhow!("dependency resolution failed: {error}"))?;
@@ -137,211 +154,37 @@ pub(super) fn run(options: Options) -> anyhow::Result<()> {
 
     let work = build_install_work(&lockfile, options.frozen)?;
     let workers = adaptive_workers(options.concurrency, work.len(), &project_root);
-    let outcomes: Vec<FetchOutcome> =
-        std::thread::scope(|scope| -> anyhow::Result<Vec<FetchOutcome>> {
-            use std::sync::mpsc::sync_channel;
-            let (send, receive) = sync_channel::<Result<PendingArtifact, FetchFail>>(workers * 2);
-            let receive = std::sync::Arc::new(std::sync::Mutex::new(receive));
-            let next = std::sync::Arc::new(AtomicUsize::new(0));
-            let mut downloaders = Vec::new();
-            for _ in 0..workers {
-                let send = send.clone();
-                let next = next.clone();
-                let work = &work;
-                let store = &store;
-                let http = http.clone();
-                downloaders.push(scope.spawn(move || -> Result<Metrics, FetchFail> {
-                    let mut local = Metrics::new();
-                    loop {
-                        let position = next.fetch_add(1, Ordering::Relaxed);
-                        if position >= work.len() {
-                            break;
-                        }
-                        let item = &work[position];
-                        let result = store
-                            .ensure_artifact_with_client(
-                                &http,
-                                &item.url,
-                                item.integrity.as_ref(),
-                                &mut local,
-                            )
-                            .map(|artifact| PendingArtifact {
-                                index: item.index,
-                                name: item.name.clone(),
-                                url: item.url.clone(),
-                                artifact,
-                            })
-                            .map_err(|source| FetchFail {
-                                name: item.name.clone(),
-                                url: item.url.clone(),
-                                source: Box::new(source),
-                            });
-                        if send.send(result).is_err() {
-                            break;
-                        }
-                    }
-                    Ok(local)
-                }));
+    let outcomes = std::thread::scope(|scope| -> anyhow::Result<Vec<FetchOutcome>> {
+        let (unit_tx, unit_rx) = std::sync::mpsc::sync_channel::<InstallWork>(workers.max(1) * 2);
+        let unit_rx = std::sync::Arc::new(std::sync::Mutex::new(unit_rx));
+        let (downloaders, extractors) =
+            spawn_fetch_pipeline(scope, &store, &http, unit_rx, workers);
+        for item in work {
+            if unit_tx.send(item).is_err() {
+                break;
             }
-            drop(send);
-            let extraction_workers = workers.min(work.len().max(1));
-            let mut extractors = Vec::new();
-            for _ in 0..extraction_workers {
-                let receive = receive.clone();
-                let store = &store;
-                extractors.push(scope.spawn(
-                    move || -> Result<(Vec<FetchOutcome>, Metrics), FetchFail> {
-                        let mut local = Metrics::new();
-                        let mut outcomes = Vec::new();
-                        let mut first_error: Option<FetchFail> = None;
-                        loop {
-                            let message = receive.lock().expect("pipeline receiver lock").recv();
-                            let Ok(message) = message else {
-                                break;
-                            };
-                            let Ok(pending) = message else {
-                                // Keep draining the bounded channel after one
-                                // worker fails. Returning immediately would
-                                // strand downloaders blocked on send and turn
-                                // a normal fetch error into an install hang.
-                                if first_error.is_none() {
-                                    first_error = message.err();
-                                }
-                                continue;
-                            };
-                            if first_error.is_some() {
-                                continue;
-                            }
-                            match store.ensure_image(&pending.artifact.id, &mut local) {
-                                Ok(image) => outcomes.push(FetchOutcome {
-                                    index: pending.index,
-                                    id: pending.artifact.id,
-                                    artifact_cached: pending.artifact.cached,
-                                    image_cached: image.cached,
-                                }),
-                                Err(source) => {
-                                    first_error = Some(FetchFail {
-                                        name: pending.name,
-                                        url: pending.url,
-                                        source: Box::new(source),
-                                    });
-                                }
-                            }
-                        }
-                        if let Some(error) = first_error {
-                            Err(error)
-                        } else {
-                            Ok((outcomes, local))
-                        }
-                    },
-                ));
-            }
-            for handle in downloaders {
-                metrics.extend(
-                    &handle
-                        .join()
-                        .map_err(|_| anyhow::anyhow!("download worker panicked"))??,
-                );
-            }
-            let mut outcomes = Vec::with_capacity(work.len());
-            for handle in extractors {
-                let (mut values, local) = handle
-                    .join()
-                    .map_err(|_| anyhow::anyhow!("extract worker panicked"))??;
-                metrics.extend(&local);
-                outcomes.append(&mut values);
-            }
-            Ok(outcomes)
-        })?;
+        }
+        drop(unit_tx);
+        join_pipeline(downloaders, extractors, &mut metrics)
+    })?;
 
-    let mut outcomes = outcomes;
-    outcomes.sort_by_key(|outcome| outcome.index);
     let cached = outcomes
         .iter()
         .filter(|outcome| outcome.artifact_cached && outcome.image_cached)
         .count();
     let fetched = outcomes.len() - cached;
-    let mut artifact_ids = vec![None; lockfile.packages.len()];
-    for outcome in &outcomes {
-        if outcome.index < artifact_ids.len() {
-            artifact_ids[outcome.index] = Some(outcome.id);
-        }
-    }
-
-    let has_workspace_links = lockfile.packages.iter().any(|package| package.link);
-    // Turbopack and similar bundlers enforce that dependency realpaths remain
-    // inside the project. Keep the O(top-level) relay fast path for ordinary
-    // projects, but use a local hardlink view automatically for Next projects;
-    // callers can override this with BPM_PROJECT_VIEW=relay|local.
-    let local_project_view = use_local_project_view(&lockfile);
-    let (volume, mut view_entry_count) = if has_workspace_links {
-        bpm::materializer::materialize_lockfile_with_backend(
-            &project_root,
-            &store,
-            &lockfile,
-            &artifact_ids,
-            bpm::materializer::MaterializeMode::Compatible,
-            if local_project_view {
-                bpm::materializer::MaterializeBackend::Hardlink
-            } else {
-                bpm::materializer::MaterializeBackend::Auto
-            },
-        )?;
-        (None, 0usize)
-    } else {
-        let volume =
-            bpm::volume::ensure_graph_volume(&store, &lockfile, &artifact_ids, &mut metrics)?;
-        let attach = bpm::volume::attach_project(&project_root, &volume)?;
-        (
-            Some(volume),
-            attach.relays_created + attach.relays_unchanged,
-        )
-    };
-    let lifecycle = run_lifecycle_if_enabled(
+    let artifact_ids = outcomes_to_artifact_ids(&outcomes, &lockfile);
+    finalize_install(
         &project_root,
         &store,
         &lockfile,
         &artifact_ids,
-        volume.as_ref().map(|v| v.path.as_path()),
-        options.ignore_scripts,
-        &mut metrics,
-    );
-    if local_project_view {
-        if let Some(volume) = volume.as_ref() {
-            let attached = bpm::volume::attach_project_local(&project_root, volume)?;
-            view_entry_count = attached.relays_created + attached.relays_unchanged;
-        }
-    }
-
-    let mut plan = graph::build_plan(&lockfile, &artifact_ids, &lifecycle.derived_paths);
-    plan.graph_id_hex = graph::graph_id_for_project(&lockfile, &project_root).to_hex();
-    if let Err(error) = graph::write_plan(&plan, &plan_path) {
-        eprintln!(
-            "warning: failed to write plan {}: {error}",
-            plan_path.display()
-        );
-    }
-    let package_count = lockfile
-        .packages
-        .iter()
-        .filter(|package| !package.link && !package.resolved.is_empty())
-        .count();
-    println!(
-        "installed {} package(s) into {} ({} cached, {} fetched; graph volume {}, {} project-view entry(s))",
-        package_count,
-        project_root.join("node_modules").display(),
         cached,
         fetched,
-        if volume.as_ref().is_some_and(|volume| volume.cached) {
-            "reused"
-        } else if volume.is_some() {
-            "built"
-        } else {
-            "direct"
-        },
-        view_entry_count
-    );
-    write_metrics(&metrics, options.json_metrics)
+        &mut metrics,
+        &options,
+        &lockfile_path,
+    )
 }
 
 fn use_local_project_view(lockfile: &Lockfile) -> bool {
@@ -675,21 +518,21 @@ fn enforce_frozen(project_root: &Path, lockfile: &Lockfile) -> anyhow::Result<()
 }
 
 struct InstallWork {
-    index: usize,
+    path: String,
     name: String,
     url: String,
     integrity: Option<Integrity>,
 }
 
 struct FetchOutcome {
-    index: usize,
+    path: String,
     id: ArtifactId,
     artifact_cached: bool,
     image_cached: bool,
 }
 
 struct PendingArtifact {
-    index: usize,
+    path: String,
     name: String,
     url: String,
     artifact: bpm::store::ArtifactRef,
@@ -702,10 +545,374 @@ struct FetchFail {
     source: Box<StoreError>,
 }
 
+/// Adapts the resolver's [`ResolveSink`] to the install download pipeline's
+/// bounded unit channel. `emit` blocks when the pipeline is full (natural
+/// backpressure on resolution) and ignores a disconnected receiver so a failed
+/// install still yields a complete lockfile.
+struct ChannelSink(std::sync::mpsc::SyncSender<InstallWork>);
+
+impl resolver::ResolveSink for ChannelSink {
+    fn emit(&self, unit: resolver::ResolvedDownloadUnit) {
+        let integrity = unit
+            .integrity
+            .as_deref()
+            .and_then(|value| Integrity::parse(value).ok());
+        let _ = self.0.send(InstallWork {
+            path: unit.path,
+            name: unit.name,
+            url: unit.url,
+            integrity,
+        });
+    }
+}
+
+/// Join handle for a download worker thread.
+type DownloaderHandle<'scope> = std::thread::ScopedJoinHandle<'scope, Result<Metrics, FetchFail>>;
+/// Join handle for an extract worker thread.
+type ExtractorHandle<'scope> =
+    std::thread::ScopedJoinHandle<'scope, Result<(Vec<FetchOutcome>, Metrics), FetchFail>>;
+
+/// Spawn the download→extract worker pipeline consuming resolved install units
+/// from `unit_rx`. Returns the downloader and extractor join handles; the
+/// caller joins them via [`join_pipeline`] after the unit producer finishes.
+///
+/// Downloaders always drain `unit_rx` to completion (stopping only fetch work,
+/// never receiving, once the extract stage has gone away) so a streaming
+/// producer can never block on a full bounded channel.
+#[allow(clippy::too_many_arguments)]
+fn spawn_fetch_pipeline<'scope, 'env>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    store: &'env ArtifactStore,
+    http: &'env HttpClient,
+    unit_rx: std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<InstallWork>>>,
+    workers: usize,
+) -> (Vec<DownloaderHandle<'scope>>, Vec<ExtractorHandle<'scope>>) {
+    use std::sync::mpsc::sync_channel;
+    let workers = workers.max(1);
+    let (send, receive) = sync_channel::<Result<PendingArtifact, FetchFail>>(workers * 2);
+    let receive = std::sync::Arc::new(std::sync::Mutex::new(receive));
+    let mut downloaders = Vec::with_capacity(workers);
+    for _ in 0..workers {
+        let unit_rx = unit_rx.clone();
+        let send = send.clone();
+        let http = http.clone();
+        downloaders.push(scope.spawn(move || -> Result<Metrics, FetchFail> {
+            let mut local = Metrics::new();
+            let mut extraction_gone = false;
+            while let Ok(item) = unit_rx.lock().expect("unit receiver lock").recv() {
+                if extraction_gone {
+                    continue;
+                }
+                let result = store
+                    .ensure_artifact_with_client(
+                        &http,
+                        &item.url,
+                        item.integrity.as_ref(),
+                        &mut local,
+                    )
+                    .map(|artifact| PendingArtifact {
+                        path: item.path.clone(),
+                        name: item.name.clone(),
+                        url: item.url.clone(),
+                        artifact,
+                    })
+                    .map_err(|source| FetchFail {
+                        name: item.name.clone(),
+                        url: item.url.clone(),
+                        source: Box::new(source),
+                    });
+                if send.send(result).is_err() {
+                    // Extractors all exited (fatal error). Keep draining unit_rx
+                    // so a streaming producer never blocks on a full channel;
+                    // just stop doing fetch work.
+                    extraction_gone = true;
+                }
+            }
+            Ok(local)
+        }));
+    }
+    drop(send);
+    let mut extractors = Vec::with_capacity(workers);
+    for _ in 0..workers {
+        let receive = receive.clone();
+        extractors.push(
+            scope.spawn(move || -> Result<(Vec<FetchOutcome>, Metrics), FetchFail> {
+                let mut local = Metrics::new();
+                let mut outcomes = Vec::new();
+                let mut first_error: Option<FetchFail> = None;
+                loop {
+                    let message = receive.lock().expect("pipeline receiver lock").recv();
+                    let Ok(message) = message else {
+                        break;
+                    };
+                    let Ok(pending) = message else {
+                        // Keep draining the bounded channel after one worker
+                        // fails. Returning immediately would strand downloaders
+                        // blocked on send and turn a fetch error into a hang.
+                        if first_error.is_none() {
+                            first_error = message.err();
+                        }
+                        continue;
+                    };
+                    if first_error.is_some() {
+                        continue;
+                    }
+                    match store.ensure_image(&pending.artifact.id, &mut local) {
+                        Ok(image) => outcomes.push(FetchOutcome {
+                            path: pending.path.clone(),
+                            id: pending.artifact.id,
+                            artifact_cached: pending.artifact.cached,
+                            image_cached: image.cached,
+                        }),
+                        Err(source) => {
+                            first_error = Some(FetchFail {
+                                name: pending.name,
+                                url: pending.url,
+                                source: Box::new(source),
+                            });
+                        }
+                    }
+                }
+                if let Some(error) = first_error {
+                    Err(error)
+                } else {
+                    Ok((outcomes, local))
+                }
+            }),
+        );
+    }
+    (downloaders, extractors)
+}
+
+/// Join the pipeline handles, merging per-worker metrics and surfacing the
+/// first fetch/extract error.
+fn join_pipeline(
+    downloaders: Vec<DownloaderHandle<'_>>,
+    extractors: Vec<ExtractorHandle<'_>>,
+    metrics: &mut Metrics,
+) -> anyhow::Result<Vec<FetchOutcome>> {
+    for handle in downloaders {
+        metrics.extend(
+            &handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("download worker panicked"))??,
+        );
+    }
+    let mut outcomes = Vec::new();
+    for handle in extractors {
+        let (mut values, local) = handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("extract worker panicked"))??;
+        metrics.extend(&local);
+        outcomes.append(&mut values);
+    }
+    Ok(outcomes)
+}
+
+/// Map path-keyed fetch outcomes back onto the lockfile's positional index
+/// for the materializer and lifecycle phases.
+fn outcomes_to_artifact_ids(
+    outcomes: &[FetchOutcome],
+    lockfile: &Lockfile,
+) -> Vec<Option<ArtifactId>> {
+    let path_to_index: HashMap<&str, usize> = lockfile
+        .packages
+        .iter()
+        .enumerate()
+        .map(|(index, package)| (package.path.as_str(), index))
+        .collect();
+    let mut artifact_ids = vec![None; lockfile.packages.len()];
+    for outcome in outcomes {
+        if let Some(&index) = path_to_index.get(outcome.path.as_str()) {
+            artifact_ids[index] = Some(outcome.id);
+        }
+    }
+    artifact_ids
+}
+
+/// Whether a fresh install overlaps downloads with resolution (Phase 3
+/// streaming). Enabled by default; set `BPM_STREAM_INSTALL=0` to resolve the
+/// whole graph before downloading (the pre-Phase-3 behavior) for benchmarking
+/// or to isolate a streaming-related regression.
+fn streaming_install_enabled() -> bool {
+    !matches!(
+        std::env::var("BPM_STREAM_INSTALL").as_deref(),
+        Ok("0") | Ok("false")
+    )
+}
+
+/// Resolve a fresh manifest while the download/extract pipeline fetches each
+/// package the instant the resolver places it, so downloads overlap with the
+/// rest of resolution. The returned lockfile is byte-identical to a sequential
+/// resolve (the sink only observes placement); downloads are integrity-keyed
+/// and idempotent, so streaming never changes the installed graph.
+#[allow(clippy::too_many_arguments)]
+fn run_streaming_install(
+    root: &Path,
+    manifest: &PackageManifest,
+    client: &bpm::registry::RegistryClient,
+    workspace_index: &bpm::resolver::workspaces::WorkspaceIndex,
+    peer_mode: bpm::resolver::peer::PeerMode,
+    concurrency: usize,
+    store: &ArtifactStore,
+    http: &HttpClient,
+    metrics: &mut Metrics,
+    options: &Options,
+) -> anyhow::Result<()> {
+    // Work count is unknown until resolution completes, so do not clamp the
+    // worker count to it (usize::MAX makes adaptive_workers' clamp a no-op).
+    let workers = adaptive_workers(concurrency, usize::MAX, root);
+    let (lockfile, outcomes) =
+        std::thread::scope(|scope| -> anyhow::Result<(Lockfile, Vec<FetchOutcome>)> {
+            let (unit_tx, unit_rx) =
+                std::sync::mpsc::sync_channel::<InstallWork>(workers.max(1) * 2);
+            let unit_rx = std::sync::Arc::new(std::sync::Mutex::new(unit_rx));
+            let (downloaders, extractors) =
+                spawn_fetch_pipeline(scope, store, http, unit_rx, workers);
+            // Run resolution on this thread, emitting each placed node to the
+            // sink; dropping `sink` closes the unit channel so downloaders (and
+            // then extractors) drain and finish before we join them below.
+            let lockfile = {
+                let sink = ChannelSink(unit_tx);
+                metrics
+                    .measure("dependency_resolution", || {
+                        resolver::resolve_manifest_with_options_sink(
+                            manifest,
+                            client,
+                            "bpm",
+                            Some(workspace_index),
+                            peer_mode,
+                            Some(&sink),
+                        )
+                    })
+                    .map_err(|error| anyhow::anyhow!("dependency resolution failed: {error}"))?
+            };
+            let outcomes = join_pipeline(downloaders, extractors, metrics)?;
+            Ok((lockfile, outcomes))
+        })?;
+    let path = root.join(bpm::lockfile::BPM_LOCK_FILE);
+    lockfile.write_to(&path)?;
+    eprintln!(
+        "resolved {} package(s) and wrote {}",
+        lockfile.packages.len(),
+        path.display()
+    );
+    // Fresh resolve: no prior lockfile, so no prior plan — always install.
+    metrics.record("plan_cache_miss", std::time::Duration::ZERO);
+    let cached = outcomes
+        .iter()
+        .filter(|outcome| outcome.artifact_cached && outcome.image_cached)
+        .count();
+    let fetched = outcomes.len() - cached;
+    let artifact_ids = outcomes_to_artifact_ids(&outcomes, &lockfile);
+    finalize_install(
+        root,
+        store,
+        &lockfile,
+        &artifact_ids,
+        cached,
+        fetched,
+        metrics,
+        options,
+        &path,
+    )
+}
+
+/// Materialize the resolved graph, run lifecycle, write the install plan, and
+/// print the summary. Shared by the lockfile-present and fresh-resolve install
+/// paths; both produce a `lockfile` and its `artifact_ids` before calling this.
+#[allow(clippy::too_many_arguments)]
+fn finalize_install(
+    project_root: &Path,
+    store: &ArtifactStore,
+    lockfile: &Lockfile,
+    artifact_ids: &[Option<ArtifactId>],
+    cached: usize,
+    fetched: usize,
+    metrics: &mut Metrics,
+    options: &Options,
+    lockfile_path: &Path,
+) -> anyhow::Result<()> {
+    let has_workspace_links = lockfile.packages.iter().any(|package| package.link);
+    // Turbopack and similar bundlers enforce that dependency realpaths remain
+    // inside the project. Keep the O(top-level) relay fast path for ordinary
+    // projects, but use a local hardlink view automatically for Next projects;
+    // callers can override this with BPM_PROJECT_VIEW=relay|local.
+    let local_project_view = use_local_project_view(lockfile);
+    let (volume, mut view_entry_count) = if has_workspace_links {
+        bpm::materializer::materialize_lockfile_with_backend(
+            project_root,
+            store,
+            lockfile,
+            artifact_ids,
+            bpm::materializer::MaterializeMode::Compatible,
+            if local_project_view {
+                bpm::materializer::MaterializeBackend::Hardlink
+            } else {
+                bpm::materializer::MaterializeBackend::Auto
+            },
+        )?;
+        (None, 0usize)
+    } else {
+        let volume = bpm::volume::ensure_graph_volume(store, lockfile, artifact_ids, metrics)?;
+        let attach = bpm::volume::attach_project(project_root, &volume)?;
+        (
+            Some(volume),
+            attach.relays_created + attach.relays_unchanged,
+        )
+    };
+    let lifecycle = run_lifecycle_if_enabled(
+        project_root,
+        store,
+        lockfile,
+        artifact_ids,
+        volume.as_ref().map(|v| v.path.as_path()),
+        options.ignore_scripts,
+        metrics,
+    );
+    if local_project_view {
+        if let Some(volume) = volume.as_ref() {
+            let attached = bpm::volume::attach_project_local(project_root, volume)?;
+            view_entry_count = attached.relays_created + attached.relays_unchanged;
+        }
+    }
+
+    let plan_path = graph::plan_path_for(lockfile_path);
+    let mut plan = graph::build_plan(lockfile, artifact_ids, &lifecycle.derived_paths);
+    plan.graph_id_hex = graph::graph_id_for_project(lockfile, project_root).to_hex();
+    if let Err(error) = graph::write_plan(&plan, &plan_path) {
+        eprintln!(
+            "warning: failed to write plan {}: {error}",
+            plan_path.display()
+        );
+    }
+    let package_count = lockfile
+        .packages
+        .iter()
+        .filter(|package| !package.link && !package.resolved.is_empty())
+        .count();
+    println!(
+        "installed {} package(s) into {} ({} cached, {} fetched; graph volume {}, {} project-view entry(s))",
+        package_count,
+        project_root.join("node_modules").display(),
+        cached,
+        fetched,
+        if volume.as_ref().is_some_and(|volume| volume.cached) {
+            "reused"
+        } else if volume.is_some() {
+            "built"
+        } else {
+            "direct"
+        },
+        view_entry_count
+    );
+    write_metrics(metrics, options.json_metrics.clone())
+}
+
 fn build_install_work(lockfile: &Lockfile, frozen: bool) -> anyhow::Result<Vec<InstallWork>> {
     let mut work = Vec::new();
     let target = resolver::current_target_platform();
-    for (index, package) in lockfile.packages.iter().enumerate() {
+    for package in lockfile.packages.iter() {
         if package.link || package.resolved.is_empty() {
             continue;
         }
@@ -753,7 +960,7 @@ fn build_install_work(lockfile: &Lockfile, frozen: bool) -> anyhow::Result<Vec<I
             None => None,
         };
         work.push(InstallWork {
-            index,
+            path: package.path.clone(),
             name: package.name.clone(),
             url: package.resolved.clone(),
             integrity,
