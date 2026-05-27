@@ -82,6 +82,34 @@ struct Node {
     source_dir: Option<PathBuf>,
 }
 
+/// A resolved package available for download, emitted by the resolver the
+/// moment its node is placed during graph expansion.
+///
+/// Keyed by the resolved install `path`, which is unique and stable across the
+/// complete lockfile, so a streaming caller can map results back onto lockfile
+/// position after resolution finishes. Best-effort: a download started from a
+/// unit is integrity-keyed and idempotent, so it never changes the resolved
+/// graph.
+#[derive(Clone, Debug)]
+pub struct ResolvedDownloadUnit {
+    pub path: String,
+    pub name: String,
+    pub url: String,
+    pub integrity: Option<String>,
+}
+
+/// Receives each resolved registry-typed package as it is placed during graph
+/// expansion, so a caller can overlap downloads with the rest of resolution.
+///
+/// `emit` may block (bounded consumers apply backpressure) but must not panic:
+/// the resolver calls it inline on the resolution thread. A send failure (the
+/// consumer dropped its receiver) must be ignored — the resolver continues and
+/// still returns the complete, deterministic lockfile; the consumer reports its
+/// own errors.
+pub trait ResolveSink {
+    fn emit(&self, unit: ResolvedDownloadUnit);
+}
+
 /// Resolve a manifest into the canonical BPM lockfile.
 pub fn resolve_manifest(
     manifest: &PackageManifest,
@@ -141,6 +169,27 @@ pub fn resolve_manifest_with_options(
     )
 }
 
+/// Streaming variant of [`resolve_manifest_with_options`] for the current
+/// target platform. See [`resolve_manifest_with_options_and_target_sink`].
+pub fn resolve_manifest_with_options_sink(
+    manifest: &PackageManifest,
+    registry: &RegistryClient,
+    generator: &str,
+    workspace: Option<&crate::resolver::workspaces::WorkspaceIndex>,
+    peer_mode: crate::resolver::peer::PeerMode,
+    sink: Option<&dyn ResolveSink>,
+) -> Result<Lockfile, ResolveError> {
+    resolve_manifest_with_options_and_target_sink(
+        manifest,
+        registry,
+        generator,
+        workspace,
+        peer_mode,
+        current_target_platform(),
+        sink,
+    )
+}
+
 /// Resolve a manifest for an explicit npm target platform.
 ///
 /// Keeping the target in the resolver (rather than consulting the host from
@@ -170,6 +219,28 @@ pub fn resolve_manifest_with_options_and_target(
     peer_mode: crate::resolver::peer::PeerMode,
     target: TargetPlatform,
 ) -> Result<Lockfile, ResolveError> {
+    resolve_manifest_with_options_and_target_sink(
+        manifest, registry, generator, workspace, peer_mode, target, None,
+    )
+}
+
+/// Streaming variant of [`resolve_manifest_with_options_and_target`].
+///
+/// Each resolved registry-typed package is pushed to `sink` the instant its
+/// node is placed, so a caller can begin downloading before the full graph is
+/// known. The returned `Lockfile` is byte-for-byte identical to the non-sink
+/// variant: streaming only overlaps the *download* of early packages with the
+/// *resolution* of later ones, and downloads are integrity-keyed and idempotent.
+/// Pass `None` to disable streaming.
+pub fn resolve_manifest_with_options_and_target_sink(
+    manifest: &PackageManifest,
+    registry: &RegistryClient,
+    generator: &str,
+    workspace: Option<&crate::resolver::workspaces::WorkspaceIndex>,
+    peer_mode: crate::resolver::peer::PeerMode,
+    target: TargetPlatform,
+    sink: Option<&dyn ResolveSink>,
+) -> Result<Lockfile, ResolveError> {
     // npm's optionalDependencies take precedence over dependencies with the
     // same name. Peer dependencies are root requests too: npm installs a
     // missing root peer so that packages below the root can bind to it. Keep
@@ -192,6 +263,7 @@ pub fn resolve_manifest_with_options_and_target(
         workspace,
         root_dir: manifest.source_dir.clone(),
         target: target.clone(),
+        sink,
     };
     let mut root_targets = BTreeMap::new();
     // Prefetch the first wave of registry packuments so the root requests
@@ -370,6 +442,7 @@ struct GraphResolver<'a> {
     workspace: Option<&'a crate::resolver::workspaces::WorkspaceIndex>,
     root_dir: Option<PathBuf>,
     target: TargetPlatform,
+    sink: Option<&'a dyn ResolveSink>,
 }
 
 impl<'a> GraphResolver<'a> {
@@ -562,6 +635,7 @@ impl<'a> GraphResolver<'a> {
                 source_dir: None,
             },
         );
+        self.announce(&path);
         // Submit prefetches for this node's registry-typed children so sibling
         // packument fetches overlap while depth-first placement proceeds.
         self.prefetch_children(&dependencies);
@@ -578,6 +652,34 @@ impl<'a> GraphResolver<'a> {
             }
         }
         Ok(Some(path))
+    }
+
+    /// If a download sink is attached, announce a just-placed node so a caller
+    /// can start fetching its tarball before the rest of the graph is resolved.
+    /// No-op for linked (workspace) nodes and nodes without a download URL.
+    fn announce(&self, path: &str) {
+        let Some(sink) = self.sink else {
+            return;
+        };
+        let unit = {
+            let Some(node) = self.nodes.get(path) else {
+                return;
+            };
+            if node.link || node.resolved.is_empty() {
+                return;
+            }
+            ResolvedDownloadUnit {
+                path: node.path.clone(),
+                name: node.placement_name.clone(),
+                url: node.resolved.clone(),
+                integrity: if node.integrity.is_empty() {
+                    None
+                } else {
+                    Some(node.integrity.clone())
+                },
+            }
+        };
+        sink.emit(unit);
     }
 
     /// Submit best-effort packument prefetches for registry-typed children.
@@ -658,6 +760,7 @@ impl<'a> GraphResolver<'a> {
                 source_dir: resolved.source_dir,
             },
         );
+        self.announce(&path);
         for (child, child_spec) in dependencies {
             let child_optional = self.nodes.get(&path).is_some_and(|node| {
                 optional || node.metadata.optional_dependencies.contains_key(&child)
@@ -1666,6 +1769,135 @@ mod tests {
         assert_eq!(
             with_prefetch_a, with_prefetch_b,
             "prefetch resolution was nondeterministic across runs"
+        );
+    }
+
+    #[test]
+    fn streaming_sink_emits_every_downloadable_node_and_keeps_the_lockfile_identical() {
+        // The sink variant must (a) produce a lockfile byte-identical to the
+        // non-sink resolver, and (b) announce exactly the registry-typed nodes
+        // that carry a tarball URL, keyed by their resolved install path. Same
+        // fan-out graph as the prefetch determinism test.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_shutdown = std::sync::Arc::clone(&shutdown);
+        let server = thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            while !server_shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(std::time::Duration::from_millis(2));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let mut request = [0_u8; 2048];
+                let length = stream.read(&mut request).unwrap_or(0);
+                let request = String::from_utf8_lossy(&request[..length]);
+                let path = request.lines().next().and_then(|line| {
+                    line.strip_prefix("GET /")
+                        .and_then(|rest| rest.split(' ').next())
+                });
+                let body = match path {
+                    Some("a") => {
+                        r#"{"name":"a","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"a","version":"1.0.0","dependencies":{"b":"^1.0.0","d":"^1.0.0"},"dist":{"tarball":"/a.tgz","integrity":"sha512-a"}}}}"#
+                    }
+                    Some("b") => {
+                        r#"{"name":"b","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"b","version":"1.0.0","dist":{"tarball":"/b.tgz","integrity":"sha512-b"}}}}"#
+                    }
+                    Some("c") => {
+                        r#"{"name":"c","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"c","version":"1.0.0","dependencies":{"b":"^1.0.0","d":"^1.0.0"},"dist":{"tarball":"/c.tgz","integrity":"sha512-c"}}}}"#
+                    }
+                    Some("d") => {
+                        r#"{"name":"d","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"d","version":"1.0.0","dist":{"tarball":"/d.tgz","integrity":"sha512-d"}}}}"#
+                    }
+                    _ => continue,
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+        });
+
+        let config = crate::config::NpmConfig::default()
+            .with_registry_override(&format!("http://{}", address))
+            .unwrap();
+        let manifest = PackageManifest::from_json(
+            r#"{"name":"app","version":"1.0.0","dependencies":{"a":"*","c":"*"}}"#,
+            std::path::Path::new("package.json"),
+        )
+        .unwrap();
+
+        let baseline =
+            resolve_manifest(&manifest, &RegistryClient::new(config.clone()), "test").unwrap();
+
+        struct RecordingSink(std::sync::Mutex<Vec<ResolvedDownloadUnit>>);
+        impl ResolveSink for RecordingSink {
+            fn emit(&self, unit: ResolvedDownloadUnit) {
+                self.0.lock().unwrap().push(unit);
+            }
+        }
+        let sink = RecordingSink(std::sync::Mutex::new(Vec::new()));
+        let streamed = resolve_manifest_with_options_sink(
+            &manifest,
+            &RegistryClient::new(config.clone()).with_prefetch(2),
+            "test",
+            None,
+            crate::resolver::peer::PeerMode::Strict,
+            Some(&sink),
+        )
+        .unwrap();
+
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().unwrap();
+
+        assert_eq!(
+            baseline.to_json().unwrap(),
+            streamed.to_json().unwrap(),
+            "streaming sink changed the resolved lockfile"
+        );
+        // The sink must announce exactly the lockfile's downloadable packages
+        // (registry-typed, non-link, with a tarball url), keyed by install path
+        // — one announce per physical placement, including deduplicated siblings
+        // placed under multiple parents.
+        let mut expected: Vec<(String, String, String, Option<String>)> = streamed
+            .packages
+            .iter()
+            .filter(|package| !package.link && !package.resolved.is_empty())
+            .map(|package| {
+                (
+                    package.path.clone(),
+                    package.name.clone(),
+                    package.resolved.clone(),
+                    package.integrity.clone(),
+                )
+            })
+            .collect();
+        expected.sort();
+        let mut emitted: Vec<(String, String, String, Option<String>)> = sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|unit| {
+                (
+                    unit.path.clone(),
+                    unit.name.clone(),
+                    unit.url.clone(),
+                    unit.integrity.clone(),
+                )
+            })
+            .collect();
+        emitted.sort();
+        assert_eq!(
+            emitted, expected,
+            "sink must announce exactly the lockfile's downloadable packages"
         );
     }
 
