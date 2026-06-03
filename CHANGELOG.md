@@ -8,6 +8,19 @@ once a 1.0 release is cut.
 
 ## [Unreleased]
 
+### Changed
+
+- Lifecycle scripts are no longer re-run when a graph volume is reused. A
+  second project that shares an existing graph volume (identical graph id) used
+  to re-execute every package's `preinstall`/`install`/`postinstall` on attach,
+  even though the volume already held the prior run's derived output. The
+  install path now detects the reused volume (`ensure_graph_volume` returns
+  `cached`), scans each package's manifest to record which volume entries are
+  derived copies (so the install plan still validates), and skips script
+  execution entirely. Only the graph-volume path benefits; the
+  workspace/compatible path still runs scripts in its disposable sandbox. The
+  skip is observable in `--json-metrics` as `lifecycle_skipped_cached_volume`.
+
 ### Added
 
 - Streaming resolve→download on fresh installs. A first install (no
