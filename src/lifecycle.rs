@@ -67,6 +67,13 @@ pub struct LifecycleStats {
 pub struct LifecyclePolicy {
     /// `true` = `--ignore-scripts`; the whole phase is a no-op.
     pub ignore_scripts: bool,
+    /// `true` = a cached graph volume is being reused, so its derived lifecycle
+    /// output is already persisted. Scan each fetchable package's image manifest
+    /// to record which volume entries are derived copies (`derived_paths`, so
+    /// the install plan validates), but do **not** execute any scripts. The
+    /// warm-path optimization described by the M7 closeout: a reused volume
+    /// must not re-run `preinstall`/`install`/`postinstall`.
+    pub skip_execution: bool,
 }
 
 /// Run permitted lifecycle scripts for every fetchable package.
@@ -95,11 +102,50 @@ pub fn run_lifecycle(
     metrics: &mut Metrics,
 ) -> Result<LifecycleStats, LifecycleError> {
     let mut stats = LifecycleStats {
-        skipped: policy.ignore_scripts,
+        skipped: policy.ignore_scripts || policy.skip_execution,
         ..Default::default()
     };
     if policy.ignore_scripts {
         metrics.record("lifecycle", std::time::Duration::ZERO);
+        return Ok(stats);
+    }
+    if policy.skip_execution {
+        // Cached graph volume: its derived lifecycle output is already on disk.
+        // Record which package paths hold derived (isolated, non-hardlink)
+        // copies so the install plan's `lifecycle_paths` stays accurate and
+        // `validate_plan` accepts them on the next install — but never execute
+        // a script, since re-running them would only reproduce output that is
+        // already present. The predicate below mirrors the execution branch
+        // exactly (fetchable package + lifecycle script in its image manifest
+        // + a materialized volume entry), so the recorded set matches what the
+        // volume-building install produced — including skipping
+        // platform-skipped packages that have no entry in the volume.
+        for (i, pkg) in lockfile.packages.iter().enumerate() {
+            if pkg.link || pkg.resolved.is_empty() {
+                continue;
+            }
+            let Some(Some(id)) = artifact_ids.get(i).copied() else {
+                continue;
+            };
+            let Some(vol) = volume_path else {
+                continue;
+            };
+            if !vol.join(&pkg.path).is_dir() {
+                // Not materialized (e.g. platform-skipped); nothing was derived.
+                continue;
+            }
+            let image = store.image_path(&id);
+            let scripts = match read_scripts(&image.join("package.json")) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            if LIFECYCLE_PHASES.iter().any(|p| scripts.contains_key(*p)) {
+                stats.packages_with_scripts += 1;
+                stats.derived_paths.push(pkg.path.clone());
+            }
+        }
+        metrics.record("lifecycle", std::time::Duration::ZERO);
+        metrics.record("lifecycle_skipped_cached_volume", std::time::Duration::ZERO);
         return Ok(stats);
     }
 
