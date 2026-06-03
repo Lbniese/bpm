@@ -234,6 +234,7 @@ fn adaptive_workers(requested: usize, work_items: usize, project_root: &Path) ->
         .min(work_items.max(1))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_lifecycle_if_enabled(
     project_root: &Path,
     store: &ArtifactStore,
@@ -241,6 +242,7 @@ fn run_lifecycle_if_enabled(
     artifact_ids: &[Option<ArtifactId>],
     volume_path: Option<&Path>,
     ignore_scripts: bool,
+    skip_execution: bool,
     metrics: &mut Metrics,
 ) -> bpm::lifecycle::LifecycleStats {
     if ignore_scripts {
@@ -249,6 +251,7 @@ fn run_lifecycle_if_enabled(
     }
     let policy = bpm::lifecycle::LifecyclePolicy {
         ignore_scripts: false,
+        skip_execution,
     };
     match bpm::lifecycle::run_lifecycle(
         project_root,
@@ -259,6 +262,11 @@ fn run_lifecycle_if_enabled(
         policy,
         metrics,
     ) {
+        Ok(result) if result.skipped => {
+            // Cached volume: nothing ran, so there is no per-phase summary to
+            // print. `run_lifecycle` already recorded the skip metric.
+            result
+        }
         Ok(result) if result.packages_with_scripts > 0 => {
             eprintln!(
                 "lifecycle: {} package(s) with scripts ({} phase(s) executed, {} succeeded, {} failed)",
@@ -868,6 +876,11 @@ fn finalize_install(
         artifact_ids,
         volume.as_ref().map(|v| v.path.as_path()),
         options.ignore_scripts,
+        // A reused graph volume already holds the derived lifecycle output
+        // from the install that built it, so the scripts must not run again.
+        // This only applies to the volume path; the workspace/compatible
+        // path (volume == None) uses disposable sandboxes and still runs.
+        volume.as_ref().is_some_and(|v| v.cached),
         metrics,
     );
     if local_project_view {

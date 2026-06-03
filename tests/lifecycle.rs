@@ -192,3 +192,87 @@ fn second_install_hits_plan_cache_without_rerunning_lifecycle() {
         "cache hit should not re-run lifecycle / rewrite derived content",
     );
 }
+
+/// A second project that shares the same graph (identical `bpm.lock`) reuses
+/// the already-built graph volume. Its derived lifecycle output is already
+/// persisted in the volume, so the reused-volume install must NOT re-run any
+/// lifecycle script. This is the warm-path fix the M7 closeout calls out: the
+/// plan-cache path already skipped lifecycle, but a volume reuse with a plan
+/// miss (this project has no `.bpm-state` yet) used to re-run every script.
+#[test]
+fn second_project_reuses_volume_and_skips_lifecycle() {
+    let (proj_a, store, _tgz, _host_image_rel) = setup_project();
+
+    // Project A builds the volume and runs the postinstall (marker appears).
+    let out_a = run_install(proj_a.path(), store.path());
+    let stderr_a = String::from_utf8_lossy(&out_a.stderr);
+    assert!(out_a.status.success(), "install A failed: {stderr_a}");
+    let stderr_a_has_lifecycle = stderr_a.contains("lifecycle:");
+    let marker_a = proj_a.path().join("node_modules/host/.bpm-marker");
+    assert!(marker_a.exists(), "install A should produce the marker");
+    let built_mtime = fs::symlink_metadata(&marker_a).unwrap().modified().unwrap();
+
+    // Settle so a re-write would be observable via mtime.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+
+    // Project B: same store, identical graph (same `bpm.lock` + manifest).
+    let proj_b = tempfile::tempdir().unwrap();
+    fs::write(
+        proj_b.path().join("package.json"),
+        fs::read_to_string(proj_a.path().join("package.json")).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        proj_b.path().join("bpm.lock"),
+        fs::read_to_string(proj_a.path().join("bpm.lock")).unwrap(),
+    )
+    .unwrap();
+
+    let metrics_b = proj_b.path().join("metrics_b.json");
+    let out_b = Command::new(bpm_bin())
+        .arg("install")
+        .arg("--frozen")
+        .arg("--store")
+        .arg(store.path())
+        .arg("--json-metrics")
+        .arg(&metrics_b)
+        .current_dir(proj_b.path())
+        .output()
+        .expect("failed to run bpm");
+    let stdout_b = String::from_utf8_lossy(&out_b.stdout);
+    let stderr_b = String::from_utf8_lossy(&out_b.stderr);
+    assert!(out_b.status.success(), "install B failed: {stderr_b}");
+    // The volume is reused (no rebuild).
+    assert!(
+        stdout_b.contains("graph volume reused"),
+        "expected volume reuse, stdout: {stdout_b}",
+    );
+    // B reaches A's derived content through the shared volume.
+    assert!(proj_b.path().join("node_modules/host/.bpm-marker").exists());
+
+    // Headline assertion: lifecycle did NOT re-run. The summary line that A
+    // produced is absent from B's stderr...
+    if stderr_a_has_lifecycle {
+        assert!(
+            !stderr_b.contains("lifecycle:"),
+            "reused-volume install must not report lifecycle execution: {stderr_b}",
+        );
+    }
+    // ...and the skip is observable in B's metrics.
+    let metrics_text = fs::read_to_string(&metrics_b).unwrap();
+    assert!(
+        metrics_text.contains("\"lifecycle_skipped_cached_volume\""),
+        "expected lifecycle_skipped_cached_volume marker in metrics: {metrics_text}",
+    );
+
+    // The derived content in the shared volume is untouched: B's view of the
+    // marker still carries A's original mtime (it was never rewritten).
+    let reuse_mtime = fs::symlink_metadata(proj_b.path().join("node_modules/host/.bpm-marker"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    assert_eq!(
+        built_mtime, reuse_mtime,
+        "reused volume must not re-run lifecycle / rewrite derived content",
+    );
+}
