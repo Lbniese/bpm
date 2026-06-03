@@ -19,7 +19,7 @@ the commit history wins.
 | 4 — Reusable graph volumes | graph-volume creation, graph-volume reuse across projects, safe project attachment | ✅ Done — `node_modules` attaches via shallow relays |
 | 5 — Lifecycle support | npm-compatible script environment, derived artifact store, native-addon fixture coverage | ✅ Mostly done — sandbox runner, graph-volume lifecycle, `bpm run`; derived-store wiring remains open |
 | 6 — Workspaces and optimization | basic npm workspaces, filesystem capability detection, reflink/clone optimization, adaptive concurrency | ✅ Mostly done — workspaces, capability probe, adaptive concurrency, local hardlink compatibility view; general reflink/clone attachment remains open |
-| 7 — Cold-path performance | representative benchmark corpus, persistent metadata efficiency, native-resolution profiling, derived lifecycle decision | 🚧 In progress — realistic fixture measurements and cold resolver hardening landed; persistent packument metadata cache with ETag revalidation (Step 1A), HTTP/2 transport via reqwest (Step 1B), concurrent metadata prefetch (Phase 2), and streaming resolve→download (Phase 3) landed; derived-artifact integration remains |
+| 7 — Cold-path performance | representative benchmark corpus, persistent metadata efficiency, native-resolution profiling, derived lifecycle decision | ✅ Done — realistic fixture measurements and cold resolver hardening landed; persistent packument metadata cache with ETag revalidation (Step 1A), HTTP/2 transport via reqwest (Step 1B), concurrent metadata prefetch (Phase 2), and streaming resolve→download (Phase 3) delivered (~2.15× faster true_cold on large-frontend; cold path now resolve-bound). Derived-artifact integration deferred by decision — it is a warm/incremental-path optimization (the derived store is empty on a cold install, so it yields zero cold-path benefit); tracked as a follow-up, not an M7 cold-path item. |
 
 ### Post-M6 — registry name resolution (not in the original plan)
 
@@ -237,9 +237,48 @@ Cold-path hardening now:
 - invalidates cached package images and graph volumes after archive-root layout
   changes, covering scoped `@types` packages used by Next.js.
 
-Next M7 work is to profile extraction and project attachment separately and
-decide whether lifecycle output becomes content-addressed through
-`src/derived/store.rs` or remains graph-keyed.
+### Derived-artifact integration — deferred by decision
+
+`src/derived/` (`DerivedStore` + `derived_key`) implements a content-addressed
+cache for lifecycle-derived images and is unit-tested in isolation, but is not
+wired into the lifecycle path. M7 deferred it explicitly as a *decision*:
+content-addressed vs graph-keyed. **Decision: defer.** Rationale:
+
+1. **It is not a cold-path optimization.** M7 is the cold-path milestone. On a
+   true cold install the derived store is empty, so it provides zero cold-path
+   benefit — every package's lifecycle runs regardless. Its value is on the
+   *incremental/warm* path: reusing a package's derived output when the graph
+   changes but that package's build inputs did not.
+2. **The cold path is now resolve-bound, not build-bound.** After Phases 1–3,
+   `true_cold` `large-frontend` is ~23s and lifecycle is a small fraction of
+   it; there is no cold-path headroom left for the derived store to capture.
+3. **The integration has a real design gap to close first.**
+   `DerivedStore::ensure` runs its build callback against a staging copy of the
+   package's *source image* (its own files), but lifecycle scripts need their
+   dependency subtree present (`node_modules`) to resolve. The current
+   graph-volume path supplies deps via the materialized volume tree; the derived
+   path would have to re-materialize the package's dep subtree into staging
+   (duplicating materialization) or source from the volume directory (which
+   would wrongly fold deps into the derived image and key). Solvable, but its
+   own design effort — not a wiring task.
+4. **Correctness sensitivity.** Lifecycle output drives native addons and
+   generated code; a cache key that is too coarse yields stale or wrong output.
+   The store already validates published trees by digest, but pinning the key
+   inputs precisely (target + runtime + source-tree identity + script + env,
+   excluding everything that should not invalidate) needs dedicated coverage
+   and is higher-risk than the M7 performance work.
+
+The current graph-volume path already persists derived output in the volume and
+reuses it for repeat installs of the *same* graph (`ensure_graph_volume` returns
+`cached` when graph id + layout match). **Lifecycle is now skipped when the
+volume is reused** — a second project attaching to an existing graph volume no
+longer re-runs `preinstall`/`install`/`postinstall`; the install path scans each
+package's manifest to record which volume entries are derived copies (so the
+plan still validates) and skips execution, observable as
+`lifecycle_skipped_cached_volume` in `--json-metrics`. The derived store's
+additional value — reuse across *changed* graphs where a package's inputs are
+unchanged — is a genuine warm-path win worth a dedicated milestone (likely an
+M5 lifecycle follow-on).
 
 ### Concurrent metadata prefetch — delivered (Phase 2)
 
