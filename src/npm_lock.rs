@@ -45,6 +45,8 @@ pub enum NpmLockError {
     InvalidBin { path: String, reason: String },
     #[error("cannot record package.json root resolution metadata: {0}")]
     ManifestMetadata(String),
+    #[error("package-lock.json contains constructs unsupported for direct install: {0}")]
+    DirectInstallUnsupported(String),
 }
 
 #[derive(Debug, Default, Deserialize)]

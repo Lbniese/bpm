@@ -76,6 +76,9 @@ pub(crate) enum Commands {
         /// Tools to include (comma-separated, default: npm,pnpm,bpm).
         #[arg(long, default_value = "npm,pnpm,bpm")]
         tools: String,
+        /// Fail before running if any requested benchmark tool is unavailable.
+        #[arg(long = "require-tools")]
+        require_tools: bool,
         /// Number of iterations per scenario.
         #[arg(long, default_value_t = 3)]
         runs: usize,
@@ -85,6 +88,18 @@ pub(crate) enum Commands {
         /// Write a machine/date-stamped baseline JSON file under this directory.
         #[arg(long = "save-baseline")]
         save_baseline: Option<PathBuf>,
+        /// Compare the current run against a semantic baseline JSON file.
+        #[arg(long = "compare-baseline")]
+        compare_baseline: Option<PathBuf>,
+        /// Allow cross-machine or version-mismatched baseline comparisons as informational output.
+        #[arg(long = "baseline-informational")]
+        baseline_informational: bool,
+        /// Maximum allowed current/baseline median ratio for baseline comparison.
+        #[arg(long = "regression-envelope", default_value_t = 2.0)]
+        regression_envelope: f64,
+        /// Write separate diagnostic BPM phase profiles under this directory.
+        #[arg(long = "profile-bpm")]
+        profile_bpm: Option<PathBuf>,
         /// List available scenarios and fixtures.
         #[arg(long)]
         list: bool,
@@ -152,6 +167,11 @@ pub(crate) enum Commands {
         /// Do not run lifecycle scripts.
         #[arg(long)]
         ignore_scripts: bool,
+        /// Cache lifecycle-derived package images per dependency closure, so a
+        /// package's scripts never re-run when another graph shares its closure
+        /// (experimental; default off).
+        #[arg(long)]
+        derived_store: bool,
         /// Ignore peer dependency conflicts.
         #[arg(long = "legacy-peer-deps")]
         legacy_peer_deps: bool,
@@ -182,6 +202,11 @@ pub(crate) enum Commands {
         /// Do not run lifecycle scripts.
         #[arg(long)]
         ignore_scripts: bool,
+        /// Cache lifecycle-derived package images per dependency closure, so a
+        /// package's scripts never re-run when another graph shares its closure
+        /// (experimental; default off).
+        #[arg(long)]
+        derived_store: bool,
         /// Ignore peer dependency conflicts.
         #[arg(long = "legacy-peer-deps")]
         legacy_peer_deps: bool,
@@ -229,7 +254,10 @@ pub(crate) enum Commands {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::{OsStr, OsString};
+    use std::{
+        ffi::{OsStr, OsString},
+        path::PathBuf,
+    };
 
     use clap::{error::ErrorKind, Parser};
 
@@ -273,6 +301,33 @@ mod tests {
         let cli = Cli::try_parse_from(["bpm", "doctor", "--json"]).unwrap();
 
         assert!(matches!(cli.command, Commands::Doctor { json: true }));
+    }
+
+    #[test]
+    fn bench_accepts_strict_and_profile_options() {
+        let cli = Cli::try_parse_from([
+            "bpm",
+            "bench",
+            "--require-tools",
+            "--profile-bpm",
+            "/tmp/profile",
+            "--compare-baseline",
+            "/tmp/baseline.json",
+        ])
+        .unwrap();
+
+        let Commands::Bench {
+            require_tools,
+            profile_bpm,
+            compare_baseline,
+            ..
+        } = cli.command
+        else {
+            panic!("expected bench command");
+        };
+        assert!(require_tools);
+        assert_eq!(profile_bpm, Some(PathBuf::from("/tmp/profile")));
+        assert_eq!(compare_baseline, Some(PathBuf::from("/tmp/baseline.json")));
     }
 
     #[cfg(unix)]

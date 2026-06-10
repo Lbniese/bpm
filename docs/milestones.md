@@ -33,9 +33,18 @@ immutable store layer is unchanged — resolution produces a
 graph resolution is now integrated into non-frozen `bpm install`; this section
 is retained as historical context for the earlier single-package resolver.
 
-The benchmark harness is implemented and has a checked-in reference baseline.
-Refresh it whenever the materialization or lifecycle strategy changes, and do
-not compare results across different toolchain/version maps.
+The benchmark harness is implemented and has a checked-in reference baseline
+(`benchmarks/baselines/reference.json`). Refresh it whenever the materialization
+or lifecycle strategy changes, and do not compare results across different
+toolchain/version maps. The current reference baseline (arm64 / macOS 26.5,
+node v26.0.0, npm 11.12.1, bun 1.3.14, **bpm 0.1.10**) covers the four synthetic
+comparability pairs (`minimal`/`small`/`medium`/`monorepo`) plus the
+representative `large-frontend` scenarios (`true_cold`, `resolved_cold`,
+`warm_store`, `repeat_install`, `second_project_same_graph`,
+`partial_dependency_change`); regenerate with
+`PATH="$PWD/target/release:$PATH" ./target/release/bpm bench --fixture <f>
+--scenario <s> --runs 3 --tools npm,bun,bpm --json <out>` (prepending the fresh
+release dir so the recorded `bpm` version and the binary under test match).
 
 ## Native resolver — delivered
 
@@ -218,10 +227,11 @@ The first M7 measurements cover `large-frontend`, `many-small-files`,
 `native-addon`, and `monorepo` across cold, warm, repeat, graph-reuse, and
 incremental scenarios. They confirm BPM's graph-volume path is already highly
 competitive after the graph exists, while cold native resolution and first-time
-artifact extraction are the current bottlenecks. The existing synthetic
-baseline is not sufficient to claim broad superiority over npm or pnpm; future
-comparisons must retain toolchain versions and include these representative
-fixtures.
+artifact extraction are the current bottlenecks. The checked-in reference
+baseline now includes the representative `large-frontend` scenarios alongside
+the synthetic pairs (see above); the remaining representative fixtures
+(`many-small-files`, `native-addon`, `monorepo` at full scenario coverage) are
+follow-ups. Future comparisons must retain toolchain versions.
 
 Cold-path hardening now:
 
