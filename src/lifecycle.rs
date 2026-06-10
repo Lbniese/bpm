@@ -11,13 +11,20 @@
 //! sandbox. `--ignore-scripts` skips the whole phase.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use serde::Serialize;
 use thiserror::Error;
 
+use crate::derived::{
+    self, DerivedInputs, EnsureDerived, EnsureOptions, NullDerivedMetadata, RuntimeIdentity,
+    SandboxFailure, TargetDescriptor,
+};
+use crate::graph::package_closure_digest;
 use crate::integrity::ArtifactId;
 use crate::lockfile::{Lockfile, PackageEntry};
 use crate::metrics::Metrics;
@@ -25,6 +32,56 @@ use crate::store::ArtifactStore;
 
 /// The lifecycle scripts bpm runs, in order, for each package.
 pub const LIFECYCLE_PHASES: &[&str] = &["preinstall", "install", "postinstall"];
+
+/// Derived-key runner version. Bumped when the derived build callback's
+/// execution contract changes (isolation, snapshot, or attach semantics).
+const DERIVED_RUNNER_VERSION: u32 = 1;
+/// Derived-key policy version. Bumped when the set of inputs folded into the
+/// key changes meaningfully (e.g. environment bounding lands in a later phase).
+const DERIVED_POLICY_VERSION: u32 = 1;
+
+/// Environment variables that can plausibly change a native lifecycle build's
+/// output, and so must distinguish two derived keys even when the source and
+/// dependency graph are identical.
+///
+/// This is a conservative allowlist, not the complete process environment:
+/// folding the whole env in would make the cache almost never hit (PATH, HOME,
+/// USER, hostname, and other host-specific noise differ across machines and
+/// invocations) and would defeat cross-machine reuse. Anything not listed is
+/// assumed not to affect build output. The full `env_clear` + complete
+/// bounded-environment execution contract is a later refinement; until then
+/// the script still inherits the parent env at run time, and this snapshot is
+/// the subset that influences the derived key.
+const ENV_INPUT_VARS: &[&str] = &[
+    // C/C++ toolchain selection and flags.
+    "CC",
+    "CXX",
+    "CFLAGS",
+    "CXXFLAGS",
+    "CPPFLAGS",
+    "LDFLAGS",
+    "AR",
+    "NM",
+    "RANLIB",
+    // Build driver.
+    "MAKE",
+    "MAKEFLAGS",
+    // node-gyp / prebuild / node-addon build configuration.
+    "npm_config_target",
+    "npm_config_arch",
+    "npm_config_target_arch",
+    "npm_config_runtime",
+    "npm_config_disturl",
+    "npm_config_python",
+    "npm_config_build_from_source",
+    "NODE_GYP_FORCE_PYTHON",
+    "PYTHON",
+    // Cross-compilation / sysroot discovery.
+    "TARGET",
+    "HOST",
+    "PKG_CONFIG_PATH",
+    "PKG_CONFIG_SYSROOT_DIR",
+];
 
 #[derive(Debug, Error)]
 pub enum LifecycleError {
@@ -74,6 +131,14 @@ pub struct LifecyclePolicy {
     /// warm-path optimization described by the M7 closeout: a reused volume
     /// must not re-run `preinstall`/`install`/`postinstall`.
     pub skip_execution: bool,
+    /// `true` = consult the per-package derived-artifact store for each
+    /// lifecycle-bearing package before executing its scripts. On a hit, the
+    /// cached post-lifecycle image is attached into the volume and the scripts
+    /// are skipped; on a miss they run in place and the result is published so
+    /// a *different* graph that shares this package's dependency closure can
+    /// reuse it. Off by default; enabled by `--derived-store` /
+    /// `BPM_DERIVED_STORE=1`. Only effective when a graph volume is in use.
+    pub use_derived_store: bool,
 }
 
 /// Run permitted lifecycle scripts for every fetchable package.
@@ -151,6 +216,23 @@ pub fn run_lifecycle(
 
     let mut outcomes: Vec<LifecycleOutcome> = Vec::new();
 
+    // The derived store is consulted per lifecycle-bearing package. It needs a
+    // runtime identity (probed from `node` once for the whole pass) and is only
+    // meaningful against a graph volume; without one, scripts run in a sandbox
+    // with no dependency resolution, so caching their output is unsound.
+    let bounded_env = bounded_environment();
+    let owned_runtime = if policy.use_derived_store && volume_path.is_some() {
+        probe_runtime()
+    } else {
+        None
+    };
+    let null_metadata = NullDerivedMetadata;
+    let derived_store = if owned_runtime.is_some() {
+        derived::DerivedStore::open(store.root(), &null_metadata).ok()
+    } else {
+        None
+    };
+
     for (i, pkg) in lockfile.packages.iter().enumerate() {
         if pkg.link || pkg.resolved.is_empty() {
             continue;
@@ -169,6 +251,157 @@ pub fn run_lifecycle(
             continue;
         }
         stats.packages_with_scripts += 1;
+
+        // Derived-artifact fast path (opt-in). On a cache hit the package's
+        // post-lifecycle image is attached into the volume and its scripts are
+        // skipped; on a miss they run in place and the result is published so
+        // a different graph that shares this package's dependency closure can
+        // reuse it. Any store/sandbox failure degrades gracefully to the
+        // ordinary in-place execution below.
+        if let (Some(vol), Some(runtime), Some(derived_store)) =
+            (volume_path, owned_runtime.as_ref(), derived_store.as_ref())
+        {
+            let pkg_dir = vol.join(&pkg.path);
+            if pkg_dir.is_dir() {
+                let phase_count = LIFECYCLE_PHASES
+                    .iter()
+                    .filter(|phase| scripts.contains_key(**phase))
+                    .count();
+                let closure = package_closure_digest(lockfile, &pkg.path);
+                let inputs = DerivedInputs {
+                    source_artifact: id.as_bytes(),
+                    dependency_graph: &closure,
+                    target: current_target(),
+                    runtime: RuntimeIdentity {
+                        // Verified identity: the BLAKE3 digest of the
+                        // canonicalized `node` binary, so a runtime change
+                        // invalidates the key even before the reported
+                        // version/ABI is consulted.
+                        executable: &runtime.executable,
+                        version: &runtime.version,
+                        modules_abi: &runtime.modules_abi,
+                        napi_version: runtime.napi_version.as_deref(),
+                    },
+                    scripts: &scripts,
+                    environment: &bounded_env,
+                    runner_version: DERIVED_RUNNER_VERSION,
+                    policy_version: DERIVED_POLICY_VERSION,
+                };
+                let mut local_outcomes: Vec<LifecycleOutcome> = Vec::new();
+                let built_entry = pkg_dir.clone();
+                let image_root = image.clone();
+                let project_root_owned = project_root.to_path_buf();
+                let pkg_clone = pkg.clone();
+                let result = derived_store.ensure(
+                    &inputs,
+                    &image,
+                    EnsureOptions::default(),
+                    |staging_image| {
+                        // Run the scripts in place against the volume entry
+                        // (current npm-compatible behavior: dependencies resolve
+                        // through the complete volume node_modules tree), then
+                        // snapshot the package's post-lifecycle own-tree into
+                        // the staging image, stripped of `node_modules` so the
+                        // published image is dependency-free.
+                        if same_file(
+                            &built_entry.join("package.json"),
+                            &image_root.join("package.json"),
+                        ) {
+                            isolate_package(&image_root, &built_entry)
+                                .map_err(|error| sandbox_io_failure(&pkg_clone, &error))?
+                        }
+                        for &phase in LIFECYCLE_PHASES {
+                            let Some(cmd) = scripts.get(phase) else {
+                                continue;
+                            };
+                            let status = run_script(
+                                &built_entry,
+                                phase,
+                                cmd,
+                                &project_root_owned,
+                                store,
+                                &pkg_clone,
+                            );
+                            let code = status
+                                .map(|status| status.code().unwrap_or(-1))
+                                .unwrap_or(-1);
+                            local_outcomes.push(LifecycleOutcome {
+                                package: pkg_clone.name.clone(),
+                                phase: phase.to_string(),
+                                command: cmd.clone(),
+                                ran: true,
+                                exit_code: Some(code),
+                            });
+                            if code != 0 {
+                                return Err(SandboxFailure::new(
+                                    pkg_clone.name.as_str(),
+                                    phase,
+                                    Some(code),
+                                    None,
+                                    &[],
+                                    &[],
+                                ));
+                            }
+                        }
+                        snapshot_pkg_tree(&built_entry, staging_image)
+                            .map_err(|error| sandbox_io_failure(&pkg_clone, &error))?;
+                        Ok(())
+                    },
+                );
+                match result {
+                    Ok(EnsureDerived::Hit(reference)) => {
+                        attach_derived(&reference.image_path, &pkg_dir)?;
+                        metrics.record("derived_store_hit", Duration::ZERO);
+                        stats.derived_paths.push(pkg.path.clone());
+                        continue;
+                    }
+                    Ok(EnsureDerived::Built(_reference)) => {
+                        // Scripts ran in place against `pkg_dir`; it already
+                        // holds the package's derived tree (nested deps under
+                        // its node_modules are untouched), so no attach needed.
+                        metrics.record("derived_store_built", Duration::ZERO);
+                        stats.phases_executed += phase_count;
+                        stats.phases_succeeded += phase_count;
+                        outcomes.append(&mut local_outcomes);
+                        stats.derived_paths.push(pkg.path.clone());
+                        continue;
+                    }
+                    Ok(EnsureDerived::Skipped) => {
+                        // `ignore_scripts` is handled at the top of the function;
+                        // reaching here is unexpected, so fall through.
+                    }
+                    Err(error) => match error {
+                        derived::DerivedError::Sandbox { failure } => {
+                            metrics.record("derived_store_built", Duration::ZERO);
+                            stats.phases_executed += 1;
+                            stats.phases_failed += 1;
+                            let command = scripts
+                                .get(failure.phase.as_str())
+                                .cloned()
+                                .unwrap_or_default();
+                            outcomes.push(LifecycleOutcome {
+                                package: failure.package,
+                                phase: failure.phase,
+                                command,
+                                ran: true,
+                                exit_code: failure.exit_code,
+                            });
+                            stats.derived_paths.push(pkg.path.clone());
+                            continue;
+                        }
+                        other => {
+                            // Store/IO error: degrade to ordinary in-place
+                            // execution for this package.
+                            metrics.record("derived_store_miss", Duration::ZERO);
+                            eprintln!(
+                                "warning: derived store unavailable for {}, running scripts in place: {other}",
+                                pkg.path
+                            );
+                        }
+                    },
+                }
+            }
+        }
 
         // Choose the execution root. `sandbox` (when set) must outlive the
         // phase loop below so the temp dir is not reaped mid-run.
@@ -466,6 +699,204 @@ fn remove_any(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Owned counterpart of [`RuntimeIdentity`] so a single `node` probe can feed
+/// every package's derived key in one lifecycle pass.
+struct OwnedRuntimeIdentity {
+    /// BLAKE3 digest of the canonicalized `node` executable (32 bytes). This
+    /// verified identity is folded into every derived key, so a native
+    /// artifact built under one runtime is never substituted for one built
+    /// under another even if both report the same version string.
+    executable: Vec<u8>,
+    version: String,
+    modules_abi: String,
+    napi_version: Option<String>,
+}
+
+/// Probe the `node` runtime once for the derived-key identity. Returns `None`
+/// when `node` is unavailable or its reported identity is incomplete, in which
+/// case the derived store is skipped for the whole pass and scripts run in
+/// place as usual.
+///
+/// A *single* `node` invocation gathers `execPath`, `version`, the modules
+/// ABI, and the N-API version (newline-separated); node startup (~50 ms)
+/// dominates the probe, so collapsing what was five spawns into one keeps the
+/// derived store cheap enough to leave on by default.
+fn probe_runtime() -> Option<OwnedRuntimeIdentity> {
+    let probe = node_output(&[
+        "-p",
+        "[process.execPath, process.version, String(process.versions.modules), String(process.versions.napi)].join('\\n')",
+    ])?;
+    let mut lines = probe.lines();
+    let exec_path = lines.next()?;
+    let version = lines.next()?.to_owned();
+    let modules_abi = lines.next()?.to_owned();
+    let napi_raw = lines.next()?;
+    let napi_version = (napi_raw != "undefined").then(|| napi_raw.to_owned());
+    let executable = node_executable_digest(exec_path)?;
+    Some(OwnedRuntimeIdentity {
+        executable,
+        version,
+        modules_abi,
+        napi_version,
+    })
+}
+
+/// BLAKE3 digest of the real `node` binary that will run the lifecycle
+/// scripts. Canonicalizing `execPath` collapses symlink farms (nvm, homebrew,
+/// fnm) onto the underlying binary -- two installs that ultimately exec the
+/// same bytes hash identically, two distinct runtimes hash differently. The
+/// digest is streamed so the binary is never fully resident. Any failure
+/// yields `None`, and the caller skips the derived store for the whole pass
+/// (graceful degradation to in-place execution).
+fn node_executable_digest(exec_path: &str) -> Option<Vec<u8>> {
+    let canonical = fs::canonicalize(exec_path).ok()?;
+    if !canonical.is_file() {
+        return None;
+    }
+    let file = fs::File::open(&canonical).ok()?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update_reader(file).ok()?;
+    Some(hasher.finalize().as_bytes().to_vec())
+}
+
+/// Snapshot the bounded lifecycle environment for the derived key: the values
+/// of [`ENV_INPUT_VARS`] that are actually set in the current process
+/// environment. Only these are folded into the key (everything else is assumed
+/// build-invariant), keeping the cache stable in the face of ambient noise like
+/// PATH/HOME/USER/hostname that must not defeat reuse. Deterministic and
+/// independent of the process environment's iteration order.
+fn bounded_environment() -> BTreeMap<OsString, OsString> {
+    ENV_INPUT_VARS
+        .iter()
+        .filter_map(|&name| std::env::var_os(name).map(|value| (OsString::from(name), value)))
+        .collect()
+}
+
+fn node_output(args: &[&str]) -> Option<String> {
+    let output = Command::new("node").args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Target platform descriptor for the current process, folded into every
+/// derived key so a native artifact built for one target never substitutes for
+/// another.
+fn current_target() -> TargetDescriptor<'static> {
+    let abi = if cfg!(target_env = "gnu") {
+        "gnu"
+    } else if cfg!(target_env = "musl") {
+        "musl"
+    } else if cfg!(target_env = "msvc") {
+        "msvc"
+    } else {
+        ""
+    };
+    TargetDescriptor {
+        os: std::env::consts::OS,
+        architecture: std::env::consts::ARCH,
+        family: std::env::consts::FAMILY,
+        abi,
+    }
+}
+
+/// Recursively mirror `src` into `dst`, replacing any existing `dst` entry at
+/// each position. When `skip_top_node_modules` is set, a top-level
+/// `node_modules` in `src` is skipped (the volume's dependency placement, never
+/// part of the package's own image).
+fn mirror_tree(src: &Path, dst: &Path, skip_top_node_modules: bool) -> Result<(), LifecycleError> {
+    fs::create_dir_all(dst).map_err(|source| lc_io(dst, source))?;
+    for entry in fs::read_dir(src).map_err(|source| lc_io(src, source))? {
+        let entry = entry.map_err(|source| lc_io(src, source))?;
+        let name = entry.file_name();
+        if skip_top_node_modules && name == "node_modules" {
+            continue;
+        }
+        let from = entry.path();
+        let to = dst.join(&name);
+        let kind = entry.file_type().map_err(|source| lc_io(&from, source))?;
+        if symlink_exists(&to) {
+            remove_any(&to).map_err(|source| lc_io(&to, source))?;
+        }
+        if kind.is_dir() {
+            mirror_tree(&from, &to, false)?;
+        } else if kind.is_symlink() {
+            copy_symlink(&from, &to)?;
+        } else {
+            fs::copy(&from, &to).map_err(|source| lc_io(&to, source))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn copy_symlink(from: &Path, to: &Path) -> Result<(), LifecycleError> {
+    let target = fs::read_link(from).map_err(|source| lc_io(from, source))?;
+    std::os::unix::fs::symlink(&target, to).map_err(|source| lc_io(to, source))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn copy_symlink(from: &Path, to: &Path) -> Result<(), LifecycleError> {
+    fs::copy(from, to).map_err(|source| lc_io(to, source))?;
+    Ok(())
+}
+
+/// Snapshot a package's post-lifecycle own-tree from the volume entry into the
+/// derived store's staging image, excluding `node_modules`: the nested
+/// dependencies there belong to the volume, not the package's published image,
+/// so stripping them keeps the derived identity a pure function of the
+/// package's own tree (the contract proven in `src/derived/store.rs`).
+fn snapshot_pkg_tree(built_entry: &Path, staging_image: &Path) -> Result<(), LifecycleError> {
+    clear_dir_contents(staging_image)?;
+    mirror_tree(built_entry, staging_image, true)
+}
+
+/// Attach a cached derived image onto a pristine volume entry, overlaying the
+/// package's post-lifecycle own-files while preserving nested dependencies the
+/// materializer already placed under the entry's `node_modules`.
+fn attach_derived(derived_image: &Path, vol_entry: &Path) -> Result<(), LifecycleError> {
+    for entry in fs::read_dir(vol_entry).map_err(|source| lc_io(vol_entry, source))? {
+        let entry = entry.map_err(|source| lc_io(vol_entry, source))?;
+        if entry.file_name() == "node_modules" {
+            continue;
+        }
+        remove_any(&entry.path()).map_err(|source| lc_io(&entry.path(), source))?;
+    }
+    mirror_tree(derived_image, vol_entry, false)
+}
+
+fn clear_dir_contents(dir: &Path) -> Result<(), LifecycleError> {
+    for entry in fs::read_dir(dir).map_err(|source| lc_io(dir, source))? {
+        let entry = entry.map_err(|source| lc_io(dir, source))?;
+        remove_any(&entry.path()).map_err(|source| lc_io(&entry.path(), source))?;
+    }
+    Ok(())
+}
+
+fn sandbox_io_failure(pkg: &PackageEntry, error: &LifecycleError) -> derived::SandboxFailure {
+    let message = error.to_string();
+    derived::SandboxFailure::new(
+        pkg.name.as_str(),
+        "install",
+        None,
+        None,
+        &[],
+        message.as_bytes(),
+    )
+}
+
+fn lc_io(path: &Path, source: std::io::Error) -> LifecycleError {
+    LifecycleError::Io {
+        path: path.display().to_string(),
+        source,
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -540,5 +971,164 @@ mod tests {
             b"{\"name\":\"pkg\"}",
             "store image must be unchanged after isolating mutations",
         );
+    }
+
+    // --- derived-store attach / snapshot helpers ---
+
+    /// Stage a volume entry shaped like a materialized package: pristine own
+    /// files plus a nested dependency placed by the materializer.
+    fn stage_volume_entry_with_deps(tmp: &Path) -> (PathBuf, PathBuf) {
+        let image = tmp.join("image");
+        let vol = tmp.join("volume/node_modules/pkg");
+        fs::create_dir_all(&image).unwrap();
+        fs::write(image.join("package.json"), b"pristine").unwrap();
+        fs::write(image.join("index.js"), b"v1").unwrap();
+        fs::create_dir_all(&vol).unwrap();
+        fs::write(vol.join("package.json"), b"pristine").unwrap();
+        fs::write(vol.join("index.js"), b"v1").unwrap();
+        fs::create_dir_all(vol.join("node_modules/dep")).unwrap();
+        fs::write(vol.join("node_modules/dep/package.json"), b"dep").unwrap();
+        (image, vol)
+    }
+
+    #[test]
+    fn snapshot_pkg_tree_strips_node_modules_and_copies_own_files() {
+        let tmp = tempdir().unwrap();
+        let (image, vol) = stage_volume_entry_with_deps(tmp.path());
+        // Simulate a post-install mutation of the package's own files plus a
+        // derived artifact written by the script.
+        fs::write(vol.join("index.js"), b"compiled").unwrap();
+        fs::write(vol.join("build.out"), b"derived").unwrap();
+        let staging = tmp.path().join("staging");
+        fs::create_dir_all(&staging).unwrap();
+        // The staging image starts as a pristine copy (ensure's contract).
+        fs::write(staging.join("package.json"), b"pristine").unwrap();
+        fs::write(staging.join("index.js"), b"v1").unwrap();
+
+        snapshot_pkg_tree(&vol, &staging).unwrap();
+
+        // Own files are mirrored (post-lifecycle content wins).
+        assert_eq!(fs::read(staging.join("package.json")).unwrap(), b"pristine");
+        assert_eq!(fs::read(staging.join("index.js")).unwrap(), b"compiled");
+        assert_eq!(fs::read(staging.join("build.out")).unwrap(), b"derived");
+        // Nested dependencies are stripped from the published image.
+        assert!(!staging.join("node_modules").exists());
+        let _ = image;
+    }
+
+    #[test]
+    fn attach_derived_overlays_image_and_preserves_nested_deps() {
+        let tmp = tempdir().unwrap();
+        let (_image, vol) = stage_volume_entry_with_deps(tmp.path());
+        // A cached derived image: the package's post-lifecycle own tree, no
+        // node_modules.
+        let derived = tmp.path().join("derived/image");
+        fs::create_dir_all(&derived).unwrap();
+        fs::write(derived.join("package.json"), b"derived").unwrap();
+        fs::write(derived.join("index.js"), b"compiled").unwrap();
+        fs::write(derived.join("build.out"), b"derived").unwrap();
+
+        attach_derived(&derived, &vol).unwrap();
+
+        // Pristine own-files are replaced by the derived image's content.
+        assert_eq!(fs::read(vol.join("package.json")).unwrap(), b"derived");
+        assert_eq!(fs::read(vol.join("index.js")).unwrap(), b"compiled");
+        assert!(vol.join("build.out").is_file());
+        // Nested dependencies the materializer placed are preserved.
+        assert_eq!(
+            fs::read(vol.join("node_modules/dep/package.json")).unwrap(),
+            b"dep",
+        );
+    }
+
+    #[test]
+    fn mirror_tree_skips_only_top_level_node_modules() {
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        fs::create_dir_all(src.join("node_modules/dep")).unwrap();
+        fs::write(src.join("node_modules/dep/package.json"), b"dep").unwrap();
+        fs::create_dir_all(src.join("sub/node_modules/inner")).unwrap();
+        fs::write(src.join("sub/node_modules/inner/package.json"), b"inner").unwrap();
+        fs::write(src.join("own.js"), b"own").unwrap();
+
+        mirror_tree(&src, &dst, true).unwrap();
+
+        // Top-level node_modules is skipped.
+        assert!(!dst.join("node_modules").exists());
+        // Everything else (including nested node_modules deeper in the tree) is
+        // mirrored, since only the package's own top-level placement is excluded.
+        assert_eq!(fs::read(dst.join("own.js")).unwrap(), b"own");
+        assert_eq!(
+            fs::read(dst.join("sub/node_modules/inner/package.json")).unwrap(),
+            b"inner",
+        );
+    }
+
+    #[test]
+    fn probe_runtime_yields_a_fixed_size_stable_node_digest() {
+        // probe_runtime requires `node` on PATH; skip cleanly when absent
+        // rather than failing on an environment that has none.
+        if std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("node not on PATH; skipping probe_runtime digest test");
+            return;
+        }
+        let identity = probe_runtime().expect("node is present but probe_runtime returned None");
+        // BLAKE3 produces a 32-byte digest; the field must never carry the old
+        // fixed marker string.
+        assert_eq!(
+            identity.executable.len(),
+            32,
+            "executable identity must be a 32-byte BLAKE3 digest of the node binary",
+        );
+        // Canonicalization + hashing are deterministic; the same binary probed
+        // twice must yield identical bytes (so the derived key is stable across
+        // installs that share a runtime).
+        let again = probe_runtime().expect("second probe_runtime returned None");
+        assert_eq!(
+            identity.executable, again.executable,
+            "node executable digest must be stable across probes",
+        );
+    }
+
+    #[test]
+    fn bounded_environment_captures_only_allowlisted_vars() {
+        let env = bounded_environment();
+        // Deterministic across calls (a pure function of the current env).
+        assert_eq!(env, bounded_environment());
+        // Every captured key must be one of the allowlisted inputs -- no
+        // ambient bleed-through.
+        for name in env.keys() {
+            let name = name.to_str().unwrap_or("");
+            assert!(
+                ENV_INPUT_VARS.contains(&name),
+                "{name:?} captured by bounded_environment but is not in ENV_INPUT_VARS",
+            );
+        }
+        // The allowlist must cover the vars most likely to steer a native build.
+        for must in [
+            "CC",
+            "CXX",
+            "CFLAGS",
+            "npm_config_arch",
+            "npm_config_target",
+        ] {
+            assert!(
+                ENV_INPUT_VARS.contains(&must),
+                "ENV_INPUT_VARS missing {must}"
+            );
+        }
+        // Host-specific ambient noise must never be folded into a derived key,
+        // or the cache would never hit and would not transfer across machines.
+        for noise in ["PATH", "HOME", "USER", "PWD", "HOSTNAME", "SHELL", "TMPDIR"] {
+            assert!(
+                !ENV_INPUT_VARS.contains(&noise),
+                "{noise} must stay out of the derived-key environment (host-specific noise)",
+            );
+        }
     }
 }

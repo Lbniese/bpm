@@ -45,6 +45,27 @@ pub trait DerivedMetadata {
     fn access_derived(&self, record: &DerivedRecord, accessed_at_ms: u64) -> Result<(), String>;
 }
 
+/// No-op [`DerivedMetadata`] for filesystem-authoritative operation.
+///
+/// Before the M3 metadata repository is wired, the derived store is usable
+/// the moment a store root exists: the filesystem (`metadata.json` + `image/`)
+/// is the sole source of truth, and [`DerivedStore::ensure`] accepts a hit
+/// only after re-validating it on disk. This adapter satisfies the trait
+/// without persisting anywhere. The LRU/GC integration that consumes access
+/// timestamps arrives with the metadata repository in a later phase.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NullDerivedMetadata;
+
+impl DerivedMetadata for NullDerivedMetadata {
+    fn publish_derived(&self, _record: &DerivedRecord) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn access_derived(&self, _record: &DerivedRecord, _accessed_at_ms: u64) -> Result<(), String> {
+        Ok(())
+    }
+}
+
 /// Options whose behavior does not belong to the cache key itself.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct EnsureOptions {
@@ -582,6 +603,14 @@ fn seal_path_with_metadata(path: &Path, metadata: fs::Metadata) -> Result<(), De
     if metadata.file_type().is_symlink() {
         return Ok(());
     }
+    // Directories are intentionally left writable. Content immutability only
+    // requires the regular files to be read-only, and GC reclaims derived
+    // images with remove_dir_all, which needs write permission on each
+    // directory to unlink its entries. Sealing directories read-only would
+    // make a published image undeletable, so disk growth would be unbounded.
+    if metadata.is_dir() {
+        return Ok(());
+    }
     let mut permissions = metadata.permissions();
     #[cfg(unix)]
     {
@@ -752,11 +781,19 @@ mod tests {
         scripts: &'a BTreeMap<String, String>,
         environment: &'a BTreeMap<OsString, OsString>,
     ) -> DerivedInputs<'a> {
-        static SOURCE: [u8; 64] = [1; 64];
         static GRAPH: [u8; 32] = [2; 32];
+        inputs_with_graph(scripts, environment, &GRAPH)
+    }
+
+    fn inputs_with_graph<'a>(
+        scripts: &'a BTreeMap<String, String>,
+        environment: &'a BTreeMap<OsString, OsString>,
+        graph: &'a [u8; 32],
+    ) -> DerivedInputs<'a> {
+        static SOURCE: [u8; 64] = [1; 64];
         DerivedInputs {
             source_artifact: &SOURCE,
-            dependency_graph: &GRAPH,
+            dependency_graph: graph,
             target: TargetDescriptor {
                 os: "linux",
                 architecture: "x86_64",
@@ -773,6 +810,31 @@ mod tests {
             environment,
             runner_version: 1,
             policy_version: 1,
+        }
+    }
+
+    /// Read the persisted tree identity back from a published image.
+    fn tree_digest_of(reference: &DerivedRef) -> String {
+        let bytes = fs::read(&reference.metadata_path).unwrap();
+        let persisted: PersistedMetadata = serde_json::from_slice(&bytes).unwrap();
+        persisted.tree_digest
+    }
+
+    /// Mirror of the inject -> build -> strip contract the lifecycle layer will
+    /// use as its `DerivedStore::ensure` build callback: remove exactly the
+    /// injected dependency subtrees and drop the `node_modules/` container when
+    /// it is left empty, so the published image is a deterministic function of
+    /// the package's own post-lifecycle tree.
+    fn strip_injected_deps(image: &Path, injected: &[&str]) {
+        let node_modules = image.join("node_modules");
+        for name in injected {
+            let path = node_modules.join(name);
+            if path.exists() {
+                fs::remove_dir_all(&path).unwrap();
+            }
+        }
+        if node_modules.exists() && fs::read_dir(&node_modules).unwrap().next().is_none() {
+            fs::remove_dir(&node_modules).unwrap();
         }
     }
 
@@ -827,6 +889,63 @@ mod tests {
         assert!(matches!(hit, EnsureDerived::Hit(_)));
         assert_eq!(metadata.published.lock().unwrap().len(), 1);
         assert_eq!(metadata.accessed.lock().unwrap().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn published_image_dirs_remain_writable_so_gc_can_reclaim() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        fs::write(source.join("base"), b"base").unwrap();
+        fs::write(source.join("nested").join("leaf"), b"leaf").unwrap();
+        let scripts = BTreeMap::from([("install".to_owned(), "build".to_owned())]);
+        let environment = BTreeMap::new();
+        let metadata = FakeMetadata::default();
+        let store = DerivedStore::open(&temp.path().join("store"), &metadata).unwrap();
+        let built = store
+            .ensure(
+                &inputs(&scripts, &environment),
+                &source,
+                EnsureOptions::default(),
+                |sandbox| {
+                    fs::write(sandbox.join("generated"), b"out").unwrap();
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let reference = match built {
+            EnsureDerived::Built(reference) => reference,
+            other => panic!("expected built object, got {other:?}"),
+        };
+        // Regular files are sealed read-only for content immutability...
+        let file_mode = fs::metadata(reference.image_path.join("base"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(file_mode & 0o222, 0, "published files must be read-only");
+        // ...but directories stay writable so GC's remove_dir_all can unlink
+        // entries -- sealing dirs read-only would make images undeletable and
+        // disk growth unbounded.
+        let dir_mode = fs::metadata(&reference.image_path)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_ne!(dir_mode & 0o200, 0, "image dir must stay writable for GC");
+        let nested_mode = fs::metadata(reference.image_path.join("nested"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_ne!(
+            nested_mode & 0o200,
+            0,
+            "nested dirs must stay writable for GC"
+        );
+        // Concrete proof: the published tree is reclaimable.
+        let destination = reference.image_path.parent().unwrap();
+        fs::remove_dir_all(destination)
+            .expect("GC must be able to remove a published derived image");
     }
 
     #[test]
@@ -901,5 +1020,165 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, DerivedError::InvalidImage { .. }));
         assert!(!temp.path().join("store").join(DERIVED).exists());
+    }
+
+    #[test]
+    fn injected_dependency_is_excluded_from_image_but_readable_during_build() {
+        // The lifecycle build callback injects the package's dependency
+        // subtree so scripts can resolve it, then strips the injected entries
+        // before returning. The published derived image must contain the
+        // package's own post-lifecycle tree only -- never the injected deps.
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("pkg.js"), b"module.exports = 1;").unwrap();
+        let scripts = BTreeMap::from([("install".to_owned(), "node build.js".to_owned())]);
+        let environment = BTreeMap::new();
+        let metadata = FakeMetadata::default();
+        let store = DerivedStore::open(&temp.path().join("store"), &metadata).unwrap();
+
+        let built = store
+            .ensure(
+                &inputs(&scripts, &environment),
+                &source,
+                EnsureOptions::default(),
+                |sandbox| {
+                    let dep = sandbox.join("node_modules").join("my-dep");
+                    fs::create_dir_all(&dep).unwrap();
+                    fs::write(dep.join("package.json"), b"{\"name\":\"my-dep\"}").unwrap();
+                    // The script reads the injected dependency during build.
+                    let manifest = fs::read_to_string(dep.join("package.json")).unwrap();
+                    fs::write(
+                        sandbox.join("built.js"),
+                        format!("// built against {manifest}"),
+                    )
+                    .unwrap();
+                    strip_injected_deps(sandbox, &["my-dep"]);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let reference = match built {
+            EnsureDerived::Built(reference) => reference,
+            other => panic!("expected built object, got {other:?}"),
+        };
+
+        // Injected dependency is absent from the published image ...
+        assert!(!reference.image_path.join("node_modules").exists());
+        // ... but the derived output that consumed it is present.
+        let published = fs::read_to_string(reference.image_path.join("built.js")).unwrap();
+        assert!(published.contains("built against {\"name\":\"my-dep\"}"));
+        // The source image is never mutated by the build.
+        assert!(!source.join("node_modules").exists());
+        assert!(!source.join("built.js").exists());
+    }
+
+    #[test]
+    fn strip_is_surgical_script_created_node_modules_entry_survives() {
+        // Stripping removes only the paths bpm injected. Content the lifecycle
+        // script itself wrote -- even inside `node_modules/` -- is derived
+        // output and must survive into the published image.
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("pkg.js"), b"module.exports = 1;").unwrap();
+        let scripts = BTreeMap::from([("postinstall".to_owned(), "node gen.js".to_owned())]);
+        let environment = BTreeMap::new();
+        let metadata = FakeMetadata::default();
+        let store = DerivedStore::open(&temp.path().join("store"), &metadata).unwrap();
+
+        let built = store
+            .ensure(
+                &inputs(&scripts, &environment),
+                &source,
+                EnsureOptions::default(),
+                |sandbox| {
+                    let dep = sandbox.join("node_modules").join("my-dep");
+                    fs::create_dir_all(&dep).unwrap();
+                    fs::write(dep.join("package.json"), b"{}").unwrap();
+                    // Script writes a sibling entry that bpm did not inject.
+                    let generated = sandbox.join("node_modules").join("generated");
+                    fs::create_dir_all(&generated).unwrap();
+                    fs::write(generated.join("extra.js"), b"// derived").unwrap();
+                    strip_injected_deps(sandbox, &["my-dep"]);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let reference = match built {
+            EnsureDerived::Built(reference) => reference,
+            other => panic!("expected built object, got {other:?}"),
+        };
+
+        assert!(!reference.image_path.join("node_modules/my-dep").exists());
+        assert_eq!(
+            fs::read(reference.image_path.join("node_modules/generated/extra.js")).unwrap(),
+            b"// derived"
+        );
+    }
+
+    #[test]
+    fn stripped_dependencies_do_not_fold_into_published_identity() {
+        // Two builds with different dependency graphs inject different deps,
+        // produce identical derived output, and strip their deps. Their cache
+        // keys differ (dependency identity is captured by the key) but their
+        // published tree identities match -- proving the derived image is a
+        // pure function of the package's own post-lifecycle tree, not of the
+        // stripped build-time dependencies.
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("pkg.js"), b"module.exports = 1;").unwrap();
+        let scripts = BTreeMap::from([("install".to_owned(), "node build.js".to_owned())]);
+        let environment = BTreeMap::new();
+        let metadata = FakeMetadata::default();
+        let store = DerivedStore::open(&temp.path().join("store"), &metadata).unwrap();
+
+        let graph_a: [u8; 32] = [2; 32];
+        let graph_b: [u8; 32] = [3; 32];
+        let inject_and_build = |sandbox: &Path, dep: &str| {
+            let dir = sandbox.join("node_modules").join(dep);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("package.json"), b"{}").unwrap();
+            fs::write(sandbox.join("built.js"), b"compiled-output").unwrap();
+            strip_injected_deps(sandbox, &[dep]);
+            Ok(())
+        };
+
+        let built_a = store
+            .ensure(
+                &inputs_with_graph(&scripts, &environment, &graph_a),
+                &source,
+                EnsureOptions::default(),
+                |sandbox| inject_and_build(sandbox, "dep-a"),
+            )
+            .unwrap();
+        let built_b = store
+            .ensure(
+                &inputs_with_graph(&scripts, &environment, &graph_b),
+                &source,
+                EnsureOptions::default(),
+                |sandbox| inject_and_build(sandbox, "dep-b"),
+            )
+            .unwrap();
+        let reference_a = match built_a {
+            EnsureDerived::Built(reference) => reference,
+            other => panic!("expected built object, got {other:?}"),
+        };
+        let reference_b = match built_b {
+            EnsureDerived::Built(reference) => reference,
+            other => panic!("expected built object, got {other:?}"),
+        };
+
+        // Dependency identity is captured by the key, so the keys differ ...
+        assert_ne!(reference_a.key, reference_b.key);
+        // ... but the published images are byte-identical (deps were stripped).
+        assert_eq!(tree_digest_of(&reference_a), tree_digest_of(&reference_b));
+        assert_eq!(
+            fs::read(reference_a.image_path.join("built.js")).unwrap(),
+            fs::read(reference_b.image_path.join("built.js")).unwrap()
+        );
+        assert!(!reference_a.image_path.join("node_modules").exists());
+        assert!(!reference_b.image_path.join("node_modules").exists());
     }
 }
