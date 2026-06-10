@@ -9,9 +9,10 @@ use bpm::config::NpmConfig;
 use bpm::graph;
 use bpm::http::HttpClient;
 use bpm::integrity::{ArtifactId, Integrity};
-use bpm::lockfile::{find_lockfile, Lockfile};
+use bpm::lockfile::Lockfile;
 use bpm::manifest::PackageManifest;
 use bpm::metrics::Metrics;
+use bpm::project_lock::{find_project_lock, validate_npm_direct_install, ProjectLockKind};
 use bpm::resolver;
 use bpm::resolver::model::PlatformConstraints;
 use bpm::resolver::platform::{check_package_platform, PackageReachability, PlatformDisposition};
@@ -28,11 +29,20 @@ pub(super) struct Options {
     pub json_metrics: Option<PathBuf>,
     pub global: bool,
     pub ignore_scripts: bool,
+    /// Experimental per-package lifecycle-derived image cache (`--derived-store` / `BPM_DERIVED_STORE`).
+    pub derived_store: bool,
     pub legacy_peer_deps: bool,
     pub cache_mode: bpm::metadata_cache::CacheMode,
 }
 
-pub(super) fn run(options: Options) -> anyhow::Result<()> {
+pub(super) fn run(mut options: Options) -> anyhow::Result<()> {
+    // `--derived-store` and `BPM_DERIVED_STORE=1` are equivalent. Honor the
+    // env var so callers (and tests) can opt in without a CLI flag, mirroring
+    // `BPM_STREAM_INSTALL` / `BPM_PROJECT_VIEW`.
+    if !options.derived_store {
+        options.derived_store =
+            matches!(env::var("BPM_DERIVED_STORE").as_deref(), Ok("1" | "true"));
+    }
     if let Some(target) = options.target {
         return run_install_bin(
             &target,
@@ -47,16 +57,21 @@ pub(super) fn run(options: Options) -> anyhow::Result<()> {
     let store = ArtifactStore::open(&store_root_path)?;
     let mut metrics = Metrics::new();
     let cwd = env::current_dir()?;
-    let (lockfile_path, lockfile, project_root) = match find_lockfile(&cwd)? {
-        Some((path, lockfile)) => {
-            let root = path
-                .parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| PathBuf::from("."));
-            (path, lockfile, root)
+    let (lockfile_path, lockfile, project_root, lock_kind) = match find_project_lock(&cwd)? {
+        Some(project_lock) => {
+            if project_lock.kind == ProjectLockKind::NpmV3 {
+                validate_npm_direct_install(&project_lock.diagnostics)?;
+                render_import_diagnostics(&project_lock.diagnostics);
+            }
+            (
+                project_lock.path,
+                project_lock.lockfile,
+                project_lock.project_root,
+                project_lock.kind,
+            )
         }
         None if options.frozen => anyhow::bail!(
-            "frozen install requires bpm.lock in {} or an ancestor",
+            "frozen install requires bpm.lock or supported package-lock.json v3 in {} or an ancestor",
             cwd.display()
         ),
         None => {
@@ -112,11 +127,11 @@ pub(super) fn run(options: Options) -> anyhow::Result<()> {
                 lockfile.packages.len(),
                 path.display()
             );
-            (path, lockfile, root)
+            (path, lockfile, root, ProjectLockKind::Bpm)
         }
     };
     if options.frozen {
-        enforce_frozen(&project_root, &lockfile)?;
+        enforce_frozen(&project_root, &lockfile, lock_kind.filename())?;
     }
 
     let config = effective_npm_config(&project_root, options.registry.as_deref())?;
@@ -152,7 +167,7 @@ pub(super) fn run(options: Options) -> anyhow::Result<()> {
     }
     metrics.record("plan_cache_miss", std::time::Duration::ZERO);
 
-    let work = build_install_work(&lockfile, options.frozen)?;
+    let work = build_install_work(&lockfile, options.frozen, lock_kind.filename())?;
     let workers = adaptive_workers(options.concurrency, work.len(), &project_root);
     let outcomes = std::thread::scope(|scope| -> anyhow::Result<Vec<FetchOutcome>> {
         let (unit_tx, unit_rx) = std::sync::mpsc::sync_channel::<InstallWork>(workers.max(1) * 2);
@@ -243,6 +258,7 @@ fn run_lifecycle_if_enabled(
     volume_path: Option<&Path>,
     ignore_scripts: bool,
     skip_execution: bool,
+    derived_store: bool,
     metrics: &mut Metrics,
 ) -> bpm::lifecycle::LifecycleStats {
     if ignore_scripts {
@@ -252,6 +268,7 @@ fn run_lifecycle_if_enabled(
     let policy = bpm::lifecycle::LifecyclePolicy {
         ignore_scripts: false,
         skip_execution,
+        use_derived_store: derived_store,
     };
     match bpm::lifecycle::run_lifecycle(
         project_root,
@@ -468,7 +485,28 @@ fn set_executable(path: &Path) {
 #[cfg(not(unix))]
 fn set_executable(_path: &Path) {}
 
-fn enforce_frozen(project_root: &Path, lockfile: &Lockfile) -> anyhow::Result<()> {
+fn render_import_diagnostics(diagnostics: &[bpm::Diagnostic]) {
+    for diagnostic in diagnostics {
+        let package = diagnostic
+            .package
+            .as_deref()
+            .map(|value| format!(" (in {value})"))
+            .unwrap_or_default();
+        eprintln!(
+            "{}[{}] {}{}",
+            diagnostic.severity.as_str(),
+            diagnostic.code,
+            diagnostic.message,
+            package
+        );
+    }
+}
+
+fn enforce_frozen(
+    project_root: &Path,
+    lockfile: &Lockfile,
+    lock_label: &str,
+) -> anyhow::Result<()> {
     let manifest_path = project_root.join("package.json");
     let manifest = match PackageManifest::from_path(&manifest_path) {
         Ok(manifest) => manifest,
@@ -508,9 +546,9 @@ fn enforce_frozen(project_root: &Path, lockfile: &Lockfile) -> anyhow::Result<()
         .map(String::as_str)
         .collect::<Vec<_>>();
     anyhow::bail!(
-        "frozen install refused: package.json and bpm.lock disagree on root dependencies\n  \
-         in package.json but not bpm.lock: {}\n  \
-         in bpm.lock but not package.json: {}\n  \
+        "frozen install refused: package.json and {lock_label} disagree on root dependencies\n  \
+         in package.json but not {lock_label}: {}\n  \
+         in {lock_label} but not package.json: {}\n  \
          re-run `bpm import` after editing package.json",
         if only_manifest.is_empty() {
             "(none)".to_string()
@@ -881,6 +919,7 @@ fn finalize_install(
         // This only applies to the volume path; the workspace/compatible
         // path (volume == None) uses disposable sandboxes and still runs.
         volume.as_ref().is_some_and(|v| v.cached),
+        options.derived_store,
         metrics,
     );
     if local_project_view {
@@ -922,7 +961,11 @@ fn finalize_install(
     write_metrics(metrics, options.json_metrics.clone())
 }
 
-fn build_install_work(lockfile: &Lockfile, frozen: bool) -> anyhow::Result<Vec<InstallWork>> {
+fn build_install_work(
+    lockfile: &Lockfile,
+    frozen: bool,
+    lock_label: &str,
+) -> anyhow::Result<Vec<InstallWork>> {
     let mut work = Vec::new();
     let target = resolver::current_target_platform();
     for package in lockfile.packages.iter() {
@@ -966,7 +1009,7 @@ fn build_install_work(lockfile: &Lockfile, frozen: bool) -> anyhow::Result<Vec<I
                 )
             })?),
             None if frozen => anyhow::bail!(
-                "package '{}' at {} has no integrity; cannot verify a frozen install (re-run `bpm import`)",
+                "package '{}' at {} in {lock_label} has no integrity; cannot verify a frozen install",
                 package.name,
                 package.path
             ),
