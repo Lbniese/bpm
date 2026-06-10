@@ -134,6 +134,72 @@ fn setup_project() -> (tempfile::TempDir, tempfile::TempDir, tempfile::TempDir) 
     (project, store, tgz)
 }
 
+fn setup_package_lock_project() -> (tempfile::TempDir, tempfile::TempDir, tempfile::TempDir) {
+    let project = tempdir().unwrap();
+    let store = tempdir().unwrap();
+    let tgz = tempdir().unwrap();
+
+    let (greet_path, greet_int) = seed_tarball(
+        tgz.path(),
+        "greet.tgz",
+        &build_tgz(&[
+            (
+                "package/package.json",
+                b"{\"name\":\"greet\",\"version\":\"1.0.0\"}",
+                0o644,
+            ),
+            (
+                "package/cli.js",
+                b"#!/usr/bin/env node\nconsole.log('hello');\n",
+                0o755,
+            ),
+        ]),
+    );
+    let (dep_path, dep_int) = seed_tarball(
+        tgz.path(),
+        "dep.tgz",
+        &build_tgz(&[("package/package.json", b"{\"name\":\"dep\"}", 0o644)]),
+    );
+
+    fs::write(
+        project.path().join("package.json"),
+        r#"{"name":"app","version":"1.0.0","dependencies":{"greet":"^1.0.0"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        project.path().join("package-lock.json"),
+        format!(
+            r#"{{
+  "name": "app",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "packages": {{
+    "": {{ "name": "app", "version": "1.0.0", "dependencies": {{ "greet": "^1.0.0" }} }},
+    "node_modules/greet": {{
+      "version": "1.0.0",
+      "resolved": "file://{}",
+      "integrity": "{}",
+      "bin": {{ "hello": "./cli.js" }},
+      "dependencies": {{ "dep": "^1.0.0" }}
+    }},
+    "node_modules/greet/node_modules/dep": {{
+      "version": "1.0.0",
+      "resolved": "file://{}",
+      "integrity": "{}"
+    }}
+  }}
+}}"#,
+            greet_path.display(),
+            greet_int.to_npm_string(),
+            dep_path.display(),
+            dep_int.to_npm_string()
+        ),
+    )
+    .unwrap();
+
+    (project, store, tgz)
+}
+
 fn run_install(project: &Path, store: &Path) -> std::process::Output {
     Command::new(bpm_bin())
         .arg("install")
@@ -153,6 +219,16 @@ fn run_plain_install(project: &Path, store: &Path) -> std::process::Output {
         .current_dir(project)
         .output()
         .expect("failed to run bpm")
+}
+
+fn run_ci(project: &Path, store: &Path) -> std::process::Output {
+    Command::new(bpm_bin())
+        .arg("ci")
+        .arg("--store")
+        .arg(store)
+        .current_dir(project)
+        .output()
+        .expect("failed to run bpm ci")
 }
 
 #[test]
@@ -199,6 +275,148 @@ fn frozen_install_materializes_node_modules_and_bins() {
         fs::read_link(&bin).unwrap(),
         PathBuf::from("../greet/cli.js"),
         "volume bins must preserve package-relative resolution",
+    );
+}
+
+#[test]
+fn installs_directly_from_package_lock_without_writing_bpm_lock() {
+    let (project, store, _tgz) = setup_package_lock_project();
+    let lock_path = project.path().join("package-lock.json");
+    let before = fs::read(&lock_path).unwrap();
+
+    let out = run_plain_install(project.path(), store.path());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "install failed: {stderr}");
+    assert!(
+        stdout.contains("installed 2 package(s)"),
+        "stdout: {stdout}"
+    );
+    assert!(project
+        .path()
+        .join("node_modules/greet/package.json")
+        .exists());
+    assert!(project
+        .path()
+        .join("node_modules/greet/node_modules/dep/package.json")
+        .exists());
+    assert!(project.path().join("node_modules/.bin/hello").exists());
+    assert!(project.path().join(".bpm-state").exists());
+    assert!(!project.path().join("bpm.lock").exists());
+    assert_eq!(fs::read(&lock_path).unwrap(), before);
+
+    let second = run_plain_install(project.path(), store.path());
+    assert!(second.status.success());
+    assert!(
+        String::from_utf8_lossy(&second.stdout).contains("nothing to install"),
+        "stdout: {}",
+        String::from_utf8_lossy(&second.stdout)
+    );
+}
+
+#[test]
+fn ci_uses_package_lock_and_reports_package_lock_drift() {
+    let (project, store, _tgz) = setup_package_lock_project();
+
+    let ci = run_ci(project.path(), store.path());
+    assert!(
+        ci.status.success(),
+        "ci failed: {}",
+        String::from_utf8_lossy(&ci.stderr)
+    );
+    assert!(!project.path().join("bpm.lock").exists());
+
+    fs::write(
+        project.path().join("package.json"),
+        r#"{"name":"app","dependencies":{"greet":"^1.0.0","extra":"1.0.0"}}"#,
+    )
+    .unwrap();
+    let drift = run_ci(project.path(), store.path());
+    assert!(!drift.status.success());
+    let stderr = String::from_utf8_lossy(&drift.stderr);
+    assert!(stderr.contains("package-lock.json"), "{stderr}");
+    assert!(stderr.contains("extra"), "{stderr}");
+}
+
+#[test]
+fn package_lock_v1_v2_and_blocking_diagnostics_are_rejected() {
+    for version in [1, 2] {
+        let project = tempdir().unwrap();
+        let store = tempdir().unwrap();
+        fs::write(project.path().join("package.json"), r#"{"name":"app"}"#).unwrap();
+        fs::write(
+            project.path().join("package-lock.json"),
+            format!(r#"{{"lockfileVersion":{version},"packages":{{}}}}"#),
+        )
+        .unwrap();
+
+        let out = run_plain_install(project.path(), store.path());
+        assert!(!out.status.success(), "v{version} should fail");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(&format!("unsupported lockfileVersion {version}")),
+            "{stderr}"
+        );
+    }
+
+    let project = tempdir().unwrap();
+    let store = tempdir().unwrap();
+    fs::write(project.path().join("package.json"), r#"{"name":"app"}"#).unwrap();
+    fs::write(
+        project.path().join("package-lock.json"),
+        r#"{"lockfileVersion":3,"packages":{"":{"name":"app"},"packages/local":{"version":"1.0.0","link":true},"node_modules/missing":{"version":"1.0.0"}}}"#,
+    )
+    .unwrap();
+
+    let out = run_plain_install(project.path(), store.path());
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("LINK_PACKAGE_UNSUPPORTED"), "{stderr}");
+    assert!(stderr.contains("MISSING_RESOLVED"), "{stderr}");
+    assert!(!project.path().join("node_modules").exists());
+}
+
+#[test]
+fn selected_lock_precedence_matches_project_lock_contract() {
+    let (project, store, _tgz) = setup_project();
+    fs::write(
+        project.path().join("package-lock.json"),
+        r#"{"lockfileVersion":2,"packages":{}}"#,
+    )
+    .unwrap();
+    let sibling = run_plain_install(project.path(), store.path());
+    assert!(
+        sibling.status.success(),
+        "sibling bpm.lock should win: {}",
+        String::from_utf8_lossy(&sibling.stderr)
+    );
+
+    let child = project.path().join("child");
+    fs::create_dir(&child).unwrap();
+    fs::write(
+        child.join("package.json"),
+        r#"{"name":"child","dependencies":{"greet":"^1.0.0"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        child.join("package-lock.json"),
+        fs::read_to_string(project.path().join("package-lock.json"))
+            .unwrap()
+            .replace("\"lockfileVersion\":2", "\"lockfileVersion\":3"),
+    )
+    .unwrap();
+
+    let nested = run_plain_install(&child, store.path());
+    assert!(
+        !nested.status.success(),
+        "nested package-lock should be selected before ancestor bpm.lock"
+    );
+    assert!(
+        String::from_utf8_lossy(&nested.stderr).contains("NoPackages")
+            || String::from_utf8_lossy(&nested.stderr).contains("no \"packages\" table")
+            || String::from_utf8_lossy(&nested.stderr).contains("package-lock.json"),
+        "{}",
+        String::from_utf8_lossy(&nested.stderr)
     );
 }
 

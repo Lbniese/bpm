@@ -276,3 +276,199 @@ fn second_project_reuses_volume_and_skips_lifecycle() {
         "reused volume must not re-run lifecycle / rewrite derived content",
     );
 }
+
+/// Headline derived-store test: two *different* graphs that share a
+/// lifecycle-bearing package's dependency closure reuse that package's derived
+/// image, so its scripts never re-run on the second graph.
+///
+/// Graph G1 = {host, host-dep, unrelated-a}; G2 = {host, host-dep,
+/// unrelated-b}. `host` carries a postinstall; `unrelated-*` is not reachable
+/// from `host`, so `host`'s closure (and thus its derived key) is identical
+/// across G1 and G2 even though the graphs differ. With `BPM_DERIVED_STORE=1`,
+/// project A builds and publishes `host`'s derived image; project B (different
+/// graph, same store) attaches it and skips the postinstall entirely -- proven
+/// by a run-counter the script appends on every execution.
+#[test]
+fn derived_store_reuses_image_across_graphs_with_same_closure() {
+    let store = tempfile::tempdir().unwrap();
+    let tgz = tempfile::tempdir().unwrap();
+
+    // `host` appends to a run-counter on every postinstall, so re-execution is
+    // observable as a line count > 1. The guard `test -d ../host-dep` proves the
+    // dependency still resolves during the derived build (npm semantics).
+    let host_bytes = build_tgz(|b| {
+        add_dir_pkg(b);
+        add_file(
+            b,
+            "package/package.json",
+            0o644,
+            br#"{"name":"host","version":"1.0.0","scripts":{"postinstall":"test -d ../host-dep && echo run >> .bpm-runs"},"dependencies":{"host-dep":"^1.0.0"}}"#,
+        );
+    });
+    let host_dep_bytes = build_tgz(|b| {
+        add_dir_pkg(b);
+        add_file(
+            b,
+            "package/package.json",
+            0o644,
+            br#"{"name":"host-dep","version":"1.0.0"}"#,
+        );
+    });
+    let unrel_a_bytes = build_tgz(|b| {
+        add_dir_pkg(b);
+        add_file(
+            b,
+            "package/package.json",
+            0o644,
+            br#"{"name":"unrelated-a","version":"1.0.0"}"#,
+        );
+    });
+    let unrel_b_bytes = build_tgz(|b| {
+        add_dir_pkg(b);
+        add_file(
+            b,
+            "package/package.json",
+            0o644,
+            br#"{"name":"unrelated-b","version":"1.0.0"}"#,
+        );
+    });
+
+    let (host_path, host_int) = seed_tarball(tgz.path(), "host.tgz", &host_bytes);
+    let (hd_path, hd_int) = seed_tarball(tgz.path(), "host-dep.tgz", &host_dep_bytes);
+    let (ua_path, ua_int) = seed_tarball(tgz.path(), "unrelated-a.tgz", &unrel_a_bytes);
+    let (ub_path, ub_int) = seed_tarball(tgz.path(), "unrelated-b.tgz", &unrel_b_bytes);
+
+    let host_resolved = format!("file://{}", host_path.display());
+    let hd_resolved = format!("file://{}", hd_path.display());
+    let host_int_str = host_int.to_npm_string();
+    let hd_int_str = hd_int.to_npm_string();
+
+    let write_project = |dir: &Path, unrel_name: &str, unrel_path: &Path, unrel_int_str: String| {
+        fs::write(
+            dir.join("package.json"),
+            format!(
+                r#"{{"name":"app","version":"1.0.0","dependencies":{{"host":"^1.0.0","{unrel_name}":"^1.0.0"}}}}"#
+            ),
+        )
+        .unwrap();
+        let mut lf = Lockfile::new("bpm-test");
+        lf.root = RootEntry {
+            name: Some("app".into()),
+            version: Some("1.0.0".into()),
+            dependencies: BTreeMap::from([
+                ("host".into(), "^1.0.0".into()),
+                (unrel_name.into(), "^1.0.0".into()),
+            ]),
+        };
+        lf.packages.push(PackageEntry {
+            path: "node_modules/host".into(),
+            name: "host".into(),
+            version: "1.0.0".into(),
+            resolved: host_resolved.clone(),
+            integrity: Some(host_int_str.clone()),
+            dependencies: BTreeMap::from([("host-dep".into(), "^1.0.0".into())]),
+            ..Default::default()
+        });
+        lf.packages.push(PackageEntry {
+            path: "node_modules/host-dep".into(),
+            name: "host-dep".into(),
+            version: "1.0.0".into(),
+            resolved: hd_resolved.clone(),
+            integrity: Some(hd_int_str.clone()),
+            ..Default::default()
+        });
+        lf.packages.push(PackageEntry {
+            path: format!("node_modules/{unrel_name}"),
+            name: unrel_name.into(),
+            version: "1.0.0".into(),
+            resolved: format!("file://{}", unrel_path.display()),
+            integrity: Some(unrel_int_str),
+            ..Default::default()
+        });
+        lf.sort_packages();
+        lf.write_to(&dir.join("bpm.lock")).unwrap();
+    };
+
+    let proj_a = tempfile::tempdir().unwrap();
+    write_project(
+        proj_a.path(),
+        "unrelated-a",
+        &ua_path,
+        ua_int.to_npm_string(),
+    );
+    let proj_b = tempfile::tempdir().unwrap();
+    write_project(
+        proj_b.path(),
+        "unrelated-b",
+        &ub_path,
+        ub_int.to_npm_string(),
+    );
+
+    let metrics_a = proj_a.path().join("metrics_a.json");
+    let out_a = Command::new(bpm_bin())
+        .arg("install")
+        .arg("--frozen")
+        .arg("--store")
+        .arg(store.path())
+        .arg("--json-metrics")
+        .arg(&metrics_a)
+        .env("BPM_DERIVED_STORE", "1")
+        .current_dir(proj_a.path())
+        .output()
+        .expect("failed to run bpm");
+    let stderr_a = String::from_utf8_lossy(&out_a.stderr);
+    assert!(out_a.status.success(), "install A failed: {stderr_a}");
+    let runs_a = proj_a.path().join("node_modules/host/.bpm-runs");
+    assert!(
+        runs_a.exists(),
+        "host postinstall did not run in A: {stderr_a}",
+    );
+    let metrics_a_text = fs::read_to_string(&metrics_a).unwrap();
+    assert!(
+        metrics_a_text.contains("derived_store_built"),
+        "A should build + publish host's derived image: {metrics_a_text}",
+    );
+
+    // Settle so an accidental re-run would advance the run-counter unambiguously.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+
+    let metrics_b = proj_b.path().join("metrics_b.json");
+    let out_b = Command::new(bpm_bin())
+        .arg("install")
+        .arg("--frozen")
+        .arg("--store")
+        .arg(store.path())
+        .arg("--json-metrics")
+        .arg(&metrics_b)
+        .env("BPM_DERIVED_STORE", "1")
+        .current_dir(proj_b.path())
+        .output()
+        .expect("failed to run bpm");
+    let stdout_b = String::from_utf8_lossy(&out_b.stdout);
+    let stderr_b = String::from_utf8_lossy(&out_b.stderr);
+    assert!(out_b.status.success(), "install B failed: {stderr_b}");
+    // G2 != G1, so the volume is NOT reused -- it is a fresh build.
+    assert!(
+        !stdout_b.contains("graph volume reused"),
+        "G2 must build its own volume (it is a different graph): {stdout_b}",
+    );
+    let metrics_b_text = fs::read_to_string(&metrics_b).unwrap();
+    assert!(
+        metrics_b_text.contains("derived_store_hit"),
+        "B must reuse host's derived image across the different graph: {metrics_b_text}",
+    );
+
+    // Headline proof: host's postinstall did NOT re-run in B. The run-counter
+    // would hold two lines had the script executed; the attached derived image
+    // still carries the single line from A's build.
+    let runs_b = proj_b.path().join("node_modules/host/.bpm-runs");
+    assert!(
+        runs_b.exists(),
+        "B did not attach host's derived image: {stderr_b}",
+    );
+    let b_runs_count = fs::read_to_string(&runs_b).unwrap().lines().count();
+    assert_eq!(
+        b_runs_count, 1,
+        "host postinstall re-ran in B (derived store did not hit): {stderr_b}\nmetrics: {metrics_b_text}",
+    );
+}

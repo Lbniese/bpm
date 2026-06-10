@@ -11,5 +11,5 @@ mod store;
 pub use key::{derived_key, DerivedInputs, DerivedKey, RuntimeIdentity, TargetDescriptor};
 pub use store::{
     DerivedError, DerivedMetadata, DerivedRecord, DerivedRef, DerivedStore, EnsureDerived,
-    EnsureOptions, SandboxFailure,
+    EnsureOptions, NullDerivedMetadata, SandboxFailure,
 };

@@ -14,7 +14,7 @@
 //! entries are already sorted by path in `bpm.lock`, and dependency/bin maps
 //! are `BTreeMap`s, so encoding is stable across machines and runs.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::integrity::ArtifactId;
-use crate::lockfile::Lockfile;
+use crate::lockfile::{Lockfile, PackageEntry, PackageResolution};
 use crate::store::ArtifactStore;
 
 ///plan file name written next to `bpm.lock` (IMPLEMENTATION §9: `.bpm-state`).
@@ -230,6 +230,101 @@ pub fn graph_id_with_workspace(
 pub fn graph_id_for_project(lockfile: &Lockfile, project_root: &Path) -> GraphId {
     let ws = crate::workspace::discover(project_root);
     graph_id_with_workspace(lockfile, &ws)
+}
+
+/// Compute a deterministic BLAKE3 digest of one package's resolved dependency
+/// closure, for use as the `dependency_graph` input of a derived-artifact key.
+///
+/// The walk follows the resolved `target` edges the resolver recorded in
+/// `bpm.lock` across `dependencies`, `optional_dependencies`, and
+/// `peer_dependencies`, so it mirrors exactly what a lifecycle script's
+/// `require()` resolves to at runtime, including npm's hoisting. An unrelated
+/// dependency elsewhere in the graph does not flip a package's digest; a
+/// reachable dependency's version, placement, or own closure does. Dependency
+/// cycles (which npm permits) terminate via a deterministic back-edge marker.
+///
+/// The digest is a pure function of `(lockfile, package_path)`: each call uses
+/// a fresh memoization table so a package's key never depends on the order in
+/// which packages are processed during an install.
+pub fn package_closure_digest(lockfile: &Lockfile, package_path: &str) -> [u8; 32] {
+    let package_index: HashMap<&str, &PackageEntry> = lockfile
+        .packages
+        .iter()
+        .map(|entry| (entry.path.as_str(), entry))
+        .collect();
+    let mut memo: HashMap<String, [u8; 32]> = HashMap::new();
+    let mut stack: HashSet<String> = HashSet::new();
+    closure_digest(
+        package_path,
+        &package_index,
+        &lockfile.resolution.packages,
+        &mut memo,
+        &mut stack,
+    )
+}
+
+fn closure_digest(
+    path: &str,
+    packages: &HashMap<&str, &PackageEntry>,
+    resolution: &BTreeMap<String, PackageResolution>,
+    memo: &mut HashMap<String, [u8; 32]>,
+    stack: &mut HashSet<String>,
+) -> [u8; 32] {
+    if let Some(digest) = memo.get(path) {
+        return *digest;
+    }
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"bpm-package-closure-v1\0");
+    // The package's own identity. Redundant with `source_artifact` for the
+    // root of the walk, but harmless and required for each transitive member
+    // of the closure to contribute its version/resolved/integrity.
+    hasher.update(b"path\0");
+    hasher.update(path.as_bytes());
+    if let Some(entry) = packages.get(path) {
+        hasher.update(b"version\0");
+        hasher.update(entry.version.as_bytes());
+        hasher.update(b"resolved\0");
+        hasher.update(entry.resolved.as_bytes());
+        hasher.update(b"integrity\0");
+        hasher.update(entry.integrity.as_deref().unwrap_or("").as_bytes());
+    }
+
+    // Collect the resolved target paths across every dependency kind npm lets a
+    // lifecycle script reach via require(). Dedup by placement so a target
+    // shared by several dep names is folded once.
+    stack.insert(path.to_string());
+    let mut children: BTreeSet<&str> = BTreeSet::new();
+    if let Some(resolved) = resolution.get(path) {
+        for dependency in resolved
+            .dependencies
+            .values()
+            .chain(resolved.optional_dependencies.values())
+            .chain(resolved.peer_dependencies.values())
+        {
+            children.insert(dependency.target.as_str());
+        }
+    }
+    for target in children {
+        hasher.update(b"child\0");
+        let child_digest = if stack.contains(target) {
+            // Back-edge (a dependency cycle). Fold a deterministic marker
+            // instead of recursing so the walk terminates without counting the
+            // cycle more than once.
+            let mut marker = blake3::Hasher::new();
+            marker.update(b"bpm-package-closure-cycle\0");
+            marker.update(target.as_bytes());
+            *marker.finalize().as_bytes()
+        } else {
+            closure_digest(target, packages, resolution, memo, stack)
+        };
+        hasher.update(&child_digest);
+    }
+    stack.remove(path);
+
+    let digest = *hasher.finalize().as_bytes();
+    memo.insert(path.to_string(), digest);
+    digest
 }
 
 /// Build a compiled plan from a lockfile and the resolved artifact id for each
@@ -445,7 +540,9 @@ fn _write_marker<W: Write>(_w: W, _b: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lockfile::{Lockfile, PackageEntry, RootEntry};
+    use crate::lockfile::{
+        LockDependency, LockSource, Lockfile, PackageEntry, PackageResolution, RootEntry,
+    };
 
     fn lf() -> Lockfile {
         let mut l = Lockfile::new("bpm");
@@ -529,5 +626,252 @@ mod tests {
             validate_plan(&plan, &l, dir.path(), &store).unwrap_err(),
             PlanInvalid::GraphChanged
         );
+    }
+
+    // --- per-package closure digest (derived-artifact `dependency_graph`) ---
+
+    fn pkg(path: &str, version: &str, integrity: &str) -> PackageEntry {
+        PackageEntry {
+            path: path.into(),
+            name: path.rsplit('/').next().unwrap_or(path).into(),
+            version: version.into(),
+            resolved: format!("https://reg/{path}-{version}.tgz"),
+            integrity: Some(integrity.into()),
+            ..Default::default()
+        }
+    }
+
+    fn res(deps: &[(&str, &str)]) -> PackageResolution {
+        PackageResolution {
+            source: LockSource::Registry {
+                registry: "https://registry.npmjs.org".into(),
+            },
+            dev_optional: false,
+            peer: false,
+            dependencies: deps
+                .iter()
+                .map(|(name, target)| {
+                    (
+                        (*name).into(),
+                        LockDependency {
+                            spec: "*".into(),
+                            target: (*target).into(),
+                        },
+                    )
+                })
+                .collect(),
+            optional_dependencies: BTreeMap::new(),
+            peer_dependencies: BTreeMap::new(),
+            optional_peers: BTreeSet::new(),
+            peer_context: BTreeMap::new(),
+            libc: Vec::new(),
+            workspace_target: None,
+            has_install_script: false,
+        }
+    }
+
+    fn closure_lockfile(
+        packages: &[PackageEntry],
+        resolution: &[(&str, PackageResolution)],
+    ) -> Lockfile {
+        let mut lockfile = Lockfile::new("bpm");
+        for entry in packages {
+            lockfile.packages.push(entry.clone());
+        }
+        for (path, resolved) in resolution {
+            lockfile
+                .resolution
+                .packages
+                .insert((*path).into(), resolved.clone());
+        }
+        lockfile.sort_packages();
+        lockfile
+    }
+
+    #[test]
+    fn closure_digest_is_stable_for_the_same_lockfile() {
+        let packages = [
+            pkg("node_modules/native", "1.0.0", "sha512-native"),
+            pkg("node_modules/headers", "2.0.0", "sha512-headers"),
+        ];
+        let resolution = [
+            (
+                "node_modules/native",
+                res(&[("headers", "node_modules/headers")]),
+            ),
+            ("node_modules/headers", res(&[])),
+        ];
+        let lockfile = closure_lockfile(&packages, &resolution);
+        let a = package_closure_digest(&lockfile, "node_modules/native");
+        let b = package_closure_digest(&lockfile, "node_modules/native");
+        assert_eq!(a, b);
+        assert_ne!(a, [0u8; 32]);
+    }
+
+    #[test]
+    fn unrelated_dependency_does_not_flip_a_package_closure() {
+        // native -> headers (reachable). unrelated -> other (NOT reachable from
+        // native). Bumping `other` must not invalidate native's closure digest.
+        let packages_a = [
+            pkg("node_modules/native", "1.0.0", "sha512-native"),
+            pkg("node_modules/headers", "2.0.0", "sha512-headers"),
+            pkg("node_modules/unrelated", "1.0.0", "sha512-unrelated"),
+            pkg("node_modules/other", "1.0.0", "sha512-other"),
+        ];
+        let resolution = [
+            (
+                "node_modules/native",
+                res(&[("headers", "node_modules/headers")]),
+            ),
+            ("node_modules/headers", res(&[])),
+            (
+                "node_modules/unrelated",
+                res(&[("other", "node_modules/other")]),
+            ),
+            ("node_modules/other", res(&[])),
+        ];
+        let lockfile_a = closure_lockfile(&packages_a, &resolution);
+
+        let mut packages_b = packages_a.clone();
+        packages_b[3] = pkg("node_modules/other", "2.0.0", "sha512-other-v2");
+        let lockfile_b = closure_lockfile(&packages_b, &resolution);
+
+        assert_eq!(
+            package_closure_digest(&lockfile_a, "node_modules/native"),
+            package_closure_digest(&lockfile_b, "node_modules/native"),
+            "an unreachable dependency must not invalidate the closure"
+        );
+        // Sanity: the unrelated package's own closure DID change.
+        assert_ne!(
+            package_closure_digest(&lockfile_a, "node_modules/unrelated"),
+            package_closure_digest(&lockfile_b, "node_modules/unrelated")
+        );
+    }
+
+    #[test]
+    fn reachable_dependency_version_flips_a_package_closure() {
+        let resolution = [
+            (
+                "node_modules/native",
+                res(&[("headers", "node_modules/headers")]),
+            ),
+            ("node_modules/headers", res(&[])),
+        ];
+        let lockfile_a = closure_lockfile(
+            &[
+                pkg("node_modules/native", "1.0.0", "sha512-native"),
+                pkg("node_modules/headers", "2.0.0", "sha512-headers"),
+            ],
+            &resolution,
+        );
+        let lockfile_b = closure_lockfile(
+            &[
+                pkg("node_modules/native", "1.0.0", "sha512-native"),
+                pkg("node_modules/headers", "2.1.0", "sha512-headers-v2"),
+            ],
+            &resolution,
+        );
+
+        assert_ne!(
+            package_closure_digest(&lockfile_a, "node_modules/native"),
+            package_closure_digest(&lockfile_b, "node_modules/native"),
+            "a reachable dependency version change must invalidate the closure"
+        );
+    }
+
+    #[test]
+    fn transitive_dependency_flips_a_package_closure() {
+        // native -> mid -> leaf; bumping leaf must flip native's closure.
+        let resolution = [
+            ("node_modules/native", res(&[("mid", "node_modules/mid")])),
+            ("node_modules/mid", res(&[("leaf", "node_modules/leaf")])),
+            ("node_modules/leaf", res(&[])),
+        ];
+        let lockfile_a = closure_lockfile(
+            &[
+                pkg("node_modules/native", "1.0.0", "sha512-native"),
+                pkg("node_modules/mid", "1.0.0", "sha512-mid"),
+                pkg("node_modules/leaf", "1.0.0", "sha512-leaf"),
+            ],
+            &resolution,
+        );
+        let lockfile_b = closure_lockfile(
+            &[
+                pkg("node_modules/native", "1.0.0", "sha512-native"),
+                pkg("node_modules/mid", "1.0.0", "sha512-mid"),
+                pkg("node_modules/leaf", "2.0.0", "sha512-leaf-v2"),
+            ],
+            &resolution,
+        );
+
+        assert_ne!(
+            package_closure_digest(&lockfile_a, "node_modules/native"),
+            package_closure_digest(&lockfile_b, "node_modules/native"),
+            "a transitive dependency change must invalidate the closure"
+        );
+    }
+
+    #[test]
+    fn dependency_placement_hoisting_flips_a_package_closure() {
+        // Same versions, but `headers` moves between a hoisted and a nested
+        // node_modules path. npm resolution observes hoisting, so the closure
+        // digest must change even though the version did not.
+        let packages = [
+            pkg("node_modules/native", "1.0.0", "sha512-native"),
+            pkg("node_modules/headers", "2.0.0", "sha512-headers"),
+            pkg(
+                "node_modules/native/node_modules/headers",
+                "2.0.0",
+                "sha512-headers",
+            ),
+        ];
+        let lockfile_hoisted = closure_lockfile(
+            &packages,
+            &[
+                (
+                    "node_modules/native",
+                    res(&[("headers", "node_modules/headers")]),
+                ),
+                ("node_modules/headers", res(&[])),
+            ],
+        );
+        let lockfile_nested = closure_lockfile(
+            &packages,
+            &[
+                (
+                    "node_modules/native",
+                    res(&[("headers", "node_modules/native/node_modules/headers")]),
+                ),
+                ("node_modules/native/node_modules/headers", res(&[])),
+            ],
+        );
+
+        assert_ne!(
+            package_closure_digest(&lockfile_hoisted, "node_modules/native"),
+            package_closure_digest(&lockfile_nested, "node_modules/native"),
+            "a hoisting change affects npm resolution and must invalidate the closure"
+        );
+    }
+
+    #[test]
+    fn dependency_cycle_terminates_and_is_deterministic() {
+        // native -> a -> b -> a (cycle). Must not recurse forever, and the
+        // digest must be stable across calls.
+        let lockfile = closure_lockfile(
+            &[
+                pkg("node_modules/native", "1.0.0", "sha512-native"),
+                pkg("node_modules/a", "1.0.0", "sha512-a"),
+                pkg("node_modules/b", "1.0.0", "sha512-b"),
+            ],
+            &[
+                ("node_modules/native", res(&[("a", "node_modules/a")])),
+                ("node_modules/a", res(&[("b", "node_modules/b")])),
+                ("node_modules/b", res(&[("a", "node_modules/a")])),
+            ],
+        );
+        let first = package_closure_digest(&lockfile, "node_modules/native");
+        let second = package_closure_digest(&lockfile, "node_modules/native");
+        assert_eq!(first, second, "cyclic closure digest must be deterministic");
+        assert_ne!(first, [0u8; 32]);
     }
 }

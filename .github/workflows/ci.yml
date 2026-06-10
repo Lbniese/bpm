@@ -7,6 +7,17 @@ on:
   schedule:
     - cron: '17 3 * * 1'
   workflow_dispatch:
+    inputs:
+      informational_baseline:
+        description: Allow cross-machine or version-mismatched baseline comparisons as informational only
+        required: false
+        default: false
+        type: boolean
+      regression_envelope:
+        description: Maximum allowed current/baseline median ratio
+        required: false
+        default: '2.0'
+        type: string
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -61,15 +72,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo run --release -- bench --fixture minimal --scenario repeat_install --tools bpm --runs 3 --json /tmp/current.json
-      - name: Compare baseline envelope
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26.0.0'
+      - name: Install pnpm
+        run: npm install --global pnpm@10.13.1
+      - name: Verify pinned tool versions
         run: |
-          python3 - <<'PY'
-          import json
-          baseline = json.load(open('benchmarks/baselines/reference.json'))[0]['tools'][0]['wall_clock_ms']['median']
-          current = json.load(open('/tmp/current.json'))[0]['tools'][0]['wall_clock_ms']['median']
-          limit = baseline * 2.0
-          print(f'baseline={baseline:.3f}ms current={current:.3f}ms limit={limit:.3f}ms')
-          if current > limit:
-              raise SystemExit('benchmark regression exceeds 2x baseline')
-          PY
+          node --version
+          npm --version
+          pnpm --version
+      - name: Run strict benchmark and compare semantic baseline
+        shell: bash
+        run: |
+          extra_flags=()
+          if [[ "${{ github.event.inputs.informational_baseline }}" == "true" ]]; then
+            extra_flags+=(--baseline-informational)
+          fi
+
+          cargo run --release -- bench \
+            --fixture minimal \
+            --scenario repeat_install \
+            --tools npm,pnpm,bpm \
+            --require-tools \
+            --runs 3 \
+            --json /tmp/current.json \
+            --compare-baseline benchmarks/baselines/reference.json \
+            --regression-envelope "${{ github.event.inputs.regression_envelope || '2.0' }}" \
+            ${extra_flags[@]}
