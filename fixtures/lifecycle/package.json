@@ -1,0 +1,11 @@
+{
+  "name": "@bpm-fixtures/lifecycle",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "preinstall": "node scripts/record.cjs preinstall",
+    "install": "node scripts/record.cjs install",
+    "postinstall": "node scripts/record.cjs postinstall",
+    "smoke": "node scripts/record.cjs --check"
+  }
+}
