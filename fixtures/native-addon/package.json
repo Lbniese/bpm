@@ -1,0 +1,11 @@
+{
+  "name": "@bpm-fixtures/native-addon",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "smoke": "node -e \"const watcher = require('@parcel/watcher'); if (typeof watcher.subscribe !== 'function' || typeof watcher.getEventsSince !== 'function') process.exit(1); process.stdout.write('native-addon:ok\\n')\""
+  },
+  "dependencies": {
+    "@parcel/watcher": "2.5.1"
+  }
+}
