@@ -31,6 +31,7 @@ use crate::download::{self, DownloadError};
 use crate::http::HttpClient;
 use crate::integrity::{ArtifactId, Integrity, IntegrityError, Sha512Digest};
 use crate::metrics::Metrics;
+use crate::remote_cache::{RemoteCacheClient, RemoteFetch};
 
 // `std::fs::File` provides inherent `lock()` (exclusive advisory lock) and
 // `unlock()` on stable Rust, used here for per-artifact mutual exclusion.
@@ -98,6 +99,20 @@ pub struct ArtifactRef {
     pub path: PathBuf,
     /// `true` when the artifact already existed (no download performed).
     pub cached: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteArtifactSource {
+    Local,
+    Remote,
+    Origin,
+    Bypassed,
+}
+
+#[derive(Debug)]
+pub struct RemoteArtifactResult {
+    pub artifact: ArtifactRef,
+    pub source: RemoteArtifactSource,
 }
 
 /// A reference to an extracted image.
@@ -226,6 +241,110 @@ impl ArtifactStore {
     ) -> Result<ArtifactRef, StoreError> {
         self.ensure_artifact_using(url, integrity, metrics, |url, dest| {
             download::download_with_client(client, url, dest)
+        })
+    }
+
+    /// Ensure a known-integrity artifact, trying the optional remote cache
+    /// between the local store and the configured origin. Remote failures are
+    /// performance failures only: origin retrieval still uses the existing
+    /// verified publication path.
+    pub fn ensure_artifact_with_remote(
+        &self,
+        origin: &HttpClient,
+        remote: &RemoteCacheClient,
+        url: &str,
+        integrity: Option<&Integrity>,
+        metrics: &mut Metrics,
+    ) -> Result<RemoteArtifactResult, StoreError> {
+        let Some(integrity) = integrity else {
+            metrics.record("remote_cache_bypass", std::time::Duration::ZERO);
+            return self
+                .ensure_artifact_with_client(origin, url, None, metrics)
+                .map(|artifact| RemoteArtifactResult {
+                    artifact,
+                    source: RemoteArtifactSource::Bypassed,
+                });
+        };
+        let id = *integrity.digest();
+        let _guard = self.acquire_lock(&id.to_hex())?;
+        let destination = self.artifact_path(&id);
+        if destination.exists() {
+            metrics.record("remote_cache_bypass", std::time::Duration::ZERO);
+            metrics.record("artifact_download", std::time::Duration::ZERO);
+            metrics.record("integrity_verify", std::time::Duration::ZERO);
+            return Ok(RemoteArtifactResult {
+                artifact: ArtifactRef {
+                    id,
+                    path: destination,
+                    cached: true,
+                },
+                source: RemoteArtifactSource::Local,
+            });
+        }
+
+        let remote_tmp = self.unique_tmp(&format!("remote-{}", id.to_hex()))?;
+        let remote_result = remote.fetch_artifact(&id, &remote_tmp);
+        match remote_result {
+            Ok(RemoteFetch::Hit { .. }) => {
+                let computed =
+                    hash_file(&remote_tmp).map_err(|source| io_err(&remote_tmp, source))?;
+                if computed == id {
+                    let created = self.publish_file(&remote_tmp, &destination)?;
+                    metrics.record("remote_cache_hit", std::time::Duration::ZERO);
+                    metrics.record("integrity_verify", std::time::Duration::ZERO);
+                    return Ok(RemoteArtifactResult {
+                        artifact: ArtifactRef {
+                            id,
+                            path: destination,
+                            cached: !created,
+                        },
+                        source: RemoteArtifactSource::Remote,
+                    });
+                }
+                let _ = fs::remove_file(&remote_tmp);
+                metrics.record("remote_cache_error", std::time::Duration::ZERO);
+            }
+            Ok(RemoteFetch::Miss) => {
+                let _ = fs::remove_file(&remote_tmp);
+                metrics.record("remote_cache_miss", std::time::Duration::ZERO);
+            }
+            Err(_) => {
+                let _ = fs::remove_file(&remote_tmp);
+                metrics.record("remote_cache_error", std::time::Duration::ZERO);
+            }
+        }
+
+        let origin_tmp = self.unique_tmp(&format!("origin-{}", id.to_hex()))?;
+        let computed = match metrics.measure("artifact_download", || {
+            download::download_with_client(origin, url, &origin_tmp)
+        }) {
+            Ok(computed) => computed,
+            Err(source) => {
+                let _ = fs::remove_file(&origin_tmp);
+                return Err(StoreError::Download {
+                    url: url.to_string(),
+                    source,
+                });
+            }
+        };
+        if computed != id {
+            let _ = fs::remove_file(&origin_tmp);
+            return Err(StoreError::IntegrityMismatch {
+                url: url.to_string(),
+                expected: integrity.to_npm_string(),
+                computed: computed.to_npm_string(),
+            });
+        }
+        let created = self.publish_file(&origin_tmp, &destination)?;
+        metrics.record("remote_cache_download", std::time::Duration::ZERO);
+        metrics.record("integrity_verify", std::time::Duration::ZERO);
+        Ok(RemoteArtifactResult {
+            artifact: ArtifactRef {
+                id,
+                path: destination,
+                cached: !created,
+            },
+            source: RemoteArtifactSource::Origin,
         })
     }
 
@@ -451,6 +570,22 @@ impl Drop for FileGuard {
         // Best-effort explicit unlock; dropping the File also releases it.
         let _ = self.0.unlock();
     }
+}
+
+fn hash_file(path: &Path) -> std::io::Result<Sha512Digest> {
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha512::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    let mut bytes = [0u8; 64];
+    bytes.copy_from_slice(&hasher.finalize());
+    Ok(Sha512Digest::from_bytes(bytes))
 }
 
 fn io_err(path: &Path, source: std::io::Error) -> StoreError {
