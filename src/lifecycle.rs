@@ -25,13 +25,24 @@ use crate::derived::{
     SandboxFailure, TargetDescriptor,
 };
 use crate::graph::package_closure_digest;
-use crate::integrity::ArtifactId;
-use crate::lockfile::{Lockfile, PackageEntry};
+use crate::integrity::{ArtifactId, Integrity};
+use crate::lockfile::{LockSource, Lockfile, PackageEntry};
+use crate::manifest::PackageManifest;
 use crate::metrics::Metrics;
+use crate::registry::RegistryClient;
 use crate::store::ArtifactStore;
 
 /// The lifecycle scripts bpm runs, in order, for each package.
 pub const LIFECYCLE_PHASES: &[&str] = &["preinstall", "install", "postinstall"];
+/// Lifecycle phases npm runs while preparing a Git package in its build clone.
+const PREPARE_PHASES: &[&str] = &[
+    "preinstall",
+    "install",
+    "postinstall",
+    "preprepare",
+    "prepare",
+    "postprepare",
+];
 
 /// Derived-key runner version. Bumped when the derived build callback's
 /// execution contract changes (isolation, snapshot, or attach semantics).
@@ -91,6 +102,8 @@ pub enum LifecycleError {
         #[source]
         source: std::io::Error,
     },
+    #[error("Git prepare failed: {0}")]
+    Prepare(String),
 }
 
 /// What happened when one phase of one package's lifecycle ran.
@@ -270,6 +283,7 @@ pub fn run_lifecycle(
                 let closure = package_closure_digest(lockfile, &pkg.path);
                 let inputs = DerivedInputs {
                     source_artifact: id.as_bytes(),
+                    source_revision: None,
                     dependency_graph: &closure,
                     target: current_target(),
                     runtime: RuntimeIdentity {
@@ -282,6 +296,7 @@ pub fn run_lifecycle(
                         modules_abi: &runtime.modules_abi,
                         napi_version: runtime.napi_version.as_deref(),
                     },
+                    phases: LIFECYCLE_PHASES,
                     scripts: &scripts,
                     environment: &bounded_env,
                     runner_version: DERIVED_RUNNER_VERSION,
@@ -467,6 +482,216 @@ pub fn run_lifecycle(
     Ok(stats)
 }
 
+/// One immutable package image produced by Git's build-context lifecycle.
+#[derive(Debug, Clone)]
+pub struct PreparedImage {
+    pub image_path: PathBuf,
+    pub key: derived::DerivedKey,
+}
+
+/// Build immutable images for Git packages that declare a `prepare` script.
+///
+/// Preparation is intentionally separate from the consumer graph. A transient
+/// closure containing dev dependencies is materialized only in a temporary
+/// build root, and the published image contains the package's own files with
+/// `node_modules` stripped. Final installation can therefore use the image
+/// without exposing preparation-only dependencies.
+pub fn prepare_git_packages(
+    _project_root: &Path,
+    store: &ArtifactStore,
+    lockfile: &Lockfile,
+    artifact_ids: &[Option<ArtifactId>],
+    registry: &RegistryClient,
+    metrics: &mut Metrics,
+) -> Result<BTreeMap<String, PreparedImage>, LifecycleError> {
+    let runtime = probe_runtime()
+        .ok_or_else(|| LifecycleError::Prepare("could not probe the node runtime".into()))?;
+    let environment = bounded_environment();
+    let metadata = NullDerivedMetadata;
+    let derived_store = derived::DerivedStore::open(store.root(), &metadata)
+        .map_err(|error| LifecycleError::Prepare(error.to_string()))?;
+    let mut prepared = BTreeMap::new();
+
+    for (index, package) in lockfile.packages.iter().enumerate() {
+        let Some(Some(artifact_id)) = artifact_ids.get(index) else {
+            continue;
+        };
+        let Some(LockSource::Git {
+            resolved_commit, ..
+        }) = lockfile
+            .resolution
+            .packages
+            .get(&package.path)
+            .map(|resolution| &resolution.source)
+        else {
+            continue;
+        };
+        let image = store.image_path(artifact_id);
+        let scripts =
+            read_scripts(&image.join("package.json")).map_err(|source| LifecycleError::Io {
+                path: image.join("package.json").display().to_string(),
+                source,
+            })?;
+        if !scripts.contains_key("prepare") {
+            continue;
+        }
+        let manifest = PackageManifest::from_path(&image.join("package.json"))
+            .map_err(|error| LifecycleError::Prepare(error.to_string()))?;
+        let closure = crate::resolver::build_prepare_closure(
+            &manifest,
+            registry,
+            "bpm-git-prepare",
+            crate::resolver::current_target_platform(),
+        )
+        .map_err(|error| LifecycleError::Prepare(error.to_string()))?;
+        let closure_digest = *closure.digest();
+        let inputs = DerivedInputs {
+            source_artifact: artifact_id.as_bytes(),
+            source_revision: Some(resolved_commit.as_str()),
+            dependency_graph: &closure_digest,
+            target: current_target(),
+            runtime: RuntimeIdentity {
+                executable: &runtime.executable,
+                version: &runtime.version,
+                modules_abi: &runtime.modules_abi,
+                napi_version: runtime.napi_version.as_deref(),
+            },
+            phases: PREPARE_PHASES,
+            scripts: &scripts,
+            environment: &environment,
+            runner_version: DERIVED_RUNNER_VERSION,
+            policy_version: DERIVED_POLICY_VERSION + 1,
+        };
+        let source_image = image.clone();
+        let package_for_script = package.clone();
+        let closure_lock = closure.lockfile;
+        let result = derived_store
+            .ensure(
+                &inputs,
+                &source_image,
+                EnsureOptions::default(),
+                |staging_image| {
+                    let build_dir = tempfile::tempdir().map_err(|error| {
+                        SandboxFailure::new(
+                            package_for_script.name.as_str(),
+                            "prepare",
+                            None,
+                            None,
+                            &[],
+                            error.to_string().as_bytes(),
+                        )
+                    })?;
+                    let build_root = build_dir.path().join("package");
+                    copy_tree(&source_image, &build_root)
+                        .map_err(|error| sandbox_io_failure(&package_for_script, &error))?;
+                    materialize_prepare_closure(
+                        &build_root,
+                        &closure_lock,
+                        store,
+                        registry,
+                        metrics,
+                    )
+                    .map_err(|error| sandbox_io_failure(&package_for_script, &error))?;
+                    for &phase in PREPARE_PHASES {
+                        let Some(command) = scripts.get(phase) else {
+                            continue;
+                        };
+                        let status = run_script(
+                            &build_root,
+                            phase,
+                            command,
+                            &build_root,
+                            store,
+                            &package_for_script,
+                        )
+                        .map_err(|error| {
+                            SandboxFailure::new(
+                                package_for_script.name.as_str(),
+                                phase,
+                                None,
+                                None,
+                                &[],
+                                error.to_string().as_bytes(),
+                            )
+                        })?;
+                        let code = status.code().unwrap_or(-1);
+                        if code != 0 {
+                            return Err(SandboxFailure::new(
+                                package_for_script.name.as_str(),
+                                phase,
+                                Some(code),
+                                None,
+                                &[],
+                                &[],
+                            ));
+                        }
+                    }
+                    snapshot_pkg_tree(&build_root, staging_image)
+                        .map_err(|error| sandbox_io_failure(&package_for_script, &error))
+                },
+            )
+            .map_err(|error| LifecycleError::Prepare(error.to_string()))?;
+        let reference = match result {
+            EnsureDerived::Hit(reference) | EnsureDerived::Built(reference) => reference,
+            EnsureDerived::Skipped => continue,
+        };
+        metrics.record("git_prepare_image", Duration::ZERO);
+        prepared.insert(
+            package.path.clone(),
+            PreparedImage {
+                image_path: reference.image_path,
+                key: reference.key,
+            },
+        );
+    }
+    Ok(prepared)
+}
+
+/// Fetch and materialize the transient preparation closure into `build_root`.
+fn materialize_prepare_closure(
+    build_root: &Path,
+    closure: &Lockfile,
+    store: &ArtifactStore,
+    registry: &RegistryClient,
+    metrics: &mut Metrics,
+) -> Result<(), LifecycleError> {
+    let mut artifact_ids = Vec::with_capacity(closure.packages.len());
+    for package in &closure.packages {
+        if package.link {
+            artifact_ids.push(None);
+            continue;
+        }
+        let integrity = package
+            .integrity
+            .as_deref()
+            .map(Integrity::parse)
+            .transpose()
+            .map_err(|error| LifecycleError::Prepare(error.to_string()))?;
+        let artifact = store
+            .ensure_artifact_with_client(
+                registry.http(),
+                &package.resolved,
+                integrity.as_ref(),
+                metrics,
+            )
+            .map_err(|error| LifecycleError::Prepare(error.to_string()))?;
+        store
+            .ensure_image(&artifact.id, metrics)
+            .map_err(|error| LifecycleError::Prepare(error.to_string()))?;
+        artifact_ids.push(Some(artifact.id));
+    }
+    crate::materializer::materialize_lockfile_with_backend(
+        build_root,
+        store,
+        closure,
+        &artifact_ids,
+        crate::materializer::MaterializeMode::Compatible,
+        crate::materializer::MaterializeBackend::Hardlink,
+    )
+    .map_err(|error| LifecycleError::Prepare(error.to_string()))?;
+    Ok(())
+}
+
 /// Read the `scripts` map from a `package.json` at `manifest_path`.
 fn read_scripts(manifest_path: &Path) -> Result<BTreeMap<String, String>, std::io::Error> {
     let bytes = fs::read(manifest_path)?;
@@ -495,8 +720,8 @@ fn run_script(
     _store: &ArtifactStore,
     pkg: &PackageEntry,
 ) -> std::io::Result<std::process::ExitStatus> {
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c").arg(command).current_dir(cwd);
+    let mut cmd = crate::platform::script_command(command);
+    cmd.current_dir(cwd);
     // npm-compatible environment (IMPLEMENTATION §14).
     cmd.env("npm_lifecycle_event", phase);
     cmd.env("npm_lifecycle_script", command);
@@ -505,7 +730,12 @@ fn run_script(
     cmd.env("npm_config_user_agent", "bpm/0.1.0");
     cmd.env("npm_execpath", "bpm");
     cmd.env("INIT_CWD", project_root);
-    cmd.env("NODE", which("node").unwrap_or_else(|| "node".to_string()));
+    let node = crate::platform::find_executable(
+        std::ffi::OsStr::new("node"),
+        std::env::var_os("PATH").as_deref(),
+    )
+    .unwrap_or_else(|| PathBuf::from("node"));
+    cmd.env("NODE", node);
     // Project node_modules/.bin should be reachable for scripts; prepend it.
     if let Some(path) = std::env::var_os("PATH") {
         let bin = project_root.join("node_modules").join(".bin");
@@ -520,17 +750,6 @@ fn run_script(
         cmd.env("PATH", new_path);
     }
     cmd.status()
-}
-
-fn which(tool: &str) -> Option<String> {
-    Command::new("sh")
-        .arg("-c")
-        .arg(format!("command -v {tool}"))
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
 }
 
 /// Recursively copy a directory tree (files + symlinks), cheap temp-sandbox

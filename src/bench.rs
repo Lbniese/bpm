@@ -299,11 +299,28 @@ fn capture_tool_version(tool: Tool) -> Option<String> {
 // Per-tool results
 // ---------------------------------------------------------------------------
 
+/// Aggregated bpm phase/profile metrics captured during timed benchmark runs
+/// (bpm only — other tools do not emit `--json-metrics`). Each `Stats` is
+/// computed across the per-run samples, so `requests_sent.median` is the
+/// median outbound-request count per run and `phase_ms["dependency_resolution"]`
+/// is the median summed duration of that phase per run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BpmMetricsSummary {
+    pub requests_sent: Stats,
+    pub phase_ms: BTreeMap<String, Stats>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolResults {
     pub tool: String,
     pub wall_clock_ms: Stats,
     pub exit_codes: Vec<i32>,
+    /// bpm-only phase timings and outbound request counts, captured via
+    /// `--json-metrics` during the timed run. Absent for other tools and for
+    /// bpm runs whose metrics file could not be read (e.g. the offline test
+    /// runner), so existing baselines without this field still deserialize.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bpm_metrics: Option<BpmMetricsSummary>,
 }
 
 // ---------------------------------------------------------------------------
@@ -620,6 +637,45 @@ pub fn run_scenario(
     run_scenario_with_runner(scenario, fixture, tool, num_runs, &mut runner)
 }
 
+/// Shape of a bpm `--json-metrics` file (only the fields the harness needs).
+#[derive(Debug, Deserialize)]
+struct BpmMetricsFile {
+    #[serde(default)]
+    phases: BTreeMap<String, f64>,
+    #[serde(default)]
+    counters: BpmMetricsCounters,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct BpmMetricsCounters {
+    #[serde(default)]
+    requests_sent: u64,
+}
+
+/// Best-effort read+parse of a bpm metrics file. Returns `None` on any I/O or
+/// parse failure so a missing/unreadable file (e.g. the offline test runner, or
+/// a run that exited before writing metrics) never fails the benchmark.
+fn read_bpm_metrics(path: &Path) -> Option<BpmMetricsFile> {
+    let bytes = fs::read(path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Aggregate per-run request counts and per-phase summed durations into the bpm
+/// metrics summary. Pure (no I/O) so it is directly unit-testable.
+pub fn aggregate_bpm_metrics(
+    request_counts: Vec<f64>,
+    phase_samples: BTreeMap<String, Vec<f64>>,
+) -> BpmMetricsSummary {
+    let phase_ms = phase_samples
+        .into_iter()
+        .map(|(name, samples)| (name, Stats::compute(samples)))
+        .collect();
+    BpmMetricsSummary {
+        requests_sent: Stats::compute(request_counts),
+        phase_ms,
+    }
+}
+
 pub fn run_scenario_with_runner(
     scenario: ScenarioKind,
     fixture: &Fixture,
@@ -637,6 +693,10 @@ pub fn run_scenario_with_runner(
 
     let mut wall_times = Vec::with_capacity(num_runs);
     let mut exit_codes = Vec::with_capacity(num_runs);
+    // bpm-only: per-run outbound request counts and per-phase summed durations,
+    // captured from each timed run's `--json-metrics` file.
+    let mut request_counts: Vec<f64> = Vec::with_capacity(num_runs);
+    let mut phase_samples: BTreeMap<String, Vec<f64>> = BTreeMap::new();
 
     for run_index in 0..num_runs {
         let work_dir = temp_base.path().join(format!("run-{run_index}"));
@@ -661,7 +721,20 @@ pub fn run_scenario_with_runner(
             runner,
         )?;
 
-        let timed_command = install_command_spec(tool, &work_dir, &run_store, scenario, None);
+        // Only bpm emits `--json-metrics`; capture it per run so phase timings
+        // and outbound request counts land in the benchmark output.
+        let metrics_path = if tool == Tool::Bpm {
+            Some(work_dir.join("bpm-timed-metrics.json"))
+        } else {
+            None
+        };
+        let timed_command = install_command_spec(
+            tool,
+            &work_dir,
+            &run_store,
+            scenario,
+            metrics_path.as_deref(),
+        );
         let start = Instant::now();
         let outcome = runner.run(&timed_command)?;
         let elapsed = start.elapsed();
@@ -678,12 +751,28 @@ pub fn run_scenario_with_runner(
 
         wall_times.push(elapsed.as_secs_f64() * 1000.0);
         exit_codes.push(outcome.exit_code);
+
+        if let Some(path) = &metrics_path {
+            if let Some(file) = read_bpm_metrics(path) {
+                request_counts.push(file.counters.requests_sent as f64);
+                for (name, ms) in file.phases {
+                    phase_samples.entry(name).or_default().push(ms);
+                }
+            }
+        }
     }
+
+    let bpm_metrics = if tool == Tool::Bpm && !request_counts.is_empty() {
+        Some(aggregate_bpm_metrics(request_counts, phase_samples))
+    } else {
+        None
+    };
 
     Ok(ToolResults {
         tool: tool.name().to_string(),
         wall_clock_ms: Stats::compute(wall_times),
         exit_codes,
+        bpm_metrics,
     })
 }
 
@@ -1364,6 +1453,20 @@ impl BenchSuite {
                     tool.wall_clock_ms.p95,
                     tool.wall_clock_ms.stddev,
                 );
+                if let Some(metrics) = &tool.bpm_metrics {
+                    println!(
+                        "     requests: median={:.0}  p95={:.0}  (per run)",
+                        metrics.requests_sent.median, metrics.requests_sent.p95,
+                    );
+                    let mut phases: Vec<(&String, &Stats)> = metrics.phase_ms.iter().collect();
+                    phases.sort_by(|a, b| b.1.median.partial_cmp(&a.1.median).unwrap());
+                    for (name, stats) in phases.iter().take(6) {
+                        println!(
+                            "     phase {:<24}: median={:.1}ms  p95={:.1}ms",
+                            name, stats.median, stats.p95,
+                        );
+                    }
+                }
             }
             println!();
         }
@@ -1438,5 +1541,66 @@ mod tests {
 
         let cold = install_command_spec(Tool::Bpm, work_dir, store, ScenarioKind::TrueCold, None);
         assert!(!cold.args.contains(&"--frozen".to_string()));
+    }
+
+    #[test]
+    fn aggregate_bpm_metrics_reports_per_run_requests_and_phases() {
+        let request_counts = vec![12.0, 12.0, 13.0];
+        let mut phase_samples = BTreeMap::new();
+        phase_samples.insert(
+            "dependency_resolution".to_string(),
+            vec![100.0, 120.0, 140.0],
+        );
+        phase_samples.insert("artifact_download".to_string(), vec![5.0, 6.0, 7.0]);
+
+        let summary = aggregate_bpm_metrics(request_counts, phase_samples);
+
+        assert_eq!(summary.requests_sent.values.len(), 3);
+        assert!((summary.requests_sent.median - 12.0).abs() < 0.001);
+        let resolve = summary.phase_ms.get("dependency_resolution").unwrap();
+        assert!((resolve.median - 120.0).abs() < 0.001);
+        let download = summary.phase_ms.get("artifact_download").unwrap();
+        assert!((download.median - 6.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn tool_results_round_trips_with_and_without_bpm_metrics() {
+        // Without bpm_metrics: existing reference baselines still deserialize.
+        let without = serde_json::json!({
+            "tool": "bpm",
+            "wall_clock_ms": {"values": [1.0], "median": 1.0, "p95": 1.0, "stddev": 0.0},
+            "exit_codes": [0],
+        });
+        let parsed: ToolResults = serde_json::from_value(without).unwrap();
+        assert!(parsed.bpm_metrics.is_none());
+
+        // With bpm_metrics: round-trips and is omitted when None.
+        let with = ToolResults {
+            tool: "bpm".to_string(),
+            wall_clock_ms: Stats::compute(vec![1.0]),
+            exit_codes: vec![0],
+            bpm_metrics: Some(BpmMetricsSummary {
+                requests_sent: Stats::compute(vec![5.0]),
+                phase_ms: BTreeMap::from([(
+                    "dependency_resolution".to_string(),
+                    Stats::compute(vec![10.0]),
+                )]),
+            }),
+        };
+        let json = serde_json::to_string(&with).unwrap();
+        assert!(json.contains("bpm_metrics"));
+        assert!(json.contains("requests_sent"));
+        let back: ToolResults = serde_json::from_str(&json).unwrap();
+        assert!((back.bpm_metrics.unwrap().requests_sent.median - 5.0).abs() < 0.001);
+
+        let none = ToolResults {
+            tool: "npm".to_string(),
+            wall_clock_ms: Stats::compute(vec![1.0]),
+            exit_codes: vec![0],
+            bpm_metrics: None,
+        };
+        assert!(!serde_json::to_string(&none)
+            .unwrap()
+            .contains("bpm_metrics"));
     }
 }

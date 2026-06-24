@@ -4,7 +4,6 @@ use std::{
     env,
     ffi::OsString,
     path::{Path, PathBuf},
-    process::Command,
 };
 
 use bpm::manifest::PackageManifest;
@@ -19,8 +18,8 @@ pub(super) fn run(script: &str) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("script '{script}' is not defined in package.json"))?;
 
     let bin = cwd.join("node_modules").join(".bin");
-    let mut child = Command::new("sh");
-    child.arg("-c").arg(command).current_dir(&cwd);
+    let mut child = bpm::platform::script_command(command);
+    child.current_dir(&cwd);
     child.env("npm_lifecycle_event", script);
     child.env("npm_lifecycle_script", command);
     child.env(
@@ -34,7 +33,12 @@ pub(super) fn run(script: &str) -> anyhow::Result<()> {
     child.env("npm_config_user_agent", "bpm/0.1.0");
     child.env("npm_execpath", "bpm");
     child.env("INIT_CWD", &cwd);
-    child.env("NODE", which("node").unwrap_or_else(|| "node".into()));
+    let node = bpm::platform::find_executable(
+        std::ffi::OsStr::new("node"),
+        env::var_os("PATH").as_deref(),
+    )
+    .unwrap_or_else(|| PathBuf::from("node"));
+    child.env("NODE", node);
     child.env("PATH", path_with_bin(&bin, env::var_os("PATH"))?);
     let status = child
         .status()
@@ -52,17 +56,6 @@ fn path_with_bin(bin: &Path, inherited: Option<OsString>) -> anyhow::Result<OsSt
     }
     env::join_paths(paths)
         .map_err(|error| anyhow::anyhow!("could not construct PATH for lifecycle script: {error}"))
-}
-
-fn which(tool: &str) -> Option<String> {
-    Command::new("sh")
-        .arg("-c")
-        .arg(format!("command -v {tool}"))
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .map(|value| value.trim().to_string())
 }
 
 #[cfg(test)]
