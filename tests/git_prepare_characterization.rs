@@ -1,13 +1,12 @@
 //! Compatibility oracle for npm's Git `prepare` lifecycle (Plan 004).
 //!
-//! This is a *characterization* oracle, not a unit test: it drives the real
-//! `git`, `node`, and `npm` binaries against a fully local fixture to pin the
-//! exact Git-`prepare` contract for the recorded toolchain. The observed
-//! behavior is the input to `docs/git-prepare-design.md`; if npm changes the
-//! contract, this test fails first and the design must be revised before any
-//! production Git-prepare implementation lands.
+//! This suite drives the real `git` and `node` binaries against a fully local
+//! fixture to pin the Git-`prepare` contract. The BPM contract test is active
+//! when those tools are available; the npm characterization oracle remains
+//! ignored because it additionally depends on the host npm toolchain. The
+//! observed behavior is the input to `docs/git-prepare-design.md`.
 //!
-//! Ignored by default because it shells out to `git`/`node`/`npm`. Run with:
+//! Run the ignored npm oracle with:
 //!
 //! ```text
 //! cargo test --test git_prepare_characterization -- --ignored --nocapture
@@ -93,6 +92,21 @@ fn npm_install(dir: &Path, cache: &Path, extra: &[&str]) -> Output {
         cmd.arg(arg);
     }
     cmd.output().expect("failed to spawn npm")
+}
+
+/// Run the experimental BPM Git-prepare path against a local fixture.
+fn bpm_install(dir: &Path, store: &Path, extra: &[&str]) -> Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_bpm"));
+    cmd.arg("install")
+        .arg("--store")
+        .arg(store)
+        .arg("--concurrency")
+        .arg("1")
+        .current_dir(dir);
+    for arg in extra {
+        cmd.arg(arg);
+    }
+    cmd.output().expect("failed to spawn bpm")
 }
 
 /// Configure deterministic git identity on a `Command` (no per-user config
@@ -375,6 +389,15 @@ fn gitpkg_resolved(consumer: &Path) -> String {
         .to_owned()
 }
 
+fn bpm_gitpkg_resolved_commit(consumer: &Path) -> String {
+    let lock = fs::read_to_string(consumer.join("bpm.lock")).unwrap();
+    let value: Value = serde_json::from_str(&lock).unwrap();
+    value["resolution"]["packages"]["node_modules/gitpkg"]["source"]["resolvedCommit"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
 /// Fresh consumer project depending on `gitpkg` at `spec` (a `git+file://…#ref`).
 fn consumer(spec: &str) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
@@ -386,6 +409,113 @@ fn consumer(spec: &str) -> tempfile::TempDir {
         ),
     );
     dir
+}
+
+#[test]
+fn bpm_git_prepare_contract() {
+    if !tool_available("git") || !tool_available("node") {
+        eprintln!("skipping BPM Git-prepare parity: missing git or node");
+        return;
+    }
+    let fixture = build_fixture();
+    let url = format!(
+        "git+file://{}#{}",
+        fixture.repo.display(),
+        fixture.good_rev1
+    );
+    let dir = consumer(&url);
+    let store = tempfile::tempdir().unwrap();
+    let output = bpm_install(dir.path(), store.path(), &["--git-prepare"]);
+    assert!(
+        output.status.success(),
+        "bpm install failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let built = built_module(dir.path()).expect("BPM should publish prepared dist/built.js");
+    assert_eq!(built["built"], true);
+    assert_eq!(built["regular"], "RT");
+    assert_eq!(built["dev"], "DT");
+    let phases = read_phases(dir.path());
+    assert_build_full_visibility(&phases);
+    assert_final_install_only_runtime(&phases);
+    assert!(!node_resolves(
+        dir.path().join("node_modules/gitpkg").as_path(),
+        "devtool"
+    ));
+    assert_eq!(bpm_gitpkg_resolved_commit(dir.path()), fixture.good_rev1);
+
+    // --ignore-scripts bypasses preparation and ships the raw source only.
+    let ignored_dir = consumer(&url);
+    let ignored = bpm_install(
+        ignored_dir.path(),
+        store.path(),
+        &["--git-prepare", "--ignore-scripts"],
+    );
+    assert!(ignored.status.success());
+    assert!(ignored_dir.path().join("node_modules/gitpkg").exists());
+    assert!(!ignored_dir
+        .path()
+        .join("node_modules/gitpkg/phases.log")
+        .exists());
+    assert!(!ignored_dir
+        .path()
+        .join("node_modules/gitpkg/dist/built.js")
+        .exists());
+    assert!(!node_resolves(ignored_dir.path(), "gitpkg"));
+
+    // Mutable refs are resolved and persisted as immutable commits.
+    for mutable_ref in ["stable", "v1.0.0"] {
+        let mutable_dir = consumer(&format!(
+            "git+file://{}#{mutable_ref}",
+            fixture.repo.display()
+        ));
+        let mutable = bpm_install(mutable_dir.path(), store.path(), &["--git-prepare"]);
+        assert!(mutable.status.success());
+        assert_eq!(
+            bpm_gitpkg_resolved_commit(mutable_dir.path()),
+            fixture.good_rev1
+        );
+    }
+
+    // A new source revision gets a distinct prepared output.
+    let rev2_dir = consumer(&format!(
+        "git+file://{}#{}",
+        fixture.repo.display(),
+        fixture.good_rev2
+    ));
+    let rev2 = bpm_install(rev2_dir.path(), store.path(), &["--git-prepare"]);
+    assert!(rev2.status.success());
+    assert_eq!(
+        bpm_gitpkg_resolved_commit(rev2_dir.path()),
+        fixture.good_rev2
+    );
+    assert_eq!(
+        built_module(rev2_dir.path()).unwrap()["REV"],
+        2,
+        "a changed commit must not reuse the prior prepared image"
+    );
+
+    let rerun = bpm_install(dir.path(), store.path(), &["--git-prepare"]);
+    assert!(rerun.status.success());
+    assert!(String::from_utf8_lossy(&rerun.stdout).contains("graph volume reused"));
+    assert_eq!(
+        read_phases(dir.path()).len(),
+        9,
+        "cached prepare must not rerun scripts"
+    );
+
+    let bad_url = format!(
+        "git+file://{}#{}",
+        fixture.repo.display(),
+        fixture.bad_prepare
+    );
+    let bad_dir = consumer(&bad_url);
+    let bad = bpm_install(bad_dir.path(), store.path(), &["--git-prepare"]);
+    assert!(
+        !bad.status.success(),
+        "failed prepare must fail installation"
+    );
+    assert!(!bad_dir.path().join("node_modules/gitpkg").exists());
 }
 
 #[test]

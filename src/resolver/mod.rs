@@ -4,6 +4,8 @@ pub mod model;
 pub mod overrides;
 pub mod peer;
 pub mod platform;
+pub mod prepare_graph;
+pub use prepare_graph::{build_prepare_closure, PreparedClosure};
 pub mod workspaces;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -1229,41 +1231,210 @@ fn write_patched_tarball(base_dir: &Path, bytes: &[u8]) -> Result<String, String
 }
 
 fn resolve_git_source(url: &str, reference: Option<&str>) -> Result<SourceResolution, String> {
-    if let Some(tarball_url) = hosted_git_tarball_url(url, reference) {
-        return resolve_tarball_source(&tarball_url).map(|mut resolution| {
-            resolution.source = LockSource::Git {
+    let resolved_commit = resolve_git_commit(url, reference)?;
+    if let Some(tarball_url) = hosted_git_tarball_url(url, Some(&resolved_commit)) {
+        let http = crate::http::HttpClient::new(crate::config::NpmConfig::default());
+        let bytes = read_source_bytes(&http, &tarball_url)?;
+        let mut resolution = source_from_tarball_bytes(
+            &tarball_url,
+            bytes.clone(),
+            LockSource::Git {
                 url: url.to_owned(),
                 reference: reference.map(str::to_owned),
-            };
-            resolution
-        });
+                resolved_commit: resolved_commit.clone(),
+            },
+        )?;
+        resolution.source_dir = Some(cache_git_source_tree(url, &resolved_commit, &bytes)?);
+        return Ok(resolution);
     }
-    let tarball = git_archive_tarball(url, reference.unwrap_or("HEAD"))?;
+    // Raw git transports may not accept a SHA as the archive ref. Fetch using
+    // the user's ref (or HEAD), but key the local archive by the resolved SHA
+    // so branch/tag aliases for the same commit share bytes.
+    let fetch_reference = reference.unwrap_or("HEAD");
+    let tarball = git_archive_tarball(url, fetch_reference, &resolved_commit)?;
     let cache_url = format!("file://{}", tarball.display());
     let bytes = fs::read(&tarball)
         .map_err(|error| format!("cannot read git archive {}: {error}", tarball.display()))?;
-    source_from_tarball_bytes(
+    let mut resolution = source_from_tarball_bytes(
         &cache_url,
-        bytes,
+        bytes.clone(),
         LockSource::Git {
             url: url.to_owned(),
             reference: reference.map(str::to_owned),
+            resolved_commit: resolved_commit.clone(),
         },
-    )
+    )?;
+    resolution.source_dir = Some(cache_git_source_tree(url, &resolved_commit, &bytes)?);
+    Ok(resolution)
 }
 
-fn git_archive_tarball(url: &str, reference: &str) -> Result<PathBuf, String> {
+/// Fetch a commit into a local repository when `git archive --remote` rejects
+/// a raw SHA (the common behavior for `file://`, SSH, and git-daemon remotes).
+fn archive_git_commit_locally(url: &str, commit: &str) -> Result<std::process::Output, String> {
+    let source = url.strip_prefix("file://").unwrap_or(url);
+    if Path::new(source).is_dir() {
+        return Command::new("git")
+            .args(["-C", source, "archive", "--format=tar", commit])
+            .output()
+            .map_err(|error| format!("cannot archive local Git commit: {error}"));
+    }
+    let mut hasher = sha2::Sha512::new();
+    hasher.update(url.as_bytes());
+    hasher.update([0]);
+    hasher.update(commit.as_bytes());
+    let clone_dir = std::env::temp_dir()
+        .join("bpm-git-clones-v1")
+        .join(hex::encode(hasher.finalize()));
+    if !clone_dir.join(".git").is_dir() {
+        if let Some(parent) = clone_dir.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("cannot create Git clone cache: {error}"))?;
+        }
+        let clone = Command::new("git")
+            .args([
+                "clone",
+                "--no-checkout",
+                url,
+                &clone_dir.display().to_string(),
+            ])
+            .output()
+            .map_err(|error| format!("cannot clone Git source: {error}"))?;
+        if !clone.status.success() {
+            return Err(String::from_utf8_lossy(&clone.stderr).trim().to_owned());
+        }
+    }
+    let fetch = Command::new("git")
+        .args([
+            "-C",
+            &clone_dir.display().to_string(),
+            "fetch",
+            "origin",
+            commit,
+        ])
+        .output()
+        .map_err(|error| format!("cannot fetch Git commit: {error}"))?;
+    if !fetch.status.success() {
+        return Err(String::from_utf8_lossy(&fetch.stderr).trim().to_owned());
+    }
+    Command::new("git")
+        .args([
+            "-C",
+            &clone_dir.display().to_string(),
+            "archive",
+            "--format=tar",
+            commit,
+        ])
+        .output()
+        .map_err(|error| format!("cannot archive fetched Git commit: {error}"))
+}
+
+/// Extract a Git archive once so relative `file:` dependencies are resolved
+/// against the Git package itself rather than the consumer project.
+fn cache_git_source_tree(url: &str, commit: &str, bytes: &[u8]) -> Result<PathBuf, String> {
+    let mut hasher = sha2::Sha512::new();
+    hasher.update(url.as_bytes());
+    hasher.update([0]);
+    hasher.update(commit.as_bytes());
+    let key = hex::encode(hasher.finalize());
+    let root = std::env::temp_dir().join("bpm-git-sources").join(key);
+    let package_root = if root.join("package.json").is_file() {
+        root.clone()
+    } else if root.join("package/package.json").is_file() {
+        root.join("package")
+    } else {
+        let staging = root.with_extension("tmp");
+        let _ = fs::remove_dir_all(&staging);
+        fs::create_dir_all(&staging)
+            .map_err(|error| format!("cannot create Git source cache: {error}"))?;
+        let archive_path = staging.join("source.tgz");
+        fs::write(&archive_path, bytes)
+            .map_err(|error| format!("cannot stage Git source archive: {error}"))?;
+        crate::archive::extract(&archive_path, &staging)
+            .map_err(|error| format!("cannot extract Git source archive: {error}"))?;
+        let _ = fs::remove_file(&archive_path);
+        if staging.join("package.json").is_file() {
+            if let Some(parent) = root.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|error| format!("cannot create Git source cache: {error}"))?;
+            }
+            fs::rename(&staging, &root).map_err(|error| {
+                format!(
+                    "cannot publish Git source cache {}: {error}",
+                    root.display()
+                )
+            })?;
+            root.clone()
+        } else {
+            if let Some(parent) = root.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|error| format!("cannot create Git source cache: {error}"))?;
+            }
+            fs::rename(&staging, &root).map_err(|error| {
+                format!(
+                    "cannot publish Git source cache {}: {error}",
+                    root.display()
+                )
+            })?;
+            root.clone()
+        }
+    };
+    Ok(package_root)
+}
+
+fn is_full_git_commit(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn resolve_git_commit(url: &str, reference: Option<&str>) -> Result<String, String> {
+    if let Some(reference) = reference.filter(|value| is_full_git_commit(value)) {
+        return Ok(reference.to_ascii_lowercase());
+    }
+    let requested = reference.unwrap_or("HEAD");
+    let remote = git_clone_url(url);
+    let output = Command::new("git")
+        .args(["ls-remote", &remote, requested])
+        .output()
+        .map_err(|error| format!("cannot execute git ls-remote for {url}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git ls-remote failed for {remote}#{requested}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let mut candidate = None;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut fields = line.split_whitespace();
+        let Some(sha) = fields.next() else { continue };
+        let name = fields.next().unwrap_or_default();
+        if !is_full_git_commit(sha) {
+            continue;
+        }
+        // Annotated tags produce both the tag object and a peeled commit. The
+        // peeled line is the commit npm records for a tag.
+        if name.ends_with("^{}") {
+            return Ok(sha.to_ascii_lowercase());
+        }
+        candidate = Some(sha.to_ascii_lowercase());
+    }
+    candidate.ok_or_else(|| format!("git reference {requested:?} does not resolve in {remote}"))
+}
+
+fn git_archive_tarball(
+    url: &str,
+    reference: &str,
+    resolved_commit: &str,
+) -> Result<PathBuf, String> {
     let mut key_hasher = sha2::Sha512::new();
     key_hasher.update(url.as_bytes());
     key_hasher.update([0]);
-    key_hasher.update(reference.as_bytes());
+    key_hasher.update(resolved_commit.as_bytes());
     let key = key_hasher
         .finalize()
         .iter()
         .take(16)
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    let cache_dir = std::env::temp_dir().join("bpm-git-archives");
+    let cache_dir = std::env::temp_dir().join("bpm-git-archives-v2");
     fs::create_dir_all(&cache_dir).map_err(|error| {
         format!(
             "cannot create git archive cache {}: {error}",
@@ -1274,7 +1445,7 @@ fn git_archive_tarball(url: &str, reference: &str) -> Result<PathBuf, String> {
     if dest.is_file() {
         return Ok(dest);
     }
-    let output = Command::new("git")
+    let remote_archive = Command::new("git")
         .args([
             "archive",
             "--format=tar",
@@ -1283,22 +1454,61 @@ fn git_archive_tarball(url: &str, reference: &str) -> Result<PathBuf, String> {
         ])
         .output()
         .map_err(|error| format!("cannot execute git archive for {url}: {error}"))?;
-    if !output.status.success() {
+    let output = if remote_archive.status.success() {
+        remote_archive
+    } else if is_full_git_commit(reference) {
+        let fallback = archive_git_commit_locally(url, resolved_commit).map_err(|error| {
+            format!(
+                "git archive failed for {url}#{reference}: {}; local commit fallback failed: {error}",
+                String::from_utf8_lossy(&remote_archive.stderr).trim()
+            )
+        })?;
+        if !fallback.status.success() {
+            return Err(format!(
+                "git archive failed for {url}#{reference}: {}; local commit fallback failed: {}",
+                String::from_utf8_lossy(&remote_archive.stderr).trim(),
+                String::from_utf8_lossy(&fallback.stderr).trim()
+            ));
+        }
+        fallback
+    } else {
         return Err(format!(
             "git archive failed for {url}#{reference}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            String::from_utf8_lossy(&remote_archive.stderr).trim()
         ));
-    }
+    };
     let tmp = dest.with_extension("tmp");
     {
         let file = fs::File::create(&tmp)
             .map_err(|error| format!("cannot create {}: {error}", tmp.display()))?;
-        let mut encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
-        std::io::copy(&mut Cursor::new(output.stdout), &mut encoder)
-            .map_err(|error| format!("cannot gzip git archive: {error}"))?;
+        let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+        let mut archive = tar::Archive::new(Cursor::new(output.stdout));
+        let entries = archive
+            .entries()
+            .map_err(|error| format!("cannot enumerate git archive: {error}"))?;
+        for entry in entries {
+            let mut entry = entry.map_err(|error| format!("cannot read git archive: {error}"))?;
+            let kind = entry.header().entry_type();
+            if matches!(
+                kind,
+                tar::EntryType::Regular
+                    | tar::EntryType::Continuous
+                    | tar::EntryType::Directory
+                    | tar::EntryType::Symlink
+            ) {
+                let header = entry.header().clone();
+                builder
+                    .append(&header, &mut entry)
+                    .map_err(|error| format!("cannot normalize git archive: {error}"))?;
+            }
+        }
+        let encoder = builder
+            .into_inner()
+            .map_err(|error| format!("cannot finish git archive: {error}"))?;
         encoder
             .finish()
-            .map_err(|error| format!("cannot finish git archive: {error}"))?;
+            .map_err(|error| format!("cannot finish git archive gzip: {error}"))?;
     }
     fs::rename(&tmp, &dest).map_err(|error| {
         format!(
@@ -1377,7 +1587,39 @@ fn split_git_reference(spec: &str) -> (String, Option<String>) {
     }
 }
 
+/// Normalize npm's hosted-Git shortcuts to a URL accepted by `git ls-remote`.
+fn git_clone_url(spec: &str) -> String {
+    if let Some(rest) = spec
+        .strip_prefix("github:")
+        .or_else(|| spec.strip_prefix("github.com/"))
+    {
+        return format!("https://github.com/{}", rest.trim_end_matches(".git"));
+    }
+    if let Some(rest) = spec
+        .strip_prefix("gitlab:")
+        .or_else(|| spec.strip_prefix("gitlab.com/"))
+    {
+        return format!("https://gitlab.com/{}", rest.trim_end_matches(".git"));
+    }
+    if let Some(rest) = spec
+        .strip_prefix("bitbucket:")
+        .or_else(|| spec.strip_prefix("bitbucket.org/"))
+    {
+        return format!("https://bitbucket.org/{}", rest.trim_end_matches(".git"));
+    }
+    spec.to_owned()
+}
+
 fn looks_like_hosted_git(spec: &str) -> bool {
+    for prefix in [
+        "https://github.com/",
+        "https://gitlab.com/",
+        "https://bitbucket.org/",
+    ] {
+        if let Some(rest) = spec.strip_prefix(prefix) {
+            return rest.split('/').count() == 2;
+        }
+    }
     let mut parts = spec.split('/');
     matches!((parts.next(), parts.next(), parts.next()), (Some(owner), Some(repo), None) if !owner.is_empty() && !repo.is_empty() && !owner.contains(':') && !repo.contains(':'))
 }
@@ -1387,12 +1629,14 @@ fn hosted_git_tarball_url(spec: &str, reference: Option<&str>) -> Option<String>
     if let Some(rest) = spec
         .strip_prefix("github:")
         .or_else(|| spec.strip_prefix("github.com/"))
+        .or_else(|| spec.strip_prefix("https://github.com/"))
     {
         return hosted_tarball("https://codeload.github.com", rest, "tar.gz", reference);
     }
     if let Some(rest) = spec
         .strip_prefix("gitlab:")
         .or_else(|| spec.strip_prefix("gitlab.com/"))
+        .or_else(|| spec.strip_prefix("https://gitlab.com/"))
     {
         let (owner, repo) = rest.split_once('/')?;
         return Some(format!(
@@ -1407,6 +1651,7 @@ fn hosted_git_tarball_url(spec: &str, reference: Option<&str>) -> Option<String>
     if let Some(rest) = spec
         .strip_prefix("bitbucket:")
         .or_else(|| spec.strip_prefix("bitbucket.org/"))
+        .or_else(|| spec.strip_prefix("https://bitbucket.org/"))
     {
         let (owner, repo) = rest.split_once('/')?;
         return Some(format!(
@@ -1610,6 +1855,34 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
+
+    #[test]
+    fn git_commit_validation_and_shortcuts_are_deterministic() {
+        assert!(is_full_git_commit(
+            "0123456789abcdef0123456789abcdef01234567"
+        ));
+        assert!(!is_full_git_commit("0123456789abcdef"));
+        assert!(!is_full_git_commit(
+            "0123456789abcdef0123456789abcdef0123456g"
+        ));
+        assert_eq!(
+            git_clone_url("github:owner/repo.git"),
+            "https://github.com/owner/repo"
+        );
+        assert_eq!(
+            git_clone_url("file:///tmp/repo.git"),
+            "file:///tmp/repo.git"
+        );
+        assert!(looks_like_hosted_git("https://github.com/owner/repo.git"));
+        assert_eq!(
+            hosted_git_tarball_url("https://github.com/owner/repo.git", Some("abc123")),
+            Some("https://codeload.github.com/owner/repo/tar.gz/abc123".into())
+        );
+        assert_eq!(
+            hosted_git_tarball_url("https://gitlab.com/owner/repo.git", Some("abc123")),
+            Some("https://gitlab.com/owner/repo.git/-/archive/abc123/repo-abc123.tar.gz".into())
+        );
+    }
 
     #[test]
     fn aliases_resolve_target_but_keep_alias_placement() {

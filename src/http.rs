@@ -11,6 +11,8 @@
 use std::cmp;
 use std::fmt;
 use std::io::{self, Read};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime};
 
@@ -30,6 +32,11 @@ const RETRY_BODY_DRAIN_LIMIT: usize = 64 * 1024;
 pub struct HttpClient {
     client: Client,
     config: NpmConfig,
+    /// Cumulative count of outbound requests issued through this client. Held
+    /// in an `Arc` so every clone (the registry client, the download worker
+    /// pool, the prefetch workers) shares one counter, and the command-level
+    /// metrics can read the true total once at the end.
+    requests: Arc<AtomicU64>,
 }
 
 impl fmt::Debug for HttpClient {
@@ -52,7 +59,16 @@ impl HttpClient {
         Self {
             client: build_client(config.network.fetch_timeout),
             config,
+            requests: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Total number of outbound requests (GET/POST/PUT) issued through this
+    /// client and every clone sharing its counter. One increment per logical
+    /// request, before retries; retries are rare and irrelevant for resolver
+    /// request-efficiency profiling.
+    pub fn request_count(&self) -> u64 {
+        self.requests.load(Ordering::Relaxed)
     }
 
     /// Execute a GET request and return its response for string/JSON handling.
@@ -127,6 +143,7 @@ impl HttpClient {
     /// (including `304 Not Modified`). Statuses at or above 400 are retried
     /// when transient and otherwise become [`HttpError::Status`].
     fn execute_get(&self, url: &str, headers: &[(&str, &str)]) -> Result<Response, HttpError> {
+        self.requests.fetch_add(1, Ordering::Relaxed);
         let display_url = redact_url(url);
         let network = &self.config.network;
         let attempts = network.retries.saturating_add(1);
@@ -189,6 +206,7 @@ impl HttpClient {
         body: &[u8],
         headers: &[(&str, &str)],
     ) -> Result<Vec<u8>, HttpError> {
+        self.requests.fetch_add(1, Ordering::Relaxed);
         let display_url = redact_url(url);
         let network = &self.config.network;
         let attempts = network.retries.saturating_add(1);

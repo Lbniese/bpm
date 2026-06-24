@@ -21,6 +21,20 @@ once a 1.0 release is cut.
   workspace/compatible path still runs scripts in its disposable sandbox. The
   skip is observable in `--json-metrics` as `lifecycle_skipped_cached_volume`.
 
+- Benchmark output now records bpm's outbound **request counts** and named
+  **phase timings**. `bpm bench` passes `--json-metrics` during each timed bpm
+  run and folds the result into a new optional `bpm_metrics` field on each tool
+  entry: `requests_sent` (median/p95 outbound registry requests per run) and
+  `phase_ms` (median/p95 summed duration per phase — `dependency_resolution`,
+  `artifact_download`, `artifact_extract`, …). Other tools omit the field, and
+  existing baselines without it still deserialize. Underlying this, `HttpClient`
+  now shares a single atomic request counter across all clones (registry
+  client, download pool, prefetch workers), and the install command records the
+  true total once at the end — so `requests_sent` is now populated instead of
+  always zero. On a cold `large-frontend` install this is reproducibly 244
+  requests with `dependency_resolution` ≈ 19s of ~26s wall, making the
+  resolve-bound cold path measurable from the JSON alone.
+
 ### Added
 
 - Streaming resolve→download on fresh installs. A first install (no

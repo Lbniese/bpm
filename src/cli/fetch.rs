@@ -15,6 +15,7 @@ use bpm::metrics::Metrics;
 use bpm::registry::RegistryClient;
 use bpm::store::ArtifactStore;
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn run(
     target: &str,
     integrity: Option<String>,
@@ -23,8 +24,11 @@ pub(super) fn run(
     no_extract: bool,
     json_metrics: Option<PathBuf>,
     cache_mode: CacheMode,
+    remote_cache: Option<String>,
 ) -> anyhow::Result<()> {
     let store_root = store_root(store)?;
+    let remote_cache = remote_cache
+        .or_else(|| env::var_os("BPM_REMOTE_CACHE").map(|v| v.to_string_lossy().into_owned()));
     let store = ArtifactStore::open(&store_root)?;
     let mut metrics = Metrics::new();
 
@@ -76,8 +80,29 @@ pub(super) fn run(
             (target.to_string(), parsed)
         };
 
-    let artifact =
-        store.ensure_artifact_with_client(&http, &url, integrity.as_ref(), &mut metrics)?;
+    let remote = if cache_mode.allows_network() {
+        remote_cache
+            .map(|base| {
+                let token = env::var("BPM_REMOTE_CACHE_TOKEN").ok();
+                let config =
+                    bpm::remote_cache::RemoteCacheConfig::new(&base, token).map_err(|error| {
+                        anyhow::anyhow!("invalid remote cache configuration: {error}")
+                    })?;
+                bpm::remote_cache::RemoteCacheClient::new(config).map_err(|error| {
+                    anyhow::anyhow!("could not create remote cache client: {error}")
+                })
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    let artifact = if let Some(remote) = remote.as_ref() {
+        store
+            .ensure_artifact_with_remote(&http, remote, &url, integrity.as_ref(), &mut metrics)?
+            .artifact
+    } else {
+        store.ensure_artifact_with_client(&http, &url, integrity.as_ref(), &mut metrics)?
+    };
     println!(
         "artifact {} ({}) -> {}",
         artifact.id,

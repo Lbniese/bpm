@@ -388,6 +388,8 @@ fn link_bins(
     symlink_bins: bool,
 ) -> Result<(), MaterializeError> {
     let bin_dir = project_root.join("node_modules").join(".bin");
+    #[cfg(windows)]
+    let _ = symlink_bins;
     fs::create_dir_all(&bin_dir).map_err(|source| io_err(&bin_dir, source))?;
 
     for (name, relpath) in bins {
@@ -399,45 +401,107 @@ fn link_bins(
             );
             continue;
         }
-        let link = bin_dir.join(name);
-        // Relative target from node_modules/.bin/ to <pkg_path>/<relpath>.
-        let rel_target = relative_bin_target(pkg_path, relpath);
-        let materialized_bin = project_root.join(pkg_path).join(strip_dot_slash(relpath));
-        if read_link_if_points_to(&link, Path::new(&rel_target))?.is_some()
-            || (!symlink_bins && same_file(&link, &materialized_bin))
+        // Windows cannot assume symlink privileges. Publish the conventional
+        // pair of shims as one owned bin; a collision in either file keeps the
+        // whole pair untouched.
+        #[cfg(windows)]
         {
-            // A previous run of this same install already linked this bin
-            // correctly; record and continue.
+            validate_windows_bin_name(name)?;
+            let cmd_path = bin_dir.join(format!("{name}.cmd"));
+            let ps1_path = bin_dir.join(format!("{name}.ps1"));
+            let rel_target = relative_bin_target(pkg_path, relpath).replace('/', "\\");
+            let cmd = windows_cmd_shim(&rel_target);
+            let ps1 = windows_ps1_shim(&rel_target);
+            let matches = fs::read(&cmd_path).ok().as_deref() == Some(cmd.as_slice())
+                && fs::read(&ps1_path).ok().as_deref() == Some(ps1.as_slice());
+            if matches {
+                linked_bins.insert(name.clone());
+                stats.bins_linked += 1;
+                continue;
+            }
+            if cmd_path.exists() || ps1_path.exists() {
+                stats.bins_collisions += 1;
+                linked_bins.insert(name.clone());
+                continue;
+            }
+            ensure_executable(image_dir, relpath);
+            fs::write(&cmd_path, cmd).map_err(|source| io_err(&cmd_path, source))?;
+            if let Err(source) = fs::write(&ps1_path, ps1) {
+                let _ = fs::remove_file(&cmd_path);
+                return Err(io_err(&ps1_path, source));
+            }
             linked_bins.insert(name.clone());
             stats.bins_linked += 1;
             continue;
         }
-        // Collision with a non-matching existing entry: first declarant wins.
-        // We detect "already taken by someone else" by `linked_bins` above, but
-        // a pre-existing link on disk from a prior partial run also counts.
-        if link.exists() || symlink_exists(&link) {
-            // Only treat as collision if it isn't already our rel_target (handled above).
-            stats.bins_collisions += 1;
-            eprintln!(
-                "warning: bin '{}' already present at {}; keeping the existing link",
-                name,
-                link.display()
-            );
+        #[cfg(not(windows))]
+        {
+            let link = bin_dir.join(name);
+            // Relative target from node_modules/.bin/ to <pkg_path>/<relpath>.
+            let rel_target = relative_bin_target(pkg_path, relpath);
+            let materialized_bin = project_root.join(pkg_path).join(strip_dot_slash(relpath));
+            if read_link_if_points_to(&link, Path::new(&rel_target))?.is_some()
+                || (!symlink_bins && same_file(&link, &materialized_bin))
+            {
+                linked_bins.insert(name.clone());
+                stats.bins_linked += 1;
+                continue;
+            }
+            if link.exists() || symlink_exists(&link) {
+                stats.bins_collisions += 1;
+                eprintln!(
+                    "warning: bin '{}' already present at {}; keeping the existing link",
+                    name,
+                    link.display()
+                );
+                linked_bins.insert(name.clone());
+                continue;
+            }
+            ensure_executable(image_dir, relpath);
+            if symlink_bins {
+                make_symlink(Path::new(&rel_target), &link)?;
+            } else {
+                hardlink_or_copy_file(&materialized_bin, &link)?;
+            }
             linked_bins.insert(name.clone());
-            continue;
+            stats.bins_linked += 1;
         }
-        // Ensure the bin file is executable (npm convention). Applied to the
-        // resolved image file; idempotent and shared across projects.
-        ensure_executable(image_dir, relpath);
-        if symlink_bins {
-            make_symlink(Path::new(&rel_target), &link)?;
-        } else {
-            hardlink_or_copy_file(&materialized_bin, &link)?;
-        }
-        linked_bins.insert(name.clone());
-        stats.bins_linked += 1;
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn validate_windows_bin_name(name: &str) -> Result<(), MaterializeError> {
+    let upper = name.trim_end_matches([' ', '.']).to_ascii_uppercase();
+    let reserved = ["CON", "PRN", "AUX", "NUL"];
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '/' | '\\' | ':'))
+        || name.contains(['<', '>', '"', '|', '?', '*'])
+        || reserved.contains(&upper.as_str())
+    {
+        return Err(MaterializeError::Io {
+            path: name.to_string(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid Windows bin name",
+            ),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_cmd_shim(relative_target: &str) -> Vec<u8> {
+    format!("@echo off\r\nnode \"%~dp0\\{}\" %*\r\n", relative_target).into_bytes()
+}
+
+#[cfg(windows)]
+fn windows_ps1_shim(relative_target: &str) -> Vec<u8> {
+    format!("$ErrorActionPreference = 'Stop'\r\n& node (Join-Path $PSScriptRoot '{}') @args\r\nexit $LASTEXITCODE\r\n", relative_target.replace('\\', "/")).into_bytes()
 }
 
 /// Compute a relative path from `node_modules/.bin/` to `<pkg_path>/<relpath>`,

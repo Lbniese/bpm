@@ -9,6 +9,7 @@ mod fetch;
 mod gc;
 mod import;
 mod install;
+mod mutate;
 mod publish;
 mod run;
 
@@ -46,6 +47,7 @@ pub(crate) fn run() -> ExitCode {
             offline,
             prefer_offline,
             prefer_online,
+            remote_cache,
         } => fetch::run(
             &target,
             integrity,
@@ -54,6 +56,7 @@ pub(crate) fn run() -> ExitCode {
             no_extract,
             json_metrics,
             fetch::resolve_cache_mode(offline, prefer_offline, prefer_online),
+            remote_cache,
         ),
         Commands::Bench {
             fixture,
@@ -96,21 +99,25 @@ pub(crate) fn run() -> ExitCode {
             audit_level,
         } => audit::run(registry, json, offline, &audit_level),
         Commands::Install {
-            target,
+            targets,
             frozen,
             registry,
             store,
             concurrency,
             json_metrics,
             global,
+            save_dev,
+            save_exact,
             ignore_scripts,
             derived_store,
+            git_prepare,
             legacy_peer_deps,
             offline,
             prefer_offline,
             prefer_online,
+            remote_cache,
         } => install::run(install::Options {
-            target,
+            targets,
             frozen,
             registry,
             store,
@@ -119,8 +126,12 @@ pub(crate) fn run() -> ExitCode {
             global,
             ignore_scripts,
             derived_store,
+            git_prepare,
             legacy_peer_deps,
             cache_mode: fetch::resolve_cache_mode(offline, prefer_offline, prefer_online),
+            remote_cache,
+            save_dev,
+            save_exact,
         }),
         Commands::Ci {
             registry,
@@ -129,12 +140,14 @@ pub(crate) fn run() -> ExitCode {
             json_metrics,
             ignore_scripts,
             derived_store,
+            git_prepare,
             legacy_peer_deps,
             offline,
             prefer_offline,
             prefer_online,
+            remote_cache,
         } => install::run(install::Options {
-            target: None,
+            targets: Vec::new(),
             frozen: true,
             registry,
             store,
@@ -143,8 +156,12 @@ pub(crate) fn run() -> ExitCode {
             global: false,
             ignore_scripts,
             derived_store,
+            git_prepare,
             legacy_peer_deps,
             cache_mode: fetch::resolve_cache_mode(offline, prefer_offline, prefer_online),
+            remote_cache,
+            save_dev: false,
+            save_exact: false,
         }),
         Commands::Bin { global: _ } => (|| -> anyhow::Result<()> {
             println!("{}", install::bin_dir()?.display());
@@ -174,6 +191,35 @@ pub(crate) fn run() -> ExitCode {
             Ok(())
         })(),
         Commands::Run { script } => run::run(&script),
+        Commands::Uninstall {
+            names,
+            registry,
+            store,
+            concurrency,
+            json_metrics,
+            ignore_scripts,
+            derived_store,
+            git_prepare,
+            legacy_peer_deps,
+            offline,
+            prefer_offline,
+            prefer_online,
+            global,
+            remote_cache,
+        } => mutate::run_uninstall(mutate::UninstallOptions {
+            names,
+            registry,
+            store,
+            concurrency,
+            json_metrics,
+            ignore_scripts,
+            derived_store,
+            git_prepare,
+            legacy_peer_deps,
+            cache_mode: fetch::resolve_cache_mode(offline, prefer_offline, prefer_online),
+            remote_cache,
+            global,
+        }),
         Commands::Exec { .. } => unreachable!("exec handled before result-based commands"),
     };
 

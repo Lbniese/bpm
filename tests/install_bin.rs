@@ -1,4 +1,4 @@
-//! End-to-end CLI tests for `bpm install <pkg>` — fetch a single package and
+//! End-to-end CLI tests for `bpm install -g <pkg>` — fetch a single package and
 //! link its declared executables into a global bin directory. Fully offline:
 //! a local mock registry serves the packument + tarball.
 
@@ -122,7 +122,7 @@ fn install_pkg_links_all_declared_bins() {
     let bin_dir = tempfile::tempdir().unwrap();
 
     let (ok, stdout, stderr) = run_install(
-        &["install", "demo-cli", "--registry", &reg.registry_url],
+        &["install", "-g", "demo-cli", "--registry", &reg.registry_url],
         bin_dir.path(),
         &reg.registry_url,
         store.path(),
@@ -203,7 +203,7 @@ fn install_pkg_uses_project_npmrc_for_metadata_and_tarball_requests() {
     .unwrap();
 
     let out = Command::new(bin())
-        .args(["install", "demo-cli", "--registry", &registry])
+        .args(["install", "-g", "demo-cli", "--registry", &registry])
         .env("BPM_BIN", bin_dir.path())
         .env("BPM_STORE", store.path())
         .current_dir(project.path())
@@ -233,7 +233,7 @@ fn install_pkg_is_idempotent() {
     let reg = RegistryMock::start();
     let store = tempfile::tempdir().unwrap();
     let bin_dir = tempfile::tempdir().unwrap();
-    let args = ["install", "demo-cli", "--registry", &reg.registry_url];
+    let args = ["install", "-g", "demo-cli", "--registry", &reg.registry_url];
 
     let (ok1, _, err1) = run_install(&args, bin_dir.path(), &reg.registry_url, store.path());
     assert!(ok1, "{err1}");
@@ -241,6 +241,23 @@ fn install_pkg_is_idempotent() {
     assert!(ok2, "{err2}");
     // Re-running links the same bins again without error.
     assert!(stdout2.contains("linked 2 bin(s)"), "{stdout2}");
+}
+
+#[test]
+fn global_install_rejects_multiple_targets() {
+    let store = tempfile::tempdir().unwrap();
+    let bin_dir = tempfile::tempdir().unwrap();
+    let (ok, _stdout, stderr) = run_install(
+        &["install", "-g", "first", "second"],
+        bin_dir.path(),
+        "https://registry.invalid",
+        store.path(),
+    );
+    assert!(!ok, "global install must not ignore additional targets");
+    assert!(
+        stderr.contains("accepts exactly one package target"),
+        "error should explain the global target limit: {stderr}"
+    );
 }
 
 #[test]
@@ -288,7 +305,7 @@ fn install_pkg_without_bin_fails_clearly() {
     let store = tempfile::tempdir().unwrap();
     let bin_dir = tempfile::tempdir().unwrap();
     let (ok, _stdout, stderr) = run_install(
-        &["install", "nope", "--registry", &registry],
+        &["install", "-g", "nope", "--registry", &registry],
         bin_dir.path(),
         &registry,
         store.path(),

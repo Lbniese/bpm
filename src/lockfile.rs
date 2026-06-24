@@ -113,6 +113,11 @@ pub enum LockSource {
     Git {
         url: String,
         reference: Option<String>,
+        /// The immutable commit selected when the dependency was resolved.
+        /// Older lockfiles deserialize this as empty and fail v2 validation,
+        /// rather than silently accepting a mutable Git identity.
+        #[serde(default)]
+        resolved_commit: String,
     },
     Patch {
         source: Box<LockSource>,
@@ -221,6 +226,10 @@ pub struct PackageEntry {
 
 fn is_false(b: &bool) -> bool {
     !b
+}
+
+fn is_full_git_commit(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 /// Errors reading or writing a `bpm.lock`.
@@ -411,10 +420,17 @@ impl Lockfile {
                         )));
                     }
                 }
-                LockSource::Git { url, .. } => {
-                    if url.is_empty() || package.resolved.is_empty() {
+                LockSource::Git {
+                    url,
+                    resolved_commit,
+                    ..
+                } => {
+                    if url.is_empty()
+                        || package.resolved.is_empty()
+                        || !is_full_git_commit(resolved_commit)
+                    {
                         return Err(LockfileError::Invalid(format!(
-                            "git package {path:?} requires source URL and resolved tarball URL"
+                            "git package {path:?} requires source URL, resolved tarball URL, and a full 40-character commit"
                         )));
                     }
                 }
@@ -700,6 +716,38 @@ mod tests {
         );
         assert!(roundtrip.resolution.packages["node_modules/foo"].has_install_script);
         assert_eq!(json, roundtrip.to_json().unwrap());
+    }
+
+    #[test]
+    fn v2_git_source_roundtrips_and_requires_an_immutable_commit() {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let json = format!(
+            r#"{{
+              "lockfileVersion": 2,
+              "generator": "bpm",
+              "root": {{}},
+              "packages": [{{
+                "path":"node_modules/gitpkg","name":"gitpkg","version":"1.0.0",
+                "resolved":"file:///tmp/gitpkg.tgz","integrity":"sha512-a"
+              }}],
+              "resolution": {{
+                "packages": {{
+                  "node_modules/gitpkg": {{
+                    "source":{{"type":"git","url":"file:///tmp/gitpkg","reference":"stable","resolvedCommit":"{sha}"}}
+                  }}
+                }}
+              }}
+            }}"#
+        );
+        let lockfile = Lockfile::from_json(&json).unwrap();
+        let roundtrip = lockfile.to_json().unwrap();
+        assert!(roundtrip.contains(&format!("\"resolvedCommit\": \"{sha}\"")));
+
+        let missing = json.replace(&format!(",\"resolvedCommit\":\"{sha}\""), "");
+        assert!(matches!(
+            Lockfile::from_json(&missing),
+            Err(LockfileError::Invalid(message)) if message.contains("full 40-character commit")
+        ));
     }
 
     #[test]

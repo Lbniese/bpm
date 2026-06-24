@@ -317,6 +317,8 @@ struct PersistedMetadata {
     schema: u32,
     key: String,
     source_artifact: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_revision: Option<String>,
     dependency_graph: String,
     target: PersistedTarget,
     runtime: PersistedRuntime,
@@ -366,6 +368,7 @@ impl PersistedMetadata {
             schema: METADATA_SCHEMA,
             key: key.to_hex(),
             source_artifact: hex::encode(inputs.source_artifact),
+            source_revision: inputs.source_revision.map(str::to_owned),
             dependency_graph: hex::encode(inputs.dependency_graph),
             target: PersistedTarget {
                 os: inputs.target.os.to_owned(),
@@ -793,6 +796,7 @@ mod tests {
         static SOURCE: [u8; 64] = [1; 64];
         DerivedInputs {
             source_artifact: &SOURCE,
+            source_revision: None,
             dependency_graph: graph,
             target: TargetDescriptor {
                 os: "linux",
@@ -806,6 +810,7 @@ mod tests {
                 modules_abi: "127",
                 napi_version: Some("10"),
             },
+            phases: &["preinstall", "install", "postinstall"],
             scripts,
             environment,
             runner_version: 1,

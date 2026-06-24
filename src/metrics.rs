@@ -101,6 +101,18 @@ impl Metrics {
         self.counters.requests_sent += 1;
     }
 
+    /// Add `n` to the outbound-request counter. Used to fold a shared HTTP
+    /// client's cumulative request count into the command metrics once, after
+    /// the request-issuing work is complete.
+    pub fn add_requests(&mut self, n: u64) {
+        self.counters.requests_sent += n;
+    }
+
+    /// Total outbound requests recorded so far.
+    pub fn requests_sent(&self) -> u64 {
+        self.counters.requests_sent
+    }
+
     /// Snapshot of the current counters.
     pub fn counters(&self) -> Counters {
         self.counters

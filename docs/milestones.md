@@ -19,7 +19,7 @@ the commit history wins.
 | 4 — Reusable graph volumes | graph-volume creation, graph-volume reuse across projects, safe project attachment | ✅ Done — `node_modules` attaches via shallow relays |
 | 5 — Lifecycle support | npm-compatible script environment, derived artifact store, native-addon fixture coverage | ✅ Mostly done — sandbox runner, graph-volume lifecycle, `bpm run`; derived-store wiring remains open |
 | 6 — Workspaces and optimization | basic npm workspaces, filesystem capability detection, reflink/clone optimization, adaptive concurrency | ✅ Mostly done — workspaces, capability probe, adaptive concurrency, local hardlink compatibility view; general reflink/clone attachment remains open |
-| 7 — Cold-path performance | representative benchmark corpus, persistent metadata efficiency, native-resolution profiling, derived lifecycle decision | ✅ Done — realistic fixture measurements and cold resolver hardening landed; persistent packument metadata cache with ETag revalidation (Step 1A), HTTP/2 transport via reqwest (Step 1B), concurrent metadata prefetch (Phase 2), and streaming resolve→download (Phase 3) delivered (~2.15× faster true_cold on large-frontend; cold path now resolve-bound). Derived-artifact integration deferred by decision — it is a warm/incremental-path optimization (the derived store is empty on a cold install, so it yields zero cold-path benefit); tracked as a follow-up, not an M7 cold-path item. |
+| 7 — Cold-path performance | representative benchmark corpus, persistent metadata efficiency, native-resolution profiling, derived lifecycle decision | ⚠️ Partially done — realistic fixture measurements and cold resolver hardening landed; persistent packument metadata cache with ETag revalidation (Step 1A), HTTP/2 transport via reqwest (Step 1B), concurrent metadata prefetch (Phase 2), and streaming resolve→download (Phase 3) delivered. Those were **bpm-vs-prior-bpm** speedups (true_cold `large-frontend` fell from ~55s to ~26s internally), but the checked-in baseline still shows bpm ~6.8× slower than pnpm on `true_cold` `large-frontend` and ~7.7× slower on `native-addon`; the cold resolver remains the bottleneck and is not yet competitive with pnpm. Derived-artifact integration deferred by decision — it is a warm/incremental-path optimization (the derived store is empty on a cold install, so it yields zero cold-path benefit); tracked as a follow-up, not an M7 cold-path item. |
 
 ### Post-M6 — registry name resolution (not in the original plan)
 
@@ -37,14 +37,42 @@ The benchmark harness is implemented and has a checked-in reference baseline
 (`benchmarks/baselines/reference.json`). Refresh it whenever the materialization
 or lifecycle strategy changes, and do not compare results across different
 toolchain/version maps. The current reference baseline (arm64 / macOS 26.5,
-node v26.0.0, npm 11.12.1, bun 1.3.14, **bpm 0.1.10**) covers the four synthetic
-comparability pairs (`minimal`/`small`/`medium`/`monorepo`) plus the
-representative `large-frontend` scenarios (`true_cold`, `resolved_cold`,
-`warm_store`, `repeat_install`, `second_project_same_graph`,
-`partial_dependency_change`); regenerate with
+node v26.0.0, npm 11.12.1, pnpm 10.13.1, **bpm 0.1.10**) covers five fixtures:
+`large-frontend`, `many-small-files`, and `native-addon` across `true_cold`,
+`resolved_cold`, and `repeat_install`; plus `minimal` (`repeat_install`) and
+`monorepo` (`repeat_install`, `resolved_cold`). Regenerate a single cell with
 `PATH="$PWD/target/release:$PATH" ./target/release/bpm bench --fixture <f>
---scenario <s> --runs 3 --tools npm,bun,bpm --json <out>` (prepending the fresh
+--scenario <s> --runs 7 --tools npm,pnpm,bpm --json <out>` (prepending the fresh
 release dir so the recorded `bpm` version and the binary under test match).
+Each tool runs from an isolated cache root, and bpm timed runs now also record
+outbound registry **request counts** and named **phase timings** (resolve,
+download, extract, …) under each tool's `bpm_metrics`, so cold-path profiling is
+reproducible from the JSON alone.
+
+What the checked-in baseline actually shows (median wall clock, bpm vs pnpm):
+
+| Fixture | Scenario | npm | pnpm | bpm | bpm/pnpm |
+|---|---|---:|---:|---:|---:|
+| large-frontend | repeat_install | 670 | 313 | 7 | **0.02×** |
+| large-frontend | resolved_cold | 4180 | 4406 | 7350 | 1.67× |
+| large-frontend | true_cold | 11552 | 3819 | 25824 | 6.76× |
+| many-small-files | repeat_install | 512 | 275 | 6 | **0.02×** |
+| many-small-files | resolved_cold | 518 | 430 | 160 | 0.37× |
+| many-small-files | true_cold | 540 | 443 | 198 | 0.45× |
+| minimal | repeat_install | 532 | 281 | 6 | **0.02×** |
+| monorepo | repeat_install | 545 | 239 | 11 | 0.05× |
+| monorepo | resolved_cold | 526 | 230 | 325 | 1.41× |
+| native-addon | repeat_install | 520 | 285 | 7 | **0.02×** |
+| native-addon | resolved_cold | 549 | 493 | 662 | 1.34× |
+| native-addon | true_cold | 955 | 507 | 3894 | 7.68× |
+
+BPM's graph-volume path is the clear win on warm/repeat installs (tens of
+milliseconds vs hundreds for npm/pnpm) and is already faster than pnpm on small
+cold graphs. On **large cold graphs** (`large-frontend`, `native-addon` true /
+resolved cold) bpm is still several times slower than pnpm — the cold resolver
+is the remaining bottleneck. This is the gap the cold-path work below targets;
+it is not yet closed, and the earlier "competitive" / "2.15× faster" wording
+referred to bpm-vs-prior-bpm internal speedups, not to a win over pnpm.
 
 ## Native resolver — delivered
 
@@ -260,7 +288,7 @@ content-addressed vs graph-keyed. **Decision: defer.** Rationale:
    *incremental/warm* path: reusing a package's derived output when the graph
    changes but that package's build inputs did not.
 2. **The cold path is now resolve-bound, not build-bound.** After Phases 1–3,
-   `true_cold` `large-frontend` is ~23s and lifecycle is a small fraction of
+   `true_cold` `large-frontend` is ~26s (median; see the checked-in baseline) and lifecycle is a small fraction of
    it; there is no cold-path headroom left for the derived store to capture.
 3. **The integration has a real design gap to close first.**
    `DerivedStore::ensure` runs its build callback against a staging copy of the

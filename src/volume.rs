@@ -17,16 +17,16 @@
 //! project-relative resolution keeps working (IMPLEMENTATION §13: "Begin with
 //! the shallow project-local root").
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::graph::graph_id;
+use crate::graph::graph_id_with_prepared;
 use crate::integrity::ArtifactId;
 use crate::lockfile::Lockfile;
-#[cfg(unix)]
 use crate::materializer::hardlink_tree;
 use crate::materializer::{
     materialize_with_backend, MaterializeBackend, MaterializeError, MaterializeStats,
@@ -52,7 +52,7 @@ const META_FILE: &str = "metadata.json";
 /// Bumped when the on-disk volume layout changes (e.g. symlink -> hardlink
 /// materialization of package images). A cached volume whose recorded layout
 /// differs is discarded and rebuilt so every project sees the current layout.
-const VOLUME_LAYOUT_VERSION: u32 = 4;
+const VOLUME_LAYOUT_VERSION: u32 = 6;
 
 #[derive(Debug, Error)]
 pub enum VolumeError {
@@ -93,7 +93,26 @@ pub fn ensure_graph_volume(
     artifact_ids: &[Option<ArtifactId>],
     metrics: &mut Metrics,
 ) -> Result<VolumeRef, VolumeError> {
-    let gid = graph_id(lockfile);
+    ensure_graph_volume_with_prepared(store, lockfile, artifact_ids, &BTreeMap::new(), metrics)
+}
+
+/// Ensure a graph volume with prepared package images overlaid on raw images.
+///
+/// `prepared` maps lockfile package paths to immutable derived images. The
+/// graph key includes each image key, so a volume built from raw Git sources
+/// can never be reused after preparation becomes available or changes.
+pub fn ensure_graph_volume_with_prepared(
+    store: &ArtifactStore,
+    lockfile: &Lockfile,
+    artifact_ids: &[Option<ArtifactId>],
+    prepared: &BTreeMap<String, crate::lifecycle::PreparedImage>,
+    metrics: &mut Metrics,
+) -> Result<VolumeRef, VolumeError> {
+    let prepared_keys = prepared
+        .iter()
+        .map(|(path, image)| (path.clone(), *image.key.as_bytes()))
+        .collect::<BTreeMap<_, _>>();
+    let gid = graph_id_with_prepared(lockfile, &prepared_keys);
     let graph_hex = gid.to_hex();
     let volume_dir = store.graph_volume_path(&graph_hex);
 
@@ -142,6 +161,17 @@ pub fn ensure_graph_volume(
         &resolved,
         MaterializeBackend::Hardlink,
     )?;
+    for package in lockfile.packages.iter().filter(|package| package.link) {
+        let Some(source) = package.workspace_target.as_deref() else {
+            continue;
+        };
+        let target = volume_dir.join(&package.path);
+        overlay_prepared_image(Path::new(source), &target)?;
+    }
+    for (package_path, prepared_image) in prepared {
+        let target = volume_dir.join(package_path);
+        overlay_prepared_image(&prepared_image.image_path, &target)?;
+    }
 
     let meta = VolumeMeta {
         graph_id_hex: graph_hex,
@@ -159,6 +189,73 @@ pub fn ensure_graph_volume(
         cached: false,
         stats,
     })
+}
+
+fn overlay_prepared_image(source: &Path, target: &Path) -> Result<(), VolumeError> {
+    fs::create_dir_all(target).map_err(|error| io_err(target, error))?;
+    for entry in fs::read_dir(source).map_err(|error| io_err(source, error))? {
+        let entry = entry.map_err(|error| io_err(source, error))?;
+        if entry.file_name() == "node_modules" {
+            continue;
+        }
+        let destination = target.join(entry.file_name());
+        remove_any(&destination).map_err(|error| io_err(&destination, error))?;
+        let source_path = entry.path();
+        copy_overlay_entry(&source_path, &destination)?;
+    }
+    Ok(())
+}
+
+fn copy_overlay_entry(source: &Path, destination: &Path) -> Result<(), VolumeError> {
+    let kind = fs::symlink_metadata(source).map_err(|error| io_err(source, error))?;
+    if kind.is_dir() {
+        fs::create_dir_all(destination).map_err(|error| io_err(destination, error))?;
+        for entry in fs::read_dir(source).map_err(|error| io_err(source, error))? {
+            let entry = entry.map_err(|error| io_err(source, error))?;
+            copy_overlay_entry(&entry.path(), &destination.join(entry.file_name()))?;
+        }
+    } else if kind.file_type().is_symlink() {
+        let target = fs::read_link(source).map_err(|error| io_err(source, error))?;
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent).map_err(|error| io_err(parent, error))?;
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, destination)
+            .map_err(|error| io_err(destination, error))?;
+        #[cfg(not(unix))]
+        fs::copy(source, destination)
+            .map(|_| ())
+            .map_err(|error| io_err(destination, error))?;
+    } else {
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent).map_err(|error| io_err(parent, error))?;
+        }
+        fs::copy(source, destination).map_err(|error| io_err(destination, error))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(source)
+                .map_err(|error| io_err(source, error))?
+                .permissions();
+            permissions.set_mode(permissions.mode() | 0o200);
+            fs::set_permissions(destination, permissions)
+                .map_err(|error| io_err(destination, error))?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_any(path: &Path) -> std::io::Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if metadata.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    }
 }
 
 /// Counters for a shallow project attachment into a graph volume.
@@ -207,7 +304,14 @@ pub fn attach_project(project_root: &Path, volume: &VolumeRef) -> Result<AttachS
     Ok(stats)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub fn attach_project(project_root: &Path, volume: &VolumeRef) -> Result<AttachStats, VolumeError> {
+    // Correctness-first Windows view: hardlinks where possible, copies as a
+    // cross-volume fallback. No junctions or privileged symlinks are needed.
+    attach_project_local(project_root, volume)
+}
+
+#[cfg(all(not(unix), not(windows)))]
 pub fn attach_project(
     _project_root: &Path,
     _volume: &VolumeRef,
@@ -250,7 +354,30 @@ pub fn attach_project_local(
     Ok(stats)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub fn attach_project_local(
+    project_root: &Path,
+    volume: &VolumeRef,
+) -> Result<AttachStats, VolumeError> {
+    let vol_nm = volume.path.join("node_modules");
+    let proj_nm = project_root.join("node_modules");
+    fs::create_dir_all(&proj_nm).map_err(|source| io_err(&proj_nm, source))?;
+    let mut entries = fs::read_dir(&vol_nm)
+        .map_err(|source| io_err(&vol_nm, source))?
+        .filter_map(Result::ok)
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.file_name());
+    let mut stats = AttachStats::default();
+    for entry in entries {
+        let target = proj_nm.join(entry.file_name());
+        bpm::materializer::hardlink_tree(&entry.path(), &target)
+            .map_err(VolumeError::Materialize)?;
+        stats.relays_created += 1;
+    }
+    Ok(stats)
+}
+
+#[cfg(all(not(unix), not(windows)))]
 pub fn attach_project_local(
     _project_root: &Path,
     _volume: &VolumeRef,
@@ -295,7 +422,26 @@ pub fn project_attached(project_root: &Path, volume_path: &Path) -> bool {
     seen > 0
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub fn project_attached(project_root: &Path, volume_path: &Path) -> bool {
+    let proj_nm = project_root.join("node_modules");
+    let vol_nm = volume_path.join("node_modules");
+    let Ok(entries) = fs::read_dir(&vol_nm) else {
+        return false;
+    };
+    let mut found = false;
+    for entry in entries.flatten() {
+        found = true;
+        let name = entry.file_name();
+        let project_entry = proj_nm.join(name);
+        if !project_entry.exists() {
+            return false;
+        }
+    }
+    found && proj_nm.exists()
+}
+
+#[cfg(all(not(unix), not(windows)))]
 pub fn project_attached(_project_root: &Path, _volume_path: &Path) -> bool {
     false
 }
