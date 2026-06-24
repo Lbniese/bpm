@@ -36,7 +36,7 @@ pub const PLAN_VERSION: u32 = 1;
 /// Bumped when the materializer's output semantics change (e.g. bin linking
 /// strategy, symlink vs hardlink volume layout). Incompatible materializer
 /// versions invalidate a cached plan even if the graph is identical.
-pub const MATERIALIZER_VERSION: u32 = 4;
+pub const MATERIALIZER_VERSION: u32 = 5;
 
 /// A 256-bit blake3 digest identifying a canonical dependency graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -209,6 +209,20 @@ pub fn graph_id(lockfile: &Lockfile) -> GraphId {
     GraphId(blake3::hash(&bytes))
 }
 
+/// Compute a graph id with prepared-image identities but without workspace
+/// layout, matching the historical graph-volume identity.
+pub fn graph_id_with_prepared(
+    lockfile: &Lockfile,
+    prepared: &BTreeMap<String, [u8; 32]>,
+) -> GraphId {
+    if prepared.is_empty() {
+        return graph_id(lockfile);
+    }
+    let mut bytes = canonical_graph_bytes(lockfile);
+    append_prepared_images(&mut bytes, prepared);
+    GraphId(blake3::hash(&bytes))
+}
+
 /// Graph id including the workspace layout (IMPLEMENTATION §15: "include
 /// workspace layout in the graph ID"). Falls back to the plain graph id when
 /// the project has no workspaces.
@@ -228,8 +242,39 @@ pub fn graph_id_with_workspace(
 /// and folds it into the id, so a change to the workspace tree invalidates the
 /// cached plan/volume.
 pub fn graph_id_for_project(lockfile: &Lockfile, project_root: &Path) -> GraphId {
+    graph_id_for_project_with_prepared(lockfile, project_root, &BTreeMap::new())
+}
+
+/// Compute the project graph id while including immutable prepared-image keys.
+///
+/// Prepared Git images are not lockfile packages, so their identity must be
+/// folded into the volume/plan key separately. Keeping this input outside the
+/// lockfile preserves the consumer graph while preventing a raw-source volume
+/// from being reused for a different prepared image.
+pub fn graph_id_for_project_with_prepared(
+    lockfile: &Lockfile,
+    project_root: &Path,
+    prepared: &BTreeMap<String, [u8; 32]>,
+) -> GraphId {
     let ws = crate::workspace::discover(project_root);
-    graph_id_with_workspace(lockfile, &ws)
+    if prepared.is_empty() {
+        return graph_id_with_workspace(lockfile, &ws);
+    }
+    let mut bytes = canonical_graph_bytes(lockfile);
+    if !ws.packages.is_empty() || !ws.patterns.is_empty() {
+        bytes.extend(crate::workspace::canonical_workspace_bytes(&ws));
+    }
+    append_prepared_images(&mut bytes, prepared);
+    GraphId(blake3::hash(&bytes))
+}
+
+fn append_prepared_images(bytes: &mut Vec<u8>, prepared: &BTreeMap<String, [u8; 32]>) {
+    bytes.extend_from_slice(b"prepared-images\n");
+    write_u64(bytes, prepared.len() as u64);
+    for (path, key) in prepared {
+        write_field(bytes, path);
+        bytes.extend_from_slice(key);
+    }
 }
 
 /// Compute a deterministic BLAKE3 digest of one package's resolved dependency

@@ -65,6 +65,8 @@ pub fn extract(archive_path: &Path, image_root: &Path) -> Result<(), ExtractErro
         .map_err(|e| ExtractError::InvalidArchive(format!("cannot enumerate tar entries: {e}")))?;
 
     let mut seen: HashSet<PathBuf> = HashSet::new();
+    #[cfg(windows)]
+    let mut deferred_links: Vec<(PathBuf, PathBuf)> = Vec::new();
     for entry_result in entries {
         let mut entry = entry_result
             .map_err(|e| ExtractError::InvalidArchive(format!("corrupt tar entry: {e}")))?;
@@ -136,10 +138,17 @@ pub fn extract(archive_path: &Path, image_root: &Path) -> Result<(), ExtractErro
                     std::os::unix::fs::symlink(&target, &dest)
                         .map_err(|source| write_err(&dest, source))?;
                 }
-                #[cfg(not(unix))]
+                #[cfg(all(not(unix), not(windows)))]
                 {
                     let _ = target;
                     return Err(ExtractError::SymlinksUnsupported);
+                }
+                #[cfg(windows)]
+                {
+                    // Windows installs must not require Developer Mode or
+                    // elevation. Resolve safe links after all regular entries
+                    // have been extracted, which also supports forward links.
+                    deferred_links.push((rel.clone(), target));
                 }
             }
             other => {
@@ -151,6 +160,112 @@ pub fn extract(archive_path: &Path, image_root: &Path) -> Result<(), ExtractErro
         }
     }
 
+    #[cfg(windows)]
+    for (link, target) in &deferred_links {
+        let mut visiting = HashSet::new();
+        materialize_windows_link(image_root, link, target, &deferred_links, &mut visiting)?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn materialize_windows_link(
+    root: &Path,
+    link: &Path,
+    target: &Path,
+    deferred: &[(PathBuf, PathBuf)],
+    visiting: &mut HashSet<PathBuf>,
+) -> Result<(), ExtractError> {
+    let normalized_target = resolve_relative(link.parent().unwrap_or(Path::new("")), target)?;
+    if !visiting.insert(link.to_path_buf()) {
+        return Err(ExtractError::UnsafeSymlink {
+            link: link.display().to_string(),
+            target: target.display().to_string(),
+        });
+    }
+    let source = root.join(&normalized_target);
+    if !source.exists() {
+        if let Some((_, next_target)) = deferred
+            .iter()
+            .find(|(candidate, _)| candidate == &normalized_target)
+        {
+            materialize_windows_link(root, &normalized_target, next_target, deferred, visiting)?;
+        }
+    }
+    if !source.exists() {
+        return Err(ExtractError::UnsafeSymlink {
+            link: link.display().to_string(),
+            target: target.display().to_string(),
+        });
+    }
+    if let Some(parent) = root.join(link).parent() {
+        fs::create_dir_all(parent).map_err(|source| write_err(parent, source))?;
+    }
+    if source.is_dir() {
+        copy_windows_tree(
+            root,
+            &normalized_target,
+            root.join(link),
+            deferred,
+            visiting,
+        )?;
+    } else {
+        fs::copy(&source, root.join(link)).map_err(|source| write_err(&root.join(link), source))?;
+    }
+    visiting.remove(link);
+    Ok(())
+}
+
+#[cfg(windows)]
+fn resolve_relative(parent: &Path, target: &Path) -> Result<PathBuf, ExtractError> {
+    let mut parts = parent.to_path_buf();
+    for component in target.components() {
+        match component {
+            Component::Normal(value) => parts.push(value),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !parts.pop() {
+                    return Err(ExtractError::UnsafeSymlink {
+                        link: parent.display().to_string(),
+                        target: target.display().to_string(),
+                    });
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(ExtractError::UnsafeSymlink {
+                    link: parent.display().to_string(),
+                    target: target.display().to_string(),
+                })
+            }
+        }
+    }
+    Ok(parts)
+}
+
+#[cfg(windows)]
+fn copy_windows_tree(
+    root: &Path,
+    source_rel: &Path,
+    destination: PathBuf,
+    deferred: &[(PathBuf, PathBuf)],
+    visiting: &mut HashSet<PathBuf>,
+) -> Result<(), ExtractError> {
+    let source = root.join(source_rel);
+    fs::create_dir_all(&destination).map_err(|source| write_err(&destination, source))?;
+    for entry in fs::read_dir(&source).map_err(|error| write_err(&source, error))? {
+        let entry = entry.map_err(|error| write_err(&source, error))?;
+        let child_rel = source_rel.join(entry.file_name());
+        let child_dest = destination.join(entry.file_name());
+        if entry
+            .file_type()
+            .map_err(|source| write_err(&entry.path(), source))?
+            .is_dir()
+        {
+            copy_windows_tree(root, &child_rel, child_dest, deferred, visiting)?;
+        } else {
+            fs::copy(entry.path(), &child_dest).map_err(|source| write_err(&child_dest, source))?;
+        }
+    }
     Ok(())
 }
 

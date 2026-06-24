@@ -18,6 +18,7 @@ bpm doctor              # inspect project configuration
 bpm fetch lodash        # download and cache a package by name (npm/bun-style)
 bpm fetch lodash@4.17.21 # or by exact version / semver range
 bpm import              # convert package-lock.json to bpm.lock
+bpm install --frozen    # materialize node_modules from bpm.lock
 ```
 
 The installer installs into `/usr/local/bin` by default and will ask for your
@@ -61,12 +62,13 @@ Turbopack can keep dependency realpaths inside the project.
 |---|---|
 | `bpm doctor` | Inspect the nearest `package.json` and report diagnostics |
 | `bpm fetch <spec\|url>` | Resolve a package by spec (`lodash`, `lodash@4.17.21`) or fetch a tarball by exact URL, then verify, store, and extract. Supports `--offline`, `--prefer-offline`, `--prefer-online` |
-| `bpm install [<spec\|url>]` | Resolve `package.json` and install, or install an existing `bpm.lock`; package arguments install/link bins globally. Supports `--offline`, `--prefer-offline`, `--prefer-online` |
+| `bpm install [<spec\|url>]` | Install the project lockfile, or add registry targets to the local manifest; use `bpm install -g <spec>` for global bin linking. Supports `--offline`, `--prefer-offline`, `--prefer-online` |
 | `bpm ci` | Reproducible frozen install from `bpm.lock` (npm `ci` compatibility) |
 | `bpm import` | Convert npm `package-lock.json` v3 to `bpm.lock` and preserve root manifest metadata |
 | `bpm exec <command>` | Execute a local dependency binary with the project bin path |
 | `bpm run <script>` | Execute a root package script with npm-compatible environment variables |
 | `bpm bench` | Run performance benchmark scenarios and emit timing results |
+| `bpm gc` | Garbage-collect unused global store data |
 
 ## Documentation
 
