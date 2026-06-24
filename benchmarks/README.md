@@ -32,8 +32,21 @@ warning rather than failing the run.
 ## Baselines
 
 `baselines/` holds machine-stamped baseline files produced by `--save-baseline`.
-They are local measurement artifacts — `.gitignore`d by default — and are not
-checked in. Regenerate on a given machine with the command above.
+Machine-stamped files are local measurement artifacts — `.gitignore`d — while
+`baselines/reference.json` is the curated, **checked-in** reference baseline
+(the `.gitignore` explicitly exempts it). Regenerate the reference cells on a
+given machine with the command above and copy the result into
+`reference.json` when the materialization or lifecycle strategy changes.
+
+## bpm metrics
+
+For `bpm` runs the harness passes `--json-metrics` during the timed install and
+folds the result into each tool entry's `bpm_metrics`: `requests_sent` (median /
+p95 outbound registry requests per run) and `phase_ms` (median / p95 summed
+duration per named phase — `dependency_resolution`, `artifact_download`,
+`artifact_extract`, `integrity_verify`, …). Other tools omit `bpm_metrics`. This
+makes cold-path request counts and resolver/download/extract phase breakdowns
+reproducible from the JSON alone, without a separate profiling run.
 
 ## Scenarios
 

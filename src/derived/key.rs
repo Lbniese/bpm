@@ -8,8 +8,7 @@ use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 
-const DOMAIN: &[u8] = b"bpm-derived-v1\0";
-const LIFECYCLE_PHASES: [&str; 3] = ["preinstall", "install", "postinstall"];
+const DOMAIN: &[u8] = b"bpm-derived-v2\0";
 
 /// A 256-bit BLAKE3 identity for one complete set of lifecycle inputs.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -70,9 +69,16 @@ pub struct RuntimeIdentity<'a> {
 /// environment that will be supplied after `Command::env_clear()`.
 pub struct DerivedInputs<'a> {
     pub source_artifact: &'a [u8; 64],
+    /// Immutable source revision, when the artifact originated from a
+    /// revisioned source such as Git. This distinguishes identical archives
+    /// produced by different commits.
+    pub source_revision: Option<&'a str>,
     pub dependency_graph: &'a [u8; 32],
     pub target: TargetDescriptor<'a>,
     pub runtime: RuntimeIdentity<'a>,
+    /// Ordered lifecycle phases and their commands. The caller supplies the
+    /// exact phases that will execute; order is part of the cache identity.
+    pub phases: &'a [&'a str],
     pub scripts: &'a BTreeMap<String, String>,
     pub environment: &'a BTreeMap<OsString, OsString>,
     pub runner_version: u32,
@@ -85,6 +91,11 @@ pub fn derived_key(inputs: &DerivedInputs<'_>) -> DerivedKey {
     hasher.update(DOMAIN);
 
     write_field(&mut hasher, b"source", inputs.source_artifact);
+    write_optional_field(
+        &mut hasher,
+        b"source.revision",
+        inputs.source_revision.map(str::as_bytes),
+    );
     write_field(&mut hasher, b"dependency_graph", inputs.dependency_graph);
 
     write_field(&mut hasher, b"target.os", inputs.target.os.as_bytes());
@@ -121,12 +132,12 @@ pub fn derived_key(inputs: &DerivedInputs<'_>) -> DerivedKey {
         inputs.runtime.napi_version.map(str::as_bytes),
     );
 
-    for phase in LIFECYCLE_PHASES {
+    for phase in inputs.phases {
         write_field(&mut hasher, b"script.phase", phase.as_bytes());
         write_optional_field(
             &mut hasher,
             b"script.command",
-            inputs.scripts.get(phase).map(String::as_bytes),
+            inputs.scripts.get(*phase).map(String::as_bytes),
         );
     }
 
@@ -193,6 +204,8 @@ mod tests {
     const SOURCE: [u8; 64] = [1; 64];
     const GRAPH: [u8; 32] = [2; 32];
 
+    const DEFAULT_PHASES: [&str; 3] = ["preinstall", "install", "postinstall"];
+
     #[allow(clippy::too_many_arguments)]
     fn key_with(
         source: &[u8; 64],
@@ -204,11 +217,38 @@ mod tests {
         runner_version: u32,
         policy_version: u32,
     ) -> DerivedKey {
+        key_with_phases(
+            source,
+            graph,
+            target,
+            runtime,
+            &DEFAULT_PHASES,
+            scripts,
+            environment,
+            runner_version,
+            policy_version,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn key_with_phases(
+        source: &[u8; 64],
+        graph: &[u8; 32],
+        target: TargetDescriptor<'_>,
+        runtime: RuntimeIdentity<'_>,
+        phases: &[&str],
+        scripts: &BTreeMap<String, String>,
+        environment: &BTreeMap<OsString, OsString>,
+        runner_version: u32,
+        policy_version: u32,
+    ) -> DerivedKey {
         derived_key(&DerivedInputs {
             source_artifact: source,
+            source_revision: None,
             dependency_graph: graph,
             target,
             runtime,
+            phases,
             scripts,
             environment,
             runner_version,
@@ -271,6 +311,72 @@ mod tests {
                 1
             )
         );
+    }
+
+    #[test]
+    fn phase_list_order_and_membership_invalidate_the_key() {
+        let scripts = BTreeMap::from([("install".into(), "node build.js".into())]);
+        let environment = BTreeMap::new();
+        let baseline = key_with_phases(
+            &SOURCE,
+            &GRAPH,
+            target(),
+            runtime(),
+            &["preinstall", "install", "postinstall"],
+            &scripts,
+            &environment,
+            1,
+            1,
+        );
+        assert_ne!(
+            baseline,
+            key_with_phases(
+                &SOURCE,
+                &GRAPH,
+                target(),
+                runtime(),
+                &["preinstall", "prepare", "install", "postinstall"],
+                &scripts,
+                &environment,
+                1,
+                1,
+            )
+        );
+        assert_ne!(
+            baseline,
+            key_with_phases(
+                &SOURCE,
+                &GRAPH,
+                target(),
+                runtime(),
+                &["install", "preinstall", "postinstall"],
+                &scripts,
+                &environment,
+                1,
+                1,
+            )
+        );
+    }
+
+    #[test]
+    fn source_revision_invalidates_identical_archive_bytes() {
+        let scripts = BTreeMap::new();
+        let environment = BTreeMap::new();
+        let key = |revision| {
+            derived_key(&DerivedInputs {
+                source_artifact: &SOURCE,
+                source_revision: Some(revision),
+                dependency_graph: &GRAPH,
+                target: target(),
+                runtime: runtime(),
+                phases: &DEFAULT_PHASES,
+                scripts: &scripts,
+                environment: &environment,
+                runner_version: 1,
+                policy_version: 1,
+            })
+        };
+        assert_ne!(key("a"), key("b"));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Lockfile and global-bin install orchestration.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -9,7 +9,7 @@ use bpm::config::NpmConfig;
 use bpm::graph;
 use bpm::http::HttpClient;
 use bpm::integrity::{ArtifactId, Integrity};
-use bpm::lockfile::Lockfile;
+use bpm::lockfile::{LockSource, Lockfile};
 use bpm::manifest::PackageManifest;
 use bpm::metrics::Metrics;
 use bpm::project_lock::{find_project_lock, validate_npm_direct_install, ProjectLockKind};
@@ -21,7 +21,7 @@ use bpm::store::{ArtifactStore, StoreError};
 use super::fetch::{name_of_spec, open_registry_client, store_root, write_metrics};
 
 pub(super) struct Options {
-    pub target: Option<String>,
+    pub targets: Vec<String>,
     pub frozen: bool,
     pub registry: Option<String>,
     pub store: Option<PathBuf>,
@@ -31,11 +31,26 @@ pub(super) struct Options {
     pub ignore_scripts: bool,
     /// Experimental per-package lifecycle-derived image cache (`--derived-store` / `BPM_DERIVED_STORE`).
     pub derived_store: bool,
+    /// Run Git package build-context prepare scripts and consume their images.
+    pub git_prepare: bool,
     pub legacy_peer_deps: bool,
     pub cache_mode: bpm::metadata_cache::CacheMode,
+    /// Optional verified remote artifact cache endpoint.
+    pub remote_cache: Option<String>,
+    /// `bpm install -D` / `bpm add --save-dev`: write added packages into
+    /// `devDependencies` and remove them from `dependencies`.
+    pub save_dev: bool,
+    /// `bpm install -E` / `bpm add --save-exact`: save the resolved version as
+    /// an exact `X.Y.Z` rather than the default `^X.Y.Z`.
+    pub save_exact: bool,
 }
 
 pub(super) fn run(mut options: Options) -> anyhow::Result<()> {
+    if options.remote_cache.is_none() {
+        options.remote_cache = env::var_os("BPM_REMOTE_CACHE")
+            .map(PathBuf::from)
+            .map(|p| p.to_string_lossy().into_owned());
+    }
     // `--derived-store` and `BPM_DERIVED_STORE=1` are equivalent. Honor the
     // env var so callers (and tests) can opt in without a CLI flag, mirroring
     // `BPM_STREAM_INSTALL` / `BPM_PROJECT_VIEW`.
@@ -43,19 +58,42 @@ pub(super) fn run(mut options: Options) -> anyhow::Result<()> {
         options.derived_store =
             matches!(env::var("BPM_DERIVED_STORE").as_deref(), Ok("1" | "true"));
     }
-    if let Some(target) = options.target {
-        return run_install_bin(
-            &target,
-            options.registry,
-            options.store,
-            options.global,
-            options.cache_mode,
-        );
+    if !options.git_prepare {
+        options.git_prepare = matches!(env::var("BPM_GIT_PREPARE").as_deref(), Ok("1" | "true"));
+    }
+    // Global bin linking retains the pre-mutation single-target behavior. Do
+    // not silently discard additional targets: users must invoke global
+    // installs once per package until multi-package bin ownership exists.
+    if options.global {
+        match options.targets.as_slice() {
+            [] => anyhow::bail!(
+                "global install (`-g`) requires a package target; \
+                 omit `-g` to install the project lockfile"
+            ),
+            [target] => {
+                return run_global_install(
+                    target,
+                    options.registry.clone(),
+                    options.store.clone(),
+                    options.cache_mode,
+                    options.remote_cache.as_deref(),
+                )
+            }
+            _ => anyhow::bail!(
+                "global install (`-g`) accepts exactly one package target; \
+                 run one command per global package"
+            ),
+        }
+    }
+
+    // Local dependency mutation: `bpm install foo` / `bpm add foo` edits
+    // package.json, resolves the whole edited graph, writes the selected lock,
+    // and installs. Save flags are only meaningful here.
+    if !options.targets.is_empty() {
+        return super::mutate::run_add(&options);
     }
 
     let store_root_path = store_root(options.store.clone())?;
-    let store = ArtifactStore::open(&store_root_path)?;
-    let mut metrics = Metrics::new();
     let cwd = env::current_dir()?;
     let (lockfile_path, lockfile, project_root, lock_kind) = match find_project_lock(&cwd)? {
         Some(project_lock) => {
@@ -93,6 +131,8 @@ pub(super) fn run(mut options: Options) -> anyhow::Result<()> {
             } else {
                 bpm::resolver::peer::PeerMode::Strict
             };
+            let store = ArtifactStore::open(&store_root_path)?;
+            let mut metrics = Metrics::new();
             if streaming_install_enabled() {
                 return run_streaming_install(
                     &root,
@@ -130,18 +170,71 @@ pub(super) fn run(mut options: Options) -> anyhow::Result<()> {
             (path, lockfile, root, ProjectLockKind::Bpm)
         }
     };
+    install_resolved_lockfile(
+        &project_root,
+        &lockfile_path,
+        lockfile,
+        lock_kind,
+        &options,
+        &store_root_path,
+    )
+}
+
+/// Install an already-resolved lockfile: enforce frozen drift, check the graph
+/// plan cache, run the download→extract pipeline, materialize, run lifecycle,
+/// and write the install plan. Shared by lockfile-present install and by
+/// [`crate::cli::mutate`] (add/remove), which resolve an edited manifest and
+/// then hand the resulting graph to this function. Never recursively invokes
+/// the BPM binary and never writes a throwaway lock to pass data around.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn install_resolved_lockfile(
+    project_root: &Path,
+    lockfile_path: &Path,
+    lockfile: Lockfile,
+    lock_kind: ProjectLockKind,
+    options: &Options,
+    store_root_path: &Path,
+) -> anyhow::Result<()> {
+    let store = ArtifactStore::open(store_root_path)?;
+    let mut metrics = Metrics::new();
     if options.frozen {
-        enforce_frozen(&project_root, &lockfile, lock_kind.filename())?;
+        enforce_frozen(project_root, &lockfile, lock_kind.filename())?;
     }
 
-    let config = effective_npm_config(&project_root, options.registry.as_deref())?;
-    let http = HttpClient::new(config);
+    let config = effective_npm_config(project_root, options.registry.as_deref())?;
+    let http = HttpClient::new(config.clone());
+    let registry = open_registry_client(store_root_path, config, http.clone(), options.cache_mode)?;
+    let remote = if options.cache_mode.allows_network() {
+        options
+            .remote_cache
+            .as_deref()
+            .map(|base| {
+                let token = env::var("BPM_REMOTE_CACHE_TOKEN").ok();
+                bpm::remote_cache::RemoteCacheConfig::new(base, token)
+                    .map_err(|error| anyhow::anyhow!("invalid remote cache configuration: {error}"))
+                    .and_then(|config| {
+                        bpm::remote_cache::RemoteCacheClient::new(config).map_err(|error| {
+                            anyhow::anyhow!("invalid remote cache configuration: {error}")
+                        })
+                    })
+            })
+            .transpose()?
+    } else {
+        None
+    };
 
-    let plan_path = graph::plan_path_for(&lockfile_path);
+    let plan_path = graph::plan_path_for(lockfile_path);
     let cached_plan = graph::read_plan(&plan_path)?;
-    let plan_valid = cached_plan
-        .as_ref()
-        .is_some_and(|plan| graph::validate_plan(plan, &lockfile, &project_root, &store).is_ok());
+    let git_prepare_enabled = options.git_prepare
+        && lockfile
+            .resolution
+            .packages
+            .values()
+            .any(|resolution| matches!(resolution.source, LockSource::Git { .. }));
+    let plan_valid = !git_prepare_enabled
+        && cached_plan.as_ref().is_some_and(|plan| {
+            graph::validate_plan(plan, &lockfile, project_root, &store).is_ok()
+        });
     if plan_valid {
         metrics.record("plan_cache_hit", std::time::Duration::ZERO);
         let plan = cached_plan.as_ref().expect("validated cached plan exists");
@@ -159,21 +252,22 @@ pub(super) fn run(mut options: Options) -> anyhow::Result<()> {
             .sum::<usize>();
         println!(
             "nothing to install — graph {} unchanged ({} package(s), {} bin(s) already materialized)",
-            graph::graph_id_for_project(&lockfile, &project_root).to_hex_short(),
+            graph::graph_id_for_project(&lockfile, project_root).to_hex_short(),
             materialized,
             bins
         );
-        return write_metrics(&metrics, options.json_metrics);
+        metrics.add_requests(http.request_count());
+        return write_metrics(&metrics, options.json_metrics.clone());
     }
     metrics.record("plan_cache_miss", std::time::Duration::ZERO);
 
     let work = build_install_work(&lockfile, options.frozen, lock_kind.filename())?;
-    let workers = adaptive_workers(options.concurrency, work.len(), &project_root);
+    let workers = adaptive_workers(options.concurrency, work.len(), project_root);
     let outcomes = std::thread::scope(|scope| -> anyhow::Result<Vec<FetchOutcome>> {
         let (unit_tx, unit_rx) = std::sync::mpsc::sync_channel::<InstallWork>(workers.max(1) * 2);
         let unit_rx = std::sync::Arc::new(std::sync::Mutex::new(unit_rx));
         let (downloaders, extractors) =
-            spawn_fetch_pipeline(scope, &store, &http, unit_rx, workers);
+            spawn_fetch_pipeline(scope, &store, &http, remote.as_ref(), unit_rx, workers);
         for item in work {
             if unit_tx.send(item).is_err() {
                 break;
@@ -189,16 +283,18 @@ pub(super) fn run(mut options: Options) -> anyhow::Result<()> {
         .count();
     let fetched = outcomes.len() - cached;
     let artifact_ids = outcomes_to_artifact_ids(&outcomes, &lockfile);
+    metrics.add_requests(http.request_count());
     finalize_install(
-        &project_root,
+        project_root,
         &store,
         &lockfile,
         &artifact_ids,
         cached,
         fetched,
         &mut metrics,
-        &options,
-        &lockfile_path,
+        options,
+        lockfile_path,
+        &registry,
     )
 }
 
@@ -313,12 +409,12 @@ fn run_lifecycle_if_enabled(
     }
 }
 
-fn run_install_bin(
+fn run_global_install(
     target: &str,
     registry: Option<String>,
     store: Option<PathBuf>,
-    _global: bool,
     cache_mode: bpm::metadata_cache::CacheMode,
+    remote_cache: Option<&str>,
 ) -> anyhow::Result<()> {
     let store_root_path = store_root(store)?;
     let store = ArtifactStore::open(&store_root_path)?;
@@ -343,8 +439,28 @@ fn run_install_bin(
     } else {
         (target.to_string(), None)
     };
-    let artifact =
-        store.ensure_artifact_with_client(&http, &url, integrity.as_ref(), &mut metrics)?;
+    let remote = if cache_mode.allows_network() {
+        remote_cache
+            .map(|base| {
+                let token = env::var("BPM_REMOTE_CACHE_TOKEN").ok();
+                let config =
+                    bpm::remote_cache::RemoteCacheConfig::new(base, token).map_err(|error| {
+                        anyhow::anyhow!("invalid remote cache configuration: {error}")
+                    })?;
+                bpm::remote_cache::RemoteCacheClient::new(config)
+                    .map_err(|error| anyhow::anyhow!("invalid remote cache configuration: {error}"))
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    let artifact = if let Some(remote) = remote.as_ref() {
+        store
+            .ensure_artifact_with_remote(&http, remote, &url, integrity.as_ref(), &mut metrics)?
+            .artifact
+    } else {
+        store.ensure_artifact_with_client(&http, &url, integrity.as_ref(), &mut metrics)?
+    };
     let image = store.ensure_image(&artifact.id, &mut metrics)?;
     println!(
         "fetched {} ({}) -> {}",
@@ -411,7 +527,10 @@ fn run_install_bin(
     Ok(())
 }
 
-fn effective_npm_config(project_root: &Path, registry: Option<&str>) -> anyhow::Result<NpmConfig> {
+pub(super) fn effective_npm_config(
+    project_root: &Path,
+    registry: Option<&str>,
+) -> anyhow::Result<NpmConfig> {
     let home = env::var_os("HOME").map(PathBuf::from);
     let mut config = NpmConfig::load(project_root, home.as_deref())
         .map_err(|e| anyhow::anyhow!("failed to load npm config: {e}"))?;
@@ -630,6 +749,7 @@ fn spawn_fetch_pipeline<'scope, 'env>(
     scope: &'scope std::thread::Scope<'scope, 'env>,
     store: &'env ArtifactStore,
     http: &'env HttpClient,
+    remote: Option<&'env bpm::remote_cache::RemoteCacheClient>,
     unit_rx: std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<InstallWork>>>,
     workers: usize,
 ) -> (Vec<DownloaderHandle<'scope>>, Vec<ExtractorHandle<'scope>>) {
@@ -642,6 +762,7 @@ fn spawn_fetch_pipeline<'scope, 'env>(
         let unit_rx = unit_rx.clone();
         let send = send.clone();
         let http = http.clone();
+        let remote = remote.cloned();
         downloaders.push(scope.spawn(move || -> Result<Metrics, FetchFail> {
             let mut local = Metrics::new();
             let mut extraction_gone = false;
@@ -649,24 +770,35 @@ fn spawn_fetch_pipeline<'scope, 'env>(
                 if extraction_gone {
                     continue;
                 }
-                let result = store
-                    .ensure_artifact_with_client(
+                let result = if let Some(remote) = remote.as_ref() {
+                    store
+                        .ensure_artifact_with_remote(
+                            &http,
+                            remote,
+                            &item.url,
+                            item.integrity.as_ref(),
+                            &mut local,
+                        )
+                        .map(|result| result.artifact)
+                } else {
+                    store.ensure_artifact_with_client(
                         &http,
                         &item.url,
                         item.integrity.as_ref(),
                         &mut local,
                     )
-                    .map(|artifact| PendingArtifact {
-                        path: item.path.clone(),
-                        name: item.name.clone(),
-                        url: item.url.clone(),
-                        artifact,
-                    })
-                    .map_err(|source| FetchFail {
-                        name: item.name.clone(),
-                        url: item.url.clone(),
-                        source: Box::new(source),
-                    });
+                }
+                .map(|artifact| PendingArtifact {
+                    path: item.path.clone(),
+                    name: item.name.clone(),
+                    url: item.url.clone(),
+                    artifact,
+                })
+                .map_err(|source| FetchFail {
+                    name: item.name.clone(),
+                    url: item.url.clone(),
+                    source: Box::new(source),
+                });
                 if send.send(result).is_err() {
                     // Extractors all exited (fatal error). Keep draining unit_rx
                     // so a streaming producer never blocks on a full channel;
@@ -805,6 +937,24 @@ fn run_streaming_install(
     metrics: &mut Metrics,
     options: &Options,
 ) -> anyhow::Result<()> {
+    let remote = if options.cache_mode.allows_network() {
+        options
+            .remote_cache
+            .as_deref()
+            .map(|base| {
+                let token = env::var("BPM_REMOTE_CACHE_TOKEN").ok();
+                bpm::remote_cache::RemoteCacheConfig::new(base, token)
+                    .map_err(|error| anyhow::anyhow!("invalid remote cache configuration: {error}"))
+                    .and_then(|config| {
+                        bpm::remote_cache::RemoteCacheClient::new(config).map_err(|error| {
+                            anyhow::anyhow!("invalid remote cache configuration: {error}")
+                        })
+                    })
+            })
+            .transpose()?
+    } else {
+        None
+    };
     // Work count is unknown until resolution completes, so do not clamp the
     // worker count to it (usize::MAX makes adaptive_workers' clamp a no-op).
     let workers = adaptive_workers(concurrency, usize::MAX, root);
@@ -814,7 +964,7 @@ fn run_streaming_install(
                 std::sync::mpsc::sync_channel::<InstallWork>(workers.max(1) * 2);
             let unit_rx = std::sync::Arc::new(std::sync::Mutex::new(unit_rx));
             let (downloaders, extractors) =
-                spawn_fetch_pipeline(scope, store, http, unit_rx, workers);
+                spawn_fetch_pipeline(scope, store, http, remote.as_ref(), unit_rx, workers);
             // Run resolution on this thread, emitting each placed node to the
             // sink; dropping `sink` closes the unit channel so downloaders (and
             // then extractors) drain and finish before we join them below.
@@ -851,6 +1001,7 @@ fn run_streaming_install(
         .count();
     let fetched = outcomes.len() - cached;
     let artifact_ids = outcomes_to_artifact_ids(&outcomes, &lockfile);
+    metrics.add_requests(http.request_count());
     finalize_install(
         root,
         store,
@@ -861,6 +1012,7 @@ fn run_streaming_install(
         metrics,
         options,
         &path,
+        client,
     )
 }
 
@@ -878,14 +1030,42 @@ fn finalize_install(
     metrics: &mut Metrics,
     options: &Options,
     lockfile_path: &Path,
+    registry: &bpm::registry::RegistryClient,
 ) -> anyhow::Result<()> {
+    let git_prepare_enabled = options.git_prepare
+        && lockfile
+            .resolution
+            .packages
+            .values()
+            .any(|resolution| matches!(resolution.source, LockSource::Git { .. }));
     let has_workspace_links = lockfile.packages.iter().any(|package| package.link);
+    // Nested `file:` dependencies need a graph volume: direct symlink
+    // materialization cannot place a child under an immutable package image.
+    // The volume copies those source links into its image. Top-level workspace
+    // links retain the existing direct-materialization path.
+    let has_nested_links = lockfile
+        .packages
+        .iter()
+        .any(|package| package.link && package.path.contains("/node_modules/"));
+    let direct_materialization = has_workspace_links && !has_nested_links;
+    let prepared = if git_prepare_enabled && !options.ignore_scripts && !direct_materialization {
+        bpm::lifecycle::prepare_git_packages(
+            project_root,
+            store,
+            lockfile,
+            artifact_ids,
+            registry,
+            metrics,
+        )?
+    } else {
+        BTreeMap::new()
+    };
     // Turbopack and similar bundlers enforce that dependency realpaths remain
     // inside the project. Keep the O(top-level) relay fast path for ordinary
     // projects, but use a local hardlink view automatically for Next projects;
     // callers can override this with BPM_PROJECT_VIEW=relay|local.
     let local_project_view = use_local_project_view(lockfile);
-    let (volume, mut view_entry_count) = if has_workspace_links {
+    let (volume, mut view_entry_count) = if direct_materialization {
         bpm::materializer::materialize_lockfile_with_backend(
             project_root,
             store,
@@ -900,7 +1080,13 @@ fn finalize_install(
         )?;
         (None, 0usize)
     } else {
-        let volume = bpm::volume::ensure_graph_volume(store, lockfile, artifact_ids, metrics)?;
+        let volume = bpm::volume::ensure_graph_volume_with_prepared(
+            store,
+            lockfile,
+            artifact_ids,
+            &prepared,
+            metrics,
+        )?;
         let attach = bpm::volume::attach_project(project_root, &volume)?;
         (
             Some(volume),
@@ -931,7 +1117,12 @@ fn finalize_install(
 
     let plan_path = graph::plan_path_for(lockfile_path);
     let mut plan = graph::build_plan(lockfile, artifact_ids, &lifecycle.derived_paths);
-    plan.graph_id_hex = graph::graph_id_for_project(lockfile, project_root).to_hex();
+    let prepared_keys = prepared
+        .iter()
+        .map(|(path, image)| (path.clone(), *image.key.as_bytes()))
+        .collect::<BTreeMap<_, _>>();
+    plan.graph_id_hex =
+        graph::graph_id_for_project_with_prepared(lockfile, project_root, &prepared_keys).to_hex();
     if let Err(error) = graph::write_plan(&plan, &plan_path) {
         eprintln!(
             "warning: failed to write plan {}: {error}",

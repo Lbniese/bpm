@@ -64,6 +64,9 @@ pub(crate) enum Commands {
         /// Always revalidate cached metadata against the registry.
         #[arg(long)]
         prefer_online: bool,
+        /// Optional verified read-through cache for raw artifacts.
+        #[arg(long)]
+        remote_cache: Option<String>,
     },
     /// Run benchmark scenarios and report timing statistics.
     Bench {
@@ -141,11 +144,12 @@ pub(crate) enum Commands {
         #[arg(long = "audit-level", default_value = "low")]
         audit_level: String,
     },
-    /// Install from `bpm.lock`, or fetch a package and link its declared bins.
+    /// Install from `bpm.lock`, add a dependency, or fetch and link a package's bins.
     #[command(alias = "i", alias = "add")]
     Install {
-        /// Package spec, URL, or `file://` path. Omit to install `bpm.lock`.
-        target: Option<String>,
+        /// Package spec(s) to add to the project (registry only in this slice).
+        /// Omit to install the existing `bpm.lock` / `package-lock.json`.
+        targets: Vec<String>,
         /// Require `package.json` and `bpm.lock` to agree.
         #[arg(long)]
         frozen: bool,
@@ -164,6 +168,12 @@ pub(crate) enum Commands {
         /// Install a target package into the user-level bin prefix (npm-compatible spelling).
         #[arg(short = 'g', long)]
         global: bool,
+        /// Add registry targets to `devDependencies` instead of `dependencies`.
+        #[arg(short = 'D', long = "save-dev")]
+        save_dev: bool,
+        /// Save the resolved version as an exact `X.Y.Z` instead of `^X.Y.Z`.
+        #[arg(short = 'E', long = "save-exact")]
+        save_exact: bool,
         /// Do not run lifecycle scripts.
         #[arg(long)]
         ignore_scripts: bool,
@@ -172,6 +182,9 @@ pub(crate) enum Commands {
         /// (experimental; default off).
         #[arg(long)]
         derived_store: bool,
+        /// Run npm's Git build-context `prepare` lifecycle (experimental; default off).
+        #[arg(long)]
+        git_prepare: bool,
         /// Ignore peer dependency conflicts.
         #[arg(long = "legacy-peer-deps")]
         legacy_peer_deps: bool,
@@ -184,6 +197,57 @@ pub(crate) enum Commands {
         /// Always revalidate cached metadata against the registry.
         #[arg(long)]
         prefer_online: bool,
+        /// Optional verified read-through cache for raw artifacts.
+        #[arg(long)]
+        remote_cache: Option<String>,
+    },
+    /// Remove one or more packages from the project manifest and lock.
+    #[command(alias = "remove", alias = "rm", alias = "un")]
+    Uninstall {
+        /// Package name(s) to remove from every dependency section.
+        #[arg(required = true)]
+        names: Vec<String>,
+        /// Registry base URL for package-spec resolution.
+        #[arg(long)]
+        registry: Option<String>,
+        /// Store root (defaults to `$BPM_STORE` or `$HOME/.bpm`).
+        #[arg(long)]
+        store: Option<PathBuf>,
+        /// Max concurrent fetch + extract workers (0 selects an adaptive limit).
+        #[arg(long, default_value_t = 0)]
+        concurrency: usize,
+        /// Write phase metrics as canonical JSON to `PATH`.
+        #[arg(long = "json-metrics")]
+        json_metrics: Option<PathBuf>,
+        /// Do not run lifecycle scripts.
+        #[arg(long)]
+        ignore_scripts: bool,
+        /// Cache lifecycle-derived package images per dependency closure
+        /// (experimental; default off).
+        #[arg(long)]
+        derived_store: bool,
+        /// Run npm's Git build-context `prepare` lifecycle (experimental; default off).
+        #[arg(long)]
+        git_prepare: bool,
+        /// Ignore peer dependency conflicts.
+        #[arg(long = "legacy-peer-deps")]
+        legacy_peer_deps: bool,
+        /// Never contact the registry; resolve only against cached metadata.
+        #[arg(long)]
+        offline: bool,
+        /// Prefer cached metadata without revalidation; fetch only on a miss.
+        #[arg(long)]
+        prefer_offline: bool,
+        /// Always revalidate cached metadata against the registry.
+        #[arg(long)]
+        prefer_online: bool,
+        /// Optional verified read-through cache for raw artifacts.
+        #[arg(long)]
+        remote_cache: Option<String>,
+        /// Rejected: global-bin ownership metadata does not exist yet, so
+        /// deleting by filename would be unsafe.
+        #[arg(short = 'g', long)]
+        global: bool,
     },
     /// Clean install from `bpm.lock` (npm `ci` compatibility).
     Ci {
@@ -207,6 +271,9 @@ pub(crate) enum Commands {
         /// (experimental; default off).
         #[arg(long)]
         derived_store: bool,
+        /// Run npm's Git build-context `prepare` lifecycle (experimental; default off).
+        #[arg(long)]
+        git_prepare: bool,
         /// Ignore peer dependency conflicts.
         #[arg(long = "legacy-peer-deps")]
         legacy_peer_deps: bool,
@@ -219,6 +286,9 @@ pub(crate) enum Commands {
         /// Always revalidate cached metadata against the registry.
         #[arg(long)]
         prefer_online: bool,
+        /// Optional verified read-through cache for raw artifacts.
+        #[arg(long)]
+        remote_cache: Option<String>,
     },
     /// Print the directory where global executable shims are linked.
     Bin {
@@ -348,5 +418,89 @@ mod tests {
             panic!("expected exec command");
         };
         assert_eq!(args, [native_argument]);
+    }
+
+    #[test]
+    fn install_accepts_multiple_targets_and_save_flags() {
+        let cli = Cli::try_parse_from([
+            "bpm",
+            "add",
+            "--save-dev",
+            "--save-exact",
+            "lodash",
+            "@scope/lib",
+        ])
+        .unwrap();
+
+        let Commands::Install {
+            targets,
+            save_dev,
+            save_exact,
+            global,
+            ..
+        } = cli.command
+        else {
+            panic!("expected install command");
+        };
+        assert_eq!(
+            targets,
+            vec!["lodash".to_string(), "@scope/lib".to_string()]
+        );
+        assert!(save_dev);
+        assert!(save_exact);
+        assert!(!global);
+    }
+
+    #[test]
+    fn install_alias_i_works() {
+        let cli = Cli::try_parse_from(["bpm", "i", "lodash"]).unwrap();
+        let Commands::Install { targets, .. } = cli.command else {
+            panic!("expected install command");
+        };
+        assert_eq!(targets, vec!["lodash".to_string()]);
+    }
+
+    #[test]
+    fn install_without_targets_parses() {
+        let cli = Cli::try_parse_from(["bpm", "install", "--frozen"]).unwrap();
+        let Commands::Install {
+            targets, frozen, ..
+        } = cli.command
+        else {
+            panic!("expected install command");
+        };
+        assert!(targets.is_empty());
+        assert!(frozen);
+    }
+
+    #[test]
+    fn install_scoped_spec_with_version_parses() {
+        let cli = Cli::try_parse_from(["bpm", "add", "@scope/lib@^1.2.0"]).unwrap();
+        let Commands::Install { targets, .. } = cli.command else {
+            panic!("expected install command");
+        };
+        assert_eq!(targets, vec!["@scope/lib@^1.2.0".to_string()]);
+    }
+
+    #[test]
+    fn uninstall_aliases_all_parse() {
+        for alias in ["uninstall", "remove", "rm", "un"] {
+            let cli = Cli::try_parse_from(["bpm", alias, "lodash", "chalk"])
+                .unwrap_or_else(|_| panic!("{alias} should parse"));
+            let Commands::Uninstall { names, .. } = cli.command else {
+                panic!("{alias} expected uninstall command");
+            };
+            assert_eq!(
+                names,
+                vec!["lodash".to_string(), "chalk".to_string()],
+                "{alias}"
+            );
+        }
+    }
+
+    #[test]
+    fn uninstall_requires_at_least_one_name() {
+        let error = Cli::try_parse_from(["bpm", "remove"]).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
     }
 }

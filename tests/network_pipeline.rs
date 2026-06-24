@@ -308,6 +308,7 @@ fn install_uses_path_specific_tokens_and_links_bins() {
     let (ok, stdout, stderr) = run_bpm(
         &[
             "install",
+            "-g",
             "demo-cli",
             "--registry",
             &server.url(""),

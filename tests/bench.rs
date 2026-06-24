@@ -525,6 +525,7 @@ fn result_with_tools(
                     stddev: 0.0,
                 },
                 exit_codes,
+                bpm_metrics: None,
             })
             .collect(),
     }
