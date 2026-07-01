@@ -268,6 +268,19 @@ pub fn resolve_manifest_with_options_and_target_sink(
         sink,
     };
     let mut root_targets = BTreeMap::new();
+
+    // ── Batch-prefetch dependency closure before DFS ───────────────────
+    // Scan the root manifest for all registry-typed dependency names and
+    // prefetch their packuments up to 3 BFS levels.  This separates metadata
+    // fetch from graph traversal (pnpm's approach): after this call the
+    // in-memory packument cache is warm for the first several levels of the
+    // dependency tree, so the resolver's DFS mostly hits cache instead of
+    // blocking on the network for each new level's packuments.  The existing
+    // per-node prefetch_children calls continue to work for deeper levels.
+    //
+    // We ignore the returned count here; the batch is purely a warmup.
+    let _ = registry.prefetch_batch_closure(&root_deps, 3);
+
     // Prefetch the first wave of registry packuments so the root requests
     // overlap instead of running strictly depth-first.
     resolver.prefetch_children(&root_deps);
@@ -698,7 +711,7 @@ impl<'a> GraphResolver<'a> {
                     .and_then(|workspace| workspace.get(child))
                     .is_none()
             {
-                self.registry.prefetch_packument(child);
+                self.registry.prefetch_packument(child, Some(child_spec));
             }
         }
     }
@@ -2042,6 +2055,124 @@ mod tests {
         assert_eq!(
             with_prefetch_a, with_prefetch_b,
             "prefetch resolution was nondeterministic across runs"
+        );
+    }
+
+    #[test]
+    fn batch_closure_does_not_change_the_resolved_lockfile() {
+        // A 3-level-deep graph (root -> a -> b -> c) so the batch-prefetch
+        // closure exercises multiple BFS levels.  Resolution with the batch
+        // closure enabled must be byte-identical to resolution without it
+        // (the closure is purely a cache warmup and must not affect placement
+        // or target selection).  We also verify the batch counter is
+        // populated, proving the closure actually ran.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_shutdown = std::sync::Arc::clone(&shutdown);
+        let server = thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            while !server_shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(std::time::Duration::from_millis(2));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let mut request = [0_u8; 2048];
+                let length = stream.read(&mut request).unwrap_or(0);
+                let request = String::from_utf8_lossy(&request[..length]);
+                let path = request.lines().next().and_then(|line| {
+                    line.strip_prefix("GET /")
+                        .and_then(|rest| rest.split(' ').next())
+                });
+                let body = match path {
+                    Some("a") => {
+                        r#"{"name":"a","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"a","version":"1.0.0","dependencies":{"b":"^1.0.0"},"dist":{"tarball":"/a.tgz","integrity":"sha512-A"}}}}"#
+                    }
+                    Some("b") => {
+                        r#"{"name":"b","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"b","version":"1.0.0","dependencies":{"c":"^1.0.0"},"dist":{"tarball":"/b.tgz","integrity":"sha512-B"}}}}"#
+                    }
+                    Some("c") => {
+                        r#"{"name":"c","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"c","version":"1.0.0","dist":{"tarball":"/c.tgz","integrity":"sha512-C"}}}}"#
+                    }
+                    _ => continue,
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+        });
+
+        let config = crate::config::NpmConfig::default()
+            .with_registry_override(&format!("http://{}", address))
+            .unwrap();
+        let manifest = PackageManifest::from_json(
+            r#"{"name":"app","version":"1.0.0","dependencies":{"a":"*"}}"#,
+            std::path::Path::new("package.json"),
+        )
+        .unwrap();
+
+        // Baseline: no prefetch, no batch.
+        let baseline = resolve_manifest(&manifest, &RegistryClient::new(config.clone()), "test")
+            .unwrap()
+            .to_json()
+            .unwrap();
+
+        // With prefetch enabled — triggers batch closure at 3 BFS levels.
+        let (with_batch_a, batch_a): (String, u64) = {
+            let _ = crate::registry::take_batch_prefetch_fetches();
+            let lock = resolve_manifest(
+                &manifest,
+                &RegistryClient::new(config.clone()).with_prefetch(4),
+                "test",
+            )
+            .unwrap()
+            .to_json()
+            .unwrap();
+            let batch = crate::registry::take_batch_prefetch_fetches();
+            (lock, batch)
+        };
+        let (with_batch_b, batch_b): (String, u64) = {
+            let _ = crate::registry::take_batch_prefetch_fetches();
+            let lock = resolve_manifest(
+                &manifest,
+                &RegistryClient::new(config.clone()).with_prefetch(4),
+                "test",
+            )
+            .unwrap()
+            .to_json()
+            .unwrap();
+            let batch = crate::registry::take_batch_prefetch_fetches();
+            (lock, batch)
+        };
+
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().unwrap();
+
+        assert_eq!(
+            baseline, with_batch_a,
+            "batch closure changed the resolved lockfile"
+        );
+        assert_eq!(
+            with_batch_a, with_batch_b,
+            "batch closure resolution was nondeterministic across runs"
+        );
+        // The batch must have fetched all 3 unique packages (a, b, c)
+        // across 3 BFS levels.
+        assert!(
+            batch_a >= 3,
+            "batch closure should fetch >=3 packuments, got {batch_a}"
+        );
+        assert!(
+            batch_b >= 3,
+            "second batch closure should also fetch >=3 packuments, got {batch_b}"
         );
     }
 

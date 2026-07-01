@@ -983,6 +983,43 @@ fn run_streaming_install(
                     })
                     .map_err(|error| anyhow::anyhow!("dependency resolution failed: {error}"))?
             };
+            // Of the `dependency_resolution` wall time, how much the resolver
+            // thread blocked on network (packument fetches + waiting on
+            // in-flight prefetches). The remainder is CPU: parse, placement,
+            // peer backtracking, lockfile generation.
+            let resolver_net_wait_ns = bpm::registry::take_resolver_fetch_nanos();
+            metrics.record(
+                "resolver_network_wait",
+                std::time::Duration::from_nanos(resolver_net_wait_ns),
+            );
+            let (hits, waits, inline, prefetch) = bpm::registry::take_resolver_diagnostics();
+            let packument_bytes = bpm::registry::take_resolver_fetch_bytes();
+            metrics.record_resolver_diagnostics(
+                hits,
+                waits,
+                inline,
+                prefetch,
+                packument_bytes,
+                resolver_net_wait_ns,
+            );
+            // Record batch-prefetch closure count (packuments fetched before
+            // DFS started, separate from inline and pool prefetches).
+            let batch_fetches = bpm::registry::take_batch_prefetch_fetches();
+            metrics.record_batch_prefetch(batch_fetches);
+            // Also record the HTTP transport diagnostics: whether HTTP/2 was
+            // observed and the peak in-flight request concurrency.
+            metrics.record(
+                "http_observed_http2",
+                if http.observed_http2() {
+                    std::time::Duration::from_nanos(1)
+                } else {
+                    std::time::Duration::ZERO
+                },
+            );
+            metrics.record(
+                "http_peak_concurrency",
+                std::time::Duration::from_nanos(http.max_concurrent_requests()),
+            );
             let outcomes = join_pipeline(downloaders, extractors, metrics)?;
             Ok((lockfile, outcomes))
         })?;
