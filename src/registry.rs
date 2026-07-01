@@ -34,6 +34,74 @@ use crate::metadata_cache::{CacheMode, MetadataCache};
 /// publish-time history (multi-megabyte for popular packages).
 const ABBREV_ACCEPT: &str = "application/vnd.npm.install-v1+json";
 
+std::thread_local! {
+    /// Wall time the current thread has spent inside synchronous `packument_for`
+    /// calls (inline fetches plus condvar waits on in-flight prefetches). The
+    /// resolver thread is the only caller of `packument_for` during graph
+    /// resolution — prefetch workers fetch directly via `fetch_packument` — so
+    /// this isolates how long the resolver blocked on the network versus the
+    /// CPU it spent parsing, placing, backtracking on peers, and emitting the
+    /// lockfile.
+    static RESOLVER_FETCH_NANOS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn add_resolver_fetch_nanos(duration: std::time::Duration) {
+    RESOLVER_FETCH_NANOS.with(|cell| {
+        cell.set(cell.get().saturating_add(duration.as_nanos() as u64));
+    });
+}
+
+/// Total bytes of packument bodies fetched over the network across all threads
+/// (resolver inline fetches plus every prefetch worker). A global atomic, not
+/// thread-local, so it captures the full network volume the resolution issued.
+static RESOLVER_FETCH_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+// Diagnostic counters for where the resolver thread spends packument lookups.
+static RESOLVER_CACHE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RESOLVER_CACHE_WAITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RESOLVER_INLINE_FETCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PREFETCH_FETCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Snapshot and reset all resolver/prefetch diagnostic counters.
+pub fn take_resolver_diagnostics() -> (u64, u64, u64, u64) {
+    (
+        RESOLVER_CACHE_HITS.swap(0, std::sync::atomic::Ordering::Relaxed),
+        RESOLVER_CACHE_WAITS.swap(0, std::sync::atomic::Ordering::Relaxed),
+        RESOLVER_INLINE_FETCHES.swap(0, std::sync::atomic::Ordering::Relaxed),
+        PREFETCH_FETCHES.swap(0, std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// Total batch-prefetch closure rounds across all BFS levels
+/// (one increment per packument fetched during the batch phase).
+static BATCH_PREFETCH_FETCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Read and reset the batch-prefetch fetch counter.
+pub fn take_batch_prefetch_fetches() -> u64 {
+    BATCH_PREFETCH_FETCHES.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+fn add_resolver_fetch_bytes(bytes: usize) {
+    RESOLVER_FETCH_BYTES.fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Read and reset the total network-fetched packument bytes across all threads
+/// (resolver inline fetches plus every prefetch worker).
+pub fn take_resolver_fetch_bytes() -> u64 {
+    RESOLVER_FETCH_BYTES.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Read and reset the current thread's accumulated `packument_for` wall time,
+/// in nanoseconds. Call from the thread that ran resolution to learn how much
+/// of `dependency_resolution` was network wait versus CPU.
+pub fn take_resolver_fetch_nanos() -> u64 {
+    RESOLVER_FETCH_NANOS.with(|cell| {
+        let value = cell.get();
+        cell.set(0);
+        value
+    })
+}
+
 /// How a spec asks for a version.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VersionRange(Vec<VersionReq>);
@@ -437,7 +505,8 @@ impl RegistryClient {
     /// the abbreviated install metadata packument so dependency fields remain
     /// available without downloading npm's publish-time metadata.
     pub fn packument_for(&self, spec: &PackageSpec) -> Result<Packument, RegistryError> {
-        match &spec.req {
+        let started = std::time::Instant::now();
+        let outcome = match &spec.req {
             VersionRequest::Exact(version) => {
                 let registry = self.config.registry_for_package(&spec.name);
                 fetch_version_packument(
@@ -450,7 +519,9 @@ impl RegistryClient {
                 )
             }
             VersionRequest::Latest | VersionRequest::Range(_) => self.packument(&spec.name),
-        }
+        };
+        add_resolver_fetch_nanos(started.elapsed());
+        outcome
     }
 
     /// Fetch a typed packument for use by dependency-graph resolution.
@@ -468,11 +539,16 @@ impl RegistryClient {
         loop {
             let mut map = self.packument_cache.map.lock().unwrap();
             match map.get(&key) {
-                Some(PackumentEntry::Ready(packument)) => return Ok(packument.clone()),
+                Some(PackumentEntry::Ready(packument)) => {
+                    RESOLVER_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(packument.clone());
+                }
                 Some(PackumentEntry::InFlight) => {
+                    RESOLVER_CACHE_WAITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     map = self.packument_cache.cv.wait(map).unwrap();
                 }
                 None => {
+                    RESOLVER_INLINE_FETCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     map.insert(key.clone(), PackumentEntry::InFlight);
                     break;
                 }
@@ -510,41 +586,241 @@ impl RegistryClient {
     /// already `Ready`, or when a fetch is already `InFlight`. Fetch failures
     /// are swallowed here; the synchronous [`Self::packument`] path reports
     /// the real error when the resolver reaches that package.
-    pub fn prefetch_packument(&self, name: &str) {
+    /// Best-effort, non-blocking prefetch of one package's packument.
+    ///
+    /// Called by the resolver as soon as a node's dependency list is known so
+    /// sibling packument fetches overlap during depth-first graph expansion.
+    /// Idempotent: a no-op when prefetching is disabled, when the slot is
+    /// already `Ready`, or when a fetch is already `InFlight`. Fetch failures
+    /// are swallowed here; the synchronous [`Self::packument`] path reports
+    /// the real error when the resolver reaches that package.
+    ///
+    /// `version_spec` (e.g. `^4.0.0`) is carried into the worker so a
+    /// successful fetch can select the version the resolver will place and
+    /// recursively prefetch *its* registry children (see [`prefetch_child_specs`]).
+    /// That turns the pool from a one-level lookahead into a concurrent
+    /// closure fetcher, so the resolver thread mostly hits cache and runs at
+    /// CPU speed instead of serializing on the dependency-tree depth.
+    pub fn prefetch_packument(&self, name: &str, version_spec: Option<&str>) {
         if self.prefetch_workers == 0 {
-            return;
-        }
-        let registry = self.config.registry_for_package(name).to_owned();
-        let key = format!("{}\0{name}", registry.trim_end_matches('/'));
-        let claimed = {
-            let mut map = self.packument_cache.map.lock().unwrap();
-            if map.contains_key(&key) {
-                false
-            } else {
-                map.insert(key.clone(), PackumentEntry::InFlight);
-                true
-            }
-        };
-        if !claimed {
             return;
         }
         let pool = self.prefetch_pool.get_or_init(|| {
             PrefetchPool::start(
                 self.prefetch_workers,
                 self.http.clone(),
+                self.config.clone(),
                 self.metadata_cache.clone(),
                 self.packument_cache.clone(),
                 self.cache_mode,
             )
         });
-        if let Some(sender) = &pool.sender {
-            let _ = sender.send(PrefetchJob {
-                key,
-                name: name.to_owned(),
-                registry,
-            });
+        enqueue_prefetch(
+            &self.packument_cache,
+            &pool.sender_slot,
+            &self.config,
+            name,
+            version_spec,
+        );
+    }
+
+    /// Prefetch the dependency closure for root dependencies up to `max_depth`
+    /// BFS levels before the resolver's DFS traversal begins.
+    ///
+    /// **How it works** (pnpm's approach — separates metadata fetch from graph
+    /// traversal):
+    ///
+    /// 1. Scan the root manifest's dependency declarations for registry-typed
+    ///    specs (skipping `file:`, `git:`, `workspace:`, etc.).
+    /// 2. At each BFS level, submit **all** packument fetches to the prefetch
+    ///    pool simultaneously so they run in parallel across workers.
+    /// 3. Block until every packument at this level is ready (the existing
+    ///    `packument()` condvar wait reuses the same cache coordination the
+    ///    resolver uses during DFS).
+    /// 4. For each completed packument, select the version the resolver will
+    ///    place and extract its registry-typed children, which become the next
+    ///    BFS level.
+    /// 5. Repeat up to `max_depth` levels or until no new registry deps are
+    ///    discovered.
+    ///
+    /// After this call, the in-memory packument cache is populated for the
+    /// first N levels of the dependency tree. The resolver's DFS will hit
+    /// cache for those packages instead of blocking on the network for each
+    /// new level's packuments — the dominant factor in the large-frontend
+    /// 4.9× benchmark gap.
+    ///
+    /// **Error handling**: root-level fetch failures propagate as errors.
+    /// Failures at deeper levels are silently skipped (the resolver will
+    /// re-fetch those packuments inline and surface the real error there).
+    ///
+    /// Returns the total number of packuments fetched during the batch phase.
+    pub fn prefetch_batch_closure(
+        &self,
+        root_deps: &std::collections::BTreeMap<String, String>,
+        max_depth: u32,
+    ) -> Result<u64, RegistryError> {
+        if self.prefetch_workers == 0 && !self.cache_mode.allows_network() {
+            return Ok(0);
+        }
+        // Level 0: extract registry-typed root dependencies, skipping
+        // workspace:, npm:, and other non-registry spec types.
+        let mut current: Vec<(String, String)> = root_deps
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .filter(|(_, spec)| {
+                // Re-check workspace: explicitly — published packuments never
+                // carry workspace: specs (so looks_like_registry_spec does not
+                // filter them) but root manifests can declare them.
+                looks_like_registry_spec(spec) && !spec.starts_with("workspace:")
+            })
+            .collect();
+        let mut total: u64 = 0;
+        let mut seen: std::collections::BTreeSet<String> =
+            current.iter().map(|(n, _)| n.clone()).collect();
+
+        for depth in 0..max_depth {
+            if current.is_empty() {
+                break;
+            }
+            // Phase A: submit every dep at this level to the prefetch pool.
+            for (name, spec) in &current {
+                self.prefetch_packument(name, Some(spec));
+            }
+            // Phase B: block until each is ready, extract children.
+            let mut next: Vec<(String, String)> = Vec::new();
+            for (name, spec) in &current {
+                let packument = match self.packument(name) {
+                    Ok(p) => p,
+                    Err(error) => {
+                        if depth == 0 {
+                            return Err(error);
+                        }
+                        // Deeper levels are best-effort: the resolver will
+                        // re-fetch inline and surface the real error.
+                        continue;
+                    }
+                };
+                total += 1;
+                BATCH_PREFETCH_FETCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                for (child, child_spec) in prefetch_child_specs(&packument, name, Some(spec)) {
+                    if seen.insert(child.clone()) {
+                        next.push((child, child_spec));
+                    }
+                }
+            }
+            current = next;
+        }
+        Ok(total)
+    }
+}
+
+/// Claim an `InFlight` cache slot for `name` (if unclaimed) and enqueue a
+/// background fetch. The slot claim deduplicates: a name already `Ready` or
+/// `InFlight` is never re-enqueued, which bounds total prefetch work to the
+/// dependency closure size and makes cycles a no-op.
+///
+/// The sender is borrowed transiently from the shared `sender_slot` (cloned
+/// only for the one `send`). Workers never hold a persistent sender clone, so
+/// taking the slot (`None`) on pool drop leaves no live senders and every
+/// worker's `recv()` returns `Disconnected` — clean shutdown without timeouts.
+fn enqueue_prefetch(
+    cache: &Arc<PackumentCache>,
+    sender_slot: &PrefetchSender,
+    config: &crate::config::NpmConfig,
+    name: &str,
+    version_spec: Option<&str>,
+) {
+    let registry = config.registry_for_package(name).to_owned();
+    let key = format!("{}\0{name}", registry.trim_end_matches('/'));
+    let claimed = {
+        let mut map = cache.map.lock().unwrap();
+        if map.contains_key(&key) {
+            false
+        } else {
+            map.insert(key.clone(), PackumentEntry::InFlight);
+            true
+        }
+    };
+    if !claimed {
+        return;
+    }
+    let Some(sender) = sender_slot.lock().unwrap().clone() else {
+        // Pool is shutting down: release the marker so the synchronous path can
+        // still fetch this name inline if the resolver reaches it.
+        cache.map.lock().unwrap().remove(&key);
+        return;
+    };
+    let _ = sender.send(PrefetchJob {
+        key,
+        name: name.to_owned(),
+        registry,
+        version_spec: version_spec.map(str::to_owned),
+    });
+}
+
+/// Heuristic mirroring `resolver::DependencySource::parse` (kept duplicated
+/// here to avoid the registry layer reaching up into the resolver): true when
+/// `spec` is a plain registry version/range rather than a source, git, tarball,
+/// or alias spec. Published packuments never carry `workspace:` specs, so no
+/// workspace filtering is needed for lookahead over registry metadata.
+fn looks_like_registry_spec(spec: &str) -> bool {
+    let lower = spec.to_ascii_lowercase();
+    !(spec.starts_with("patch:")
+        || spec.starts_with("file:")
+        || spec.starts_with("link:")
+        || lower.starts_with("git+")
+        || lower.starts_with("git:")
+        || lower.starts_with("github:")
+        || lower.starts_with("http:")
+        || lower.starts_with("https:")
+        || lower.starts_with("npm:")
+        || spec.starts_with("./")
+        || spec.starts_with("../")
+        || spec.starts_with('/'))
+}
+
+/// Build the [`VersionRequest`] the resolver will use for `name`/`version_spec`,
+/// so the lookahead reads the *same* version's dependencies the resolver will
+/// place. `None` (prefetch with no range) falls back to `Latest`.
+fn lookahead_version_request(name: &str, version_spec: Option<&str>) -> Option<VersionRequest> {
+    match version_spec {
+        None | Some("") | Some("latest") => Some(VersionRequest::Latest),
+        Some(spec) => parse_spec(&format!("{name}@{spec}"))
+            .ok()
+            .map(|parsed| parsed.req),
+    }
+}
+
+/// Registry-typed runtime + optional dependencies of the version the resolver
+/// will place for `name`/`version_spec`, for recursive prefetch lookahead.
+/// Returns an empty vec when the version cannot be selected (the resolver will
+/// fetch those children inline).
+fn prefetch_child_specs(
+    packument: &Packument,
+    name: &str,
+    version_spec: Option<&str>,
+) -> Vec<(String, String)> {
+    let Some(request) = lookahead_version_request(name, version_spec) else {
+        return Vec::new();
+    };
+    let Ok(version) = select_version(name, &request, packument) else {
+        return Vec::new();
+    };
+    let Some(metadata) = packument.versions.get(version.to_string().as_str()) else {
+        return Vec::new();
+    };
+    let mut children = Vec::new();
+    for (child, spec) in &metadata.dependencies {
+        if looks_like_registry_spec(spec) {
+            children.push((child.clone(), spec.clone()));
         }
     }
+    for (child, spec) in &metadata.optional_dependencies {
+        if looks_like_registry_spec(spec) {
+            children.push((child.clone(), spec.clone()));
+        }
+    }
+    children
 }
 
 /// One unit of background packument work.
@@ -552,6 +828,9 @@ struct PrefetchJob {
     key: String,
     name: String,
     registry: String,
+    /// The version range the resolver requested for this package, so a worker
+    /// can select the matching version and prefetch its registry children.
+    version_spec: Option<String>,
 }
 
 /// A fixed-size pool of worker threads that resolve prefetched packuments.
@@ -561,8 +840,21 @@ struct PrefetchJob {
 /// client and the in-process cache, so prefetches multiplex over the same
 /// HTTP/2 connection pool as synchronous fetches. The pool is joined on drop,
 /// which happens when the last `RegistryClient` clone is dropped.
+/// Shared, takeable sender so the pool can shut the channel down by clearing
+/// it. Workers borrow the sender transiently (clone-per-send) and never hold a
+/// persistent clone, so clearing the slot leaves no live senders and every
+/// worker's `recv()` returns `Disconnected`.
+type PrefetchSender = Arc<Mutex<Option<mpsc::Sender<PrefetchJob>>>>;
+
+/// A fixed-size pool of worker threads that resolve prefetched packuments.
+///
+/// Workers share one `mpsc` receiver (guarded by a mutex, the standard
+/// `mpsc` multi-consumer pattern) and close over clones of the pooled HTTP
+/// client and the in-process cache, so prefetches multiplex over the same
+/// HTTP/2 connection pool as synchronous fetches. The pool is joined on drop,
+/// which happens when the last `RegistryClient` clone is dropped.
 struct PrefetchPool {
-    sender: Option<mpsc::Sender<PrefetchJob>>,
+    sender_slot: PrefetchSender,
     handles: Vec<JoinHandle<()>>,
 }
 
@@ -570,18 +862,22 @@ impl PrefetchPool {
     fn start(
         workers: usize,
         http: HttpClient,
+        config: crate::config::NpmConfig,
         metadata_cache: Option<Arc<MetadataCache>>,
         cache: Arc<PackumentCache>,
         cache_mode: CacheMode,
     ) -> PrefetchPool {
         let (sender, receiver) = mpsc::channel::<PrefetchJob>();
         let receiver = Arc::new(Mutex::new(receiver));
+        let sender_slot: PrefetchSender = Arc::new(Mutex::new(Some(sender)));
         let mut handles = Vec::with_capacity(workers);
         for _ in 0..workers {
             let receiver = Arc::clone(&receiver);
             let http = http.clone();
+            let config = config.clone();
             let metadata_cache = metadata_cache.clone();
             let cache = Arc::clone(&cache);
+            let sender_slot = Arc::clone(&sender_slot);
             handles.push(std::thread::spawn(move || {
                 loop {
                     // Hold the receiver guard only long enough to dequeue, so
@@ -593,30 +889,56 @@ impl PrefetchPool {
                             Err(_) => break, // channel closed: pool shutting down
                         }
                     };
-                    let result = fetch_packument(
+                    PREFETCH_FETCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let result = fetch_packument_for_spec(
                         &http,
                         &job.name,
                         &job.registry,
+                        job.version_spec.as_deref(),
                         metadata_cache.as_deref(),
                         cache_mode,
                     );
-                    let mut map = cache.map.lock().unwrap();
-                    match result {
-                        Ok(packument) => {
-                            map.insert(job.key, PackumentEntry::Ready(packument));
+                    {
+                        let mut map = cache.map.lock().unwrap();
+                        match &result {
+                            Ok(packument) => {
+                                map.insert(
+                                    job.key.clone(),
+                                    PackumentEntry::Ready(packument.clone()),
+                                );
+                            }
+                            Err(_) => {
+                                // Clear the in-flight marker; the synchronous path
+                                // will re-fetch and surface the real error.
+                                map.remove(&job.key);
+                            }
                         }
-                        Err(_) => {
-                            // Clear the in-flight marker; the synchronous path
-                            // will re-fetch and surface the real error.
-                            map.remove(&job.key);
+                        cache.cv.notify_all();
+                    }
+                    // Recursive lookahead: now that this packument is Ready,
+                    // select the version the resolver will place and prefetch
+                    // its registry children so the closure fans out
+                    // concurrently instead of one DFS level at a time. Slot
+                    // claiming deduplicates, bounding work to the closure and
+                    // making cycles a no-op.
+                    if let Ok(packument) = &result {
+                        for (child, child_spec) in
+                            prefetch_child_specs(packument, &job.name, job.version_spec.as_deref())
+                        {
+                            enqueue_prefetch(
+                                &cache,
+                                &sender_slot,
+                                &config,
+                                &child,
+                                Some(&child_spec),
+                            );
                         }
                     }
-                    cache.cv.notify_all();
                 }
             }));
         }
         PrefetchPool {
-            sender: Some(sender),
+            sender_slot,
             handles,
         }
     }
@@ -624,10 +946,13 @@ impl PrefetchPool {
 
 impl Drop for PrefetchPool {
     fn drop(&mut self) {
-        // Drop the sender first so workers observe the closed channel and exit
-        // before we join. Join so no worker outlives the client (matters for
-        // deterministic test teardown).
-        self.sender.take();
+        // Take the sender so no new jobs can be enqueued. Because workers never
+        // hold a persistent sender clone (they borrow it transiently via the
+        // slot), once this is `None` the channel has no live senders and every
+        // worker's `recv()` returns `Disconnected`, letting them exit before we
+        // join. Joining guarantees no worker outlives the client, which matters
+        // for deterministic test teardown.
+        self.sender_slot.lock().unwrap().take();
         for handle in self.handles.drain(..) {
             let _ = handle.join();
         }
@@ -774,6 +1099,36 @@ fn resolve_tarball_url(registry: &str, tarball: &str) -> String {
 }
 
 /// Fetch and parse the packument JSON for `name` through the shared client.
+/// Fetch the smallest metadata document for `name`/`version_spec`, mirroring
+/// the resolver's `packument_for`: an exact version uses the per-version
+/// endpoint (a few KB even for packages whose full packument is megabytes);
+/// a range or tag uses the abbreviated packument. This keeps prefetch from
+/// downloading multi-megabyte packuments for pinned-exact dependencies.
+fn fetch_packument_for_spec(
+    http: &HttpClient,
+    name: &str,
+    registry: &str,
+    version_spec: Option<&str>,
+    cache: Option<&MetadataCache>,
+    mode: CacheMode,
+) -> Result<Packument, RegistryError> {
+    match exact_version_from_spec(name, version_spec) {
+        Some(version) => fetch_version_packument(http, name, &version, registry, cache, mode),
+        None => fetch_packument(http, name, registry, cache, mode),
+    }
+}
+
+/// If `version_spec` pins an exact version, return it. `None` for ranges, tags,
+/// or absent specs (which need the full version list to resolve).
+fn exact_version_from_spec(name: &str, version_spec: Option<&str>) -> Option<Version> {
+    let spec = version_spec?;
+    let parsed = parse_spec(&format!("{name}@{spec}")).ok()?;
+    match parsed.req {
+        VersionRequest::Exact(version) => Some(version),
+        _ => None,
+    }
+}
+
 fn fetch_packument(
     http: &HttpClient,
     name: &str,
@@ -903,6 +1258,7 @@ fn fetch_with_cache(
             package: package.to_string(),
             source: Box::new(error),
         })?;
+    add_resolver_fetch_bytes(body.len());
 
     // Best-effort refresh: a write failure must never fail an install.
     if let Some(store) = cache {
@@ -1248,7 +1604,7 @@ mod tests {
             .with_registry_override(&registry)
             .unwrap();
         let client = RegistryClient::new(config).with_prefetch(1);
-        client.prefetch_packument("pkg");
+        client.prefetch_packument("pkg", None);
         // Let the worker claim the slot and reach the in-flight fetch.
         std::thread::sleep(std::time::Duration::from_millis(15));
         // This must wait on the in-flight prefetch instead of fetching again.
@@ -1414,6 +1770,299 @@ mod tests {
 
         // Exactly one request reached the server (the warm-up fetch).
         assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    // ── Recursive prefetch lookahead unit tests ────────────────────────
+
+    #[test]
+    fn looks_like_registry_spec_accepts_plain_versions_and_ranges() {
+        assert!(looks_like_registry_spec("^1.0.0"));
+        assert!(looks_like_registry_spec("~2.3.4"));
+        assert!(looks_like_registry_spec(">=1.0.0 <2.0.0"));
+        assert!(looks_like_registry_spec("*"));
+        assert!(looks_like_registry_spec("1.2.3"));
+        assert!(looks_like_registry_spec("latest"));
+    }
+
+    #[test]
+    fn looks_like_registry_spec_rejects_non_registry_sources() {
+        assert!(!looks_like_registry_spec("file:./local.tgz"));
+        assert!(!looks_like_registry_spec("link:../other"));
+        assert!(!looks_like_registry_spec(
+            "git+https://github.com/user/repo.git"
+        ));
+        assert!(!looks_like_registry_spec("github:user/repo"));
+        assert!(!looks_like_registry_spec("https://example.test/pkg.tgz"));
+        assert!(!looks_like_registry_spec("./relative/path"));
+        assert!(!looks_like_registry_spec("../sibling"));
+        assert!(!looks_like_registry_spec("/absolute/path"));
+        assert!(!looks_like_registry_spec("npm:@scope/pkg"));
+        assert!(!looks_like_registry_spec("patch:some-patch"));
+    }
+
+    #[test]
+    fn exact_version_from_spec_returns_some_for_exact_versions() {
+        assert_eq!(
+            exact_version_from_spec("lodash", Some("4.17.21")),
+            Some(Version::new(4, 17, 21))
+        );
+        assert_eq!(
+            exact_version_from_spec("@scope/pkg", Some("1.0.0")),
+            Some(Version::new(1, 0, 0))
+        );
+    }
+
+    #[test]
+    fn exact_version_from_spec_returns_none_for_ranges_and_tags() {
+        assert_eq!(exact_version_from_spec("lodash", Some("^4.0.0")), None);
+        assert_eq!(exact_version_from_spec("lodash", Some("~4.0.0")), None);
+        assert_eq!(exact_version_from_spec("lodash", Some("latest")), None);
+        assert_eq!(exact_version_from_spec("lodash", None::<&str>), None);
+        assert_eq!(exact_version_from_spec("lodash", Some("")), None);
+    }
+
+    fn version_meta(name: &str, version: &str) -> VersionMetadata {
+        VersionMetadata {
+            name: name.to_string(),
+            version: Version::parse(version).unwrap(),
+            deprecated: None,
+            dependencies: BTreeMap::new(),
+            optional_dependencies: BTreeMap::new(),
+            peer_dependencies: BTreeMap::new(),
+            peer_dependencies_meta: BTreeMap::new(),
+            bin: BTreeMap::new(),
+            dist: Dist::default(),
+            engines: BTreeMap::new(),
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            has_install_script: false,
+            has_shrinkwrap: false,
+        }
+    }
+
+    #[test]
+    fn prefetch_child_specs_extracts_registry_deps_only() {
+        let mut v1 = version_meta("pkg", "1.0.0");
+        v1.dependencies = BTreeMap::from([
+            ("registry-child".to_string(), "^1.0.0".to_string()),
+            (
+                "git-child".to_string(),
+                "git+https://example.test/repo.git".to_string(),
+            ),
+            ("file-child".to_string(), "file:./local".to_string()),
+        ]);
+        v1.optional_dependencies = BTreeMap::from([
+            ("opt-child".to_string(), "^2.0.0".to_string()),
+            (
+                "http-child".to_string(),
+                "https://example.test/tgz".to_string(),
+            ),
+        ]);
+
+        let mut versions = BTreeMap::new();
+        versions.insert("1.0.0".to_string(), v1);
+
+        let packument = Packument {
+            name: "pkg".to_string(),
+            dist_tags: BTreeMap::from([("latest".to_string(), "1.0.0".to_string())]),
+            versions,
+        };
+
+        let children = prefetch_child_specs(&packument, "pkg", Some("^1.0.0"));
+        // Only registry-typed deps & optionalDeps: "registry-child" and "opt-child"
+        assert_eq!(children.len(), 2);
+        assert!(children.contains(&("registry-child".to_string(), "^1.0.0".to_string())));
+        assert!(children.contains(&("opt-child".to_string(), "^2.0.0".to_string())));
+        // git-child, file-child, and http-child are excluded
+        assert!(!children.iter().any(|(n, _)| n == "git-child"));
+        assert!(!children.iter().any(|(n, _)| n == "file-child"));
+        assert!(!children.iter().any(|(n, _)| n == "http-child"));
+    }
+
+    #[test]
+    fn prefetch_child_specs_returns_empty_on_unresolvable_spec() {
+        let packument = Packument {
+            name: "empty".to_string(),
+            dist_tags: BTreeMap::new(),
+            versions: BTreeMap::new(),
+        };
+        assert!(prefetch_child_specs(&packument, "empty", Some("^1.0.0")).is_empty());
+    }
+
+    #[test]
+    fn prefetch_child_specs_handles_no_version_spec_as_latest() {
+        let mut meta = version_meta("pkg", "2.0.0");
+        meta.dependencies = BTreeMap::from([("child".to_string(), "^1.0.0".to_string())]);
+
+        let mut versions = BTreeMap::new();
+        versions.insert("2.0.0".to_string(), meta);
+
+        let packument = Packument {
+            name: "pkg".to_string(),
+            dist_tags: BTreeMap::from([("latest".to_string(), "2.0.0".to_string())]),
+            versions,
+        };
+        let children = prefetch_child_specs(&packument, "pkg", None);
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0], ("child".to_string(), "^1.0.0".to_string()));
+    }
+
+    #[test]
+    fn prefetch_batch_closure_fetches_root_children_and_grandchildren() {
+        // A three-level chain: root -> a -> b, root -> c -> d.
+        // Each BFS level discovers unique children so dedup never
+        // short-circuits the expansion.  Batch closure must discover
+        // and prefetch all 4 packages across 3 BFS levels.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let registry = format!("http://{address}");
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server_count = Arc::clone(&count);
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_shutdown = Arc::clone(&shutdown);
+        let server = std::thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            let responses: BTreeMap<&str, &str> = BTreeMap::from([
+                (
+                    "a",
+                    r#"{"name":"a","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"a","version":"1.0.0","dependencies":{"b":"^1.0.0"},"dist":{"tarball":"/a.tgz","integrity":"sha512-a"}}}}"#,
+                ),
+                (
+                    "c",
+                    r#"{"name":"c","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"c","version":"1.0.0","dependencies":{"d":"^1.0.0"},"dist":{"tarball":"/c.tgz","integrity":"sha512-c"}}}}"#,
+                ),
+                (
+                    "b",
+                    r#"{"name":"b","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"b","version":"1.0.0","dist":{"tarball":"/b.tgz","integrity":"sha512-b"}}}}"#,
+                ),
+                (
+                    "d",
+                    r#"{"name":"d","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"d","version":"1.0.0","dist":{"tarball":"/d.tgz","integrity":"sha512-d"}}}}"#,
+                ),
+            ]);
+            while !server_shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                server_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                let mut request = [0_u8; 2048];
+                let _ = stream.read(&mut request);
+                let request_str = String::from_utf8_lossy(&request);
+                let path = request_str
+                    .lines()
+                    .next()
+                    .and_then(|line| {
+                        line.strip_prefix("GET /")
+                            .and_then(|rest| rest.split(' ').next())
+                    })
+                    .unwrap_or("");
+                let body = responses.get(path).copied().unwrap_or("{}");
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+        });
+
+        let config = NpmConfig::default()
+            .with_registry_override(&registry)
+            .unwrap();
+        let client = RegistryClient::new(config).with_prefetch(4);
+
+        let mut root_deps = BTreeMap::new();
+        root_deps.insert("a".to_string(), "*".to_string());
+        root_deps.insert("c".to_string(), "*".to_string());
+
+        // Reset the batch counter before measuring.
+        let _ = take_batch_prefetch_fetches();
+
+        let total = client
+            .prefetch_batch_closure(&root_deps, 3)
+            .expect("batch closure should succeed");
+
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().unwrap();
+
+        // Must have fetched 4 unique packuments (a, c, b, d):
+        //   Level 0: a, c
+        //   Level 1: b (child of a), d (child of c)
+        //   Level 2: b, d have no further registry children
+        assert_eq!(total, 4, "batch closure should prefetch 4 packuments");
+
+        // The batch counter must reflect the same total.
+        let batch_count = take_batch_prefetch_fetches();
+        assert_eq!(
+            batch_count, 4,
+            "batch counter should match total ({batch_count} != 4)"
+        );
+
+        // Exactly 4 server requests: one per unique packument.
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "must issue exactly 4 requests for the 4 unique packages"
+        );
+    }
+
+    #[test]
+    fn prefetch_batch_closure_skips_non_registry_specs() {
+        // Workspace and file specs must be filtered out so the batch
+        // prefetch never issues requests for non-registry sources.
+        let config = NpmConfig::default();
+        let client = RegistryClient::new(config).with_prefetch(2);
+
+        let mut root_deps = BTreeMap::new();
+        root_deps.insert("workspace-pkg".to_string(), "workspace:*".to_string());
+        root_deps.insert("file-pkg".to_string(), "file:./local".to_string());
+        root_deps.insert("registry-pkg".to_string(), "^1.0.0".to_string());
+
+        // This will fail for "registry-pkg" since no server is listening,
+        // proving the non-registry specs were filtered out (they would
+        // have been enqueued and failed with a different error).
+        let result = client.prefetch_batch_closure(&root_deps, 1);
+        assert!(
+            result.is_err(),
+            "batch closure should fail on registry-pkg (no server), \
+             proving workspace:/file: were skipped"
+        );
+    }
+
+    #[test]
+    fn prefetch_batch_closure_is_no_op_with_zero_depth() {
+        let config = NpmConfig::default();
+        let client = RegistryClient::new(config).with_prefetch(2);
+        let mut root_deps = BTreeMap::new();
+        root_deps.insert("anything".to_string(), "*".to_string());
+        let total = client
+            .prefetch_batch_closure(&root_deps, 0)
+            .expect("zero-depth batch closure should succeed as a no-op");
+        assert_eq!(total, 0, "zero depth must fetch nothing");
+    }
+
+    #[test]
+    fn prefetch_batch_closure_returns_zero_without_prefetch_pool() {
+        // When prefetch_workers == 0 and network is blocked, the
+        // batch closure should short-circuit to a no-op.
+        let config = NpmConfig::default();
+        let cache = Arc::new(MetadataCache::open_in_memory().unwrap());
+        // Offline + no prefetch workers = early return Ok(0).
+        let client = RegistryClient::new(config).with_metadata_cache(cache, CacheMode::Offline);
+        let mut root_deps = BTreeMap::new();
+        root_deps.insert("pkg".to_string(), "*".to_string());
+        let total = client
+            .prefetch_batch_closure(&root_deps, 3)
+            .expect("offline no-prefetch batch closure should return 0");
+        assert_eq!(total, 0, "must be a no-op when no workers and offline");
     }
 
     #[test]

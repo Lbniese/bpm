@@ -185,10 +185,13 @@ pub(super) fn open_registry_client(
 /// to trip registry rate-limiting or stall the HTTP/2 stream. The pooled
 /// client multiplexes whatever count is chosen.
 fn default_prefetch_workers() -> usize {
+    // Scale workers with available cores. The HTTP/1.1 transport gives each
+    // worker its own connection (pool_max_idle_per_host=64), so higher worker
+    // counts directly increase packument fetch concurrency.
     std::thread::available_parallelism()
         .map(|n| n.get())
-        .unwrap_or(4)
-        .min(4)
+        .unwrap_or(8)
+        .min(16)
 }
 
 /// Resolve the prefetch worker count from the `BPM_PREFETCH_WORKERS` override

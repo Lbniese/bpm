@@ -30,6 +30,7 @@
     --text-muted:   oklch(0.47 0.018 155);
     --text-faint:   oklch(0.62 0.016 150);
     --amber:        oklch(0.72 0.14 75);
+    --num:          oklch(0.72 0.11 230);
 
     --font-sans: "Geist Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
     --font-mono: "Geist Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
@@ -252,6 +253,7 @@
   .terminal-body .l-dim{ color:oklch(0.5 0.02 150); }
   .terminal-body .l-ok{ color:oklch(0.72 0.13 152); }
   .terminal-body .l-warn{ color:var(--amber); }
+  .terminal-body .l-num{ color:var(--num); }
   .terminal-body .l-bar{ color:oklch(0.6 0.02 150); }
   .terminal-body .cursor{
     display:inline-block; width:7px; height:14px; background:oklch(0.72 0.13 152);
@@ -317,8 +319,45 @@
   .store-caption{
     text-align:center; font-family:var(--font-mono); font-size:12.5px; color:var(--text-faint);
     margin-top:18px;
+    transition:color .15s ease;
   }
   .store-caption strong{ color:var(--green-dark); font-weight:600; }
+
+  /* Interactive shared-node highlighting */
+  .store-node{
+    cursor:pointer;
+    transition:r .18s ease, stroke-width .18s ease, filter .18s ease;
+    transform-box:fill-box;
+    transform-origin:center;
+  }
+  .store-node.hl{
+    filter:drop-shadow(0 0 4px oklch(0.58 0.14 152 / 0.55));
+  }
+  .store-diagram.has-hover .store-node:not(.hl){ opacity:0.35; }
+  .store-diagram.has-hover line{ transition:opacity .15s ease; }
+  .store-square{
+    border-radius:4px;
+    transition:transform .18s ease, box-shadow .18s ease;
+  }
+  .store-square.hl{
+    transform:scale(1.18);
+    box-shadow:0 0 0 3px oklch(0.58 0.14 152 / 0.25);
+  }
+
+  /* Connector line draw-in */
+  .connector-line{
+    stroke-dasharray:210;
+    stroke-dashoffset:210;
+  }
+  .store-diagram.reveal.in .connector-line{
+    animation:drawLine 1s cubic-bezier(.2,.7,.2,1) forwards;
+    animation-delay:0.35s;
+  }
+  .connector-line:nth-of-type(2){ animation-delay:0.5s !important; }
+  @keyframes drawLine{ to{ stroke-dashoffset:0; } }
+  @media (prefers-reduced-motion: reduce){
+    .connector-line{ stroke-dashoffset:0; animation:none; }
+  }
 
   /* ---------- Features ---------- */
   .feature-grid{
@@ -524,7 +563,7 @@
 
         <div class="install-box">
           <span class="prompt">$</span>
-          <code id="install-cmd">curl -fsSL https://raw.githubusercontent.com/Lbniese/bpm/main/install.sh | sh</code>
+          <code id="install-cmd">curl -fsSL https://raw.githubusercontent.com/lbniese/bpm/main/install.sh | sh</code>
           <button class="copy-btn" data-copy-target="install-cmd" aria-label="Copy install command">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
             <span class="copy-label">Copy</span>
@@ -538,25 +577,25 @@
         <p class="hero-note">No Rust locally? Grab a pre-built binary from <a href="https://github.com/lbniese/bpm/releases" target="_blank" rel="noopener">Releases</a>, or set <code>BPM_INSTALL_DIR</code> to install without <code>sudo</code>.</p>
       </div>
 
-      <div class="terminal reveal" id="hero-terminal" aria-hidden="false">
+      <div class="terminal reveal" id="hero-terminal">
         <div class="terminal-bar">
           <span class="dot"></span><span class="dot"></span><span class="dot"></span>
           <span class="t-title" id="hero-terminal-title">bpm — web-app</span>
         </div>
-        <div class="terminal-body" id="hero-terminal-body">
+        <div class="terminal-body" id="hero-terminal-body" aria-live="off">
           <div class="terminal-line" style="--i:0"><span class="l-prompt">➜</span> bpm import</div>
-          <div class="terminal-line" style="--i:1"><span class="l-ok">✓</span> imported 214 packages into <span class="l-file">bpm.lock</span></div>
+          <div class="terminal-line" style="--i:1"><span class="l-ok">✓</span> imported <span class="l-num">214</span> packages into <span class="l-file">bpm.lock</span></div>
           <div class="terminal-line" style="--i:2">&nbsp;</div>
           <div class="terminal-line" style="--i:3"><span class="l-prompt">➜</span> bpm install --frozen</div>
-          <div class="terminal-line" style="--i:4"><span class="l-dim">resolving graph · 214 packages, 42 not yet in store</span></div>
+          <div class="terminal-line" style="--i:4"><span class="l-dim">resolving graph · <span class="l-num">214</span> packages, <span class="l-num">42</span> not yet in store</span></div>
           <div class="terminal-line" style="--i:5">
             <span class="l-dim">fetching &amp; verifying new packages</span>
             <div class="mini-track" style="--i:5"><div class="mini-fill" style="--i:5"></div></div>
           </div>
-          <div class="terminal-line" style="--i:6"><span class="l-ok">✓</span> installed 214 packages <span class="l-dim">· 172 reused, 42 fetched · 3.8s</span></div>
+          <div class="terminal-line" style="--i:6"><span class="l-ok">✓</span> installed <span class="l-num">214</span> packages <span class="l-dim">· <span class="l-num">172</span> reused, <span class="l-num">42</span> fetched · <span class="l-num">3.8s</span></span></div>
           <div class="terminal-line" style="--i:7">&nbsp;</div>
           <div class="terminal-line" style="--i:8"><span class="l-prompt">➜</span> bpm install --frozen</div>
-          <div class="terminal-line" style="--i:9"><span class="l-ok">✓</span> 214 packages already in store <span class="l-dim">· nothing to fetch · 9ms</span><span class="cursor"></span></div>
+          <div class="terminal-line" style="--i:9"><span class="l-ok">✓</span> <span class="l-num">214</span> packages already in store <span class="l-dim">· nothing to fetch · <span class="l-num">9ms</span></span><span class="cursor"></span></div>
         </div>
       </div>
     </div>
@@ -568,10 +607,10 @@
       <div class="section-head reveal">
         <span class="eyebrow">The core idea</span>
         <h2>Most managers cache packages. BPM caches graphs.</h2>
-        <p>Two projects that resolve to the same dependency graph share every artifact — the tarball, the extracted files, and the resolution itself. The second project's install has almost nothing left to do.</p>
+        <p>Two projects that resolve to the same dependency graph share every artifact — the tarball, the extracted files, and the resolution itself. The second project's install has almost nothing left to do. <span class="store-hint">Hover a node below to see it.</span></p>
       </div>
 
-      <div class="store-diagram reveal">
+      <div class="store-diagram reveal" id="store-diagram">
         <div class="store-projects">
           <div class="store-project">
             <span class="p-label">project-a/package.json</span>
@@ -585,10 +624,10 @@
                 <line x1="160" y1="55" x2="230" y2="90"/>
               </g>
               <circle cx="40" cy="30" r="9" fill="var(--surface-2)" stroke="var(--text-faint)" stroke-width="1.5"/>
-              <circle cx="100" cy="70" r="9" fill="var(--green-tint-2)" stroke="var(--green)" stroke-width="1.6"/>
-              <circle cx="160" cy="55" r="9" fill="var(--green-tint-2)" stroke="var(--green)" stroke-width="1.6"/>
+              <circle cx="100" cy="70" r="9" fill="var(--green-tint-2)" stroke="var(--green)" stroke-width="1.6" class="store-node" data-key="k1"/>
+              <circle cx="160" cy="55" r="9" fill="var(--green-tint-2)" stroke="var(--green)" stroke-width="1.6" class="store-node" data-key="k2"/>
               <circle cx="70" cy="120" r="9" fill="var(--surface-2)" stroke="var(--text-faint)" stroke-width="1.5"/>
-              <circle cx="150" cy="120" r="9" fill="var(--green-tint-2)" stroke="var(--green)" stroke-width="1.6"/>
+              <circle cx="150" cy="120" r="9" fill="var(--green-tint-2)" stroke="var(--green)" stroke-width="1.6" class="store-node" data-key="k3"/>
               <circle cx="230" cy="90" r="9" fill="var(--surface-2)" stroke="var(--text-faint)" stroke-width="1.5"/>
             </svg>
           </div>
@@ -604,31 +643,31 @@
                 <line x1="160" y1="50" x2="90" y2="86"/>
               </g>
               <circle cx="280" cy="26" r="9" fill="var(--surface-2)" stroke="var(--text-faint)" stroke-width="1.5"/>
-              <circle cx="220" cy="66" r="9" fill="var(--green-tint-2)" stroke="var(--green)" stroke-width="1.6"/>
-              <circle cx="160" cy="50" r="9" fill="var(--green-tint-2)" stroke="var(--green)" stroke-width="1.6"/>
+              <circle cx="220" cy="66" r="9" fill="var(--green-tint-2)" stroke="var(--green)" stroke-width="1.6" class="store-node" data-key="k1"/>
+              <circle cx="160" cy="50" r="9" fill="var(--green-tint-2)" stroke="var(--green)" stroke-width="1.6" class="store-node" data-key="k2"/>
               <circle cx="250" cy="118" r="9" fill="var(--surface-2)" stroke="var(--text-faint)" stroke-width="1.5"/>
-              <circle cx="170" cy="118" r="9" fill="var(--green-tint-2)" stroke="var(--green)" stroke-width="1.6"/>
+              <circle cx="170" cy="118" r="9" fill="var(--green-tint-2)" stroke="var(--green)" stroke-width="1.6" class="store-node" data-key="k3"/>
               <circle cx="90" cy="86" r="9" fill="var(--surface-2)" stroke="var(--text-faint)" stroke-width="1.5"/>
             </svg>
           </div>
         </div>
 
         <svg viewBox="0 0 700 46" width="100%" height="46" aria-hidden="true" style="margin:4px 0;">
-          <line x1="150" y1="0" x2="330" y2="40" stroke="var(--green)" stroke-width="1.5" stroke-dasharray="3 4"/>
-          <line x1="550" y1="0" x2="370" y2="40" stroke="var(--green)" stroke-width="1.5" stroke-dasharray="3 4"/>
+          <line class="connector-line" x1="150" y1="0" x2="330" y2="40" stroke="var(--green)" stroke-width="1.5"/>
+          <line class="connector-line" x1="550" y1="0" x2="370" y2="40" stroke="var(--green)" stroke-width="1.5"/>
         </svg>
 
         <div style="background:var(--green-deep); border-radius:var(--radius-md); padding:16px 20px; display:flex; align-items:center; justify-content:center; gap:14px; flex-wrap:wrap;">
           <span class="mono" style="color:oklch(0.85 0.02 150); font-size:12.5px; letter-spacing:0.03em;">CONTENT-ADDRESSED STORE</span>
           <span style="display:flex; gap:8px;">
-            <span style="width:16px;height:16px;border-radius:4px;background:var(--green);"></span>
-            <span style="width:16px;height:16px;border-radius:4px;background:var(--green);"></span>
-            <span style="width:16px;height:16px;border-radius:4px;background:var(--green);"></span>
+            <span class="store-square store-node" data-key="k1" style="width:16px;height:16px;background:var(--green);"></span>
+            <span class="store-square store-node" data-key="k2" style="width:16px;height:16px;background:var(--green);"></span>
+            <span class="store-square store-node" data-key="k3" style="width:16px;height:16px;background:var(--green);"></span>
             <span style="width:16px;height:16px;border-radius:4px;background:oklch(0.4 0.03 155);"></span>
             <span style="width:16px;height:16px;border-radius:4px;background:oklch(0.4 0.03 155);"></span>
           </span>
         </div>
-        <p class="store-caption">Shared nodes are fetched, extracted, and verified <strong>once</strong> — every later project that resolves to them just points at the existing bytes.</p>
+        <p class="store-caption" id="store-caption">Shared nodes are fetched, extracted, and verified <strong>once</strong> — every later project that resolves to them just points at the existing bytes.</p>
       </div>
     </div>
   </section>
@@ -797,7 +836,7 @@
           <p>One curl command, and every project on this machine starts sharing a store.</p>
           <div class="cta-install">
             <span class="prompt">$</span>
-            <code id="cta-install-cmd">curl -fsSL https://raw.githubusercontent.com/Lbniese/bpm/main/install.sh | sh</code>
+            <code id="cta-install-cmd">curl -fsSL https://raw.githubusercontent.com/lbniese/bpm/main/install.sh | sh</code>
             <button class="copy-btn" data-copy-target="cta-install-cmd" aria-label="Copy install command">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
             </button>
@@ -942,7 +981,37 @@
     revealEls.forEach(function(el){ el.classList.add('in'); });
   }
 
-  // Animate benchmark bars once visible
+  // Interactive store-diagram: hovering a shared node highlights its
+  // twin in the other project and its byte in the content store.
+  (function(){
+    var diagram = document.getElementById('store-diagram');
+    var caption = document.getElementById('store-caption');
+    if(!diagram) return;
+
+    var defaultCaption = caption ? caption.innerHTML : '';
+    var nodes = diagram.querySelectorAll('.store-node');
+
+    function setHover(key){
+      diagram.classList.toggle('has-hover', !!key);
+      nodes.forEach(function(n){
+        n.classList.toggle('hl', key && n.getAttribute('data-key') === key);
+      });
+      if(caption){
+        caption.innerHTML = key
+          ? 'This package is resolved <strong>once</strong> and shared by every project that needs it.'
+          : defaultCaption;
+      }
+    }
+
+    nodes.forEach(function(n){
+      n.addEventListener('mouseenter', function(){ setHover(n.getAttribute('data-key')); });
+      n.addEventListener('mouseleave', function(){ setHover(null); });
+      n.addEventListener('focus', function(){ setHover(n.getAttribute('data-key')); });
+      n.addEventListener('blur', function(){ setHover(null); });
+    });
+  })();
+
+  // Animate benchmark bars once visible (section currently disabled, kept for when it returns)
   var benchChart = document.querySelector('.bench-chart');
   if(benchChart && 'IntersectionObserver' in window){
     var benchIo = new IntersectionObserver(function(entries){
@@ -971,6 +1040,7 @@
     var reduceMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
     function rand(min, max){ return Math.floor(Math.random() * (max - min + 1)) + min; }
+    function num(n){ return '<span class="l-num">' + n + '</span>'; }
 
     function renderDemo(){
       var total = rand(180, 260);
@@ -984,15 +1054,15 @@
 
       bodyEl.innerHTML =
         '<div class="terminal-line" style="--i:0"><span class="l-prompt">➜</span> bpm import</div>' +
-        '<div class="terminal-line" style="--i:1"><span class="l-ok">✓</span> imported ' + total + ' packages into <span class="l-file">bpm.lock</span></div>' +
+        '<div class="terminal-line" style="--i:1"><span class="l-ok">✓</span> imported ' + num(total) + ' packages into <span class="l-file">bpm.lock</span></div>' +
         '<div class="terminal-line" style="--i:2">&nbsp;</div>' +
         '<div class="terminal-line" style="--i:3"><span class="l-prompt">➜</span> bpm install --frozen</div>' +
-        '<div class="terminal-line" style="--i:4"><span class="l-dim">resolving graph · ' + total + ' packages, ' + fetched + ' not yet in store</span></div>' +
+        '<div class="terminal-line" style="--i:4"><span class="l-dim">resolving graph · ' + num(total) + ' packages, ' + num(fetched) + ' not yet in store</span></div>' +
         '<div class="terminal-line" style="--i:5"><span class="l-dim">fetching &amp; verifying new packages</span><div class="mini-track" style="--i:5"><div class="mini-fill" style="--i:5"></div></div></div>' +
-        '<div class="terminal-line" style="--i:6"><span class="l-ok">✓</span> installed ' + total + ' packages <span class="l-dim">· ' + reused + ' reused, ' + fetched + ' fetched · ' + installTime + '</span></div>' +
+        '<div class="terminal-line" style="--i:6"><span class="l-ok">✓</span> installed ' + num(total) + ' packages <span class="l-dim">· ' + num(reused) + ' reused, ' + num(fetched) + ' fetched · ' + num(installTime) + '</span></div>' +
         '<div class="terminal-line" style="--i:7">&nbsp;</div>' +
         '<div class="terminal-line" style="--i:8"><span class="l-prompt">➜</span> bpm install --frozen</div>' +
-        '<div class="terminal-line" style="--i:9"><span class="l-ok">✓</span> ' + total + ' packages already in store <span class="l-dim">· nothing to fetch · ' + warmTime + '</span><span class="cursor"></span></div>';
+        '<div class="terminal-line" style="--i:9"><span class="l-ok">✓</span> ' + num(total) + ' packages already in store <span class="l-dim">· nothing to fetch · ' + num(warmTime) + '</span><span class="cursor"></span></div>';
     }
 
     renderDemo();

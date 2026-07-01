@@ -20,7 +20,9 @@ flate2 = "1.0"
 tar = "0.4"
 # HTTP transport: reqwest::blocking over a pooled client, negotiating HTTP/2
 # over TLS (ALPN) so concurrent registry/tarball requests multiplex per host.
-reqwest = { version = "0.13", default-features = false, features = ["native-tls", "blocking", "http2"] }
+# rustls negotiates HTTP/2 reliably across platforms; native-tls on macOS often
+# fails ALPN and silently falls back to HTTP/1.1, capping metadata throughput.
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "blocking", "http2"] }
 httpdate = "1.0.3"
 tempfile = "3.12"
 

@@ -18,6 +18,12 @@ use std::time::{Duration, SystemTime};
 
 use reqwest::blocking::{Client, ClientBuilder, Response};
 use reqwest::header::RETRY_AFTER;
+use reqwest::Version;
+
+/// Best-effort record of whether any response arrived over HTTP/2. The cold
+/// resolver depends on HTTP/2 multiplexing for throughput; if this stays false
+/// the TLS backend is not negotiating ALPN and metadata fetches serialize.
+static SAW_HTTP2: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 use crate::config::{NetworkConfig, NpmConfig};
 
@@ -37,6 +43,13 @@ pub struct HttpClient {
     /// pool, the prefetch workers) shares one counter, and the command-level
     /// metrics can read the true total once at the end.
     requests: Arc<AtomicU64>,
+    /// Diagnostic gauges for resolver/download concurrency profiling:
+    /// `in_flight` is the current number of requests awaiting a response, and
+    /// `max_in_flight` is the peak observed across the client's lifetime. If
+    /// the peak stays near 1 despite many prefetch workers, requests are
+    /// serializing on the transport (e.g. HTTP/2 not negotiated).
+    in_flight: Arc<AtomicU64>,
+    max_in_flight: Arc<AtomicU64>,
 }
 
 impl fmt::Debug for HttpClient {
@@ -60,6 +73,8 @@ impl HttpClient {
             client: build_client(config.network.fetch_timeout),
             config,
             requests: Arc::new(AtomicU64::new(0)),
+            in_flight: Arc::new(AtomicU64::new(0)),
+            max_in_flight: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -69,6 +84,42 @@ impl HttpClient {
     /// request-efficiency profiling.
     pub fn request_count(&self) -> u64 {
         self.requests.load(Ordering::Relaxed)
+    }
+
+    /// Peak number of requests that were awaiting a response at the same time,
+    /// across this client's lifetime. A concurrency diagnostic: a value near 1
+    /// despite many prefetch/download workers means requests are serializing on
+    /// the transport rather than multiplexing.
+    pub fn max_concurrent_requests(&self) -> u64 {
+        self.max_in_flight.load(Ordering::Relaxed)
+    }
+
+    /// Whether any observed response used HTTP/2. False means the TLS backend
+    /// did not negotiate ALPN and the client is on HTTP/1.1 (per-connection
+    /// concurrency, no multiplexing).
+    pub fn observed_http2(&self) -> bool {
+        SAW_HTTP2.load(Ordering::Relaxed)
+    }
+
+    /// Record one request entering flight, returning a guard that decrements on
+    /// drop and updates the peak-concurrency gauge. Cheap (relaxed atomics).
+    fn track_in_flight(&self) -> InFlightGuard {
+        let now = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut current = self.max_in_flight.load(Ordering::Relaxed);
+        while now > current {
+            match self.max_in_flight.compare_exchange(
+                current,
+                now,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
+        InFlightGuard {
+            counter: Arc::clone(&self.in_flight),
+        }
     }
 
     /// Execute a GET request and return its response for string/JSON handling.
@@ -144,6 +195,7 @@ impl HttpClient {
     /// when transient and otherwise become [`HttpError::Status`].
     fn execute_get(&self, url: &str, headers: &[(&str, &str)]) -> Result<Response, HttpError> {
         self.requests.fetch_add(1, Ordering::Relaxed);
+        let _in_flight = self.track_in_flight();
         let display_url = redact_url(url);
         let network = &self.config.network;
         let attempts = network.retries.saturating_add(1);
@@ -152,6 +204,9 @@ impl HttpClient {
             let request = self.build_get(url, headers);
             match request.send() {
                 Ok(response) => {
+                    if response.version() == Version::HTTP_2 {
+                        SAW_HTTP2.store(true, Ordering::Relaxed);
+                    }
                     let status = response.status().as_u16();
                     if status < 400 {
                         return Ok(response);
@@ -207,6 +262,7 @@ impl HttpClient {
         headers: &[(&str, &str)],
     ) -> Result<Vec<u8>, HttpError> {
         self.requests.fetch_add(1, Ordering::Relaxed);
+        let _in_flight = self.track_in_flight();
         let display_url = redact_url(url);
         let network = &self.config.network;
         let attempts = network.retries.saturating_add(1);
@@ -348,15 +404,47 @@ impl fmt::Display for HttpError {
 
 impl std::error::Error for HttpError {}
 
-/// Build a pooled client with the bpm user agent and request timeout.
+/// RAII guard that decrements the in-flight counter when dropped, so every
+/// exit path of a request (success, error, retry) restores the gauge.
+struct InFlightGuard {
+    counter: Arc<AtomicU64>,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Build a pooled HTTP client.
+///
+/// HTTP/1.1 with a large idle connection pool is the default. The npm registry
+/// (and registries behind CDNs like Fastly) commonly rate-limit per *connection*
+/// rather than per stream. HTTP/2 multiplexes all streams over one connection,
+/// so a single rate-limited link caps all concurrent requests. HTTP/1.1 with
+/// `pool_max_idle_per_host(64)` lets each worker own its own connection,
+/// achieving N-way concurrency for N workers.
+///
+/// Set `BPM_HTTP2=1` to negotiate HTTP/2 via ALPN for benchmarking against
+/// registries that do not per-connection throttle.
 ///
 /// A static user agent and a valid timeout never produce an invalid builder in
 /// practice, so a build failure falls back to the default client rather than
 /// hard-failing configuration.
 fn build_client(timeout: Duration) -> Client {
-    ClientBuilder::new()
-        .user_agent(USER_AGENT)
-        .timeout(timeout)
+    let use_http2 = std::env::var("BPM_HTTP2")
+        .ok()
+        .and_then(|v| v.parse::<u8>().ok())
+        .unwrap_or(0)
+        != 0;
+
+    let mut builder = ClientBuilder::new().user_agent(USER_AGENT).timeout(timeout);
+    if use_http2 {
+        builder = builder.pool_max_idle_per_host(64);
+    } else {
+        builder = builder.http1_only().pool_max_idle_per_host(64);
+    }
+    builder
         .build()
         .unwrap_or_else(|_| ClientBuilder::new().build().expect("default client builds"))
 }
