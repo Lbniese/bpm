@@ -34,6 +34,21 @@ pub struct Counters {
     pub cache_misses: u64,
     /// Total outbound network requests issued.
     pub requests_sent: u64,
+    // ── Resolver/prefetch diagnostics ──────────────────────────────────
+    /// Packument cache hits (resolver found a Ready entry, no fetch needed).
+    pub resolver_cache_hits: u64,
+    /// Packument cache waits (resolver blocked on an in-flight prefetch).
+    pub resolver_cache_waits: u64,
+    /// Inline packument fetches (resolver fetched itself, no prefetch hit).
+    pub resolver_inline_fetches: u64,
+    /// Background prefetch fetches (prefetch pool fetched on behalf of resolver).
+    pub prefetch_fetches: u64,
+    /// Total bytes of packument bodies fetched over the network.
+    pub packument_bytes: u64,
+    /// Nanoseconds the resolver thread spent blocked on network during depscan.
+    pub resolver_network_wait_ns: u64,
+    /// Packuments fetched during the batch-prefetch closure phase (before DFS).
+    pub batch_prefetch_fetches: u64,
 }
 
 impl Counters {
@@ -49,6 +64,13 @@ impl Counters {
         self.cache_hits += other.cache_hits;
         self.cache_misses += other.cache_misses;
         self.requests_sent += other.requests_sent;
+        self.resolver_cache_hits += other.resolver_cache_hits;
+        self.resolver_cache_waits += other.resolver_cache_waits;
+        self.resolver_inline_fetches += other.resolver_inline_fetches;
+        self.prefetch_fetches += other.prefetch_fetches;
+        self.packument_bytes += other.packument_bytes;
+        self.resolver_network_wait_ns += other.resolver_network_wait_ns;
+        self.batch_prefetch_fetches += other.batch_prefetch_fetches;
     }
 }
 
@@ -99,6 +121,30 @@ impl Metrics {
     /// Increment the outbound-request counter.
     pub fn record_request(&mut self) {
         self.counters.requests_sent += 1;
+    }
+
+    /// Record resolver/prefetch diagnostic counters from a fresh resolution.
+    pub fn record_resolver_diagnostics(
+        &mut self,
+        cache_hits: u64,
+        cache_waits: u64,
+        inline_fetches: u64,
+        prefetch_fetches: u64,
+        packument_bytes: u64,
+        network_wait_ns: u64,
+    ) {
+        self.counters.resolver_cache_hits += cache_hits;
+        self.counters.resolver_cache_waits += cache_waits;
+        self.counters.resolver_inline_fetches += inline_fetches;
+        self.counters.prefetch_fetches += prefetch_fetches;
+        self.counters.packument_bytes += packument_bytes;
+        self.counters.resolver_network_wait_ns += network_wait_ns;
+    }
+
+    /// Record batch-prefetch closure counters (separate from inline per-node
+    /// prefetches because the batch phase runs before DFS traversal begins).
+    pub fn record_batch_prefetch(&mut self, batch_fetches: u64) {
+        self.counters.batch_prefetch_fetches += batch_fetches;
     }
 
     /// Add `n` to the outbound-request counter. Used to fold a shared HTTP
@@ -177,6 +223,34 @@ impl Metrics {
         counters.insert(
             "requests_sent".into(),
             serde_json::Value::from(self.counters.requests_sent),
+        );
+        counters.insert(
+            "resolver_cache_hits".into(),
+            serde_json::Value::from(self.counters.resolver_cache_hits),
+        );
+        counters.insert(
+            "resolver_cache_waits".into(),
+            serde_json::Value::from(self.counters.resolver_cache_waits),
+        );
+        counters.insert(
+            "resolver_inline_fetches".into(),
+            serde_json::Value::from(self.counters.resolver_inline_fetches),
+        );
+        counters.insert(
+            "prefetch_fetches".into(),
+            serde_json::Value::from(self.counters.prefetch_fetches),
+        );
+        counters.insert(
+            "packument_bytes".into(),
+            serde_json::Value::from(self.counters.packument_bytes),
+        );
+        counters.insert(
+            "resolver_network_wait_ms".into(),
+            serde_json::Value::from((self.counters.resolver_network_wait_ns as f64) / 1_000_000.0),
+        );
+        counters.insert(
+            "batch_prefetch_fetches".into(),
+            serde_json::Value::from(self.counters.batch_prefetch_fetches),
         );
         let mut root = serde_json::Map::new();
         root.insert(
