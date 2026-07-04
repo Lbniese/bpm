@@ -473,3 +473,66 @@ fn frozen_install_uses_direct_tarball_urls_without_registry_lookups() {
         "direct tarball URL should be fetched once"
     );
 }
+
+/// Verify that the async resolver (`BPM_ASYNC_RESOLVE=1`) produces the same
+/// `bpm.lock` bytes as the default blocking resolver. Uses a local registry
+/// server for deterministic, offline resolution.
+#[test]
+fn async_resolve_produces_byte_identical_lockfile() {
+    let dep_tgz = package_tgz("test-dep", "1.0.0", None);
+    let server =
+        same_host_registry_mock("test-dep", "1.0.0", "tarballs/test-dep-1.0.0.tgz", dep_tgz);
+
+    let project = tempfile::tempdir().unwrap();
+    let store_block = tempfile::tempdir().unwrap();
+
+    // Write package.json with a dependency on test-dep so the resolver runs.
+    fs::write(
+        project.path().join("package.json"),
+        r#"{"name":"app","version":"1.0.0","dependencies":{"test-dep":"^1.0.0"}}"#,
+    )
+    .unwrap();
+
+    // Point the project's registry at our local mock server.
+    write_npmrc(project.path(), &[format!("registry={}", server.url(""))]);
+
+    // ---- Blocking resolve (default) ----
+    let (ok_block, stdout_block, stderr_block) = run_bpm(
+        &["install"],
+        project.path(),
+        store_block.path(),
+        None,
+    );
+    assert!(
+        ok_block,
+        "blocking install failed\nstdout: {stdout_block}\nstderr: {stderr_block}"
+    );
+    let blocking_lock =
+        fs::read_to_string(project.path().join("bpm.lock"))
+            .expect("bpm.lock should exist after blocking install");
+
+    // ---- Async resolve (BPM_ASYNC_RESOLVE=1) ----
+    let store_async = tempfile::tempdir().unwrap();
+    let _ = fs::remove_file(project.path().join("bpm.lock"));
+
+    let mut cmd = std::process::Command::new(bin());
+    cmd.args(["install"])
+        .current_dir(project.path())
+        .env("BPM_STORE", store_async.path())
+        .env("BPM_ASYNC_RESOLVE", "1");
+    let out = cmd.output().expect("run bpm with async resolver");
+    assert!(
+        out.status.success(),
+        "async install failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let async_lock =
+        fs::read_to_string(project.path().join("bpm.lock"))
+            .expect("bpm.lock should exist after async install");
+
+    assert_eq!(
+        blocking_lock, async_lock,
+        "blocking and async resolve must produce byte-identical bpm.lock"
+    );
+}

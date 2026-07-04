@@ -50,6 +50,13 @@ once a 1.0 release is cut.
   benchmarking or regression isolation. Only the fresh-resolve path is
   affected; lockfile-present installs are unchanged.
 
+- Experimental async resolver behind `BPM_ASYNC_RESOLVE=1`. Fresh-resolve
+  installs may now use the non-blocking resolver in `src/async_resolver.rs`
+  instead of the blocking one. The resolved `bpm.lock` is byte-for-byte
+  identical to the blocking path; only the I/O model differs. Opt-in while
+  the async path is being A/B measured against the cold-resolve bottleneck;
+  the blocking resolver remains the default. See `docs/milestones.md` M7.
+
 - Concurrent registry-metadata prefetch during dependency-graph resolution.
   As soon as a package's dependency list is known, its registry-typed
   children's packuments are fetched in the background over the shared HTTP/2

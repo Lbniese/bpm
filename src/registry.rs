@@ -32,7 +32,7 @@ use crate::metadata_cache::{CacheMode, MetadataCache};
 /// The abbreviated install-metadata media type npm negotiates for graph
 /// resolution. Requesting it avoids downloading each packument's full
 /// publish-time history (multi-megabyte for popular packages).
-const ABBREV_ACCEPT: &str = "application/vnd.npm.install-v1+json";
+pub(crate) const ABBREV_ACCEPT: &str = "application/vnd.npm.install-v1+json";
 
 std::thread_local! {
     /// Wall time the current thread has spent inside synchronous `packument_for`
@@ -214,7 +214,7 @@ struct WirePackument {
 }
 
 #[derive(Default, Deserialize)]
-struct WireVersionMetadata {
+pub(crate) struct WireVersionMetadata {
     #[serde(default)]
     name: String,
     #[serde(default)]
@@ -301,7 +301,7 @@ fn normalize_list(mut values: Vec<String>) -> Vec<String> {
     values
 }
 
-fn version_metadata(
+pub(crate) fn version_metadata(
     package_name: &str,
     version_key: &str,
     metadata: WireVersionMetadata,
@@ -1274,7 +1274,7 @@ fn fetch_with_cache(
 }
 
 /// Pick the target version string from a packument for a version request.
-fn select_version(
+pub(crate) fn select_version(
     name: &str,
     req: &VersionRequest,
     packument: &Packument,
