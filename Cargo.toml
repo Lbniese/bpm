@@ -23,6 +23,10 @@ tar = "0.4"
 # rustls negotiates HTTP/2 reliably across platforms; native-tls on macOS often
 # fails ALPN and silently falls back to HTTP/1.1, capping metadata throughput.
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "blocking", "http2"] }
+
+# Async runtime for the non-blocking resolver path. Used by `async_resolver`
+# to issue concurrent packument fetches without stalling the resolution thread.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync"] }
 httpdate = "1.0.3"
 tempfile = "3.12"
 

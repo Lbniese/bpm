@@ -119,7 +119,7 @@ pub(super) fn run(mut options: Options) -> anyhow::Result<()> {
             let config = effective_npm_config(&root, options.registry.as_deref())?;
             let http = HttpClient::new(config.clone());
             let client =
-                open_registry_client(&store_root_path, config, http.clone(), options.cache_mode)?;
+                open_registry_client(&store_root_path, config.clone(), http.clone(), options.cache_mode)?;
             let workspace_layout = bpm::workspace::discover(&root);
             let workspace_index = bpm::resolver::workspaces::WorkspaceIndex::from_project_root(
                 &root,
@@ -147,27 +147,58 @@ pub(super) fn run(mut options: Options) -> anyhow::Result<()> {
                     &options,
                 );
             }
-            // Streaming disabled (BPM_STREAM_INSTALL=0): resolve the whole
-            // graph first, then let the shared download pipeline below run.
-            let lockfile = metrics
-                .measure("dependency_resolution", || {
-                    resolver::resolve_manifest_with_options(
-                        &manifest,
-                        &client,
-                        "bpm",
-                        Some(&workspace_index),
-                        peer_mode,
-                    )
-                })
-                .map_err(|error| anyhow::anyhow!("dependency resolution failed: {error}"))?;
-            let path = root.join(bpm::lockfile::BPM_LOCK_FILE);
-            lockfile.write_to(&path)?;
-            eprintln!(
-                "resolved {} package(s) and wrote {}",
-                lockfile.packages.len(),
-                path.display()
-            );
-            (path, lockfile, root, ProjectLockKind::Bpm)
+            // Async resolve: opt-in experimental path using the non-blocking
+            // resolver from src/async_resolver.rs. The output bpm.lock is
+            // byte-identical to the blocking path; only the I/O model differs.
+            if async_resolve_enabled() {
+                let lockfile = metrics
+                    .measure("dependency_resolution", || {
+                        tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .expect("failed to build tokio runtime")
+                            .block_on(async {
+                                bpm::async_resolver::resolve_manifest_with_workspaces_async(
+                                    &manifest,
+                                    &bpm::async_resolver::AsyncRegistryClient::new(config),
+                                    "bpm",
+                                    Some(&workspace_index),
+                                )
+                                .await
+                            })
+                    })
+                    .map_err(|error| anyhow::anyhow!("dependency resolution failed: {error}"))?;
+                let path = root.join(bpm::lockfile::BPM_LOCK_FILE);
+                lockfile.write_to(&path)?;
+                eprintln!(
+                    "resolved {} package(s) (async) and wrote {}",
+                    lockfile.packages.len(),
+                    path.display()
+                );
+                (path, lockfile, root, ProjectLockKind::Bpm)
+            } else {
+                // Streaming disabled (BPM_STREAM_INSTALL=0): resolve the whole
+                // graph first, then let the shared download pipeline below run.
+                let lockfile = metrics
+                    .measure("dependency_resolution", || {
+                        resolver::resolve_manifest_with_options(
+                            &manifest,
+                            &client,
+                            "bpm",
+                            Some(&workspace_index),
+                            peer_mode,
+                        )
+                    })
+                    .map_err(|error| anyhow::anyhow!("dependency resolution failed: {error}"))?;
+                let path = root.join(bpm::lockfile::BPM_LOCK_FILE);
+                lockfile.write_to(&path)?;
+                eprintln!(
+                    "resolved {} package(s) and wrote {}",
+                    lockfile.packages.len(),
+                    path.display()
+                );
+                (path, lockfile, root, ProjectLockKind::Bpm)
+            }
         }
     };
     install_resolved_lockfile(
@@ -916,6 +947,17 @@ fn streaming_install_enabled() -> bool {
     !matches!(
         std::env::var("BPM_STREAM_INSTALL").as_deref(),
         Ok("0") | Ok("false")
+    )
+}
+
+/// Experimental non-blocking resolver (`BPM_ASYNC_RESOLVE=1`). Uses the async
+/// resolver in `src/async_resolver.rs` instead of the blocking one. The
+/// resolved `bpm.lock` is byte-for-byte identical to the blocking path; only
+/// the I/O model differs. Opt-in while the async path is being measured.
+fn async_resolve_enabled() -> bool {
+    matches!(
+        std::env::var("BPM_ASYNC_RESOLVE").as_deref(),
+        Ok("1") | Ok("true")
     )
 }
 

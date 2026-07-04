@@ -18,6 +18,7 @@
 
 pub mod alternate_lock;
 pub mod archive;
+pub mod async_resolver;
 pub mod bench;
 pub mod config;
 pub mod derived;

@@ -1069,7 +1069,7 @@ impl<'a> GraphResolver<'a> {
 }
 
 #[derive(Debug, Clone)]
-enum DependencySource {
+pub(crate) enum DependencySource {
     File(PathBuf),
     Tarball(String),
     Git {
@@ -1083,18 +1083,18 @@ enum DependencySource {
 }
 
 #[derive(Debug, Clone)]
-struct SourceResolution {
-    metadata: VersionMetadata,
-    resolved: String,
-    integrity: Option<String>,
-    source: LockSource,
-    link: bool,
-    workspace_target: Option<String>,
-    source_dir: Option<PathBuf>,
+pub(crate) struct SourceResolution {
+    pub(crate) metadata: VersionMetadata,
+    pub(crate) resolved: String,
+    pub(crate) integrity: Option<String>,
+    pub(crate) source: LockSource,
+    pub(crate) link: bool,
+    pub(crate) workspace_target: Option<String>,
+    pub(crate) source_dir: Option<PathBuf>,
 }
 
 impl DependencySource {
-    fn parse(spec: &str) -> Option<Self> {
+    pub(crate) fn parse(spec: &str) -> Option<Self> {
         let lower = spec.to_ascii_lowercase();
         if let Some(payload) = spec.strip_prefix("patch:") {
             let (inner, patch) = payload.rsplit_once('#')?;
@@ -1132,7 +1132,7 @@ impl DependencySource {
         None
     }
 
-    fn resolve(self, base_dir: &Path) -> Result<SourceResolution, String> {
+    pub(crate) fn resolve(self, base_dir: &Path) -> Result<SourceResolution, String> {
         match self {
             Self::File(path) => resolve_file_source(base_dir, &path),
             Self::Tarball(url) => resolve_tarball_source(&url),
@@ -1713,7 +1713,7 @@ fn package_source_for_node(node: &Node, registry: &str) -> crate::resolver::mode
     }
 }
 
-fn merged_dependencies(metadata: &VersionMetadata) -> BTreeMap<String, String> {
+pub(crate) fn merged_dependencies(metadata: &VersionMetadata) -> BTreeMap<String, String> {
     let mut dependencies = metadata.dependencies.clone();
     for (name, spec) in &metadata.optional_dependencies {
         dependencies.insert(name.clone(), spec.clone());
@@ -1721,7 +1721,7 @@ fn merged_dependencies(metadata: &VersionMetadata) -> BTreeMap<String, String> {
     dependencies
 }
 
-fn workspace_metadata(
+pub(crate) fn workspace_metadata(
     name: &str,
     version: &str,
     manifest: Option<&PackageManifest>,
@@ -1796,7 +1796,7 @@ fn manifest_bin(manifest: &PackageManifest, fallback_name: &str) -> BTreeMap<Str
     }
 }
 
-fn request_matches(spec: &str, version: &Version) -> bool {
+pub(crate) fn request_matches(spec: &str, version: &Version) -> bool {
     let Ok(parsed) = parse_spec(&format!("pkg@{spec}")) else {
         return false;
     };
@@ -1809,7 +1809,7 @@ fn request_matches(spec: &str, version: &Version) -> bool {
 
 /// Split npm's `npm:target@range` alias syntax while retaining the requested
 /// dependency name for physical placement (`node_modules/alias`).
-fn registry_request(name: &str, spec: &str) -> (String, String) {
+pub(crate) fn registry_request(name: &str, spec: &str) -> (String, String) {
     let Some(alias) = spec.strip_prefix("npm:") else {
         return (name.to_owned(), spec.to_owned());
     };
