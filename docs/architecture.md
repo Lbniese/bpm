@@ -16,7 +16,8 @@ page records the architecture that is currently shipped.
    and `src/npm_lock.rs` parse `package.json`, import npm `package-lock.json`
    v3, and write canonical `bpm.lock` v2 files. Imported locks are enriched
    from the sibling manifest so `bpm ci` validates dev, optional, peer, and
-   override declarations.
+   override declarations. `src/npm_lock.rs` also exports npm v3 lockfiles for
+   package-lock-authority projects.
 2. **Native resolver** — `src/resolver/` resolves registry ranges, tags, and
    exact versions into a deterministic physical graph. Exact requests use the
    registry's version endpoint; ranges and tags use abbreviated install
@@ -25,17 +26,29 @@ page records the architecture that is currently shipped.
    peer modes, npm platform filtering, optional reachability, cycles, and local
    workspaces. Non-frozen `bpm install` resolves `package.json` and writes
    `bpm.lock`; frozen installs are resolution-free.
-3. **Artifact and metadata stores** — `src/store.rs`, `src/download.rs`,
+3. **Async resolver (experimental)** — `src/async_resolver.rs` is a drop-in
+   async counterpart of the native resolver. It uses tokio and reqwest's async
+   HTTP client to issue concurrent packument fetches without stalling the
+   resolution thread. The output `bpm.lock` is byte-identical to the blocking
+   path; only the I/O model differs. Enabled with `BPM_ASYNC_RESOLVE=1`. Still
+   experimental; the blocking resolver remains the default.
+4. **Artifact and metadata stores** — `src/store.rs`, `src/download.rs`,
    `src/archive.rs`, and `src/integrity.rs` provide immutable, verified
    tarballs and extracted package images. `src/metadata/` records artifacts,
    images, derived objects, graphs, plans, projects, leases, and access data
    in SQLite. Publication uses temporary paths, per-object locking, and
    atomic rename.
-4. **Graph and plan cache** — `src/graph.rs` computes canonical graph IDs,
+5. **Remote artifact cache (experimental)** — `src/remote_cache.rs` provides
+   an optional read-through cache keyed by SHA-512 digest. Every remote byte
+   is rehashed before local atomic publication via the store. Cache misses,
+   errors, and corruption fall back to the origin registry. Enabled with
+   `--remote-cache HTTPS_URL` or `BPM_REMOTE_CACHE`. See
+   [remote-cache-protocol.md](remote-cache-protocol.md).
+6. **Graph and plan cache** — `src/graph.rs` computes canonical graph IDs,
    records platform/workspace/override/peer inputs, and stores disposable
    install plans beside the lockfile in `.bpm-state`. Plan validation checks
    graph-volume integrity and the live project view.
-5. **Reusable graph volumes** — `src/volume.rs` builds a complete graph-keyed
+7. **Reusable graph volumes** — `src/volume.rs` builds a complete graph-keyed
    `node_modules` projection under `graphs/blake3/<id>/`. Package files are
    hardlinked to immutable store images, while `.bin` entries remain relative
    symlinks so Node resolves bin scripts from their package directory. Ordinary
@@ -44,12 +57,18 @@ page records the architecture that is currently shipped.
    view so tools such as Turbopack and Next.js do not reject dependency
    realpaths outside the project. Workspace-linked installs use the same
    hardlink backend for registry packages. `BPM_PROJECT_VIEW=relay|local`
-   overrides that choice.
-6. **Materializer** — `src/materializer.rs` supports compatible npm-v3 layout
+   overrides that choice. Windows uses a correctness-first local hardlink/copy
+   view; junctions and reflink/clone performance are deferred.
+8. **Materializer** — `src/materializer.rs` supports compatible npm-v3 layout
    and strict declared-edge validation. It has symlink, hardlink, and fallback
    copy backends; package files are never exposed as writable store symlinks
-   in graph volumes.
-7. **Lifecycle runner** — `src/lifecycle.rs` supplies npm-compatible script
+   in graph volumes. On Windows, safe archive symlinks are materialized as
+   copied content, and `.cmd`/`.ps1` bin shims are generated.
+9. **Platform primitives** — `src/platform.rs` provides `find_executable`,
+   `script_command`, and `same_file_identity` shared by lifecycle and CLI
+   execution. The platform script command produces `sh -c` on Unix and
+   `cmd.exe /D /S /C` on Windows, with `COMSPEC` fallback.
+10. **Lifecycle runner** — `src/lifecycle.rs` supplies npm-compatible script
    environments and `--ignore-scripts`. Workspace/compatible installs retain
    the disposable sandbox. Graph-volume installs execute scripts in the
    volume after isolating each package from the store, so derived output
@@ -58,9 +77,16 @@ page records the architecture that is currently shipped.
    implementation described by the long-term plan, but the current graph
    lifecycle path is volume-derived rather than publishing through that store;
    reconciling those two strategies is an open hardening decision.
-8. **CLI and measurement** — `src/cli/` exposes install, ci, import, exec,
-   run, fetch, doctor, gc, audit, publish, and bench. `src/bench.rs` records
-   machine/tool versions, phase timings, cache state, and JSON results.
+11. **CLI and measurement** — `src/cli/` exposes install, ci, import, exec,
+   run, fetch, doctor, gc, audit, publish, bench, and uninstall. `bpm install`
+   without `-g` and with targets performs local dependency mutation (add):
+   it edits `package.json` losslessly through `src/manifest_edit.rs`, resolves
+   the complete edited graph, exports the selected lock, and installs.
+   `bpm remove`/`bpm uninstall` similarly strips names from all dependency
+   groups, re-resolves, and reinstalls. The two-file publisher in
+   `src/manifest_edit.rs` ensures pre-publication and publication errors leave
+   both files restored. `src/bench.rs` records machine/tool versions, phase
+   timings, cache state, and JSON results.
 
 ## Global store layout
 
@@ -119,5 +145,10 @@ enumeration, task completion order, or network timing.
   derivation and retire the unused path.
 - Expand project-local compatibility attachment beyond the automatic Next.js
   case, ideally using filesystem clone/reflink capabilities where available.
-- Finish non-Unix project attachment support; Windows currently builds the CLI
-  but directory-symlink project attachment remains unsupported.
+- Windows junction/reflink attachment performance (currently correctness-first
+  local hardlink/copy).
+- Combine the async resolver with the streaming install path for maximum cold
+  overlap.
+- Default-flip the async resolver to `BPM_ASYNC_RESOLVE=1` once the A/B
+  evidence and streaming composition are settled.
+- Upload support and conditional-PUT idempotent writes for the remote cache.
