@@ -242,3 +242,28 @@ two-file publication are all completed before either project file is changed,
 so any failure there leaves `package.json` and the lock byte-identical. A later
 download, materialization, or lifecycle failure may leave the already-published
 manifest and lock in place; re-run `bpm install` to retry.
+
+### Streaming install (default)
+
+By default, `bpm install` overlaps tarball downloads with resolution: as soon
+as the resolver places each registry package in the graph, its tarball download
+and extraction start on worker threads, so downloads make progress while the
+rest of the graph is resolved.
+
+Set `BPM_STREAM_INSTALL=0` to resolve the whole graph before downloading
+anything — useful for benchmarking or isolating streaming-related regressions.
+
+### Async resolver (experimental)
+
+`BPM_ASYNC_RESOLVE=1` replaces the blocking resolver with a non-blocking async
+counterpart that never stalls on inline packument fetches. The output
+`bpm.lock` is byte-identical to the blocking path.
+
+When `BPM_ASYNC_RESOLVE=1` and `BPM_STREAM_INSTALL` is set to its default of
+`1`, the async resolver feeds each placed package to the download pipeline via
+a non-blocking sink, combining concurrent packument fetches with overlapped
+downloads. Missing pipeline units (from channel backpressure) are fetched in a
+sequential pass after resolution completes.
+
+Set `BPM_STREAM_INSTALL=0` alongside `BPM_ASYNC_RESOLVE=1` to use the async
+resolver without the download overlap.

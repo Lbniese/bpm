@@ -53,6 +53,7 @@ use crate::resolver::overrides::OverrideSet;
 use crate::resolver::peer::{PeerMode, VisibleProviders};
 use crate::resolver::platform::{self, check_package_platform, PackageReachability};
 use crate::resolver::workspaces::WorkspaceIndex;
+use crate::resolver::{ResolveSink, ResolvedDownloadUnit};
 
 // ── Public types ────────────────────────────────────────────────────────
 
@@ -350,6 +351,7 @@ struct AsyncGraphResolver<'a> {
     workspace: Option<&'a WorkspaceIndex>,
     root_dir: Option<PathBuf>,
     target: TargetPlatform,
+    sink: Option<&'a dyn ResolveSink>,
 }
 
 impl<'a> AsyncGraphResolver<'a> {
@@ -359,6 +361,7 @@ impl<'a> AsyncGraphResolver<'a> {
         workspace: Option<&'a WorkspaceIndex>,
         root_dir: Option<PathBuf>,
         target: TargetPlatform,
+        sink: Option<&'a dyn ResolveSink>,
     ) -> Self {
         Self {
             registry,
@@ -368,6 +371,7 @@ impl<'a> AsyncGraphResolver<'a> {
             workspace,
             root_dir,
             target,
+            sink,
         }
     }
 
@@ -572,6 +576,9 @@ impl<'a> AsyncGraphResolver<'a> {
                 },
             );
 
+            // ── Announce to sink (streaming pipeline) ──────────────────────
+            self.announce(&path);
+
             // ── Recurse into children ───────────────────────────────────────
             self.resolve_children(&path, &dependencies, optional, dev)
                 .await?;
@@ -654,9 +661,38 @@ impl<'a> AsyncGraphResolver<'a> {
                 source_dir: source_res.source_dir,
             },
         );
+        self.announce(&path);
         self.resolve_children(&path, &dependencies, optional, dev)
             .await?;
         Ok(Some(path))
+    }
+
+    /// If a download sink is attached, announce a just-placed node so a caller
+    /// can start fetching its tarball before the rest of the graph is resolved.
+    /// No-op for linked (workspace) nodes and nodes without a download URL.
+    fn announce(&self, path: &str) {
+        let Some(sink) = self.sink else {
+            return;
+        };
+        let unit = {
+            let Some(node) = self.nodes.get(path) else {
+                return;
+            };
+            if node.link || node.resolved.is_empty() {
+                return;
+            }
+            ResolvedDownloadUnit {
+                path: node.path.clone(),
+                name: node.placement_name.clone(),
+                url: node.resolved.clone(),
+                integrity: if node.integrity.is_empty() {
+                    None
+                } else {
+                    Some(node.integrity.clone())
+                },
+            }
+        };
+        sink.emit(unit);
     }
 
     /// Check whether a package is compatible with the target platform.
@@ -961,6 +997,244 @@ pub async fn resolve_manifest_with_workspaces_async(
     .await
 }
 
+/// Resolve a manifest with workspace support and a download sink for
+/// streaming install composition.  See
+/// [`resolve_manifest_with_options_and_target_async_sink`].
+pub async fn resolve_manifest_with_workspaces_async_sink(
+    manifest: &PackageManifest,
+    registry: &AsyncRegistryClient,
+    generator: &str,
+    workspace: Option<&WorkspaceIndex>,
+    sink: Option<&dyn ResolveSink>,
+) -> Result<Lockfile, AsyncResolveError> {
+    resolve_manifest_with_options_and_target_async_sink(
+        manifest,
+        registry,
+        generator,
+        workspace,
+        PeerMode::Strict,
+        crate::resolver::current_target_platform(),
+        sink,
+    )
+    .await
+}
+
+/// Resolve a manifest with full options (workspace, peer mode, target) and
+/// a download sink for streaming install composition.
+///
+/// When `sink` is `Some`, every placed registry node is emitted via
+/// [`ResolveSink::emit`]. The caller should provide a non-blocking adapter
+/// when running inside a tokio runtime to avoid stalling async I/O on
+/// channel backpressure.
+#[allow(clippy::too_many_arguments)]
+pub async fn resolve_manifest_with_options_and_target_async_sink(
+    manifest: &PackageManifest,
+    registry: &AsyncRegistryClient,
+    generator: &str,
+    workspace: Option<&WorkspaceIndex>,
+    peer_mode: PeerMode,
+    target: TargetPlatform,
+    sink: Option<&dyn ResolveSink>,
+) -> Result<Lockfile, AsyncResolveError> {
+    // ── Build overrides ────────────────────────────────────────────────
+    let root_deps = manifest.root_dependency_declarations();
+    let overrides = OverrideSet::from_manifest(
+        &manifest.overrides,
+        &root_deps,
+        crate::resolver::overrides::OverrideOrigin::Root,
+    )
+    .map_err(|e| AsyncResolveError::Override(e.to_string()))?;
+    let normalized_overrides = overrides.as_map().clone();
+
+    let mut res = AsyncGraphResolver::new(
+        registry,
+        overrides,
+        workspace,
+        manifest.source_dir.clone(),
+        target.clone(),
+        sink,
+    );
+
+    // ── Prefetch root-level packuments (concurrent warmup) ──────────
+    for (name, spec) in &root_deps {
+        if looks_like_registry_spec(spec) {
+            if let Ok(parsed) = parse_spec(&format!("{name}@{spec}")) {
+                let _ = registry.packument_for(&parsed).await;
+            }
+        }
+    }
+
+    // ── Resolve root dependencies ───────────────────────────────────────
+    let mut root_targets: BTreeMap<String, (String, String)> = BTreeMap::new();
+    for (name, spec) in &root_deps {
+        let optional = manifest.optional_dependencies.contains_key(name);
+        let dev = manifest.dev_dependencies.contains_key(name)
+            && !manifest.dependencies.contains_key(name)
+            && !manifest.optional_dependencies.contains_key(name);
+        if let Some(path) = res
+            .resolve_dependency("", name, spec, optional, dev)
+            .await?
+        {
+            root_targets.insert(name.clone(), (spec.clone(), path));
+        }
+    }
+
+    // ── Build the lockfile ──────────────────────────────────────────────
+    let mut lock = Lockfile::new(generator);
+    lock.root = RootEntry {
+        name: manifest.name.clone(),
+        version: manifest.version.clone(),
+        dependencies: root_deps,
+    };
+    lock.resolution.root = RootResolution {
+        dev_dependencies: manifest.dev_dependencies.clone(),
+        optional_dependencies: manifest.optional_dependencies.clone(),
+        overrides: normalized_overrides,
+        target: Some(crate::lockfile::LockTarget {
+            os: target.os,
+            cpu: target.cpu,
+            libc: target.libc,
+        }),
+        ..RootResolution::default()
+    };
+    lock.resolution.root.peer_mode = match peer_mode {
+        PeerMode::Strict => crate::lockfile::PeerMode::Strict,
+        PeerMode::LegacyIgnore => crate::lockfile::PeerMode::LegacyIgnore,
+    };
+
+    // ── Bind peer contexts ──────────────────────────────────────────────
+    let node_paths: Vec<String> = res.nodes.keys().cloned().collect();
+    for path in &node_paths {
+        let (metadata, parent) = {
+            let node = res.nodes.get(path).expect("node path exists");
+            (node.metadata.clone(), parent_path(path))
+        };
+        let providers = res.visible_providers(&parent);
+        let visible = VisibleProviders::new(std::iter::once(path.clone()), providers);
+        let context = crate::resolver::peer::bind_peer_context(&metadata, &visible, peer_mode)
+            .map_err(|e| AsyncResolveError::Peer(e.to_string()))?;
+        let peer_context: BTreeMap<String, crate::lockfile::PeerProvider> = context
+            .0
+            .into_iter()
+            .map(|(peer_name, provider)| {
+                let provider_name = provider.name.clone();
+                let provider_path = res
+                    .find_visible_any(&parent, &provider_name)
+                    .unwrap_or_default();
+                let source = res
+                    .nodes
+                    .get(&provider_path)
+                    .map(|n| n.source.clone())
+                    .unwrap_or_else(|| LockSource::Registry {
+                        registry: registry.registry_for_package(&provider_name).to_owned(),
+                    });
+                (
+                    peer_name,
+                    crate::lockfile::PeerProvider {
+                        name: provider.name,
+                        version: provider.version,
+                        source,
+                        path: provider_path,
+                    },
+                )
+            })
+            .collect();
+        if let Some(node) = res.nodes.get_mut(path) {
+            node.peer_context = peer_context;
+        }
+    }
+
+    // ── Emit packages ───────────────────────────────────────────────────
+    for node in res.nodes.values() {
+        lock.packages.push(PackageEntry {
+            path: node.path.clone(),
+            name: node.placement_name.clone(),
+            version: node.metadata.version.to_string(),
+            resolved: node.resolved.clone(),
+            workspace_target: node.workspace_target.clone(),
+            integrity: Some(node.integrity.clone()),
+            link: node.link,
+            dev: node.dev,
+            optional: node.optional,
+            os: node.metadata.os.clone(),
+            cpu: node.metadata.cpu.clone(),
+            bin: node.metadata.bin.clone(),
+            dependencies: node.dependencies.clone(),
+        });
+    }
+    for node in res.nodes.values() {
+        let mut dependencies = BTreeMap::new();
+        for (dep_name, spec) in &node.dependencies {
+            if let Some(target) = node.targets.get(dep_name) {
+                dependencies.insert(
+                    dep_name.clone(),
+                    LockDependency {
+                        spec: spec.clone(),
+                        target: target.clone(),
+                    },
+                );
+            }
+        }
+        lock.resolution.packages.insert(
+            node.path.clone(),
+            PackageResolution {
+                source: node.source.clone(),
+                dev_optional: node.dev || node.optional,
+                dependencies,
+                has_install_script: node.metadata.has_install_script,
+                peer: !node.metadata.peer_dependencies.is_empty(),
+                libc: Vec::new(),
+                optional_dependencies: node
+                    .metadata
+                    .optional_dependencies
+                    .iter()
+                    .filter_map(|(name, spec)| {
+                        node.targets.get(name).map(|target| {
+                            (
+                                name.clone(),
+                                LockDependency {
+                                    spec: spec.clone(),
+                                    target: target.clone(),
+                                },
+                            )
+                        })
+                    })
+                    .collect(),
+                peer_dependencies: node
+                    .metadata
+                    .peer_dependencies
+                    .iter()
+                    .filter_map(|(name, spec)| {
+                        node.peer_context.get(name).map(|provider| {
+                            (
+                                name.clone(),
+                                LockDependency {
+                                    spec: spec.clone(),
+                                    target: provider.path.clone(),
+                                },
+                            )
+                        })
+                    })
+                    .collect(),
+                optional_peers: node
+                    .metadata
+                    .peer_dependencies_meta
+                    .iter()
+                    .filter(|(_, meta)| meta.optional)
+                    .map(|(name, _)| name.clone())
+                    .collect(),
+                peer_context: node.peer_context.clone(),
+                workspace_target: node.workspace_target.clone(),
+            },
+        );
+    }
+    lock.sort_packages();
+
+    // Suppress unused variable warning (retained for future CLI use).
+    let _ = root_targets;
+    Ok(lock)
+}
+
 /// Resolve a manifest with full options (workspace, peer mode, target).
 #[allow(clippy::too_many_arguments)]
 pub async fn resolve_manifest_with_options_and_target_async(
@@ -987,6 +1261,7 @@ pub async fn resolve_manifest_with_options_and_target_async(
         workspace,
         manifest.source_dir.clone(),
         target.clone(),
+        None,
     );
 
     // ── Prefetch root-level packuments (concurrent warmup) ──────────
@@ -1176,6 +1451,7 @@ mod tests {
     use super::*;
     use crate::config::NpmConfig;
     use crate::registry::Dist;
+    use crate::resolver::{ResolveSink, ResolvedDownloadUnit};
     use std::collections::BTreeMap;
 
     /// Verify that the async RegistryClient can be constructed.
@@ -1342,5 +1618,63 @@ mod tests {
         let (name, spec) = registry_req("react", "^18.0.0");
         assert_eq!(name, "react");
         assert_eq!(spec, "^18.0.0");
+    }
+
+    /// Verify the sink entry point produces the same lockfile as the
+    /// non-sink entry point (with no sink, they should be identical).
+    #[tokio::test]
+    async fn async_sink_none_matches_vanilla() {
+        let manifest = test_manifest("sink-test", "1.0.0");
+        let config = NpmConfig::default();
+        let registry = AsyncRegistryClient::new(config.clone());
+        let registry2 = AsyncRegistryClient::new(config);
+        let lock_no_sink = resolve_manifest_async(&manifest, &registry, "bpm-test")
+            .await
+            .expect("empty manifest should resolve");
+        let lock_with_sink = resolve_manifest_with_workspaces_async_sink(
+            &manifest, &registry2, "bpm-test", None, None,
+        )
+        .await
+        .expect("empty manifest with None sink should resolve");
+        assert_eq!(
+            lock_no_sink.to_json().unwrap(),
+            lock_with_sink.to_json().unwrap(),
+            "sink=None must produce identical output"
+        );
+    }
+
+    /// Verify that a RecordingSink attached via the sink entry point captures
+    /// exactly the packages that `announce` should emit (non-link, non-empty
+    /// resolved).  Since the test manifest has no real dependencies, the
+    /// recording sink should be empty.
+    #[tokio::test]
+    async fn async_sink_records_announced_packages() {
+        let manifest = test_manifest("sink-recording", "1.0.0");
+        let config = NpmConfig::default();
+        let registry = AsyncRegistryClient::new(config);
+        let recorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        struct RecordSink(std::sync::Arc<std::sync::Mutex<Vec<ResolvedDownloadUnit>>>);
+        impl ResolveSink for RecordSink {
+            fn emit(&self, unit: ResolvedDownloadUnit) {
+                self.0.lock().unwrap().push(unit);
+            }
+        }
+        let sink = RecordSink(recorded.clone());
+        let _lock = resolve_manifest_with_workspaces_async_sink(
+            &manifest,
+            &registry,
+            "bpm-test",
+            None,
+            Some(&sink as &dyn ResolveSink),
+        )
+        .await
+        .expect("empty manifest should resolve");
+        let units = recorded.lock().unwrap();
+        assert!(
+            units.is_empty(),
+            "empty manifest must not announce any packages; got {}: {:?}",
+            units.len(),
+            units
+        );
     }
 }

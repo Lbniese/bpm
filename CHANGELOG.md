@@ -8,6 +8,17 @@ once a 1.0 release is cut.
 
 ## [Unreleased]
 
+### Added
+
+- **Compose async resolver with streaming install**. `BPM_ASYNC_RESOLVE=1` and
+  `BPM_STREAM_INSTALL=1` are no longer mutually exclusive. The async resolver
+  feeds each placed package to the download pipeline through a non-blocking
+  sink adapter; any packages missed by the pipeline are fetched in a
+  post-resolution pass. New entry points
+  `resolve_manifest_with_workspaces_async_sink` and
+  `resolve_manifest_with_options_and_target_async_sink` bridge the two
+  subsystems. (Plan 008)
+
 ### Changed
 
 - Lifecycle scripts are no longer re-run when a graph volume is reused. A
