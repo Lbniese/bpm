@@ -133,6 +133,21 @@ pub(super) fn run(mut options: Options) -> anyhow::Result<()> {
             };
             let store = ArtifactStore::open(&store_root_path)?;
             let mut metrics = Metrics::new();
+            // Combined streaming+async: non-blocking resolver feeding the
+            // download pipeline through a non-blocking sink adapter.
+            if streaming_install_enabled() && async_resolve_enabled() {
+                return run_streaming_async_install(
+                    &root,
+                    &manifest,
+                    &workspace_index,
+                    peer_mode,
+                    options.concurrency,
+                    &store,
+                    &http,
+                    &mut metrics,
+                    &options,
+                );
+            }
             if streaming_install_enabled() {
                 return run_streaming_install(
                     &root,
@@ -959,6 +974,177 @@ fn async_resolve_enabled() -> bool {
         std::env::var("BPM_ASYNC_RESOLVE").as_deref(),
         Ok("1") | Ok("true")
     )
+}
+
+/// A non-blocking variant of [`ChannelSink`] that uses `try_send` instead of
+/// `send`, so the async resolver's tokio runtime thread never blocks on
+/// pipeline backpressure. Units that cannot be delivered (channel full) are
+/// silently dropped and fetched in a post-resolution pass.
+struct TryChannelSink(std::sync::mpsc::SyncSender<InstallWork>);
+
+impl resolver::ResolveSink for TryChannelSink {
+    fn emit(&self, unit: resolver::ResolvedDownloadUnit) {
+        let integrity = unit
+            .integrity
+            .as_deref()
+            .and_then(|value| Integrity::parse(value).ok());
+        let _ = self.0.try_send(InstallWork {
+            path: unit.path,
+            name: unit.name,
+            url: unit.url,
+            integrity,
+        });
+    }
+}
+
+/// Resolve a fresh manifest with the async resolver while the download/extract
+/// pipeline fetches each package via the non-blocking sink.  Any packages that
+/// the pipeline missed (channel was full during resolution) are fetched in a
+/// post-resolution sequential pass.
+#[allow(clippy::too_many_arguments)]
+fn run_streaming_async_install(
+    root: &Path,
+    manifest: &PackageManifest,
+    workspace_index: &bpm::resolver::workspaces::WorkspaceIndex,
+    _peer_mode: bpm::resolver::peer::PeerMode,
+    concurrency: usize,
+    store: &ArtifactStore,
+    http: &HttpClient,
+    metrics: &mut Metrics,
+    options: &Options,
+) -> anyhow::Result<()> {
+    let config = effective_npm_config(root, options.registry.as_deref())?;
+    let remote = if options.cache_mode.allows_network() {
+        options
+            .remote_cache
+            .as_deref()
+            .map(|base| {
+                let token = env::var("BPM_REMOTE_CACHE_TOKEN").ok();
+                bpm::remote_cache::RemoteCacheConfig::new(base, token)
+                    .map_err(|error| anyhow::anyhow!("invalid remote cache configuration: {error}"))
+                    .and_then(|config| {
+                        bpm::remote_cache::RemoteCacheClient::new(config).map_err(|error| {
+                            anyhow::anyhow!("invalid remote cache configuration: {error}")
+                        })
+                    })
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    let workers = adaptive_workers(concurrency, usize::MAX, root);
+    let (lockfile, mut outcomes) =
+        std::thread::scope(|scope| -> anyhow::Result<(Lockfile, Vec<FetchOutcome>)> {
+            let (unit_tx, unit_rx) =
+                std::sync::mpsc::sync_channel::<InstallWork>(workers.max(1) * 2);
+            let unit_rx = std::sync::Arc::new(std::sync::Mutex::new(unit_rx));
+            let (downloaders, extractors) =
+                spawn_fetch_pipeline(scope, store, http, remote.as_ref(), unit_rx, workers);
+            // Run async resolution on a tokio runtime, emitting placed nodes
+            // to the non-blocking TryChannelSink.
+            let config_clone = config.clone();
+            let lockfile = metrics
+                .measure("dependency_resolution", || {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("failed to build tokio runtime")
+                        .block_on(async {
+                            let sink = TryChannelSink(unit_tx);
+                            let registry =
+                                bpm::async_resolver::AsyncRegistryClient::new(config_clone);
+                            bpm::async_resolver::resolve_manifest_with_workspaces_async_sink(
+                                manifest,
+                                &registry,
+                                "bpm",
+                                Some(workspace_index),
+                                Some(&sink as &dyn resolver::ResolveSink),
+                            )
+                            .await
+                        })
+                })
+                .map_err(|error| anyhow::anyhow!("dependency resolution failed: {error}"))?;
+            // Record async resolver diagnostics. The sync resolver counters
+            // (resolver_cache_waits, prefetch_fetches, packument_bytes) do not
+            // apply to the async path.
+            let outcomes = join_pipeline(downloaders, extractors, metrics)?;
+            Ok((lockfile, outcomes))
+        })?;
+    // Post-resolution pass: fetch any packages the pipeline missed.
+    fetch_missing_outcomes(&lockfile, &mut outcomes, store, http, metrics)?;
+    let path = root.join(bpm::lockfile::BPM_LOCK_FILE);
+    lockfile.write_to(&path)?;
+    eprintln!(
+        "resolved {} package(s) (async+streaming) and wrote {}",
+        lockfile.packages.len(),
+        path.display()
+    );
+    metrics.record("plan_cache_miss", std::time::Duration::ZERO);
+    let cached = outcomes
+        .iter()
+        .filter(|outcome| outcome.artifact_cached && outcome.image_cached)
+        .count();
+    let fetched = outcomes.len() - cached;
+    let artifact_ids = outcomes_to_artifact_ids(&outcomes, &lockfile);
+    metrics.add_requests(http.request_count());
+    finalize_install(
+        root,
+        store,
+        &lockfile,
+        &artifact_ids,
+        cached,
+        fetched,
+        metrics,
+        options,
+        &path,
+        &bpm::registry::RegistryClient::new(config),
+    )
+}
+
+/// Fetch any packages in `lockfile` that are missing from `outcomes` and
+/// append their fetch results.  Used by the combined streaming+async path
+/// when the non-blocking sink dropped units due to channel backpressure.
+fn fetch_missing_outcomes(
+    lockfile: &Lockfile,
+    outcomes: &mut Vec<FetchOutcome>,
+    store: &ArtifactStore,
+    http: &HttpClient,
+    metrics: &mut Metrics,
+) -> anyhow::Result<()> {
+    // Collect present paths into an owned set so the immutable borrow on
+    // `outcomes` is dropped before the mutable push below.
+    let present: BTreeSet<String> = outcomes.iter().map(|o| o.path.clone()).collect();
+    let mut missing = 0usize;
+    for package in &lockfile.packages {
+        if package.link || package.resolved.is_empty() || present.contains(&package.path) {
+            continue;
+        }
+        let integrity = package
+            .integrity
+            .as_deref()
+            .and_then(|v| Integrity::parse(v).ok());
+        let artifact = store.ensure_artifact_with_client(
+            http,
+            &package.resolved,
+            integrity.as_ref(),
+            metrics,
+        )?;
+        let image = store.ensure_image(&artifact.id, metrics)?;
+        outcomes.push(FetchOutcome {
+            path: package.path.clone(),
+            id: artifact.id,
+            artifact_cached: artifact.cached,
+            image_cached: image.cached,
+        });
+        missing += 1;
+    }
+    if missing > 0 {
+        metrics.record(
+            "post_resolution_fetches",
+            std::time::Duration::from_nanos(missing as u64),
+        );
+    }
+    Ok(())
 }
 
 /// Resolve a fresh manifest while the download/extract pipeline fetches each

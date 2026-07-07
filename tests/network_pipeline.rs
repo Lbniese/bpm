@@ -497,19 +497,14 @@ fn async_resolve_produces_byte_identical_lockfile() {
     write_npmrc(project.path(), &[format!("registry={}", server.url(""))]);
 
     // ---- Blocking resolve (default) ----
-    let (ok_block, stdout_block, stderr_block) = run_bpm(
-        &["install"],
-        project.path(),
-        store_block.path(),
-        None,
-    );
+    let (ok_block, stdout_block, stderr_block) =
+        run_bpm(&["install"], project.path(), store_block.path(), None);
     assert!(
         ok_block,
         "blocking install failed\nstdout: {stdout_block}\nstderr: {stderr_block}"
     );
-    let blocking_lock =
-        fs::read_to_string(project.path().join("bpm.lock"))
-            .expect("bpm.lock should exist after blocking install");
+    let blocking_lock = fs::read_to_string(project.path().join("bpm.lock"))
+        .expect("bpm.lock should exist after blocking install");
 
     // ---- Async resolve (BPM_ASYNC_RESOLVE=1) ----
     let store_async = tempfile::tempdir().unwrap();
@@ -527,12 +522,64 @@ fn async_resolve_produces_byte_identical_lockfile() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    let async_lock =
-        fs::read_to_string(project.path().join("bpm.lock"))
-            .expect("bpm.lock should exist after async install");
+    let async_lock = fs::read_to_string(project.path().join("bpm.lock"))
+        .expect("bpm.lock should exist after async install");
 
     assert_eq!(
         blocking_lock, async_lock,
         "blocking and async resolve must produce byte-identical bpm.lock"
+    );
+}
+
+#[test]
+fn async_streaming_resolve_produces_byte_identical_lockfile() {
+    let dep_tgz = package_tgz("test-dep", "1.0.0", None);
+    let server =
+        same_host_registry_mock("test-dep", "1.0.0", "tarballs/test-dep-1.0.0.tgz", dep_tgz);
+
+    let project = tempfile::tempdir().unwrap();
+    let store_block = tempfile::tempdir().unwrap();
+
+    fs::write(
+        project.path().join("package.json"),
+        r#"{"name":"app-stream-async","version":"1.0.0","dependencies":{"test-dep":"^1.0.0"}}"#,
+    )
+    .unwrap();
+
+    write_npmrc(project.path(), &[format!("registry={}", server.url(""))]);
+
+    // ---- Blocking resolve (default, no streaming) ----
+    let (ok_block, stdout_block, stderr_block) =
+        run_bpm(&["install"], project.path(), store_block.path(), None);
+    assert!(
+        ok_block,
+        "blocking install failed\nstdout: {stdout_block}\nstderr: {stderr_block}"
+    );
+    let blocking_lock = fs::read_to_string(project.path().join("bpm.lock"))
+        .expect("bpm.lock should exist after blocking install");
+
+    // ---- Streaming+async resolve (BPM_ASYNC_RESOLVE=1 + BPM_STREAM_INSTALL=1) ----
+    let store_combined = tempfile::tempdir().unwrap();
+    let _ = fs::remove_file(project.path().join("bpm.lock"));
+
+    let mut cmd = std::process::Command::new(bin());
+    cmd.args(["install"])
+        .current_dir(project.path())
+        .env("BPM_STORE", store_combined.path())
+        .env("BPM_ASYNC_RESOLVE", "1")
+        .env("BPM_STREAM_INSTALL", "1");
+    let out = cmd.output().expect("run bpm with streaming+async");
+    assert!(
+        out.status.success(),
+        "streaming+async install failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let combined_lock = fs::read_to_string(project.path().join("bpm.lock"))
+        .expect("bpm.lock should exist after streaming+async install");
+
+    assert_eq!(
+        blocking_lock, combined_lock,
+        "blocking and streaming+async resolve must produce byte-identical bpm.lock"
     );
 }
