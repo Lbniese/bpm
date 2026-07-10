@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::path_safety::{validate_bin_name, validate_bin_target, validate_package_path};
+
 /// `bpm.lock` schema version this implementation writes.
 pub const BPM_LOCK_VERSION: u32 = 2;
 const LEGACY_LOCK_VERSION: u32 = 1;
@@ -249,6 +251,10 @@ pub enum LockfileError {
     UnsupportedVersion { found: u32 },
     #[error("invalid bpm.lock v{BPM_LOCK_VERSION}: {0}")]
     Invalid(String),
+    #[error("package path in lockfile is unsafe: {details}")]
+    UnsafePath { details: String },
+    #[error("bin entry in lockfile for {path} is unsafe: {details}")]
+    UnsafeBin { path: String, details: String },
     #[error("failed to write lockfile {path}: {source}")]
     Write {
         path: PathBuf,
@@ -300,6 +306,11 @@ impl Lockfile {
         }
 
         let mut lockfile: Self = serde_json::from_str(json)?;
+
+        // Validate every package path and bin entry before any other
+        // processing so unsafe input is rejected regardless of lock version.
+        lockfile.validate_package_safety()?;
+
         if version == LEGACY_LOCK_VERSION {
             // Migration is deliberately in memory only. `from_path` never
             // writes, so frozen installs leave the legacy bytes untouched.
@@ -355,6 +366,31 @@ impl Lockfile {
             package.libc.sort();
             package.libc.dedup();
         }
+    }
+
+    /// Validate every package path and bin entry for safety, regardless
+    /// of lock version.  This runs on both legacy and v2 locks.
+    /// Link/workspace packages may have paths outside node_modules; only
+    /// validate non-link packages for standard node_modules placement.
+    fn validate_package_safety(&self) -> Result<(), LockfileError> {
+        for package in &self.packages {
+            if !package.link {
+                validate_package_path(&package.path).map_err(|e| LockfileError::UnsafePath {
+                    details: format!("{}: {}", package.path, e),
+                })?;
+            }
+            for (name, target) in &package.bin {
+                validate_bin_name(name).map_err(|e| LockfileError::UnsafeBin {
+                    path: package.path.clone(),
+                    details: format!("bin name {name:?}: {e}"),
+                })?;
+                validate_bin_target(target).map_err(|e| LockfileError::UnsafeBin {
+                    path: package.path.clone(),
+                    details: format!("bin target {target:?}: {e}"),
+                })?;
+            }
+        }
+        Ok(())
     }
 
     fn validate_v2(&self) -> Result<(), LockfileError> {

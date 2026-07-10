@@ -583,3 +583,202 @@ fn async_streaming_resolve_produces_byte_identical_lockfile() {
         "blocking and streaming+async resolve must produce byte-identical bpm.lock"
     );
 }
+
+/// Helper that starts a registry mock returning a packument with an arbitrary
+/// (possibly invalid) integrity string.  The tarball endpoint returns 404 so
+/// we can tell if the client ever requests one despite the malformed integrity.
+fn malformed_integrity_mock(
+    name: &str,
+    version: &str,
+    tarball_path: &str,
+    integrity: &str,
+) -> MiniServer {
+    let expected_metadata = format!("/{}", name.replace('/', "%2F"));
+    let expected_tarball = format!("/{}", tarball_path.trim_start_matches('/'));
+    let version = version.to_owned();
+    let integrity = integrity.to_owned();
+    let tarball_requests: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+
+    MiniServer::start_keep_alive_routed(move |path| {
+        if path == expected_metadata {
+            // Return invalid integrity in the packument.
+            let mut versions = serde_json::Map::new();
+            let mut dist = serde_json::Map::new();
+            dist.insert("tarball".into(), serde_json::json!(expected_tarball));
+            dist.insert("integrity".into(), serde_json::json!(&integrity));
+            let mut entry = serde_json::Map::new();
+            entry.insert("dist".into(), serde_json::Value::Object(dist));
+            versions.insert(version.clone(), serde_json::Value::Object(entry));
+            let mut root = serde_json::Map::new();
+            let mut tags = serde_json::Map::new();
+            tags.insert("latest".into(), serde_json::json!(&version));
+            root.insert("dist-tags".into(), serde_json::Value::Object(tags));
+            root.insert("versions".into(), serde_json::Value::Object(versions));
+            Some(RouteBody(
+                serde_json::to_vec(&serde_json::Value::Object(root)).unwrap(),
+                "application/json",
+            ))
+        } else if path == expected_tarball {
+            // Record that a tarball request was made.
+            *tarball_requests.lock().unwrap() += 1;
+            None
+        } else {
+            None
+        }
+    })
+}
+
+/// Default sync+streaming install must reject malformed integrity.
+#[test]
+fn malformed_integrity_fails_default_streaming() {
+    let server = malformed_integrity_mock(
+        "bad-integrity-pkg",
+        "1.0.0",
+        "tarballs/bad-integrity-pkg-1.0.0.tgz",
+        "sha512-tooshort",
+    );
+    let project = tempfile::tempdir().unwrap();
+    let store = tempfile::tempdir().unwrap();
+    fs::write(
+        project.path().join("package.json"),
+        r#"{"name":"app","version":"1.0.0","dependencies":{"bad-integrity-pkg":"^1.0.0"}}"#,
+    )
+    .unwrap();
+    write_npmrc(project.path(), &[format!("registry={}", server.url(""))]);
+
+    let (ok, stdout, stderr) = run_bpm(
+        &[
+            "install",
+            "--store",
+            store.path().to_str().unwrap(),
+        ],
+        project.path(),
+        store.path(),
+        None,
+    );
+    assert!(
+        !ok,
+        "install must fail with malformed integrity;\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("malformed") || stderr.contains("integrity"),
+        "stderr must mention integrity problem; got: {stderr}"
+    );
+    assert!(
+        !project.path().join("node_modules").join("bad-integrity-pkg").exists(),
+        "package must not be installed"
+    );
+}
+
+/// Sync resolver without streaming must also reject malformed integrity.
+#[test]
+fn malformed_integrity_fails_sync_no_stream() {
+    let server = malformed_integrity_mock(
+        "bad-integrity-pkg",
+        "1.0.0",
+        "tarballs/bad-integrity-pkg-1.0.0.tgz",
+        "sha512-unspported",
+    );
+    let project = tempfile::tempdir().unwrap();
+    let store = tempfile::tempdir().unwrap();
+    fs::write(
+        project.path().join("package.json"),
+        r#"{"name":"app","version":"1.0.0","dependencies":{"bad-integrity-pkg":"^1.0.0"}}"#,
+    )
+    .unwrap();
+    write_npmrc(project.path(), &[format!("registry={}", server.url(""))]);
+
+    let (ok, stdout, stderr) = run_bpm(
+        &[
+            "install",
+            "--store",
+            store.path().to_str().unwrap(),
+        ],
+        project.path(),
+        store.path(),
+        None,
+    );
+    assert!(
+        !ok,
+        "install must fail with malformed integrity;\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("malformed") || stderr.contains("integrity") || stderr.contains("unsupported"),
+        "stderr must mention integrity problem; got: {stderr}"
+    );
+}
+
+/// Async resolver must also reject malformed integrity.
+#[test]
+fn malformed_integrity_fails_async_resolver() {
+    let server = malformed_integrity_mock(
+        "bad-integrity-pkg",
+        "1.0.0",
+        "tarballs/bad-integrity-pkg-1.0.0.tgz",
+        "sha512-this-is-not-valid-base64",
+    );
+    let project = tempfile::tempdir().unwrap();
+    let store = tempfile::tempdir().unwrap();
+    fs::write(
+        project.path().join("package.json"),
+        r#"{"name":"app","version":"1.0.0","dependencies":{"bad-integrity-pkg":"^1.0.0"}}"#,
+    )
+    .unwrap();
+    write_npmrc(project.path(), &[format!("registry={}", server.url(""))]);
+
+    let mut cmd = std::process::Command::new(bin());
+    cmd.args(["install", "--store", store.path().to_str().unwrap()])
+        .current_dir(project.path())
+        .env("BPM_STORE", store.path())
+        .env("BPM_ASYNC_RESOLVE", "1");
+    let out = cmd.output().expect("run bpm with async resolver");
+    assert!(
+        !out.status.success(),
+        "async install must fail with malformed integrity;\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("malformed") || stderr.contains("integrity"),
+        "stderr must mention integrity problem; got: {stderr}"
+    );
+}
+
+/// Async + streaming must also reject malformed integrity.
+#[test]
+fn malformed_integrity_fails_async_streaming() {
+    let server = malformed_integrity_mock(
+        "bad-integrity-pkg",
+        "1.0.0",
+        "tarballs/bad-integrity-pkg-1.0.0.tgz",
+        "sha512-",
+    );
+    let project = tempfile::tempdir().unwrap();
+    let store = tempfile::tempdir().unwrap();
+    fs::write(
+        project.path().join("package.json"),
+        r#"{"name":"app","version":"1.0.0","dependencies":{"bad-integrity-pkg":"^1.0.0"}}"#,
+    )
+    .unwrap();
+    write_npmrc(project.path(), &[format!("registry={}", server.url(""))]);
+
+    let mut cmd = std::process::Command::new(bin());
+    cmd.args(["install", "--store", store.path().to_str().unwrap()])
+        .current_dir(project.path())
+        .env("BPM_STORE", store.path())
+        .env("BPM_ASYNC_RESOLVE", "1")
+        .env("BPM_STREAM_INSTALL", "1");
+    let out = cmd.output().expect("run bpm with async resolver + streaming");
+    assert!(
+        !out.status.success(),
+        "async+streaming install must fail with malformed integrity;\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("malformed") || stderr.contains("integrity"),
+        "stderr must mention integrity problem; got: {stderr}"
+    );
+}

@@ -39,6 +39,7 @@ pub mod metadata_cache;
 pub mod metrics;
 pub mod npm_lock;
 pub mod package_image;
+pub mod path_safety;
 pub mod patch;
 pub mod platform;
 pub mod project;
