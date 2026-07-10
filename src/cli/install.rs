@@ -12,6 +12,7 @@ use bpm::integrity::{ArtifactId, Integrity};
 use bpm::lockfile::{LockSource, Lockfile};
 use bpm::manifest::PackageManifest;
 use bpm::metrics::Metrics;
+use bpm::path_safety::{validate_bin_name, validate_bin_target};
 use bpm::project_lock::{find_project_lock, validate_npm_direct_install, ProjectLockKind};
 use bpm::resolver;
 use bpm::resolver::model::PlatformConstraints;
@@ -535,6 +536,15 @@ fn run_global_install(
             manifest.name.as_deref().unwrap_or(target)
         );
     }
+    // Validate all bin names and targets before creating directories or linking.
+    for (name, relpath) in &bins {
+        validate_bin_name(name)
+            .map_err(|e| anyhow::anyhow!("invalid bin name {name:?} in global install: {e}"))?;
+        let normalized = relpath.strip_prefix("./").unwrap_or(relpath);
+        validate_bin_target(normalized)
+            .map_err(|e| anyhow::anyhow!("invalid bin target {normalized:?} in global install: {e}"))?;
+    }
+
     let bin_dir = bin_dir()?;
     fs::create_dir_all(&bin_dir)
         .map_err(|error| anyhow::anyhow!("could not create {}: {error}", bin_dir.display()))?;
@@ -764,15 +774,11 @@ struct ChannelSink(std::sync::mpsc::SyncSender<InstallWork>);
 
 impl resolver::ResolveSink for ChannelSink {
     fn emit(&self, unit: resolver::ResolvedDownloadUnit) {
-        let integrity = unit
-            .integrity
-            .as_deref()
-            .and_then(|value| Integrity::parse(value).ok());
         let _ = self.0.send(InstallWork {
             path: unit.path,
             name: unit.name,
             url: unit.url,
-            integrity,
+            integrity: unit.integrity,
         });
     }
 }
@@ -984,15 +990,11 @@ struct TryChannelSink(std::sync::mpsc::SyncSender<InstallWork>);
 
 impl resolver::ResolveSink for TryChannelSink {
     fn emit(&self, unit: resolver::ResolvedDownloadUnit) {
-        let integrity = unit
-            .integrity
-            .as_deref()
-            .and_then(|value| Integrity::parse(value).ok());
         let _ = self.0.try_send(InstallWork {
             path: unit.path,
             name: unit.name,
             url: unit.url,
-            integrity,
+            integrity: unit.integrity,
         });
     }
 }
@@ -1122,7 +1124,16 @@ fn fetch_missing_outcomes(
         let integrity = package
             .integrity
             .as_deref()
-            .and_then(|v| Integrity::parse(v).ok());
+            .map(|v| Integrity::parse(v).map_err(|e| {
+                anyhow::anyhow!(
+                    "package '{}' at {} has invalid integrity \"{}\": {}",
+                    package.name,
+                    package.path,
+                    v,
+                    e
+                )
+            }))
+            .transpose()?;
         let artifact = store.ensure_artifact_with_client(
             http,
             &package.resolved,

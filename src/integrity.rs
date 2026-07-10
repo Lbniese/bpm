@@ -210,3 +210,24 @@ mod tests {
         assert_ne!(a, Sha512Digest::hash_bytes(b"world").to_hex());
     }
 }
+
+#[test]
+fn debug_b64() {
+    let val = "q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urqw==";
+    println!("len={}", val.len());
+    match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, val) {
+        Ok(b) => println!("decoded {} bytes", b.len()),
+        Err(e) => println!("b64 err: {}", e),
+    }
+    // Also try with no padding
+    let val2 = "q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urqw";
+    match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, val2) {
+        Ok(b) => println!("no pad decoded {} bytes", b.len()),
+        Err(e) => println!("no pad b64 err: {}", e),
+    }
+    // Try with STANDARD_NO_PAD
+    match base64::Engine::decode(&base64::engine::general_purpose::STANDARD_NO_PAD, val2) {
+        Ok(b) => println!("no pad engine decoded {} bytes", b.len()),
+        Err(e) => println!("no pad engine err: {}", e),
+    }
+}
