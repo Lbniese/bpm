@@ -1,0 +1,360 @@
+[
+  {
+    "scenario": "true_cold",
+    "fixture": "large-frontend",
+    "system": {
+      "machine": "arm64",
+      "operating_system": "26.5",
+      "kernel": "25.5.0",
+      "runtime_versions": {
+        "bpm": "bpm 0.3.0",
+        "node": "v26.5.0",
+        "npm": "11.12.1",
+        "pnpm": "10.13.1"
+      }
+    },
+    "versions": {
+      "bpm": "bpm 0.3.0",
+      "node": "v26.5.0",
+      "npm": "11.12.1",
+      "pnpm": "10.13.1"
+    },
+    "cache_state": "cold",
+    "number_of_runs": 1,
+    "tools": [
+      {
+        "tool": "npm",
+        "wall_clock_ms": {
+          "values": [
+            8900.636541000002
+          ],
+          "median": 8900.636541000002,
+          "p95": 8900.636541000002,
+          "stddev": 0.0
+        },
+        "exit_codes": [
+          0
+        ],
+        "network": {
+          "request_count": 205,
+          "response_bytes": 40158385,
+          "peak_concurrent": 15,
+          "p50_latency_ms": 67.2165,
+          "p95_latency_ms": 376.692292
+        }
+      },
+      {
+        "tool": "pnpm",
+        "wall_clock_ms": {
+          "values": [
+            2646.372875
+          ],
+          "median": 2646.372875,
+          "p95": 2646.372875,
+          "stddev": 0.0
+        },
+        "exit_codes": [
+          0
+        ],
+        "network": {
+          "request_count": 116,
+          "response_bytes": 13502385,
+          "peak_concurrent": 16,
+          "p50_latency_ms": 65.642541,
+          "p95_latency_ms": 392.611667
+        }
+      },
+      {
+        "tool": "bpm",
+        "wall_clock_ms": {
+          "values": [
+            7137.891375
+          ],
+          "median": 7137.891375,
+          "p95": 7137.891375,
+          "stddev": 0.0
+        },
+        "exit_codes": [
+          0
+        ],
+        "bpm_metrics": {
+          "requests_sent": {
+            "values": [
+              69.0
+            ],
+            "median": 69.0,
+            "p95": 69.0,
+            "stddev": 0.0
+          },
+          "phase_ms": {
+            "artifact_download": {
+              "values": [
+                4125.932335
+              ],
+              "median": 4125.932335,
+              "p95": 4125.932335,
+              "stddev": 0.0
+            },
+            "artifact_extract": {
+              "values": [
+                647.217126
+              ],
+              "median": 647.217126,
+              "p95": 647.217126,
+              "stddev": 0.0
+            },
+            "artifact_pipeline_wall": {
+              "values": [
+                2890.358667
+              ],
+              "median": 2890.358667,
+              "p95": 2890.358667,
+              "stddev": 0.0
+            },
+            "dependency_resolution": {
+              "values": [
+                2856.089709
+              ],
+              "median": 2856.089709,
+              "p95": 2856.089709,
+              "stddev": 0.0
+            },
+            "graph_volume_build": {
+              "values": [
+                101.36625
+              ],
+              "median": 101.36625,
+              "p95": 101.36625,
+              "stddev": 0.0
+            },
+            "integrity_verify": {
+              "values": [
+                0.0021729999999999996
+              ],
+              "median": 0.0021729999999999996,
+              "p95": 0.0021729999999999996,
+              "stddev": 0.0
+            },
+            "lifecycle": {
+              "values": [
+                401.844167
+              ],
+              "median": 401.844167,
+              "p95": 401.844167,
+              "stddev": 0.0
+            },
+            "materialization": {
+              "values": [
+                3569.535083
+              ],
+              "median": 3569.535083,
+              "p95": 3569.535083,
+              "stddev": 0.0
+            },
+            "metadata_finalize": {
+              "values": [
+                20.89725
+              ],
+              "median": 20.89725,
+              "p95": 20.89725,
+              "stddev": 0.0
+            },
+            "metadata_graph_record": {
+              "values": [
+                77.32404199999999
+              ],
+              "median": 77.32404199999999,
+              "p95": 77.32404199999999,
+              "stddev": 0.0
+            },
+            "metadata_lease": {
+              "values": [
+                555.199333
+              ],
+              "median": 555.199333,
+              "p95": 555.199333,
+              "stddev": 0.0
+            },
+            "metadata_open": {
+              "values": [
+                2.996875
+              ],
+              "median": 2.996875,
+              "p95": 2.996875,
+              "stddev": 0.0
+            },
+            "ownership_reconciliation": {
+              "values": [
+                0.0
+              ],
+              "median": 0.0,
+              "p95": 0.0,
+              "stddev": 0.0
+            },
+            "plan_cache_miss": {
+              "values": [
+                0.0
+              ],
+              "median": 0.0,
+              "p95": 0.0,
+              "stddev": 0.0
+            },
+            "plan_write": {
+              "values": [
+                0.593417
+              ],
+              "median": 0.593417,
+              "p95": 0.593417,
+              "stddev": 0.0
+            },
+            "project_local_view": {
+              "values": [
+                0.000042
+              ],
+              "median": 0.000042,
+              "p95": 0.000042,
+              "stddev": 0.0
+            },
+            "project_reconciliation": {
+              "values": [
+                0.0
+              ],
+              "median": 0.0,
+              "p95": 0.0,
+              "stddev": 0.0
+            },
+            "resolver_network_wait": {
+              "values": [
+                22393.459577
+              ],
+              "median": 22393.459577,
+              "p95": 22393.459577,
+              "stddev": 0.0
+            }
+          },
+          "counters": {
+            "batch_prefetch_fetches": {
+              "values": [
+                0.0
+              ],
+              "median": 0.0,
+              "p95": 0.0,
+              "stddev": 0.0
+            },
+            "bytes_transferred": {
+              "values": [
+                0.0
+              ],
+              "median": 0.0,
+              "p95": 0.0,
+              "stddev": 0.0
+            },
+            "cache_hits": {
+              "values": [
+                0.0
+              ],
+              "median": 0.0,
+              "p95": 0.0,
+              "stddev": 0.0
+            },
+            "cache_misses": {
+              "values": [
+                0.0
+              ],
+              "median": 0.0,
+              "p95": 0.0,
+              "stddev": 0.0
+            },
+            "http_peak_concurrency": {
+              "values": [
+                6.0
+              ],
+              "median": 6.0,
+              "p95": 6.0,
+              "stddev": 0.0
+            },
+            "max_concurrent_overlap": {
+              "values": [
+                0.0
+              ],
+              "median": 0.0,
+              "p95": 0.0,
+              "stddev": 0.0
+            },
+            "max_queue_depth": {
+              "values": [
+                0.0
+              ],
+              "median": 0.0,
+              "p95": 0.0,
+              "stddev": 0.0
+            },
+            "packument_bytes": {
+              "values": [
+                18194536.0
+              ],
+              "median": 18194536.0,
+              "p95": 18194536.0,
+              "stddev": 0.0
+            },
+            "prefetch_fetches": {
+              "values": [
+                116.0
+              ],
+              "median": 116.0,
+              "p95": 116.0,
+              "stddev": 0.0
+            },
+            "resolver_cache_hits": {
+              "values": [
+                169.0
+              ],
+              "median": 169.0,
+              "p95": 169.0,
+              "stddev": 0.0
+            },
+            "resolver_cache_waits": {
+              "values": [
+                32.0
+              ],
+              "median": 32.0,
+              "p95": 32.0,
+              "stddev": 0.0
+            },
+            "resolver_inline_fetches": {
+              "values": [
+                93.0
+              ],
+              "median": 93.0,
+              "p95": 93.0,
+              "stddev": 0.0
+            },
+            "resolver_network_wait_ms": {
+              "values": [
+                22393.459577
+              ],
+              "median": 22393.459577,
+              "p95": 22393.459577,
+              "stddev": 0.0
+            },
+            "resolver_peak_http_concurrency": {
+              "values": [
+                27.0
+              ],
+              "median": 27.0,
+              "p95": 27.0,
+              "stddev": 0.0
+            }
+          }
+        },
+        "network": {
+          "request_count": 116,
+          "response_bytes": 18194536,
+          "peak_concurrent": 27,
+          "p50_latency_ms": 211.241125,
+          "p95_latency_ms": 272.244083
+        }
+      }
+    ]
+  }
+]
