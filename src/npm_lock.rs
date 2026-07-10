@@ -17,6 +17,7 @@ use thiserror::Error;
 use crate::diagnostic::{Diagnostic, Severity};
 use crate::lockfile::{LockSource, Lockfile, PackageEntry, RootEntry};
 use crate::manifest::PackageManifest;
+use crate::path_safety::{validate_bin_name, validate_bin_target, validate_package_path};
 use crate::resolver::overrides::{OverrideOrigin, OverrideSet};
 
 /// The npm lockfile version this importer supports.
@@ -48,6 +49,8 @@ pub enum NpmLockError {
     ManifestMetadata(String),
     #[error("package-lock.json contains constructs unsupported for direct install: {0}")]
     DirectInstallUnsupported(String),
+    #[error("package-lock.json has unsafe package path \"{path}\": {reason}")]
+    UnsafePath { path: String, reason: String },
     #[error("cannot export package-lock v3: unsupported package layouts: {0}")]
     ExportUnsupported(String),
 }
@@ -269,6 +272,26 @@ pub fn import(json: &str) -> Result<ImportReport, NpmLockError> {
         }
 
         let bin = parse_bin(path, &name, &pkg.bin)?;
+
+        // Reject unsafe paths and bin entries before any filesystem operation.
+        // Link/workspace packages may have paths outside node_modules; only
+        // validate non-link packages for standard node_modules placement.
+        if !link {
+            validate_package_path(path).map_err(|e| NpmLockError::UnsafePath {
+                path: path.clone(),
+                reason: e.to_string(),
+            })?;
+        }
+        for (bin_name, bin_target) in &bin {
+            validate_bin_name(bin_name).map_err(|e| NpmLockError::InvalidBin {
+                path: path.clone(),
+                reason: format!("unsafe bin name {bin_name:?}: {e}"),
+            })?;
+            validate_bin_target(bin_target).map_err(|e| NpmLockError::InvalidBin {
+                path: path.clone(),
+                reason: format!("unsafe bin target {bin_target:?}: {e}"),
+            })?;
+        }
 
         lockfile.packages.push(PackageEntry {
             path: path.clone(),

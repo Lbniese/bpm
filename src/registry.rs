@@ -27,6 +27,7 @@ use thiserror::Error;
 
 use crate::config::NpmConfig;
 use crate::http::HttpClient;
+use crate::integrity::Integrity;
 use crate::metadata_cache::{CacheMode, MetadataCache};
 
 /// The abbreviated install-metadata media type npm negotiates for graph
@@ -983,6 +984,12 @@ pub enum RegistryError {
     VersionNotFound { package: String, req: String },
     #[error("packument for {package}@{version} is missing a tarball URL or integrity")]
     MissingDist { package: String, version: String },
+    #[error("packument for {package}@{version} has malformed integrity: {detail}")]
+    InvalidIntegrity {
+        package: String,
+        version: String,
+        detail: String,
+    },
     #[error("no cached metadata for {url}; --offline refused to contact the registry")]
     OfflineMiss { url: String },
 }
@@ -1076,6 +1083,15 @@ pub fn resolve_packument(
             version: version.to_string(),
         });
     }
+
+    // Reject malformed or unsupported integrity before any tarball request.
+    let _integrity = Integrity::parse(&metadata.dist.integrity).map_err(|error| {
+        RegistryError::InvalidIntegrity {
+            package: spec.name.clone(),
+            version: version.to_string(),
+            detail: error.to_string(),
+        }
+    })?;
 
     Ok(ResolvedArtifact {
         name: metadata.name.clone(),
@@ -1506,6 +1522,7 @@ mod tests {
 
     #[test]
     fn resolve_reads_tarball_and_integrity() {
+        let valid_integrity = "sha512-abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab";
         let packument = packument(serde_json::json!({
             "name": "p",
             "dist-tags": { "latest": "1.2.3" },
@@ -1513,7 +1530,7 @@ mod tests {
                 "1.2.3": {
                     "dist": {
                         "tarball": "https://example.test/p/-/p-1.2.3.tgz",
-                        "integrity": "sha512-abc"
+                        "integrity": valid_integrity,
                     }
                 }
             }
@@ -1521,7 +1538,7 @@ mod tests {
         let spec = parse_spec("p").unwrap();
         let resolved = resolve_packument(&spec, &packument, "https://example.test/").unwrap();
         assert_eq!(resolved.tarball_url, "https://example.test/p/-/p-1.2.3.tgz");
-        assert_eq!(resolved.integrity, "sha512-abc");
+        assert_eq!(resolved.integrity, valid_integrity);
     }
 
     #[test]
@@ -1537,7 +1554,7 @@ mod tests {
             request_tx
                 .send(String::from_utf8_lossy(&request[..read]).into_owned())
                 .unwrap();
-            let body = r#"{"name":"p","version":"1.2.3","dist":{"tarball":"https://example.test/p.tgz","integrity":"sha512-abc"}}"#;
+            let body = r#"{"name":"p","version":"1.2.3","dist":{"tarball":"https://example.test/p.tgz","integrity":"sha512-abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab"}}"#;
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -1589,7 +1606,7 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(40));
                 let mut request = [0_u8; 2048];
                 let _ = stream.read(&mut request);
-                let body = r#"{"name":"pkg","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"pkg","version":"1.0.0","dist":{"tarball":"/pkg.tgz","integrity":"sha512-x"}}}}"#;
+                let body = r#"{"name":"pkg","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"pkg","version":"1.0.0","dist":{"tarball":"/pkg.tgz","integrity":"sha512-78000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"}}}}"#;
                 write!(
                     stream,
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -1636,7 +1653,7 @@ mod tests {
             let body = r#"{
                 "name":"p",
                 "dist-tags":{"latest":"1.0.0"},
-                "versions":{"1.0.0":{"dist":{"tarball":"https://example.test/p.tgz","integrity":"sha512-abc"}}}
+                "versions":{"1.0.0":{"dist":{"tarball":"https://example.test/p.tgz","integrity":"sha512-abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab"}}}
             }"#;
             write!(
                 stream,
@@ -1715,7 +1732,7 @@ mod tests {
 
     #[test]
     fn persistent_cache_revalidates_and_serves_identical_packument() {
-        let body = r#"{"name":"p","dist-tags":{"latest":"1.4.0"},"versions":{"1.4.0":{"dist":{"tarball":"https://example.test/p.tgz","integrity":"sha512-abc"}}}}"#;
+        let body = r#"{"name":"p","dist-tags":{"latest":"1.4.0"},"versions":{"1.4.0":{"dist":{"tarball":"https://example.test/p.tgz","integrity":"sha512-abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab"}}}}"#;
         let (registry, requests, _server) = conditional_server(body);
         let config = NpmConfig::default()
             .with_registry_override(&registry)
@@ -1748,7 +1765,7 @@ mod tests {
 
     #[test]
     fn prefer_offline_serves_stale_without_revalidation() {
-        let body = r#"{"name":"p","dist-tags":{"latest":"2.0.0"},"versions":{"2.0.0":{"dist":{"tarball":"https://example.test/p.tgz","integrity":"sha512-xyz"}}}}"#;
+        let body = r#"{"name":"p","dist-tags":{"latest":"2.0.0"},"versions":{"2.0.0":{"dist":{"tarball":"https://example.test/p.tgz","integrity":"sha512-ff000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"}}}}"#;
         let (registry, requests, _server) = conditional_server(body);
         let config = NpmConfig::default()
             .with_registry_override(&registry)
@@ -1926,19 +1943,19 @@ mod tests {
             let responses: BTreeMap<&str, &str> = BTreeMap::from([
                 (
                     "a",
-                    r#"{"name":"a","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"a","version":"1.0.0","dependencies":{"b":"^1.0.0"},"dist":{"tarball":"/a.tgz","integrity":"sha512-a"}}}}"#,
+                    r#"{"name":"a","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"a","version":"1.0.0","dependencies":{"b":"^1.0.0"},"dist":{"tarball":"/a.tgz","integrity":"sha512-61000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"}}}}"#,
                 ),
                 (
                     "c",
-                    r#"{"name":"c","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"c","version":"1.0.0","dependencies":{"d":"^1.0.0"},"dist":{"tarball":"/c.tgz","integrity":"sha512-c"}}}}"#,
+                    r#"{"name":"c","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"c","version":"1.0.0","dependencies":{"d":"^1.0.0"},"dist":{"tarball":"/c.tgz","integrity":"sha512-63000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"}}}}"#,
                 ),
                 (
                     "b",
-                    r#"{"name":"b","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"b","version":"1.0.0","dist":{"tarball":"/b.tgz","integrity":"sha512-b"}}}}"#,
+                    r#"{"name":"b","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"b","version":"1.0.0","dist":{"tarball":"/b.tgz","integrity":"sha512-62000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"}}}}"#,
                 ),
                 (
                     "d",
-                    r#"{"name":"d","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"d","version":"1.0.0","dist":{"tarball":"/d.tgz","integrity":"sha512-d"}}}}"#,
+                    r#"{"name":"d","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"d","version":"1.0.0","dist":{"tarball":"/d.tgz","integrity":"sha512-64000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"}}}}"#,
                 ),
             ]);
             while !server_shutdown.load(std::sync::atomic::Ordering::SeqCst) {
