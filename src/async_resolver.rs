@@ -38,6 +38,7 @@ use thiserror::Error;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::config::NpmConfig;
+use crate::integrity::Integrity;
 use crate::lockfile::{
     LockDependency, LockSource, Lockfile, PackageEntry, PackageResolution, RootEntry,
     RootResolution,
@@ -688,7 +689,14 @@ impl<'a> AsyncGraphResolver<'a> {
                 integrity: if node.integrity.is_empty() {
                     None
                 } else {
-                    Some(node.integrity.clone())
+                    // integrity is validated at registry selection;
+                    // a non-empty string must parse.
+                    Some(Integrity::parse(&node.integrity).unwrap_or_else(|e| {
+                        panic!(
+                            "invalid integrity in resolved node for {}: {}: {}",
+                            node.placement_name, node.integrity, e
+                        )
+                    }))
                 },
             }
         };

@@ -19,6 +19,7 @@ use semver::Version;
 use sha2::Digest;
 use thiserror::Error;
 
+use crate::integrity::Integrity;
 use crate::lockfile::{
     LockDependency, LockSource, Lockfile, PackageEntry, PackageResolution, RootEntry,
     RootResolution,
@@ -97,7 +98,7 @@ pub struct ResolvedDownloadUnit {
     pub path: String,
     pub name: String,
     pub url: String,
-    pub integrity: Option<String>,
+    pub integrity: Option<Integrity>,
 }
 
 /// Receives each resolved registry-typed package as it is placed during graph
@@ -690,7 +691,14 @@ impl<'a> GraphResolver<'a> {
                 integrity: if node.integrity.is_empty() {
                     None
                 } else {
-                    Some(node.integrity.clone())
+                    // integrity is validated at registry selection;
+                    // a non-empty string must parse.
+                    Some(Integrity::parse(&node.integrity).unwrap_or_else(|e| {
+                        panic!(
+                            "invalid integrity in resolved node for {}: {}: {}",
+                            node.placement_name, node.integrity, e
+                        )
+                    }))
                 },
             }
         };
@@ -1920,9 +1928,9 @@ mod tests {
                 let length = stream.read(&mut request).unwrap();
                 let request = String::from_utf8_lossy(&request[..length]);
                 let body = if request.starts_with("GET /a ") {
-                    r#"{"name":"a","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"a","version":"1.0.0","dependencies":{"b":"^1.0.0"},"dist":{"tarball":"/a.tgz","integrity":"sha512-a"}}}}"#
+                    r#"{"name":"a","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"a","version":"1.0.0","dependencies":{"b":"^1.0.0"},"dist":{"tarball":"/a.tgz","integrity":"sha512-61000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"}}}}"#
                 } else {
-                    r#"{"name":"b","dist-tags":{"latest":"1.2.0"},"versions":{"1.2.0":{"name":"b","version":"1.2.0","dist":{"tarball":"/b.tgz","integrity":"sha512-b"}}}}"#
+                    r#"{"name":"b","dist-tags":{"latest":"1.2.0"},"versions":{"1.2.0":{"name":"b","version":"1.2.0","dist":{"tarball":"/b.tgz","integrity":"sha512-62000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"}}}}"#
                 };
                 write!(
                     stream,
@@ -1992,16 +2000,16 @@ mod tests {
                 });
                 let body = match path {
                     Some("a") => {
-                        r#"{"name":"a","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"a","version":"1.0.0","dependencies":{"b":"^1.0.0","d":"^1.0.0"},"dist":{"tarball":"/a.tgz","integrity":"sha512-a"}}}}"#
+                        r#"{"name":"a","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"a","version":"1.0.0","dependencies":{"b":"^1.0.0","d":"^1.0.0"},"dist":{"tarball":"/a.tgz","integrity":"sha512-61000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"}}}}"#
                     }
                     Some("b") => {
-                        r#"{"name":"b","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"b","version":"1.0.0","dist":{"tarball":"/b.tgz","integrity":"sha512-b"}}}}"#
+                        r#"{"name":"b","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"b","version":"1.0.0","dist":{"tarball":"/b.tgz","integrity":"sha512-62000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"}}}}"#
                     }
                     Some("c") => {
-                        r#"{"name":"c","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"c","version":"1.0.0","dependencies":{"b":"^1.0.0","d":"^1.0.0"},"dist":{"tarball":"/c.tgz","integrity":"sha512-c"}}}}"#
+                        r#"{"name":"c","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"c","version":"1.0.0","dependencies":{"b":"^1.0.0","d":"^1.0.0"},"dist":{"tarball":"/c.tgz","integrity":"sha512-63000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"}}}}"#
                     }
                     Some("d") => {
-                        r#"{"name":"d","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"d","version":"1.0.0","dist":{"tarball":"/d.tgz","integrity":"sha512-d"}}}}"#
+                        r#"{"name":"d","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"d","version":"1.0.0","dist":{"tarball":"/d.tgz","integrity":"sha512-64000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"}}}}"#
                     }
                     _ => continue,
                 };
@@ -2090,13 +2098,13 @@ mod tests {
                 });
                 let body = match path {
                     Some("a") => {
-                        r#"{"name":"a","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"a","version":"1.0.0","dependencies":{"b":"^1.0.0"},"dist":{"tarball":"/a.tgz","integrity":"sha512-A"}}}}"#
+                        r#"{"name":"a","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"a","version":"1.0.0","dependencies":{"b":"^1.0.0"},"dist":{"tarball":"/a.tgz","integrity":"sha512-41000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"}}}}"#
                     }
                     Some("b") => {
-                        r#"{"name":"b","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"b","version":"1.0.0","dependencies":{"c":"^1.0.0"},"dist":{"tarball":"/b.tgz","integrity":"sha512-B"}}}}"#
+                        r#"{"name":"b","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"b","version":"1.0.0","dependencies":{"c":"^1.0.0"},"dist":{"tarball":"/b.tgz","integrity":"sha512-42000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"}}}}"#
                     }
                     Some("c") => {
-                        r#"{"name":"c","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"c","version":"1.0.0","dist":{"tarball":"/c.tgz","integrity":"sha512-C"}}}}"#
+                        r#"{"name":"c","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"c","version":"1.0.0","dist":{"tarball":"/c.tgz","integrity":"sha512-43000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"}}}}"#
                     }
                     _ => continue,
                 };
@@ -2206,16 +2214,16 @@ mod tests {
                 });
                 let body = match path {
                     Some("a") => {
-                        r#"{"name":"a","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"a","version":"1.0.0","dependencies":{"b":"^1.0.0","d":"^1.0.0"},"dist":{"tarball":"/a.tgz","integrity":"sha512-a"}}}}"#
+                        r#"{"name":"a","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"a","version":"1.0.0","dependencies":{"b":"^1.0.0","d":"^1.0.0"},"dist":{"tarball":"/a.tgz","integrity":"sha512-61000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"}}}}"#
                     }
                     Some("b") => {
-                        r#"{"name":"b","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"b","version":"1.0.0","dist":{"tarball":"/b.tgz","integrity":"sha512-b"}}}}"#
+                        r#"{"name":"b","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"b","version":"1.0.0","dist":{"tarball":"/b.tgz","integrity":"sha512-62000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"}}}}"#
                     }
                     Some("c") => {
-                        r#"{"name":"c","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"c","version":"1.0.0","dependencies":{"b":"^1.0.0","d":"^1.0.0"},"dist":{"tarball":"/c.tgz","integrity":"sha512-c"}}}}"#
+                        r#"{"name":"c","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"c","version":"1.0.0","dependencies":{"b":"^1.0.0","d":"^1.0.0"},"dist":{"tarball":"/c.tgz","integrity":"sha512-63000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"}}}}"#
                     }
                     Some("d") => {
-                        r#"{"name":"d","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"d","version":"1.0.0","dist":{"tarball":"/d.tgz","integrity":"sha512-d"}}}}"#
+                        r#"{"name":"d","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"d","version":"1.0.0","dist":{"tarball":"/d.tgz","integrity":"sha512-64000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"}}}}"#
                     }
                     _ => continue,
                 };
@@ -2270,6 +2278,11 @@ mod tests {
         // (registry-typed, non-link, with a tarball url), keyed by install path
         // — one announce per physical placement, including deduplicated siblings
         // placed under multiple parents.
+        // Compare sink announcements to lockfile packages.  Integrity values
+        // stored in the lockfile may be in hex or base64; we canonicalize
+        // through Integrity::parse + to_npm_string so both sides use the same
+        // canonical base64 form, even when the lockfile was populated from
+        // packument fixtures with hex-style values.
         let mut expected: Vec<(String, String, String, Option<String>)> = streamed
             .packages
             .iter()
@@ -2279,7 +2292,11 @@ mod tests {
                     package.path.clone(),
                     package.name.clone(),
                     package.resolved.clone(),
-                    package.integrity.clone(),
+                    package
+                        .integrity
+                        .as_deref()
+                        .and_then(|v| Integrity::parse(v).ok())
+                        .map(|i| i.to_npm_string()),
                 )
             })
             .collect();
@@ -2294,7 +2311,7 @@ mod tests {
                     unit.path.clone(),
                     unit.name.clone(),
                     unit.url.clone(),
-                    unit.integrity.clone(),
+                    unit.integrity.as_ref().map(|i| i.to_npm_string()),
                 )
             })
             .collect();
@@ -2328,7 +2345,7 @@ mod tests {
             let length = stream.read(&mut request).unwrap();
             let request = String::from_utf8_lossy(&request[..length]);
             assert!(request.starts_with("GET /b "), "{request}");
-            let body = r#"{"name":"b","dist-tags":{"latest":"1.2.0"},"versions":{"1.2.0":{"name":"b","version":"1.2.0","dist":{"tarball":"/b.tgz","integrity":"sha512-b"}}}}"#;
+            let body = r#"{"name":"b","dist-tags":{"latest":"1.2.0"},"versions":{"1.2.0":{"name":"b","version":"1.2.0","dist":{"tarball":"/b.tgz","integrity":"sha512-62000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"}}}}"#;
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -2390,7 +2407,7 @@ mod tests {
             let length = stream.read(&mut request).unwrap();
             let request = String::from_utf8_lossy(&request[..length]);
             assert!(request.starts_with("GET /b "), "{request}");
-            let body = r#"{"name":"b","dist-tags":{"latest":"1.2.0"},"versions":{"1.2.0":{"name":"b","version":"1.2.0","dist":{"tarball":"/b.tgz","integrity":"sha512-b"}}}}"#;
+            let body = r#"{"name":"b","dist-tags":{"latest":"1.2.0"},"versions":{"1.2.0":{"name":"b","version":"1.2.0","dist":{"tarball":"/b.tgz","integrity":"sha512-62000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"}}}}"#;
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
