@@ -28,6 +28,7 @@ use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
 
 use crate::integrity::ArtifactId;
+use crate::path_safety::{validate_bin_name, validate_bin_target, validate_package_path, validate_workspace_target};
 use crate::lockfile::{Lockfile, PackageEntry};
 use crate::store::ArtifactStore;
 
@@ -73,6 +74,23 @@ pub enum MaterializeError {
     },
     #[error("symlinks are required for node_modules materialization but are unsupported on this platform")]
     SymlinksUnsupported,
+    #[error("unsafe package path \"{path}\": {detail}")]
+    UnsafePackagePath {
+        path: String,
+        detail: String,
+    },
+    #[error("unsafe bin name for {package}: \"{name}\": {detail}")]
+    UnsafeBinName {
+        package: String,
+        name: String,
+        detail: String,
+    },
+    #[error("unsafe bin target for {package}: \"{target}\": {detail}")]
+    UnsafeBinTarget {
+        package: String,
+        target: String,
+        detail: String,
+    },
 }
 
 /// Materialize `resolved` packages under `project_root`, symlinking each
@@ -97,12 +115,52 @@ pub fn materialize(
     materialize_with_backend(project_root, store, resolved, MaterializeBackend::Auto)
 }
 
+fn preflight_resolved(resolved: &[(&PackageEntry, ArtifactId)]) -> Result<(), MaterializeError> {
+    for (entry, _) in resolved {
+        // Link/workspace packages may have paths outside node_modules.
+        if !entry.link {
+            validate_package_path(&entry.path).map_err(|e| {
+                MaterializeError::UnsafePackagePath {
+                    path: entry.path.clone(),
+                    detail: e.to_string(),
+                }
+            })?;
+        }
+        if let Some(ref target) = entry.workspace_target {
+            validate_workspace_target(target).map_err(|e| {
+                MaterializeError::UnsafePackagePath {
+                    path: entry.path.clone(),
+                    detail: format!("workspace target {target:?}: {e}"),
+                }
+            })?;
+        }
+        for (name, target) in &entry.bin {
+            validate_bin_name(name).map_err(|e| {
+                MaterializeError::UnsafeBinName {
+                    package: entry.path.clone(),
+                    name: name.clone(),
+                    detail: e.to_string(),
+                }
+            })?;
+            validate_bin_target(target).map_err(|e| {
+                MaterializeError::UnsafeBinTarget {
+                    package: entry.path.clone(),
+                    target: target.clone(),
+                    detail: e.to_string(),
+                }
+            })?;
+        }
+    }
+    Ok(())
+}
+
 pub fn materialize_with_backend(
     project_root: &Path,
     store: &ArtifactStore,
     resolved: &[(&PackageEntry, ArtifactId)],
     backend: MaterializeBackend,
 ) -> Result<MaterializeStats, MaterializeError> {
+    preflight_resolved(resolved)?;
     let mut stats = MaterializeStats::default();
     // Names already linked into node_modules/.bin, for deterministic collision
     // reporting (first declarant wins).
