@@ -102,6 +102,12 @@ pub enum LifecycleError {
         #[source]
         source: std::io::Error,
     },
+    #[error("required lifecycle script '{phase}' for {package} failed with exit code {exit_code}")]
+    RequiredScriptFailure {
+        package: String,
+        phase: String,
+        exit_code: i32,
+    },
     #[error("Git prepare failed: {0}")]
     Prepare(String),
 }
@@ -387,22 +393,12 @@ pub fn run_lifecycle(
                     }
                     Err(error) => match error {
                         derived::DerivedError::Sandbox { failure } => {
-                            metrics.record("derived_store_built", Duration::ZERO);
-                            stats.phases_executed += 1;
-                            stats.phases_failed += 1;
-                            let command = scripts
-                                .get(failure.phase.as_str())
-                                .cloned()
-                                .unwrap_or_default();
-                            outcomes.push(LifecycleOutcome {
+                            // A sandbox failure is a required lifecycle failure.
+                            return Err(LifecycleError::RequiredScriptFailure {
                                 package: failure.package,
                                 phase: failure.phase,
-                                command,
-                                ran: true,
-                                exit_code: failure.exit_code,
+                                exit_code: failure.exit_code.unwrap_or(-1),
                             });
-                            stats.derived_paths.push(pkg.path.clone());
-                            continue;
                         }
                         other => {
                             // Store/IO error: degrade to ordinary in-place
@@ -454,25 +450,31 @@ pub fn run_lifecycle(
             let Some(cmd) = scripts.get(phase) else {
                 continue;
             };
-            let mut outcome = LifecycleOutcome {
-                package: pkg.name.clone(),
-                phase: phase.to_string(),
-                command: cmd.clone(),
-                ran: true,
-                exit_code: None,
-            };
             let status = metrics.measure("lifecycle", || {
                 run_script(&cwd, phase, cmd, project_root, store, pkg)
             });
             let code = status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
-            outcome.exit_code = Some(code);
+            let outcome = LifecycleOutcome {
+                package: pkg.name.clone(),
+                phase: phase.to_string(),
+                command: cmd.clone(),
+                ran: true,
+                exit_code: Some(code),
+            };
+            outcomes.push(outcome);
+            stats.phases_executed += 1;
             if code == 0 {
                 stats.phases_succeeded += 1;
             } else {
                 stats.phases_failed += 1;
+                // Return immediately on first required failure.
+                // The sandbox is dropped via the return, cleaning temporary files.
+                return Err(LifecycleError::RequiredScriptFailure {
+                    package: pkg.name.clone(),
+                    phase: phase.to_string(),
+                    exit_code: code,
+                });
             }
-            stats.phases_executed += 1;
-            outcomes.push(outcome);
         }
         // Hold the sandbox (if any) until every phase has run.
         drop(sandbox);
