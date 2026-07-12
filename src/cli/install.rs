@@ -403,17 +403,17 @@ fn run_lifecycle_if_enabled(
     skip_execution: bool,
     derived_store: bool,
     metrics: &mut Metrics,
-) -> bpm::lifecycle::LifecycleStats {
+) -> anyhow::Result<bpm::lifecycle::LifecycleStats> {
     if ignore_scripts {
         metrics.record("lifecycle", std::time::Duration::ZERO);
-        return bpm::lifecycle::LifecycleStats::default();
+        return Ok(bpm::lifecycle::LifecycleStats::default());
     }
     let policy = bpm::lifecycle::LifecyclePolicy {
         ignore_scripts: false,
         skip_execution,
         use_derived_store: derived_store,
     };
-    match bpm::lifecycle::run_lifecycle(
+    let result = bpm::lifecycle::run_lifecycle(
         project_root,
         store,
         lockfile,
@@ -421,38 +421,33 @@ fn run_lifecycle_if_enabled(
         volume_path,
         policy,
         metrics,
-    ) {
-        Ok(result) if result.skipped => {
-            // Cached volume: nothing ran, so there is no per-phase summary to
-            // print. `run_lifecycle` already recorded the skip metric.
-            result
-        }
-        Ok(result) if result.packages_with_scripts > 0 => {
+    )?;
+    if result.skipped {
+        // Cached volume: nothing ran, so there is no per-phase summary to
+        // print. `run_lifecycle` already recorded the skip metric.
+        Ok(result)
+    } else if result.packages_with_scripts > 0 {
+        eprintln!(
+            "lifecycle: {} package(s) with scripts ({} phase(s) executed, {} succeeded, {} failed)",
+            result.packages_with_scripts,
+            result.phases_executed,
+            result.phases_succeeded,
+            result.phases_failed
+        );
+        for outcome in &result.outcomes {
+            let marker = if outcome.exit_code == Some(0) {
+                "ok"
+            } else {
+                "FAIL"
+            };
             eprintln!(
-                "lifecycle: {} package(s) with scripts ({} phase(s) executed, {} succeeded, {} failed)",
-                result.packages_with_scripts,
-                result.phases_executed,
-                result.phases_succeeded,
-                result.phases_failed
+                "  [{marker}] {}.{}) {}",
+                outcome.package, outcome.phase, outcome.command
             );
-            for outcome in &result.outcomes {
-                let marker = if outcome.exit_code == Some(0) {
-                    "ok"
-                } else {
-                    "FAIL"
-                };
-                eprintln!(
-                    "  [{marker}] {}.{}) {}",
-                    outcome.package, outcome.phase, outcome.command
-                );
-            }
-            result
         }
-        Ok(result) => result,
-        Err(error) => {
-            eprintln!("warning: lifecycle phase failed: {error}");
-            bpm::lifecycle::LifecycleStats::default()
-        }
+        Ok(result)
+    } else {
+        Ok(result)
     }
 }
 
@@ -1383,7 +1378,7 @@ fn finalize_install(
         volume.as_ref().is_some_and(|v| v.cached),
         options.derived_store,
         metrics,
-    );
+    )?;
     if local_project_view {
         if let Some(volume) = volume.as_ref() {
             let attached = bpm::volume::attach_project_local(project_root, volume)?;
