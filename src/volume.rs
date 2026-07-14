@@ -82,6 +82,27 @@ pub struct VolumeRef {
     pub stats: MaterializeStats,
 }
 
+/// Result of ensuring a graph volume: either a ready (cached) volume or a
+/// pending build that must be completed via [`PendingVolume::publish`].
+#[derive(Debug)]
+pub enum EnsuredVolume {
+    Ready(VolumeRef),
+    Building(PendingVolume),
+}
+
+/// A graph volume being built under a staging directory with an exclusive
+/// per-graph lock held.  Must be published via [`publish`](PendingVolume::publish)
+/// or dropped (which cleans up staging and releases the lock).
+#[derive(Debug)]
+pub struct PendingVolume {
+    staging: PathBuf,
+    final_path: PathBuf,
+    graph_id_hex: String,
+    stats: MaterializeStats,
+    /// The lock file guard.  Kept alive for the lifetime of this object.
+    _lock: fs::File,
+}
+
 /// Ensure the graph volume for `graph_hex` exists and is complete. Idempotent:
 /// if `<volume>/metadata.json` already records this graph id, the volume is
 /// reused untouched (cached). Otherwise the volume's `node_modules` is built
@@ -189,6 +210,80 @@ pub fn ensure_graph_volume_with_prepared(
         cached: false,
         stats,
     })
+}
+
+/// Acquire an exclusive per-graph lock file at `<store>/locks/graph-<hex>.lock`.
+fn acquire_graph_lock(store: &ArtifactStore, graph_hex: &str) -> Result<fs::File, VolumeError> {
+    let lock_dir = store.root().join("locks");
+    fs::create_dir_all(&lock_dir).map_err(|source| VolumeError::Io {
+        path: lock_dir.display().to_string(),
+        source,
+    })?;
+    let lock_path = lock_dir.join(format!("graph-{graph_hex}.lock"));
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|source| VolumeError::Io {
+            path: lock_path.display().to_string(),
+            source,
+        })?;
+    // Acquire exclusive advisory lock (Rust 1.68+).
+    file.lock().map_err(|source| VolumeError::Io {
+        path: lock_path.display().to_string(),
+        source,
+    })?;
+    Ok(file)
+}
+
+impl PendingVolume {
+    /// The staging path where lifecycle and materialization happen.
+    pub fn path(&self) -> &Path {
+        &self.staging
+    }
+
+    /// Atomically publish the staging tree to the final graph path.
+    /// After success the volume is ready for reuse.
+    pub fn publish(mut self) -> Result<VolumeRef, VolumeError> {
+        // Write metadata inside staging before the rename.
+        let meta = VolumeMeta {
+            graph_id_hex: self.graph_id_hex.clone(),
+            layout_version: VOLUME_LAYOUT_VERSION,
+            packages_materialized: self.stats.packages_materialized,
+            bins_linked: self.stats.bins_linked,
+        };
+        let meta_bytes = serde_json::to_vec_pretty(&meta).unwrap_or_default();
+        fs::write(self.staging.join(META_FILE), meta_bytes)
+            .map_err(|source| io_err(&self.staging.join(META_FILE), source))?;
+
+        // Atomically rename staging to final path.  The lock serializes
+        // concurrent builders, so the destination should not exist.  If it
+        // does (e.g. a crash left a partial tree), remove it first.
+        let _ = fs::remove_dir_all(&self.final_path);
+        fs::rename(&self.staging, &self.final_path).map_err(|source| VolumeError::Io {
+            path: self.final_path.display().to_string(),
+            source,
+        })?;
+
+        let vref = VolumeRef {
+            path: self.final_path.clone(),
+            cached: false,
+            stats: std::mem::take(&mut self.stats),
+        };
+        // Prevent drop from cleaning the now-published tree.
+        self.staging = PathBuf::new();
+        Ok(vref)
+    }
+}
+
+impl Drop for PendingVolume {
+    fn drop(&mut self) {
+        if !self.staging.as_os_str().is_empty() && self.staging.exists() {
+            let _ = fs::remove_dir_all(&self.staging);
+        }
+        // Lock file is closed/cleaned up by the OS when the fd drops.
+    }
 }
 
 fn overlay_prepared_image(source: &Path, target: &Path) -> Result<(), VolumeError> {
