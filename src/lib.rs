@@ -51,6 +51,7 @@ pub mod store;
 pub mod volume;
 pub mod workspace;
 
+pub use http::redact_url;
 pub use diagnostic::{Diagnostic, Severity};
 pub use doctor::{DoctorReport, ManifestSummary};
 pub use integrity::{ArtifactId, Integrity, IntegrityError, Sha512Digest};

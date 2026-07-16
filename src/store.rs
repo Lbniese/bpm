@@ -28,7 +28,7 @@ use thiserror::Error;
 
 use crate::archive::{self, ExtractError};
 use crate::download::{self, DownloadError};
-use crate::http::HttpClient;
+use crate::http::{redact_url, HttpClient};
 use crate::integrity::{ArtifactId, Integrity, IntegrityError, Sha512Digest};
 use crate::metrics::Metrics;
 use crate::remote_cache::{RemoteCacheClient, RemoteFetch};
@@ -322,7 +322,7 @@ impl ArtifactStore {
             Err(source) => {
                 let _ = fs::remove_file(&origin_tmp);
                 return Err(StoreError::Download {
-                    url: url.to_string(),
+                    url: redact_url(url),
                     source,
                 });
             }
@@ -330,7 +330,7 @@ impl ArtifactStore {
         if computed != id {
             let _ = fs::remove_file(&origin_tmp);
             return Err(StoreError::IntegrityMismatch {
-                url: url.to_string(),
+                url: redact_url(url),
                 expected: integrity.to_npm_string(),
                 computed: computed.to_npm_string(),
             });
@@ -383,14 +383,14 @@ impl ArtifactStore {
                 let computed = metrics
                     .measure("artifact_download", || retrieve(url, &tmp))
                     .map_err(|source| StoreError::Download {
-                        url: url.to_string(),
+                        url: redact_url(url),
                         source,
                     })?;
                 let ok = metrics.measure("integrity_verify", || computed == id);
                 if !ok {
                     let _ = fs::remove_file(&tmp);
                     return Err(StoreError::IntegrityMismatch {
-                        url: url.to_string(),
+                        url: redact_url(url),
                         expected: integ.to_npm_string(),
                         computed: computed.to_npm_string(),
                     });

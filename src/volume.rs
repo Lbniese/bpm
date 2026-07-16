@@ -416,6 +416,63 @@ pub fn attach_project(
     ))
 }
 
+/// Remove stale BPM-owned top-level entries from the project's `node_modules`
+/// that are not present in the new volume.  Only removes entries that are
+/// symlinks (relay) or directories (local view) at the expected paths.
+pub fn reconcile_project_view(
+    project_root: &Path,
+    volume: &VolumeRef,
+    previous_top_level: &[String],
+) -> Result<usize, VolumeError> {
+    let proj_nm = project_root.join("node_modules");
+    if !proj_nm.exists() {
+        return Ok(0);
+    }
+    // Collect the new set of top-level entries from the volume.
+    let vol_nm = volume.path.join("node_modules");
+    let mut current: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    if vol_nm.is_dir() {
+        for entry in fs::read_dir(&vol_nm).map_err(|source| io_err(&vol_nm, source))? {
+            let entry = entry.map_err(|source| io_err(&vol_nm, source))?;
+            current.insert(entry.file_name().to_string_lossy().to_string());
+        }
+    }
+
+    let mut removed = 0usize;
+    for name in previous_top_level {
+        if current.contains(name.as_str()) {
+            continue; // still present in the new volume
+        }
+        let proj_entry = proj_nm.join(name);
+        if !proj_entry.exists() {
+            continue;
+        }
+        // Only remove entries that look like BPM-owned relay symlinks or
+        // local directories.  Never remove arbitrary files.
+        let meta = fs::symlink_metadata(&proj_entry)
+            .map_err(|source| io_err(&proj_entry, source))?;
+        if meta.file_type().is_symlink() {
+            // Relay: only remove if the target is inside the old volume path.
+            if let Ok(target) = fs::read_link(&proj_entry) {
+                if target.starts_with(&volume.path) || target.starts_with(
+                    volume.path.parent().unwrap_or(Path::new("")),
+                ) {
+                    fs::remove_file(&proj_entry)
+                        .map_err(|source| io_err(&proj_entry, source))?;
+                    removed += 1;
+                }
+            }
+        } else if meta.is_dir() {
+            // Local directory: assume BPM-owned (conservative, safe).
+            fs::remove_dir_all(&proj_entry)
+                .map_err(|source| io_err(&proj_entry, source))?;
+            removed += 1;
+        }
+        // Regular files (not symlinks, not dirs) are left alone.
+    }
+    Ok(removed)
+}
+
 /// Attach a project with a local hardlink view of the graph volume.
 ///
 /// Unlike relay attachment, every package file gets a project-local directory

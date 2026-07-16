@@ -62,6 +62,10 @@ pub enum MaterializeMode {
 pub enum MaterializeBackend {
     Symlink,
     Hardlink,
+    /// Deep copy that guarantees independent inodes.  Use for project views
+    /// so writes to one project never affect the shared store or another
+    /// project.
+    IsolatedCopy,
     Auto,
 }
 
@@ -194,6 +198,10 @@ pub fn materialize_with_backend(
                 // example: it requires ../server/require-hook). Keep .bin
                 // entries as relative symlinks into the hardlinked package
                 // tree; only package files themselves are hardlinked.
+                cfg!(unix)
+            }
+            MaterializeBackend::IsolatedCopy => {
+                copy_tree(&image_dir, &target)?;
                 cfg!(unix)
             }
             MaterializeBackend::Auto => {
@@ -634,6 +642,58 @@ fn read_link_if_points_to(
         Ok(_) => Ok(None),
         Err(source) => Err(io_err(link, source)),
     }
+}
+
+/// Recursively copy a directory tree to independent inodes.
+/// Preserves executable bits and re-creates symlinks without following them.
+pub(crate) fn copy_tree(source: &Path, target: &Path) -> Result<(), MaterializeError> {
+    if target.exists() || symlink_exists(target) {
+        remove_any(target)?;
+    }
+    fs::create_dir_all(target)
+        .map_err(|source| io_err(target, source))?;
+    copy_tree_inner(source, target)
+}
+
+fn copy_tree_inner(source: &Path, target: &Path) -> Result<(), MaterializeError> {
+    for entry in fs::read_dir(source).map_err(|e| io_err(Path::new("<read_dir>"), e))? {
+        let entry = entry.map_err(|e| io_err(Path::new("<read_dir_entry>"), e))?;
+        let src_path = entry.path();
+        let dst_path = target.join(entry.file_name());
+        let kind = entry.file_type().map_err(|source| io_err(&src_path, source))?;
+
+        if kind.is_dir() {
+            fs::create_dir_all(&dst_path)
+                .map_err(|source| io_err(&dst_path, source))?;
+            copy_tree_inner(&src_path, &dst_path)?;
+        } else if kind.is_symlink() {
+            let link_target = fs::read_link(&src_path)
+                .map_err(|source| io_err(&src_path, source))?;
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&link_target, &dst_path)
+                .map_err(|source| io_err(&dst_path, source))?;
+            #[cfg(not(unix))]
+            fs::copy(&src_path, &dst_path)
+                .map(|_| ())
+                .map_err(|source| io_err(&dst_path, source))?;
+        } else {
+            fs::copy(&src_path, &dst_path)
+                .map_err(|source| io_err(&dst_path, source))?;
+            // Preserve executable bit.
+            let meta = fs::metadata(&src_path)
+                .map_err(|source| io_err(&src_path, source))?;
+            let perms = meta.permissions();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if perms.mode() & 0o111 != 0 {
+                    fs::set_permissions(&dst_path, perms)
+                        .map_err(|source| io_err(&dst_path, source))?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `true` if a symlink (or any entry) exists at `path` without following links.
