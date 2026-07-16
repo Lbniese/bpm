@@ -582,7 +582,10 @@ fn collect_headers(map: &reqwest::header::HeaderMap) -> Vec<(String, String)> {
 }
 
 /// Remove user information, query, and fragment from URLs included in errors.
-fn redact_url(url: &str) -> String {
+/// Display-only URL redaction: strip userinfo, query, and fragment while
+/// preserving scheme, host, port, and path for actionable diagnostics.
+/// The original URL is **not** modified for requests, cache keys, or locks.
+pub fn redact_url(url: &str) -> String {
     let without_suffix = url.split(['?', '#']).next().unwrap_or(url);
     let Some((scheme, remainder)) = without_suffix.split_once("://") else {
         return "<invalid-url>".to_string();
