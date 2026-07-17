@@ -174,9 +174,21 @@ pub(super) fn run(mut options: Options) -> anyhow::Result<()> {
                             .build()
                             .expect("failed to build tokio runtime")
                             .block_on(async {
+                                let async_cache = bpm::metadata_cache::MetadataCache::open(
+                                    store.root(),
+                                )
+                                .ok();
+                                let mut async_registry =
+                                    bpm::async_resolver::AsyncRegistryClient::new(config);
+                                if let Some(cache) = async_cache {
+                                    async_registry = async_registry.with_metadata_cache(
+                                        std::sync::Arc::new(cache),
+                                        options.cache_mode,
+                                    );
+                                }
                                 bpm::async_resolver::resolve_manifest_with_workspaces_async(
                                     &manifest,
-                                    &bpm::async_resolver::AsyncRegistryClient::new(config),
+                                    &async_registry,
                                     "bpm",
                                     Some(&workspace_index),
                                 )
@@ -1048,8 +1060,18 @@ fn run_streaming_async_install(
                         .expect("failed to build tokio runtime")
                         .block_on(async {
                             let sink = TryChannelSink(unit_tx);
-                            let registry =
+                            let async_cache = bpm::metadata_cache::MetadataCache::open(
+                                store.root(),
+                            )
+                            .ok();
+                            let mut registry =
                                 bpm::async_resolver::AsyncRegistryClient::new(config_clone);
+                            if let Some(cache) = async_cache {
+                                registry = registry.with_metadata_cache(
+                                    std::sync::Arc::new(cache),
+                                    options.cache_mode,
+                                );
+                            }
                             bpm::async_resolver::resolve_manifest_with_workspaces_async_sink(
                                 manifest,
                                 &registry,
