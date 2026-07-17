@@ -39,6 +39,7 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::config::NpmConfig;
 use crate::integrity::Integrity;
+use crate::metadata_cache::{CacheMode, MetadataCache};
 use crate::lockfile::{
     LockDependency, LockSource, Lockfile, PackageEntry, PackageResolution, RootEntry,
     RootResolution,
@@ -230,6 +231,17 @@ pub struct AsyncRegistryClient {
     inline_fetches: Arc<AtomicU64>,
     /// Total count of cache hits.
     cache_hits: Arc<AtomicU64>,
+    /// Persistent metadata cache (SQLite), shared with the blocking path.
+    metadata_cache: Option<Arc<MetadataCache>>,
+    /// Cache mode (offline, prefer-offline, default, prefer-online).
+    cache_mode: CacheMode,
+    /// Maximum number of concurrent in-flight metadata requests for bounded
+    /// concurrent prefetch.  1 = sequential (no overlap).
+    max_in_flight: u32,
+    /// Peak concurrent metadata requests observed (diagnostic).
+    peak_in_flight: Arc<AtomicU64>,
+    /// Current in-flight request count.
+    in_flight: Arc<AtomicU64>,
 }
 
 impl AsyncRegistryClient {
@@ -243,7 +255,34 @@ impl AsyncRegistryClient {
             fetch_bytes: Arc::new(AtomicU64::new(0)),
             inline_fetches: Arc::new(AtomicU64::new(0)),
             cache_hits: Arc::new(AtomicU64::new(0)),
+            metadata_cache: None,
+            cache_mode: CacheMode::Default,
+            max_in_flight: 4,
+            peak_in_flight: Arc::new(AtomicU64::new(0)),
+            in_flight: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Set the maximum number of concurrent in-flight metadata requests.
+    pub fn with_max_in_flight(mut self, max: u32) -> Self {
+        self.max_in_flight = max.max(1);
+        self
+    }
+
+    /// Peak concurrent metadata requests observed during resolution.
+    pub fn peak_in_flight(&self) -> u64 {
+        self.peak_in_flight.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Attach a persistent metadata cache and set the cache mode.
+    pub fn with_metadata_cache(
+        mut self,
+        cache: Arc<MetadataCache>,
+        cache_mode: CacheMode,
+    ) -> Self {
+        self.metadata_cache = Some(cache);
+        self.cache_mode = cache_mode;
+        self
     }
 
     /// Return the effective registry for a package name.
