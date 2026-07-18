@@ -1,10 +1,13 @@
 # Contributing to BPM
 
-for humans and coding agents alike. Read it, along with
+This guide applies to human and automated contributors alike. Read it, along
+with [`AGENTS.md`](AGENTS.md), for the current architecture, milestone docs,
+and repository conventions.
 
 ## Before you start
 
-   documentation.
+1. Read the repository guidance in `AGENTS.md` and current design documents
+   under `docs/` for the area you are touching.
 2. Look at existing tests and benchmarks for the area you're touching.
 3. Classify the change:
 
@@ -15,7 +18,8 @@ for humans and coding agents alike. Read it, along with
    D. Nice to have
    ```
 
-   Only A, B, and C are implemented without an explicit request — see
+   Only A, B, and C are implemented without an explicit request — see the
+   project maintainers for scope D approval.
 
 ## Building and testing
 
@@ -35,7 +39,7 @@ make bench
 
 ## Required validation
 
-Every change must pass, from inside the container:
+Every change must pass, from inside the container or on the host:
 
 ```bash
 cargo fmt --all --check
@@ -50,10 +54,11 @@ faster run is not evidence.
 
 ## Tests are part of the change, not an afterthought
 
-extraction, graph, materializer, lifecycle) must be tested against.
-Determinism regressions (hash-map iteration order, filesystem enumeration
-order, network completion order, locale) need an explicit test, not just a
-manual check.
+Store, extraction, graph, materializer, lifecycle, networking, resolver,
+and CLI changes must include success plus negative, interruption, and reuse
+tests appropriate to the area.  Determinism regressions (hash-map iteration
+order, filesystem enumeration order, network completion order, locale) need
+an explicit test, not just a manual check.
 
 ## Commit messages
 
@@ -65,10 +70,9 @@ docs(site): add CLI reference page
 bench(ci): add warm graph reuse scenario
 ```
 
-Keep pull requests focused: one objective, its affected milestone,
-correctness tests, relevant benchmark results if applicable, and explicit
-notes about anything left unsupported. Avoid combining unrelated refactors
-with feature work.
+Keep commits focused: one objective per commit, correctness tests,
+relevant benchmark results if applicable, and explicit notes about anything
+left unsupported. Avoid combining unrelated refactors with feature work.
 
 ## Security and correctness come first
 

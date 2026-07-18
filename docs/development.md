@@ -32,11 +32,12 @@ cargo build --release --workspace
 ```
 
 Performance work must use release builds — debug-build timings are not
+comparable evidence. Report median, p95, and variance when benchmarking.
 
 ## Working rules (summary)
 
-The authoritative rules live in
-short:
+The authoritative rules live in [`AGENTS.md`](AGENTS.md) at the repository
+root. In short:
 
 - **Benchmark before optimizing.** Identify the scenario, record a
   baseline, profile, make the smallest change, rerun, report median/p95/
@@ -75,13 +76,14 @@ Only A, B, and C are implemented without an explicit request.
 
 ## Testing expectations by area
 
-interrupted-write/concurrent-writer/corruption/read-only/atomic-reuse
-coverage; extraction changes need path-traversal/absolute-path/symlink/
-permission/malformed-archive/duplicate-entry coverage; graph changes need
-stable-ID/peer-context/platform/workspace/ordering coverage; materializer
+Store changes need interrupted-write/concurrent-writer/corruption/read-only/
+atomic-reuse coverage; extraction changes need path-traversal/absolute-path/
+symlink/permission/malformed-archive/duplicate-entry coverage; graph changes
+need stable-ID/peer-context/platform/workspace/ordering coverage; materializer
 changes need isolation/resolution/bin-link/repeat-install/reuse/read-only
-coverage; lifecycle changes need script-order/environment/failure-
-propagation/`--ignore-scripts`/reuse/immutability coverage.
+coverage; lifecycle changes need script-order/environment/failure-propagation/
+`--ignore-scripts`/reuse/immutability coverage; resolver and networking changes
+need environment/offline/retry/redirect/auth/timeout/cache/concurrency coverage.
 
 ## Contributing
 

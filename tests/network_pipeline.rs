@@ -647,11 +647,7 @@ fn malformed_integrity_fails_default_streaming() {
     write_npmrc(project.path(), &[format!("registry={}", server.url(""))]);
 
     let (ok, stdout, stderr) = run_bpm(
-        &[
-            "install",
-            "--store",
-            store.path().to_str().unwrap(),
-        ],
+        &["install", "--store", store.path().to_str().unwrap()],
         project.path(),
         store.path(),
         None,
@@ -665,7 +661,11 @@ fn malformed_integrity_fails_default_streaming() {
         "stderr must mention integrity problem; got: {stderr}"
     );
     assert!(
-        !project.path().join("node_modules").join("bad-integrity-pkg").exists(),
+        !project
+            .path()
+            .join("node_modules")
+            .join("bad-integrity-pkg")
+            .exists(),
         "package must not be installed"
     );
 }
@@ -689,11 +689,7 @@ fn malformed_integrity_fails_sync_no_stream() {
     write_npmrc(project.path(), &[format!("registry={}", server.url(""))]);
 
     let (ok, stdout, stderr) = run_bpm(
-        &[
-            "install",
-            "--store",
-            store.path().to_str().unwrap(),
-        ],
+        &["install", "--store", store.path().to_str().unwrap()],
         project.path(),
         store.path(),
         None,
@@ -703,7 +699,9 @@ fn malformed_integrity_fails_sync_no_stream() {
         "install must fail with malformed integrity;\nstdout: {stdout}\nstderr: {stderr}"
     );
     assert!(
-        stderr.contains("malformed") || stderr.contains("integrity") || stderr.contains("unsupported"),
+        stderr.contains("malformed")
+            || stderr.contains("integrity")
+            || stderr.contains("unsupported"),
         "stderr must mention integrity problem; got: {stderr}"
     );
 }
@@ -769,7 +767,9 @@ fn malformed_integrity_fails_async_streaming() {
         .env("BPM_STORE", store.path())
         .env("BPM_ASYNC_RESOLVE", "1")
         .env("BPM_STREAM_INSTALL", "1");
-    let out = cmd.output().expect("run bpm with async resolver + streaming");
+    let out = cmd
+        .output()
+        .expect("run bpm with async resolver + streaming");
     assert!(
         !out.status.success(),
         "async+streaming install must fail with malformed integrity;\nstdout: {}\nstderr: {}",

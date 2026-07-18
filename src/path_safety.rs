@@ -71,7 +71,9 @@ pub fn validate_package_path(path: &str) -> Result<String, PathSafetyError> {
     }
     // Must contain at least one `node_modules/<name>` segment.
     let segments: Vec<&str> = path.split('/').collect();
-    let has_nm = segments.windows(2).any(|w| w[0] == "node_modules" && !w[1].is_empty() && w[1] != "." && w[1] != "..");
+    let has_nm = segments
+        .windows(2)
+        .any(|w| w[0] == "node_modules" && !w[1].is_empty() && w[1] != "." && w[1] != "..");
     if !has_nm {
         return Err(PathSafetyError::InvalidPackagePath {
             path: path.to_owned(),
@@ -129,7 +131,7 @@ pub fn validate_bin_name(name: &str) -> Result<String, PathSafetyError> {
         });
     }
     // Trim trailing dot or space for Windows compatibility.
-    let trimmed = name.trim_end_matches(|c: char| c == '.' || c == ' ');
+    let trimmed = name.trim_end_matches(['.', ' ']);
     if trimmed.is_empty() {
         return Err(PathSafetyError::InvalidBinName {
             name: name.to_owned(),
@@ -153,8 +155,8 @@ pub fn validate_bin_name(name: &str) -> Result<String, PathSafetyError> {
 /// empty/`.`/`..` components, and any path outside the package image.
 pub fn validate_bin_target(target: &str) -> Result<String, PathSafetyError> {
     // Strip leading `./` (npm convention).
-    let normalized = if target.starts_with("./") {
-        &target[2..]
+    let normalized = if let Some(stripped) = target.strip_prefix("./") {
+        stripped
     } else {
         target
     };
