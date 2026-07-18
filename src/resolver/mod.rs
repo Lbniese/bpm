@@ -1252,6 +1252,10 @@ fn write_patched_tarball(base_dir: &Path, bytes: &[u8]) -> Result<String, String
 }
 
 fn resolve_git_source(url: &str, reference: Option<&str>) -> Result<SourceResolution, String> {
+    reject_git_option_value("url", url)?;
+    if let Some(reference) = reference {
+        reject_git_option_value("reference", reference)?;
+    }
     let resolved_commit = resolve_git_commit(url, reference)?;
     if let Some(tarball_url) = hosted_git_tarball_url(url, Some(&resolved_commit)) {
         let http = crate::http::HttpClient::new(crate::config::NpmConfig::default());
@@ -1293,9 +1297,10 @@ fn resolve_git_source(url: &str, reference: Option<&str>) -> Result<SourceResolu
 /// a raw SHA (the common behavior for `file://`, SSH, and git-daemon remotes).
 fn archive_git_commit_locally(url: &str, commit: &str) -> Result<std::process::Output, String> {
     let source = url.strip_prefix("file://").unwrap_or(url);
+    reject_git_option_value("url", source)?;
     if Path::new(source).is_dir() {
         return Command::new("git")
-            .args(["-C", source, "archive", "--format=tar", commit])
+            .args(["-C", source, "archive", "--format=tar", "--", commit])
             .output()
             .map_err(|error| format!("cannot archive local Git commit: {error}"));
     }
@@ -1315,6 +1320,7 @@ fn archive_git_commit_locally(url: &str, commit: &str) -> Result<std::process::O
             .args([
                 "clone",
                 "--no-checkout",
+                "--",
                 url,
                 &clone_dir.display().to_string(),
             ])
@@ -1330,6 +1336,7 @@ fn archive_git_commit_locally(url: &str, commit: &str) -> Result<std::process::O
             &clone_dir.display().to_string(),
             "fetch",
             "origin",
+            "--",
             commit,
         ])
         .output()
@@ -1343,6 +1350,7 @@ fn archive_git_commit_locally(url: &str, commit: &str) -> Result<std::process::O
             &clone_dir.display().to_string(),
             "archive",
             "--format=tar",
+            "--",
             commit,
         ])
         .output()
@@ -1406,14 +1414,32 @@ fn is_full_git_commit(value: &str) -> bool {
     value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+/// Reject values that git would parse as options. Git parses a leading `-`
+/// (single or double) as an option flag, so a Git reference or url beginning
+/// with `-` becomes an injected option rather than a positional. The `--`
+/// separator added at the call sites makes this defense-in-depth, but
+/// rejecting leading-dash values yields a clearer error than a confusing git
+/// message and blocks the injection class explicitly.
+fn reject_git_option_value(label: &str, value: &str) -> Result<(), String> {
+    if value.starts_with('-') {
+        return Err(format!(
+            "git {label} {value:?} is rejected: values beginning with '-' \
+             would be parsed as a git option"
+        ));
+    }
+    Ok(())
+}
+
 fn resolve_git_commit(url: &str, reference: Option<&str>) -> Result<String, String> {
     if let Some(reference) = reference.filter(|value| is_full_git_commit(value)) {
         return Ok(reference.to_ascii_lowercase());
     }
     let requested = reference.unwrap_or("HEAD");
+    reject_git_option_value("reference", requested)?;
     let remote = git_clone_url(url);
+    reject_git_option_value("remote", &remote)?;
     let output = Command::new("git")
-        .args(["ls-remote", &remote, requested])
+        .args(["ls-remote", "--", &remote, requested])
         .output()
         .map_err(|error| format!("cannot execute git ls-remote for {url}: {error}"))?;
     if !output.status.success() {
@@ -1471,6 +1497,7 @@ fn git_archive_tarball(
             "archive",
             "--format=tar",
             &format!("--remote={url}"),
+            "--",
             reference,
         ])
         .output()
@@ -1903,6 +1930,38 @@ mod tests {
             hosted_git_tarball_url("https://gitlab.com/owner/repo.git", Some("abc123")),
             Some("https://gitlab.com/owner/repo.git/-/archive/abc123/repo-abc123.tar.gz".into())
         );
+    }
+
+    #[test]
+    fn git_option_values_are_rejected() {
+        // References beginning with '-' are rejected — they would be parsed as
+        // git options (argument injection). 40-hex SHAs and normal ref names pass.
+        assert!(reject_git_option_value("reference", "main").is_ok());
+        assert!(reject_git_option_value("reference", "v1.0.0").is_ok());
+        assert!(reject_git_option_value("reference", "HEAD").is_ok());
+        assert!(reject_git_option_value("reference", "-.upload-pack evil").is_err());
+        assert!(reject_git_option_value("reference", "-anything").is_err());
+        assert!(reject_git_option_value("reference", "--anything").is_err());
+
+        // Urls are subject to the same rule.
+        assert!(reject_git_option_value("url", "https://example/x.git").is_ok());
+        assert!(reject_git_option_value("url", "file:///tmp/repo").is_ok());
+        assert!(reject_git_option_value("url", "-Otouch").is_err());
+
+        // A `git+-O...` spec reaches `resolve_git_source` with url="-O...".
+        // Confirm the entry-point rejection without invoking git.
+        assert!(resolve_git_source("-Ofoo", None).is_err());
+        assert!(resolve_git_source("https://example/x.git", Some("-UploadPack")).is_err());
+    }
+
+    #[test]
+    fn git_40_hex_ref_path_is_still_accepted() {
+        // The fast path that bypasses ls-remote must keep working for valid SHAs.
+        // (This is a regression guard: step 3 must not have rejected the safe path.)
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        // resolve_git_source will try network for the hosted case; only assert that
+        // the leading-dash guard did not fire for a legitimate 40-hex ref.
+        assert!(reject_git_option_value("reference", sha).is_ok());
     }
 
     #[test]

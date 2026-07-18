@@ -39,12 +39,12 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::config::NpmConfig;
 use crate::integrity::Integrity;
-use crate::metadata_cache::{CacheMode, MetadataCache};
 use crate::lockfile::{
     LockDependency, LockSource, Lockfile, PackageEntry, PackageResolution, RootEntry,
     RootResolution,
 };
 use crate::manifest::PackageManifest;
+use crate::metadata_cache::{CacheMode, MetadataCache};
 use crate::registry::{
     self, parse_spec, resolve_packument, version_metadata, PackageSpec, Packument, RegistryError,
     VersionMetadata, VersionRequest, WireVersionMetadata, ABBREV_ACCEPT,
@@ -241,6 +241,7 @@ pub struct AsyncRegistryClient {
     /// Peak concurrent metadata requests observed (diagnostic).
     peak_in_flight: Arc<AtomicU64>,
     /// Current in-flight request count.
+    #[allow(dead_code)]
     in_flight: Arc<AtomicU64>,
 }
 
@@ -271,15 +272,12 @@ impl AsyncRegistryClient {
 
     /// Peak concurrent metadata requests observed during resolution.
     pub fn peak_in_flight(&self) -> u64 {
-        self.peak_in_flight.load(std::sync::atomic::Ordering::Relaxed)
+        self.peak_in_flight
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Attach a persistent metadata cache and set the cache mode.
-    pub fn with_metadata_cache(
-        mut self,
-        cache: Arc<MetadataCache>,
-        cache_mode: CacheMode,
-    ) -> Self {
+    pub fn with_metadata_cache(mut self, cache: Arc<MetadataCache>, cache_mode: CacheMode) -> Self {
         self.metadata_cache = Some(cache);
         self.cache_mode = cache_mode;
         self
