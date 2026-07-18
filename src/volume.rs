@@ -155,29 +155,58 @@ pub fn ensure_graph_volume_with_prepared(
             stale = true;
         }
     }
+
+    // Acquire an exclusive per-graph lock to serialise concurrent builders.
+    let lock = acquire_graph_lock(store, &graph_hex)?;
+
+    // Double-check after acquiring the lock: another builder may have
+    // completed the volume under lock while we were waiting.
+    if let Ok(meta_bytes) = fs::read(volume_dir.join(META_FILE)) {
+        if let Ok(meta) = serde_json::from_slice::<VolumeMeta>(&meta_bytes) {
+            if meta.graph_id_hex == graph_hex && meta.layout_version == VOLUME_LAYOUT_VERSION {
+                metrics.record("graph_volume_hit", std::time::Duration::ZERO);
+                return Ok(VolumeRef {
+                    path: volume_dir,
+                    cached: true,
+                    stats: MaterializeStats::default(),
+                });
+            }
+        }
+    }
     if stale {
-        // Discard the stale projection so the rebuild contains no orphan
-        // entries from the previous layout/graph. Removing hardlinked entries
-        // only unlinks directory entries; the shared store images persist.
+        // Discard the stale projection now that we hold the lock, so the
+        // rebuild contains no orphan entries from the previous layout/graph.
+        // Removing hardlinked entries only unlinks directory entries; the
+        // shared store images persist.
         let _ = fs::remove_dir_all(&volume_dir);
     }
 
-    // Build: materialize the full node_modules projection inside the volume as
+    // Build under a staging directory so that a crash during materialization
+    // or overlay leaves no partial volume visible.  Staging is cleaned up by
+    // PendingVolume::drop if publish is not called.
+    let staging_base = store.root().join("tmp");
+    fs::create_dir_all(&staging_base).map_err(|source| VolumeError::Io {
+        path: staging_base.display().to_string(),
+        source,
+    })?;
+    let staging = staging_base.join(format!("graph-{}-{}", graph_hex, std::process::id()));
+    let _ = fs::remove_dir_all(&staging);
+    fs::create_dir_all(staging.join("node_modules")).map_err(|source| io_err(&staging, source))?;
+
+    // Materialize the full node_modules projection inside staging as
     // HARDLINKS (real directories sharing inodes with the immutable store
     // images) rather than symlinks into the store. A package's realpath then
     // lands inside the volume, where `node_modules/<self>` is reachable as a
     // sibling, so self-referential requires (e.g. `require('next/...')` issued
     // from within next's own code) resolve instead of escaping into the store
     // (which has no node_modules and breaks them).
-    fs::create_dir_all(volume_dir.join("node_modules"))
-        .map_err(|source| io_err(&volume_dir, source))?;
     let resolved: Vec<(_, ArtifactId)> = artifact_ids
         .iter()
         .zip(lockfile.packages.iter())
         .filter_map(|(maybe_id, pkg)| maybe_id.map(|id| (pkg, id)))
         .collect();
     let stats = materialize_with_backend(
-        volume_dir.as_path(),
+        staging.as_path(),
         store,
         &resolved,
         MaterializeBackend::Hardlink,
@@ -186,34 +215,30 @@ pub fn ensure_graph_volume_with_prepared(
         let Some(source) = package.workspace_target.as_deref() else {
             continue;
         };
-        let target = volume_dir.join(&package.path);
+        let target = staging.join(&package.path);
         overlay_prepared_image(Path::new(source), &target)?;
     }
     for (package_path, prepared_image) in prepared {
-        let target = volume_dir.join(package_path);
+        let target = staging.join(package_path);
         overlay_prepared_image(&prepared_image.image_path, &target)?;
     }
 
-    let meta = VolumeMeta {
+    // Atomically publish the staging directory to the final path.
+    let pending = PendingVolume {
+        staging,
+        final_path: volume_dir,
         graph_id_hex: graph_hex,
-        layout_version: VOLUME_LAYOUT_VERSION,
-        packages_materialized: stats.packages_materialized,
-        bins_linked: stats.bins_linked,
+        stats,
+        _lock: lock,
     };
-    let meta_bytes = serde_json::to_vec_pretty(&meta).unwrap_or_default();
-    fs::write(volume_dir.join(META_FILE), meta_bytes)
-        .map_err(|source| io_err(&volume_dir.join(META_FILE), source))?;
+    let vref = pending.publish()?;
 
     metrics.record("graph_volume_build", std::time::Duration::ZERO);
-    Ok(VolumeRef {
-        path: volume_dir,
-        cached: false,
-        stats,
-    })
+    Ok(vref)
 }
 
 /// Acquire an exclusive per-graph lock file at `<store>/locks/graph-<hex>.lock`.
-fn acquire_graph_lock(store: &ArtifactStore, graph_hex: &str) -> Result<fs::File, VolumeError> {
+pub fn acquire_graph_lock(store: &ArtifactStore, graph_hex: &str) -> Result<fs::File, VolumeError> {
     let lock_dir = store.root().join("locks");
     fs::create_dir_all(&lock_dir).map_err(|source| VolumeError::Io {
         path: lock_dir.display().to_string(),
@@ -449,23 +474,21 @@ pub fn reconcile_project_view(
         }
         // Only remove entries that look like BPM-owned relay symlinks or
         // local directories.  Never remove arbitrary files.
-        let meta = fs::symlink_metadata(&proj_entry)
-            .map_err(|source| io_err(&proj_entry, source))?;
+        let meta =
+            fs::symlink_metadata(&proj_entry).map_err(|source| io_err(&proj_entry, source))?;
         if meta.file_type().is_symlink() {
             // Relay: only remove if the target is inside the old volume path.
             if let Ok(target) = fs::read_link(&proj_entry) {
-                if target.starts_with(&volume.path) || target.starts_with(
-                    volume.path.parent().unwrap_or(Path::new("")),
-                ) {
-                    fs::remove_file(&proj_entry)
-                        .map_err(|source| io_err(&proj_entry, source))?;
+                if target.starts_with(&volume.path)
+                    || target.starts_with(volume.path.parent().unwrap_or(Path::new("")))
+                {
+                    fs::remove_file(&proj_entry).map_err(|source| io_err(&proj_entry, source))?;
                     removed += 1;
                 }
             }
         } else if meta.is_dir() {
             // Local directory: assume BPM-owned (conservative, safe).
-            fs::remove_dir_all(&proj_entry)
-                .map_err(|source| io_err(&proj_entry, source))?;
+            fs::remove_dir_all(&proj_entry).map_err(|source| io_err(&proj_entry, source))?;
             removed += 1;
         }
         // Regular files (not symlinks, not dirs) are left alone.

@@ -548,8 +548,9 @@ fn run_global_install(
         validate_bin_name(name)
             .map_err(|e| anyhow::anyhow!("invalid bin name {name:?} in global install: {e}"))?;
         let normalized = relpath.strip_prefix("./").unwrap_or(relpath);
-        validate_bin_target(normalized)
-            .map_err(|e| anyhow::anyhow!("invalid bin target {normalized:?} in global install: {e}"))?;
+        validate_bin_target(normalized).map_err(|e| {
+            anyhow::anyhow!("invalid bin target {normalized:?} in global install: {e}")
+        })?;
     }
 
     let bin_dir = bin_dir()?;
@@ -1060,10 +1061,8 @@ fn run_streaming_async_install(
                         .expect("failed to build tokio runtime")
                         .block_on(async {
                             let sink = TryChannelSink(unit_tx);
-                            let async_cache = bpm::metadata_cache::MetadataCache::open(
-                                store.root(),
-                            )
-                            .ok();
+                            let async_cache =
+                                bpm::metadata_cache::MetadataCache::open(store.root()).ok();
                             let mut registry =
                                 bpm::async_resolver::AsyncRegistryClient::new(config_clone);
                             if let Some(cache) = async_cache {
@@ -1141,15 +1140,17 @@ fn fetch_missing_outcomes(
         let integrity = package
             .integrity
             .as_deref()
-            .map(|v| Integrity::parse(v).map_err(|e| {
-                anyhow::anyhow!(
-                    "package '{}' at {} has invalid integrity \"{}\": {}",
-                    package.name,
-                    package.path,
-                    v,
-                    e
-                )
-            }))
+            .map(|v| {
+                Integrity::parse(v).map_err(|e| {
+                    anyhow::anyhow!(
+                        "package '{}' at {} has invalid integrity \"{}\": {}",
+                        package.name,
+                        package.path,
+                        v,
+                        e
+                    )
+                })
+            })
             .transpose()?;
         let artifact = store.ensure_artifact_with_client(
             http,

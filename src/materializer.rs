@@ -28,8 +28,10 @@ use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
 
 use crate::integrity::ArtifactId;
-use crate::path_safety::{validate_bin_name, validate_bin_target, validate_package_path, validate_workspace_target};
 use crate::lockfile::{Lockfile, PackageEntry};
+use crate::path_safety::{
+    validate_bin_name, validate_bin_target, validate_package_path, validate_workspace_target,
+};
 use crate::store::ArtifactStore;
 
 /// Default permission bits applied to a linked bin (owner rwx, group rx, other rx).
@@ -79,10 +81,7 @@ pub enum MaterializeError {
     #[error("symlinks are required for node_modules materialization but are unsupported on this platform")]
     SymlinksUnsupported,
     #[error("unsafe package path \"{path}\": {detail}")]
-    UnsafePackagePath {
-        path: String,
-        detail: String,
-    },
+    UnsafePackagePath { path: String, detail: String },
     #[error("unsafe bin name for {package}: \"{name}\": {detail}")]
     UnsafeBinName {
         package: String,
@@ -131,27 +130,21 @@ fn preflight_resolved(resolved: &[(&PackageEntry, ArtifactId)]) -> Result<(), Ma
             })?;
         }
         if let Some(ref target) = entry.workspace_target {
-            validate_workspace_target(target).map_err(|e| {
-                MaterializeError::UnsafePackagePath {
-                    path: entry.path.clone(),
-                    detail: format!("workspace target {target:?}: {e}"),
-                }
+            validate_workspace_target(target).map_err(|e| MaterializeError::UnsafePackagePath {
+                path: entry.path.clone(),
+                detail: format!("workspace target {target:?}: {e}"),
             })?;
         }
         for (name, target) in &entry.bin {
-            validate_bin_name(name).map_err(|e| {
-                MaterializeError::UnsafeBinName {
-                    package: entry.path.clone(),
-                    name: name.clone(),
-                    detail: e.to_string(),
-                }
+            validate_bin_name(name).map_err(|e| MaterializeError::UnsafeBinName {
+                package: entry.path.clone(),
+                name: name.clone(),
+                detail: e.to_string(),
             })?;
-            validate_bin_target(target).map_err(|e| {
-                MaterializeError::UnsafeBinTarget {
-                    package: entry.path.clone(),
-                    target: target.clone(),
-                    detail: e.to_string(),
-                }
+            validate_bin_target(target).map_err(|e| MaterializeError::UnsafeBinTarget {
+                package: entry.path.clone(),
+                target: target.clone(),
+                detail: e.to_string(),
             })?;
         }
     }
@@ -650,8 +643,7 @@ pub(crate) fn copy_tree(source: &Path, target: &Path) -> Result<(), MaterializeE
     if target.exists() || symlink_exists(target) {
         remove_any(target)?;
     }
-    fs::create_dir_all(target)
-        .map_err(|source| io_err(target, source))?;
+    fs::create_dir_all(target).map_err(|source| io_err(target, source))?;
     copy_tree_inner(source, target)
 }
 
@@ -660,15 +652,16 @@ fn copy_tree_inner(source: &Path, target: &Path) -> Result<(), MaterializeError>
         let entry = entry.map_err(|e| io_err(Path::new("<read_dir_entry>"), e))?;
         let src_path = entry.path();
         let dst_path = target.join(entry.file_name());
-        let kind = entry.file_type().map_err(|source| io_err(&src_path, source))?;
+        let kind = entry
+            .file_type()
+            .map_err(|source| io_err(&src_path, source))?;
 
         if kind.is_dir() {
-            fs::create_dir_all(&dst_path)
-                .map_err(|source| io_err(&dst_path, source))?;
+            fs::create_dir_all(&dst_path).map_err(|source| io_err(&dst_path, source))?;
             copy_tree_inner(&src_path, &dst_path)?;
         } else if kind.is_symlink() {
-            let link_target = fs::read_link(&src_path)
-                .map_err(|source| io_err(&src_path, source))?;
+            let link_target =
+                fs::read_link(&src_path).map_err(|source| io_err(&src_path, source))?;
             #[cfg(unix)]
             std::os::unix::fs::symlink(&link_target, &dst_path)
                 .map_err(|source| io_err(&dst_path, source))?;
@@ -677,11 +670,9 @@ fn copy_tree_inner(source: &Path, target: &Path) -> Result<(), MaterializeError>
                 .map(|_| ())
                 .map_err(|source| io_err(&dst_path, source))?;
         } else {
-            fs::copy(&src_path, &dst_path)
-                .map_err(|source| io_err(&dst_path, source))?;
+            fs::copy(&src_path, &dst_path).map_err(|source| io_err(&dst_path, source))?;
             // Preserve executable bit.
-            let meta = fs::metadata(&src_path)
-                .map_err(|source| io_err(&src_path, source))?;
+            let meta = fs::metadata(&src_path).map_err(|source| io_err(&src_path, source))?;
             let perms = meta.permissions();
             #[cfg(unix)]
             {
