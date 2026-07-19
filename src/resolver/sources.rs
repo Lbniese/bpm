@@ -9,6 +9,7 @@ use base64::Engine;
 use sha2::Digest;
 
 use super::workspace_metadata;
+use crate::http::redact_url;
 use crate::lockfile::LockSource;
 use crate::manifest::PackageManifest;
 use crate::registry::VersionMetadata;
@@ -383,11 +384,18 @@ fn resolve_git_commit(url: &str, reference: Option<&str>) -> Result<String, Stri
     let output = Command::new("git")
         .args(["ls-remote", "--", &remote, requested])
         .output()
-        .map_err(|error| format!("cannot execute git ls-remote for {url}: {error}"))?;
+        .map_err(|error| {
+            format!(
+                "cannot execute git ls-remote for {}: {error}",
+                redact_url(url)
+            )
+        })?;
     if !output.status.success() {
         return Err(format!(
-            "git ls-remote failed for {remote}#{requested}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            "git ls-remote failed for {}#{}: {}",
+            redact_url(&remote),
+            requested,
+            sanitize_git_stderr(&output.stderr, &remote, url)
         ));
     }
     let mut candidate = None;
@@ -405,7 +413,25 @@ fn resolve_git_commit(url: &str, reference: Option<&str>) -> Result<String, Stri
         }
         candidate = Some(sha.to_ascii_lowercase());
     }
-    candidate.ok_or_else(|| format!("git reference {requested:?} does not resolve in {remote}"))
+    candidate.ok_or_else(|| {
+        format!(
+            "git reference {requested:?} does not resolve in {}",
+            redact_url(&remote)
+        )
+    })
+}
+
+fn sanitize_git_stderr(stderr: &[u8], remote: &str, url: &str) -> String {
+    let mut msg = String::from_utf8_lossy(stderr).trim().to_string();
+    // Replace known raw URL/remote arguments with redacted forms
+    // so credential-bearing URLs cannot leak through git stderr.
+    if !remote.is_empty() {
+        msg = msg.replace(remote, &redact_url(remote));
+    }
+    if !url.is_empty() && url != remote {
+        msg = msg.replace(url, &redact_url(url));
+    }
+    msg
 }
 
 fn git_archive_tarball(
@@ -434,6 +460,7 @@ fn git_archive_tarball(
     if dest.is_file() {
         return Ok(dest);
     }
+    let display_url = redact_url(url);
     let remote_archive = Command::new("git")
         .args([
             "archive",
@@ -443,28 +470,33 @@ fn git_archive_tarball(
             reference,
         ])
         .output()
-        .map_err(|error| format!("cannot execute git archive for {url}: {error}"))?;
+        .map_err(|error| format!("cannot execute git archive for {}: {error}", display_url))?;
     let output = if remote_archive.status.success() {
         remote_archive
     } else if is_full_git_commit(reference) {
+        let sanitized_stderr = sanitize_git_stderr(&remote_archive.stderr, url, url);
         let fallback = archive_git_commit_locally(url, resolved_commit).map_err(|error| {
             format!(
-                "git archive failed for {url}#{reference}: {}; local commit fallback failed: {error}",
-                String::from_utf8_lossy(&remote_archive.stderr).trim()
+                "git archive failed for {}#{}: {}; local commit fallback failed: {error}",
+                display_url, reference, sanitized_stderr,
             )
         })?;
         if !fallback.status.success() {
             return Err(format!(
-                "git archive failed for {url}#{reference}: {}; local commit fallback failed: {}",
-                String::from_utf8_lossy(&remote_archive.stderr).trim(),
-                String::from_utf8_lossy(&fallback.stderr).trim()
+                "git archive failed for {}#{}: {}; local commit fallback failed: {}",
+                display_url,
+                reference,
+                sanitized_stderr,
+                sanitize_git_stderr(&fallback.stderr, url, url),
             ));
         }
         fallback
     } else {
         return Err(format!(
-            "git archive failed for {url}#{reference}: {}",
-            String::from_utf8_lossy(&remote_archive.stderr).trim()
+            "git archive failed for {}#{}: {}",
+            display_url,
+            reference,
+            sanitize_git_stderr(&remote_archive.stderr, url, url),
         ));
     };
     let tmp = dest.with_extension("tmp");
