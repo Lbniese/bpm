@@ -1244,25 +1244,22 @@ fn run_streaming_install(
             // thread blocked on network (packument fetches + waiting on
             // in-flight prefetches). The remainder is CPU: parse, placement,
             // peer backtracking, lockfile generation.
-            let resolver_net_wait_ns = bpm::registry::take_resolver_fetch_nanos();
+            let diag = client.take_diagnostics();
             metrics.record(
                 "resolver_network_wait",
-                std::time::Duration::from_nanos(resolver_net_wait_ns),
+                std::time::Duration::from_nanos(diag.resolver_fetch_nanos),
             );
-            let (hits, waits, inline, prefetch) = bpm::registry::take_resolver_diagnostics();
-            let packument_bytes = bpm::registry::take_resolver_fetch_bytes();
             metrics.record_resolver_diagnostics(
-                hits,
-                waits,
-                inline,
-                prefetch,
-                packument_bytes,
-                resolver_net_wait_ns,
+                diag.cache_hits,
+                diag.cache_waits,
+                diag.inline_fetches,
+                diag.prefetch_fetches,
+                diag.fetch_bytes,
+                diag.resolver_fetch_nanos,
             );
             // Record batch-prefetch closure count (packuments fetched before
             // DFS started, separate from inline and pool prefetches).
-            let batch_fetches = bpm::registry::take_batch_prefetch_fetches();
-            metrics.record_batch_prefetch(batch_fetches);
+            metrics.record_batch_prefetch(diag.batch_prefetch_fetches);
             // Also record the HTTP transport diagnostics: whether HTTP/2 was
             // observed and the peak in-flight request concurrency.
             metrics.record(
