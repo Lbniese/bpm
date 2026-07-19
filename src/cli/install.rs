@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use bpm::config::NpmConfig;
 use bpm::graph;
-use bpm::http::HttpClient;
+use bpm::http::{redact_url, HttpClient};
 use bpm::integrity::{ArtifactId, Integrity};
 use bpm::lockfile::{LockSource, Lockfile};
 use bpm::manifest::PackageManifest;
@@ -168,8 +168,9 @@ pub(super) fn run(mut options: Options) -> anyhow::Result<()> {
             // byte-identical to the blocking path; only the I/O model differs.
             if async_resolve_enabled() {
                 let lockfile = metrics
-                    .measure("dependency_resolution", || {
-                        tokio::runtime::Builder::new_current_thread()
+                    .measure("dependency_resolution", || -> anyhow::Result<(Lockfile, (u64, u64, u64))> {
+                        let diag_cell = std::cell::Cell::new((0u64, 0u64, 0u64));
+                        let result = tokio::runtime::Builder::new_current_thread()
                             .enable_all()
                             .build()
                             .expect("failed to build tokio runtime")
@@ -186,14 +187,22 @@ pub(super) fn run(mut options: Options) -> anyhow::Result<()> {
                                         options.cache_mode,
                                     );
                                 }
-                                bpm::async_resolver::resolve_manifest_with_workspaces_async(
+                                let result = bpm::async_resolver::resolve_manifest_with_workspaces_async(
                                     &manifest,
                                     &async_registry,
                                     "bpm",
                                     Some(&workspace_index),
                                 )
-                                .await
-                            })
+                                .await?;
+                                diag_cell.set(async_registry.take_diagnostics());
+                                Ok::<_, anyhow::Error>(result)
+                            })?;
+                        let diag = diag_cell.into_inner();
+                        Ok((result, diag))
+                    })
+                    .map(|(lockfile, (hits, fetches, fetch_bytes))| {
+                        metrics.record_resolver_diagnostics(hits, 0, fetches, 0, fetch_bytes, 0);
+                        lockfile
                     })
                     .map_err(|error| anyhow::anyhow!("dependency resolution failed: {error}"))?;
                 let path = root.join(bpm::lockfile::BPM_LOCK_FILE);
@@ -343,6 +352,10 @@ pub(super) fn install_resolved_lockfile(
     let fetched = outcomes.len() - cached;
     let artifact_ids = outcomes_to_artifact_ids(&outcomes, &lockfile);
     metrics.add_requests(http.request_count());
+    let prior_owned = cached_plan
+        .as_ref()
+        .map(|p| p.owned_entries.as_slice())
+        .unwrap_or(&[]);
     finalize_install(
         project_root,
         &store,
@@ -354,6 +367,7 @@ pub(super) fn install_resolved_lockfile(
         options,
         lockfile_path,
         &registry,
+        prior_owned,
     )
 }
 
@@ -486,7 +500,9 @@ fn run_global_install(
             .map_err(|error| anyhow::anyhow!("failed to resolve '{target}': {error}"))?;
         eprintln!(
             "resolved {}@{} -> {}",
-            resolved.name, resolved.version, resolved.tarball_url
+            resolved.name,
+            resolved.version,
+            redact_url(&resolved.tarball_url)
         );
         let integrity = Integrity::parse(&resolved.integrity)?;
         (resolved.tarball_url, Some(integrity))
@@ -1053,6 +1069,7 @@ fn run_streaming_async_install(
             // Run async resolution on a tokio runtime, emitting placed nodes
             // to the non-blocking TryChannelSink.
             let config_clone = config.clone();
+            let diag_cell = std::cell::Cell::new((0u64, 0u64, 0u64));
             let lockfile = metrics
                 .measure("dependency_resolution", || {
                     tokio::runtime::Builder::new_current_thread()
@@ -1071,20 +1088,24 @@ fn run_streaming_async_install(
                                     options.cache_mode,
                                 );
                             }
-                            bpm::async_resolver::resolve_manifest_with_workspaces_async_sink(
-                                manifest,
-                                &registry,
-                                "bpm",
-                                Some(workspace_index),
-                                Some(&sink as &dyn resolver::ResolveSink),
-                            )
-                            .await
+                            let result =
+                                bpm::async_resolver::resolve_manifest_with_workspaces_async_sink(
+                                    manifest,
+                                    &registry,
+                                    "bpm",
+                                    Some(workspace_index),
+                                    Some(&sink as &dyn resolver::ResolveSink),
+                                )
+                                .await;
+                            let diag = registry.take_diagnostics();
+                            diag_cell.set(diag);
+                            result
                         })
                 })
                 .map_err(|error| anyhow::anyhow!("dependency resolution failed: {error}"))?;
-            // Record async resolver diagnostics. The sync resolver counters
-            // (resolver_cache_waits, prefetch_fetches, packument_bytes) do not
-            // apply to the async path.
+            // Record async resolver diagnostics.
+            let (hits, fetches, fetch_bytes) = diag_cell.into_inner();
+            metrics.record_resolver_diagnostics(hits, 0, fetches, 0, fetch_bytes, 0);
             let outcomes = join_pipeline(downloaders, extractors, metrics)?;
             Ok((lockfile, outcomes))
         })?;
@@ -1116,6 +1137,7 @@ fn run_streaming_async_install(
         options,
         &path,
         &bpm::registry::RegistryClient::new(config),
+        &[],
     )
 }
 
@@ -1304,6 +1326,7 @@ fn run_streaming_install(
         options,
         &path,
         client,
+        &[],
     )
 }
 
@@ -1322,6 +1345,7 @@ fn finalize_install(
     options: &Options,
     lockfile_path: &Path,
     registry: &bpm::registry::RegistryClient,
+    prior_owned: &[bpm::graph::ManagedEntry],
 ) -> anyhow::Result<()> {
     let git_prepare_enabled = options.git_prepare
         && lockfile
@@ -1379,6 +1403,12 @@ fn finalize_install(
             metrics,
         )?;
         let attach = bpm::volume::attach_project(project_root, &volume)?;
+        // Reconcile stale project-view entries from the prior install.
+        if !prior_owned.is_empty() {
+            let new_desired: std::collections::BTreeSet<String> =
+                lockfile.packages.iter().map(|p| p.path.clone()).collect();
+            let _ = bpm::volume::reconcile_project_view(project_root, prior_owned, &new_desired);
+        }
         (
             Some(volume),
             attach.relays_created + attach.relays_unchanged,
@@ -1512,7 +1542,9 @@ impl std::fmt::Display for FetchFail {
         write!(
             formatter,
             "install failed for package '{}' from {}: {}",
-            self.name, self.url, self.source
+            self.name,
+            redact_url(&self.url),
+            self.source
         )
     }
 }

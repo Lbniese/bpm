@@ -31,7 +31,7 @@ pub const PLAN_FILE: &str = ".bpm-state";
 
 /// Bumped when the plan encoding or materialization semantics change. A plan
 /// with a different version is treated as invalid and regenerated.
-pub const PLAN_VERSION: u32 = 1;
+pub const PLAN_VERSION: u32 = 2;
 
 /// Bumped when the materializer's output semantics change (e.g. bin linking
 /// strategy, symlink vs hardlink volume layout). Incompatible materializer
@@ -77,6 +77,20 @@ pub struct PlanEntry {
     pub bin: BTreeMap<String, String>,
 }
 
+/// A project-view entry that BPM created and therefore may safely remove.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ManagedEntry {
+    /// Exact project-relative path (e.g. `node_modules/foo`,
+    /// `node_modules/@scope/bar`).
+    pub path: String,
+    /// How this entry was attached: "relay" (symlink to volume),
+    /// "local" (hardlink/copy), or "direct" (workspace symlink).
+    pub mode: String,
+    /// Old volume or symlink target at the time of recording, for identity
+    /// preflight before removal.
+    pub identity: String,
+}
+
 /// A compiled install plan for one graph (IMPLEMENTATION §9).
 ///
 /// Authoritative only as a cache: `bpm.lock` drives regeneration on mismatch.
@@ -90,6 +104,11 @@ pub struct InstallPlan {
     /// entries are validated by existence rather than store-image identity.
     #[serde(default)]
     pub lifecycle_paths: Vec<String>,
+    /// Exact project-relative paths BPM created in the previous install,
+    /// with their attachment mode and identity, used for safe stale-entry
+    /// reconciliation on the next graph change.
+    #[serde(default)]
+    pub owned_entries: Vec<ManagedEntry>,
     pub entries: Vec<PlanEntry>,
 }
 
@@ -405,6 +424,7 @@ pub fn build_plan(
         materializer_version: MATERIALIZER_VERSION,
         graph_id_hex: graph_id(lockfile).to_hex(),
         lifecycle_paths: lifecycle_paths.to_vec(),
+        owned_entries: Vec::new(),
         entries,
     }
 }
