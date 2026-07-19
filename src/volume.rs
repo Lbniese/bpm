@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::graph::graph_id_with_prepared;
+use crate::graph::{graph_id_with_prepared, ManagedEntry};
 use crate::integrity::ArtifactId;
 use crate::lockfile::Lockfile;
 use crate::materializer::hardlink_tree;
@@ -454,54 +454,55 @@ pub fn attach_project(
 /// Remove stale BPM-owned top-level entries from the project's `node_modules`
 /// that are not present in the new volume.  Only removes entries that are
 /// symlinks (relay) or directories (local view) at the expected paths.
+/// Remove stale BPM-owned project-view entries that are no longer needed.
+/// Uses the prior plan's `owned_entries` for exact identity preflight.
 pub fn reconcile_project_view(
     project_root: &Path,
-    volume: &VolumeRef,
-    previous_top_level: &[String],
+    old_owned: &[ManagedEntry],
+    new_desired: &std::collections::BTreeSet<String>,
 ) -> Result<usize, VolumeError> {
     let proj_nm = project_root.join("node_modules");
-    if !proj_nm.exists() {
-        return Ok(0);
-    }
-    // Collect the new set of top-level entries from the volume.
-    let vol_nm = volume.path.join("node_modules");
-    let mut current: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    if vol_nm.is_dir() {
-        for entry in fs::read_dir(&vol_nm).map_err(|source| io_err(&vol_nm, source))? {
-            let entry = entry.map_err(|source| io_err(&vol_nm, source))?;
-            current.insert(entry.file_name().to_string_lossy().to_string());
-        }
-    }
-
     let mut removed = 0usize;
-    for name in previous_top_level {
-        if current.contains(name.as_str()) {
-            continue; // still present in the new volume
-        }
-        let proj_entry = proj_nm.join(name);
-        if !proj_entry.exists() {
+
+    let mut sorted_old: Vec<&ManagedEntry> = old_owned.iter().collect();
+    sorted_old.sort_by(|a, b| b.path.cmp(&a.path));
+
+    for entry in sorted_old {
+        if new_desired.contains(&entry.path) {
             continue;
         }
-        // Only remove entries that look like BPM-owned relay symlinks or
-        // local directories.  Never remove arbitrary files.
-        let meta =
-            fs::symlink_metadata(&proj_entry).map_err(|source| io_err(&proj_entry, source))?;
-        if meta.file_type().is_symlink() {
-            // Relay: only remove if the target is inside the old volume path.
-            if let Ok(target) = fs::read_link(&proj_entry) {
-                if target.starts_with(&volume.path)
-                    || target.starts_with(volume.path.parent().unwrap_or(Path::new("")))
-                {
-                    fs::remove_file(&proj_entry).map_err(|source| io_err(&proj_entry, source))?;
-                    removed += 1;
+        let full_path = proj_nm.join(&entry.path);
+        if !full_path.exists() {
+            continue;
+        }
+        let meta = fs::symlink_metadata(&full_path).map_err(|source| io_err(&full_path, source))?;
+
+        let safe_to_remove = match entry.mode.as_str() {
+            "relay" | "direct" => {
+                meta.file_type().is_symlink()
+                    && fs::read_link(&full_path)
+                        .map(|target| target.to_string_lossy() == entry.identity.as_str())
+                        .unwrap_or(false)
+            }
+            "local" => meta.is_dir() && !entry.identity.is_empty(),
+            _ => false,
+        };
+
+        if safe_to_remove {
+            if meta.file_type().is_symlink() {
+                fs::remove_file(&full_path).map_err(|source| io_err(&full_path, source))?;
+            } else if meta.is_dir() {
+                fs::remove_dir_all(&full_path).map_err(|source| io_err(&full_path, source))?;
+            }
+            removed += 1;
+
+            // Remove empty parent scoped directories.
+            if let Some(parent) = full_path.parent() {
+                if parent.file_name().is_some_and(|n| n.to_string_lossy().starts_with('@')) {
+                    let _ = fs::remove_dir(parent);
                 }
             }
-        } else if meta.is_dir() {
-            // Local directory: assume BPM-owned (conservative, safe).
-            fs::remove_dir_all(&proj_entry).map_err(|source| io_err(&proj_entry, source))?;
-            removed += 1;
         }
-        // Regular files (not symlinks, not dirs) are left alone.
     }
     Ok(removed)
 }

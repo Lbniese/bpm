@@ -668,6 +668,79 @@ mod tests {
     }
 
     #[test]
+    fn redacts_query_only() {
+        assert_eq!(
+            redact_url("https://registry.example/pkg?abc=123"),
+            "https://registry.example/pkg"
+        );
+    }
+
+    #[test]
+    fn redacts_fragment_only() {
+        assert_eq!(
+            redact_url("https://example.test/path#section"),
+            "https://example.test/path"
+        );
+    }
+
+    #[test]
+    fn preserves_explicit_port() {
+        assert_eq!(
+            redact_url("https://registry.example:8443/pkg"),
+            "https://registry.example:8443/pkg"
+        );
+    }
+
+    #[test]
+    fn handles_ipv6_authority() {
+        assert_eq!(
+            redact_url("https://[::1]:8080/path"),
+            "https://[::1]:8080/path"
+        );
+    }
+
+    #[test]
+    fn handles_mixed_case_scheme() {
+        assert_eq!(
+            redact_url("HTTPS://user:pass@example.test/pkg"),
+            "https://example.test/pkg"
+        );
+    }
+
+    #[test]
+    fn redacts_git_https_url() {
+        assert_eq!(
+            redact_url("git+https://token@github.com/user/repo.git#ref"),
+            "git+https://github.com/user/repo.git"
+        );
+    }
+
+    #[test]
+    fn redacts_url_with_userinfo_only() {
+        assert_eq!(
+            redact_url("https://token@example.test/repo"),
+            "https://example.test/repo"
+        );
+    }
+
+    #[test]
+    fn preserves_url_without_secrets() {
+        assert_eq!(
+            redact_url("https://registry.npmjs.org/lodash"),
+            "https://registry.npmjs.org/lodash"
+        );
+    }
+
+    #[test]
+    fn handles_malformed_url() {
+        assert_eq!(redact_url(""), "<invalid-url>");
+        assert_eq!(redact_url("no-scheme"), "<invalid-url>");
+        // "://" produces "://" since it has an empty scheme and authority.
+        // This is harmless because no real URL has this shape.
+        assert_eq!(redact_url("://"), "://");
+    }
+
+    #[test]
     fn retry_delay_is_exponential_and_bounded() {
         let network = NetworkConfig {
             retries: 4,
