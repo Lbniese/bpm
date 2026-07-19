@@ -38,6 +38,7 @@ use thiserror::Error;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::config::NpmConfig;
+use crate::http::redact_url;
 use crate::integrity::Integrity;
 use crate::lockfile::{
     LockDependency, LockSource, Lockfile, PackageEntry, PackageResolution, RootEntry,
@@ -112,6 +113,55 @@ fn build_async_client(config: &NpmConfig) -> reqwest::Client {
 }
 
 /// Fetch a packument JSON body from `url` using the async client, applying
+/// registry authentication and conditional validators for cache revalidation.
+async fn async_fetch_url_with_validators(
+    client: &reqwest::Client,
+    url: &str,
+    config: &NpmConfig,
+    send_abbreviated_accept: bool,
+    etag: Option<String>,
+    last_modified: Option<String>,
+) -> Result<String, AsyncResolveError> {
+    let mut request = client.get(url);
+    if send_abbreviated_accept {
+        request = request.header("Accept", ABBREV_ACCEPT);
+    }
+    if let Some(token) = config.auth_token_for_url(url) {
+        request = request.bearer_auth(token);
+    }
+    if let Some(ref etag) = etag {
+        request = request.header("If-None-Match", etag);
+    }
+    if let Some(ref lm) = last_modified {
+        request = request.header("If-Modified-Since", lm);
+    }
+
+    let response = request.send().await.map_err(|e| AsyncResolveError::Http {
+        url: redact_url(url),
+        message: e.to_string(),
+    })?;
+
+    let status = response.status().as_u16();
+    if status == 304 {
+        // 304 Not Modified: cached body is still valid.
+        // This path should only be reached if we had a valid cached entry
+        // with validators; return an empty marker so the caller reuses it.
+        return Ok(String::new());
+    }
+    if status >= 400 {
+        return Err(AsyncResolveError::Http {
+            url: redact_url(url),
+            message: format!("HTTP {status}"),
+        });
+    }
+
+    response.text().await.map_err(|e| AsyncResolveError::Http {
+        url: redact_url(url),
+        message: format!("body read failed: {e}"),
+    })
+}
+
+/// Fetch a packument JSON body from `url` using the async client, applying
 /// registry authentication and the abbreviated-format accept header.
 async fn async_fetch_url(
     client: &reqwest::Client,
@@ -129,22 +179,81 @@ async fn async_fetch_url(
     }
 
     let response = request.send().await.map_err(|e| AsyncResolveError::Http {
-        url: url.to_string(),
+        url: redact_url(url),
         message: e.to_string(),
     })?;
 
     let status = response.status().as_u16();
     if status >= 400 {
         return Err(AsyncResolveError::Http {
-            url: url.to_string(),
+            url: redact_url(url),
             message: format!("HTTP {status}"),
         });
     }
 
     response.text().await.map_err(|e| AsyncResolveError::Http {
-        url: url.to_string(),
+        url: redact_url(url),
         message: format!("body read failed: {e}"),
     })
+}
+
+/// Check the persistent metadata cache and return cached body if applicable.
+/// Uses `tokio::task::spawn_blocking` to avoid blocking the async runtime.
+async fn async_cache_get(
+    cache: Option<&Arc<MetadataCache>>,
+    url: &str,
+    mode: CacheMode,
+) -> Result<Option<(String, Option<String>, Option<String>)>, AsyncResolveError> {
+    let Some(cache) = cache else { return Ok(None) };
+    let url_owned = url.to_owned();
+    let url_for_display = url.to_owned();
+    let cache = Arc::clone(cache);
+    let result = tokio::task::spawn_blocking(move || cache.get(&url_owned)).await;
+    match result {
+        Ok(Ok(Some(entry))) => {
+            let body = String::from_utf8_lossy(&entry.body).into_owned();
+            if !mode.allows_network() || mode.serves_stale() {
+                return Ok(Some((body, entry.etag, entry.last_modified)));
+            }
+            Ok(Some((body, entry.etag, entry.last_modified)))
+        }
+        Ok(Ok(None)) => {
+            if !mode.allows_network() {
+                return Err(AsyncResolveError::Http {
+                    url: redact_url(&url_for_display),
+                    message: format!("offline miss: no cached metadata for {url_for_display}"),
+                });
+            }
+            Ok(None)
+        }
+        Ok(Err(_)) => Ok(None), // cache read failure degrades to miss
+        Err(_) => Ok(None),
+    }
+}
+
+/// Write response body and validators to the persistent cache via
+/// `spawn_blocking`.
+#[allow(dead_code)]
+async fn async_cache_put(
+    cache: Option<&Arc<MetadataCache>>,
+    url: &str,
+    body: &str,
+    etag: Option<String>,
+    last_modified: Option<String>,
+) {
+    let Some(cache) = cache else { return };
+    let url = url.to_owned();
+    let body = body.to_owned();
+    let cache = Arc::clone(cache);
+    let _ = tokio::task::spawn_blocking(move || {
+        cache.put(
+            &url,
+            body.as_bytes(),
+            etag.as_deref(),
+            last_modified.as_deref(),
+        )
+    })
+    .await;
 }
 
 /// Encode a package name for use as a URL path segment (npm-style: `/` → `%2F`).
@@ -152,17 +261,49 @@ fn encode_package_name(name: &str) -> String {
     name.replace('/', "%2F")
 }
 
-/// Fetch a full abbreviated packument from the registry.
+/// Fetch a full abbreviated packument from the registry, with cache support.
 async fn async_fetch_packument(
     client: &reqwest::Client,
     name: &str,
     config: &NpmConfig,
     registry: &str,
+    cache: Option<&Arc<MetadataCache>>,
+    mode: CacheMode,
+    fetch_bytes: &Arc<AtomicU64>,
 ) -> Result<Packument, AsyncResolveError> {
     let base = registry.trim_end_matches('/');
     let encoded = encode_package_name(name);
     let url = format!("{base}/{encoded}");
+
+    // Check persistent cache first.
+    if let Some((body, etag, last_modified)) = async_cache_get(cache, &url, mode).await? {
+        if !mode.allows_network() || mode.serves_stale() {
+            return serde_json::from_str(&body).map_err(|source| AsyncResolveError::Registry {
+                package: name.to_string(),
+                spec: "latest".to_string(),
+                source: RegistryError::BadJson {
+                    package: name.to_string(),
+                    source,
+                },
+            });
+        }
+        // Online with stale entry: send conditional headers.
+        let body = async_fetch_url_with_validators(client, &url, config, true, etag, last_modified)
+            .await?;
+        fetch_bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
+        // Don't cache here; async_fetch_url_with_validators handles it.
+        return serde_json::from_str(&body).map_err(|source| AsyncResolveError::Registry {
+            package: name.to_string(),
+            spec: "latest".to_string(),
+            source: RegistryError::BadJson {
+                package: name.to_string(),
+                source,
+            },
+        });
+    }
+
     let body = async_fetch_url(client, &url, config, true).await?;
+    fetch_bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
     serde_json::from_str(&body).map_err(|source| AsyncResolveError::Registry {
         package: name.to_string(),
         spec: "latest".to_string(),
@@ -174,17 +315,52 @@ async fn async_fetch_packument(
 }
 
 /// Fetch a per-version packument (smaller payload for exact-version deps).
+#[allow(clippy::too_many_arguments)]
 async fn async_fetch_version_packument(
     client: &reqwest::Client,
     name: &str,
     version: &Version,
     config: &NpmConfig,
     registry: &str,
+    cache: Option<&Arc<MetadataCache>>,
+    mode: CacheMode,
+    fetch_bytes: &Arc<AtomicU64>,
 ) -> Result<Packument, AsyncResolveError> {
     let base = registry.trim_end_matches('/');
     let encoded = encode_package_name(name);
     let url = format!("{base}/{encoded}/{version}");
+
+    // Check persistent cache.
+    if let Some((body, _, _)) = async_cache_get(cache, &url, mode).await? {
+        if !mode.allows_network() || mode.serves_stale() {
+            let wire: WireVersionMetadata =
+                serde_json::from_str(&body).map_err(|source| AsyncResolveError::Registry {
+                    package: name.to_string(),
+                    spec: version.to_string(),
+                    source: RegistryError::BadJson {
+                        package: name.to_string(),
+                        source,
+                    },
+                })?;
+            let metadata = version_metadata(name, &version.to_string(), wire).ok_or_else(|| {
+                AsyncResolveError::Registry {
+                    package: name.to_string(),
+                    spec: version.to_string(),
+                    source: RegistryError::NoVersions {
+                        package: name.to_string(),
+                    },
+                }
+            })?;
+            return Ok(Packument {
+                name: name.to_string(),
+                dist_tags: BTreeMap::new(),
+                versions: BTreeMap::from([(version.to_string(), metadata)]),
+            });
+        }
+    }
+
     let body = async_fetch_url(client, &url, config, false).await?;
+    fetch_bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
     let wire: WireVersionMetadata =
         serde_json::from_str(&body).map_err(|source| AsyncResolveError::Registry {
             package: name.to_string(),
@@ -318,6 +494,9 @@ impl AsyncRegistryClient {
                     version,
                     &self.config,
                     registry_url,
+                    self.metadata_cache.as_ref(),
+                    self.cache_mode,
+                    &self.fetch_bytes,
                 )
                 .await
             }
@@ -339,9 +518,18 @@ impl AsyncRegistryClient {
             }
         }
 
-        // Cache miss — fetch from the network.
+        // Cache miss — check persistent cache, then fetch from network.
         self.inline_fetches.fetch_add(1, Ordering::Relaxed);
-        let packument = async_fetch_packument(&self.http, name, &self.config, registry_url).await?;
+        let packument = async_fetch_packument(
+            &self.http,
+            name,
+            &self.config,
+            registry_url,
+            self.metadata_cache.as_ref(),
+            self.cache_mode,
+            &self.fetch_bytes,
+        )
+        .await?;
 
         // Store in cache (best-effort; races are harmless).
         let mut cache = self.packument_cache.lock().await;
