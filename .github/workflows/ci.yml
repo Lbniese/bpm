@@ -100,3 +100,24 @@ jobs:
             --compare-baseline benchmarks/baselines/reference.json \
             --regression-envelope "${{ github.event.inputs.regression_envelope || '2.0' }}" \
             ${extra_flags[@]}
+
+  git-prepare-oracle:
+    name: git-prepare oracle (pinned npm)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26.0.0'
+      - name: Verify pinned tool versions (npm must be 11.12.1)
+        run: |
+          node --version
+          npm --version
+          test "$(npm --version)" = "11.12.1"
+      - name: Run the ignored git-prepare oracle
+        run: cargo test --test git_prepare_characterization -- --ignored --nocapture --test-threads=1

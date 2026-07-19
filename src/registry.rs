@@ -35,61 +35,87 @@ use crate::metadata_cache::{CacheMode, MetadataCache};
 /// publish-time history (multi-megabyte for popular packages).
 pub(crate) const ABBREV_ACCEPT: &str = "application/vnd.npm.install-v1+json";
 
+/// Per-client diagnostic accumulator shared by a `RegistryClient` and its
+/// prefetch workers. All fields use saturating atomic adds so concurrent
+/// increments from the resolver thread and workers never collide or overflow
+/// silently.
+#[derive(Debug)]
+pub(crate) struct ResolverDiagnostics {
+    /// Total packument fetch bytes across all threads.
+    pub fetch_bytes: std::sync::atomic::AtomicU64,
+    /// Cache hits in the in-memory packument cache.
+    pub cache_hits: std::sync::atomic::AtomicU64,
+    /// Cache waits (condvar waits on in-flight prefetches).
+    pub cache_waits: std::sync::atomic::AtomicU64,
+    /// Inline (synchronous) packument fetches.
+    pub inline_fetches: std::sync::atomic::AtomicU64,
+    /// Prefetch worker fetches.
+    pub prefetch_fetches: std::sync::atomic::AtomicU64,
+    /// Batch-prefetch closure fetches (one per packument in the BFS phase).
+    pub batch_prefetch_fetches: std::sync::atomic::AtomicU64,
+    /// Accumulated resolver fetch nanoseconds (thread-local, migrated to
+    /// client-local accumulator updated by `packument_for`).
+    pub resolver_fetch_nanos: std::sync::atomic::AtomicU64,
+}
+
+impl ResolverDiagnostics {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            fetch_bytes: std::sync::atomic::AtomicU64::new(0),
+            cache_hits: std::sync::atomic::AtomicU64::new(0),
+            cache_waits: std::sync::atomic::AtomicU64::new(0),
+            inline_fetches: std::sync::atomic::AtomicU64::new(0),
+            prefetch_fetches: std::sync::atomic::AtomicU64::new(0),
+            batch_prefetch_fetches: std::sync::atomic::AtomicU64::new(0),
+            resolver_fetch_nanos: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    /// Snapshot and reset all counters in this accumulator.
+    pub(crate) fn take(&self) -> ResolverDiagnosticsSnapshot {
+        ResolverDiagnosticsSnapshot {
+            fetch_bytes: self
+                .fetch_bytes
+                .swap(0, std::sync::atomic::Ordering::Relaxed),
+            cache_hits: self
+                .cache_hits
+                .swap(0, std::sync::atomic::Ordering::Relaxed),
+            cache_waits: self
+                .cache_waits
+                .swap(0, std::sync::atomic::Ordering::Relaxed),
+            inline_fetches: self
+                .inline_fetches
+                .swap(0, std::sync::atomic::Ordering::Relaxed),
+            prefetch_fetches: self
+                .prefetch_fetches
+                .swap(0, std::sync::atomic::Ordering::Relaxed),
+            batch_prefetch_fetches: self
+                .batch_prefetch_fetches
+                .swap(0, std::sync::atomic::Ordering::Relaxed),
+            resolver_fetch_nanos: self
+                .resolver_fetch_nanos
+                .swap(0, std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+}
+
+/// Immutable snapshot of per-client resolver diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ResolverDiagnosticsSnapshot {
+    pub fetch_bytes: u64,
+    pub cache_hits: u64,
+    pub cache_waits: u64,
+    pub inline_fetches: u64,
+    pub prefetch_fetches: u64,
+    pub batch_prefetch_fetches: u64,
+    pub resolver_fetch_nanos: u64,
+}
+
+// Thread-local resolver fetch nanoseconds accumulator used by the legacy
+// public `take_resolver_fetch_nanos` bridge. New code uses
+// `ResolverDiagnostics` passed through `RegistryClient`.
 std::thread_local! {
-    /// Wall time the current thread has spent inside synchronous `packument_for`
-    /// calls (inline fetches plus condvar waits on in-flight prefetches). The
-    /// resolver thread is the only caller of `packument_for` during graph
-    /// resolution — prefetch workers fetch directly via `fetch_packument` — so
-    /// this isolates how long the resolver blocked on the network versus the
-    /// CPU it spent parsing, placing, backtracking on peers, and emitting the
-    /// lockfile.
     static RESOLVER_FETCH_NANOS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
-fn add_resolver_fetch_nanos(duration: std::time::Duration) {
-    RESOLVER_FETCH_NANOS.with(|cell| {
-        cell.set(cell.get().saturating_add(duration.as_nanos() as u64));
-    });
-}
-
-/// Total bytes of packument bodies fetched over the network across all threads
-/// (resolver inline fetches plus every prefetch worker). A global atomic, not
-/// thread-local, so it captures the full network volume the resolution issued.
-static RESOLVER_FETCH_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-// Diagnostic counters for where the resolver thread spends packument lookups.
-static RESOLVER_CACHE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static RESOLVER_CACHE_WAITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static RESOLVER_INLINE_FETCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static PREFETCH_FETCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Snapshot and reset all resolver/prefetch diagnostic counters.
-pub fn take_resolver_diagnostics() -> (u64, u64, u64, u64) {
-    (
-        RESOLVER_CACHE_HITS.swap(0, std::sync::atomic::Ordering::Relaxed),
-        RESOLVER_CACHE_WAITS.swap(0, std::sync::atomic::Ordering::Relaxed),
-        RESOLVER_INLINE_FETCHES.swap(0, std::sync::atomic::Ordering::Relaxed),
-        PREFETCH_FETCHES.swap(0, std::sync::atomic::Ordering::Relaxed),
-    )
-}
-
-/// Total batch-prefetch closure rounds across all BFS levels
-/// (one increment per packument fetched during the batch phase).
-static BATCH_PREFETCH_FETCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Read and reset the batch-prefetch fetch counter.
-pub fn take_batch_prefetch_fetches() -> u64 {
-    BATCH_PREFETCH_FETCHES.swap(0, std::sync::atomic::Ordering::Relaxed)
-}
-
-fn add_resolver_fetch_bytes(bytes: usize) {
-    RESOLVER_FETCH_BYTES.fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Read and reset the total network-fetched packument bytes across all threads
-/// (resolver inline fetches plus every prefetch worker).
-pub fn take_resolver_fetch_bytes() -> u64 {
-    RESOLVER_FETCH_BYTES.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Read and reset the current thread's accumulated `packument_for` wall time,
@@ -409,6 +435,8 @@ pub struct RegistryClient {
     prefetch_workers: usize,
     /// Lazily-started worker pool, shared across clones of this client.
     prefetch_pool: Arc<OnceLock<PrefetchPool>>,
+    /// Per-client diagnostic accumulator shared with clones and workers.
+    diagnostics: Arc<ResolverDiagnostics>,
 }
 
 impl std::fmt::Debug for RegistryClient {
@@ -448,6 +476,7 @@ impl RegistryClient {
             cache_mode: CacheMode::Default,
             prefetch_workers: 0,
             prefetch_pool: Arc::new(OnceLock::new()),
+            diagnostics: ResolverDiagnostics::new(),
         }
     }
 
@@ -464,7 +493,14 @@ impl RegistryClient {
             cache_mode: CacheMode::Default,
             prefetch_workers: 0,
             prefetch_pool: Arc::new(OnceLock::new()),
+            diagnostics: ResolverDiagnostics::new(),
         }
+    }
+
+    /// Snapshot and reset all diagnostics accumulated by this client and its
+    /// shared workers. Returns zeroes on a second call until new work occurs.
+    pub fn take_diagnostics(&self) -> ResolverDiagnosticsSnapshot {
+        self.diagnostics.take()
     }
 
     /// Enable background packument prefetching with `workers` threads.
@@ -517,11 +553,15 @@ impl RegistryClient {
                     registry,
                     self.metadata_cache.as_deref(),
                     self.cache_mode,
+                    &self.diagnostics,
                 )
             }
             VersionRequest::Latest | VersionRequest::Range(_) => self.packument(&spec.name),
         };
-        add_resolver_fetch_nanos(started.elapsed());
+        self.diagnostics.resolver_fetch_nanos.fetch_add(
+            started.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         outcome
     }
 
@@ -541,15 +581,21 @@ impl RegistryClient {
             let mut map = self.packument_cache.map.lock().unwrap();
             match map.get(&key) {
                 Some(PackumentEntry::Ready(packument)) => {
-                    RESOLVER_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.diagnostics
+                        .cache_hits
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return Ok(packument.clone());
                 }
                 Some(PackumentEntry::InFlight) => {
-                    RESOLVER_CACHE_WAITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.diagnostics
+                        .cache_waits
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     map = self.packument_cache.cv.wait(map).unwrap();
                 }
                 None => {
-                    RESOLVER_INLINE_FETCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.diagnostics
+                        .inline_fetches
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     map.insert(key.clone(), PackumentEntry::InFlight);
                     break;
                 }
@@ -561,6 +607,7 @@ impl RegistryClient {
             registry,
             self.metadata_cache.as_deref(),
             self.cache_mode,
+            &self.diagnostics,
         );
         let mut map = self.packument_cache.map.lock().unwrap();
         match result {
@@ -614,6 +661,7 @@ impl RegistryClient {
                 self.metadata_cache.clone(),
                 self.packument_cache.clone(),
                 self.cache_mode,
+                self.diagnostics.clone(),
             )
         });
         enqueue_prefetch(
@@ -702,7 +750,9 @@ impl RegistryClient {
                     }
                 };
                 total += 1;
-                BATCH_PREFETCH_FETCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.diagnostics
+                    .batch_prefetch_fetches
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 for (child, child_spec) in prefetch_child_specs(&packument, name, Some(spec)) {
                     if seen.insert(child.clone()) {
                         next.push((child, child_spec));
@@ -867,6 +917,7 @@ impl PrefetchPool {
         metadata_cache: Option<Arc<MetadataCache>>,
         cache: Arc<PackumentCache>,
         cache_mode: CacheMode,
+        diagnostics: Arc<ResolverDiagnostics>,
     ) -> PrefetchPool {
         let (sender, receiver) = mpsc::channel::<PrefetchJob>();
         let receiver = Arc::new(Mutex::new(receiver));
@@ -879,6 +930,7 @@ impl PrefetchPool {
             let metadata_cache = metadata_cache.clone();
             let cache = Arc::clone(&cache);
             let sender_slot = Arc::clone(&sender_slot);
+            let diag = Arc::clone(&diagnostics);
             handles.push(std::thread::spawn(move || {
                 loop {
                     // Hold the receiver guard only long enough to dequeue, so
@@ -890,7 +942,8 @@ impl PrefetchPool {
                             Err(_) => break, // channel closed: pool shutting down
                         }
                     };
-                    PREFETCH_FETCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    diag.prefetch_fetches
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let result = fetch_packument_for_spec(
                         &http,
                         &job.name,
@@ -898,6 +951,7 @@ impl PrefetchPool {
                         job.version_spec.as_deref(),
                         metadata_cache.as_deref(),
                         cache_mode,
+                        &diag,
                     );
                     {
                         let mut map = cache.map.lock().unwrap();
@@ -1055,7 +1109,15 @@ pub fn parse_spec(spec: &str) -> Result<PackageSpec, RegistryError> {
 /// so metadata and artifact retrieval share one caller-owned pool.
 pub fn resolve(spec: &PackageSpec, registry: &str) -> Result<ResolvedArtifact, RegistryError> {
     let http = HttpClient::new(NpmConfig::default());
-    let packument = fetch_packument(&http, &spec.name, registry, None, CacheMode::Default)?;
+    let diagnostics = ResolverDiagnostics::new();
+    let packument = fetch_packument(
+        &http,
+        &spec.name,
+        registry,
+        None,
+        CacheMode::Default,
+        &diagnostics,
+    )?;
     resolve_packument(spec, &packument, registry)
 }
 
@@ -1127,10 +1189,13 @@ fn fetch_packument_for_spec(
     version_spec: Option<&str>,
     cache: Option<&MetadataCache>,
     mode: CacheMode,
+    diagnostics: &Arc<ResolverDiagnostics>,
 ) -> Result<Packument, RegistryError> {
     match exact_version_from_spec(name, version_spec) {
-        Some(version) => fetch_version_packument(http, name, &version, registry, cache, mode),
-        None => fetch_packument(http, name, registry, cache, mode),
+        Some(version) => {
+            fetch_version_packument(http, name, &version, registry, cache, mode, diagnostics)
+        }
+        None => fetch_packument(http, name, registry, cache, mode, diagnostics),
     }
 }
 
@@ -1151,13 +1216,14 @@ fn fetch_packument(
     registry: &str,
     cache: Option<&MetadataCache>,
     mode: CacheMode,
+    diagnostics: &Arc<ResolverDiagnostics>,
 ) -> Result<Packument, RegistryError> {
     let base = registry.trim_end_matches('/');
     // npm encodes scoped names so the whole name is one path segment.
     let encoded = name.replace('/', "%2F");
     let url = format!("{base}/{encoded}");
 
-    let body = fetch_with_cache(http, &url, name, cache, mode, true)?;
+    let body = fetch_with_cache(http, &url, name, cache, mode, true, diagnostics)?;
     serde_json::from_str(&body).map_err(|source| RegistryError::BadJson {
         package: name.to_string(),
         source,
@@ -1171,11 +1237,12 @@ fn fetch_version_packument(
     registry: &str,
     cache: Option<&MetadataCache>,
     mode: CacheMode,
+    diagnostics: &Arc<ResolverDiagnostics>,
 ) -> Result<Packument, RegistryError> {
     let base = registry.trim_end_matches('/');
     let encoded = name.replace('/', "%2F");
     let url = format!("{base}/{encoded}/{version}");
-    let body = fetch_with_cache(http, &url, name, cache, mode, false)?;
+    let body = fetch_with_cache(http, &url, name, cache, mode, false, diagnostics)?;
     let wire: WireVersionMetadata =
         serde_json::from_str(&body).map_err(|source| RegistryError::BadJson {
             package: name.to_string(),
@@ -1212,6 +1279,7 @@ fn fetch_with_cache(
     cache: Option<&MetadataCache>,
     mode: CacheMode,
     send_abbreviated_accept: bool,
+    diagnostics: &Arc<ResolverDiagnostics>,
 ) -> Result<String, RegistryError> {
     // A persistent-cache read failure degrades to a miss for every mode: the
     // online modes fall back to a network fetch, and offline mode fails on the
@@ -1274,7 +1342,9 @@ fn fetch_with_cache(
             package: package.to_string(),
             source: Box::new(error),
         })?;
-    add_resolver_fetch_bytes(body.len());
+    diagnostics
+        .fetch_bytes
+        .fetch_add(body.len() as u64, std::sync::atomic::Ordering::Relaxed);
 
     // Best-effort refresh: a write failure must never fail an install.
     if let Some(store) = cache {
@@ -2000,8 +2070,8 @@ mod tests {
         root_deps.insert("a".to_string(), "*".to_string());
         root_deps.insert("c".to_string(), "*".to_string());
 
-        // Reset the batch counter before measuring.
-        let _ = take_batch_prefetch_fetches();
+        // Reset the per-client batch counter before measuring.
+        let _ = client.take_diagnostics();
 
         let total = client
             .prefetch_batch_closure(&root_deps, 3)
@@ -2016,11 +2086,13 @@ mod tests {
         //   Level 2: b, d have no further registry children
         assert_eq!(total, 4, "batch closure should prefetch 4 packuments");
 
-        // The batch counter must reflect the same total.
-        let batch_count = take_batch_prefetch_fetches();
+        // The per-client batch counter must reflect the same total.
+        let diag = client.take_diagnostics();
         assert_eq!(
-            batch_count, 4,
-            "batch counter should match total ({batch_count} != 4)"
+            diag.batch_prefetch_fetches,
+            4,
+            "batch counter should match total ({batch_count} != 4)",
+            batch_count = diag.batch_prefetch_fetches
         );
 
         // Exactly 4 server requests: one per unique packument.
@@ -2103,5 +2175,114 @@ mod tests {
             matches!(error, RegistryError::OfflineMiss { .. }),
             "expected OfflineMiss, got {error:?}"
         );
+    }
+
+    #[test]
+    fn concurrent_clients_have_independent_diagnostics() {
+        // Two clients, each with its own local server, must have completely
+        // independent diagnostics: draining one must never reset the other.
+        let listener_a = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr_a = listener_a.local_addr().unwrap();
+        let listener_b = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr_b = listener_b.local_addr().unwrap();
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Start two servers that each serve the same packument data.
+        let body = r#"{"name":"pkg","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"pkg","version":"1.0.0","dist":{"tarball":"/pkg.tgz","integrity":"sha512-7iaw3Ur350mqGo7jwQrpkj9hiYB3Lkc/iBml1JQODbJ6wYX4oOHV+E+IvIh/1nsUNzLDBMxfqa2Ob1f1ACio/w=="},"dependencies":{}}}}"#;
+
+        let shutdown_a = std::sync::Arc::clone(&shutdown);
+        let body_a = body.to_owned();
+        let server_a = std::thread::spawn(move || {
+            let listener = listener_a;
+            listener.set_nonblocking(true).unwrap();
+            while !shutdown_a.load(std::sync::atomic::Ordering::SeqCst) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(c) => c,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body_a.len(),
+                    body_a
+                );
+                let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
+            }
+        });
+
+        let shutdown_b = std::sync::Arc::clone(&shutdown);
+        let body_b = body.to_owned();
+        let server_b = std::thread::spawn(move || {
+            let listener = listener_b;
+            listener.set_nonblocking(true).unwrap();
+            while !shutdown_b.load(std::sync::atomic::Ordering::SeqCst) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(c) => c,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body_b.len(),
+                    body_b
+                );
+                let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
+            }
+        });
+
+        // Client A points to server A, client B points to server B.
+        let config_a = NpmConfig::default()
+            .with_registry_override(&format!("http://{addr_a}"))
+            .unwrap();
+        let config_b = NpmConfig::default()
+            .with_registry_override(&format!("http://{addr_b}"))
+            .unwrap();
+        let client_a = RegistryClient::new(config_a);
+        let client_b = RegistryClient::new(config_b);
+
+        // Drain both to reset.
+        let _ = client_a.take_diagnostics();
+        let _ = client_b.take_diagnostics();
+
+        // Resolve on client A only.
+        let spec = parse_spec("pkg").unwrap();
+        let _ = client_a.resolve(&spec).unwrap();
+
+        // Client A must have some diagnostics; client B must have zero.
+        let diag_a = client_a.take_diagnostics();
+        let diag_b = client_b.take_diagnostics();
+        assert!(
+            diag_a.inline_fetches >= 1,
+            "client A should have performed fetches"
+        );
+        assert_eq!(
+            diag_b,
+            ResolverDiagnosticsSnapshot::default(),
+            "client B's diagnostics must remain untouched by client A's work"
+        );
+
+        // Now resolve on client B and prove A's second drain returns zero.
+        let _ = client_b.resolve(&spec).unwrap();
+        let diag_a2 = client_a.take_diagnostics();
+        let diag_b2 = client_b.take_diagnostics();
+        assert_eq!(
+            diag_a2,
+            ResolverDiagnosticsSnapshot::default(),
+            "second drain on client A must return zero"
+        );
+        assert!(
+            diag_b2.inline_fetches >= 1,
+            "client B should have performed fetches"
+        );
+
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = server_a.join();
+        let _ = server_b.join();
     }
 }

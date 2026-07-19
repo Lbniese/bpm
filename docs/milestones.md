@@ -382,3 +382,14 @@ npm-compatible `--offline` / `--prefer-offline` / `--prefer-online` flags on
 `bpm fetch`, `bpm install`, and `bpm ci` (plus `BPM_OFFLINE` /
 `BPM_PREFER_OFFLINE` / `BPM_PREFER_ONLINE`). The cache is best-effort for
 online modes and fails the install only in `--offline` mode on a genuine miss.
+
+### Async resolver A/B — no default-flip (2026-07-20)
+
+The async resolver (`BPM_ASYNC_RESOLVE=1`, `src/async_resolver.rs`) was
+benchmarked against the blocking resolver on `true_cold` `large-frontend` and
+`true_cold` `native-addon` (7 runs each). Results: `large-frontend` showed
+1.05× speedup (median 24,992 → 23,873 ms), below the 1.10× bar;
+`native-addon` showed 1.23× speedup (6,768 → 5,514 ms), meeting the bar.
+The default remains blocking (`BPM_ASYNC_RESOLVE=1` opt-in) because both
+fixtures must meet the 10% minimum. See commit `6cb572b` for the full evidence table. The async resolver stays available for continued
+measurement and refinement.

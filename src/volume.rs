@@ -285,6 +285,16 @@ impl PendingVolume {
         // Atomically rename staging to final path.  The lock serializes
         // concurrent builders, so the destination should not exist.  If it
         // does (e.g. a crash left a partial tree), remove it first.
+        // Ensure the parent directory exists — the original code relied on
+        // create_dir_all(volume_dir.join("node_modules")) for this, but
+        // staging is created under tmp/ so the final path may not have a
+        // parent yet.
+        if let Some(parent) = self.final_path.parent() {
+            fs::create_dir_all(parent).map_err(|source| VolumeError::Io {
+                path: parent.display().to_string(),
+                source,
+            })?;
+        }
         let _ = fs::remove_dir_all(&self.final_path);
         fs::rename(&self.staging, &self.final_path).map_err(|source| VolumeError::Io {
             path: self.final_path.display().to_string(),
