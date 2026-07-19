@@ -8,7 +8,7 @@
 use std::{env, fs, io, path::PathBuf};
 
 use bpm::config::NpmConfig;
-use bpm::http::HttpClient;
+use bpm::http::{redact_url, HttpClient};
 use bpm::integrity::Integrity;
 use bpm::metadata_cache::{CacheMode, MetadataCache};
 use bpm::metrics::Metrics;
@@ -72,7 +72,9 @@ pub(super) fn run(
             };
             eprintln!(
                 "resolved {}@{} -> {}",
-                resolved.name, resolved.version, resolved.tarball_url
+                resolved.name,
+                resolved.version,
+                redact_url(&resolved.tarball_url)
             );
             (resolved.tarball_url, Some(parsed))
         } else {

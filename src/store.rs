@@ -407,7 +407,7 @@ impl ArtifactStore {
                 let computed = metrics
                     .measure("artifact_download", || retrieve(url, &tmp))
                     .map_err(|source| StoreError::Download {
-                        url: url.to_string(),
+                        url: redact_url(url),
                         source,
                     })?;
                 let dest = self.artifact_path(&computed);
