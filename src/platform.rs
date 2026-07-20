@@ -68,13 +68,12 @@ pub fn same_file_identity(a: &Path, b: &Path) -> std::io::Result<bool> {
     }
     #[cfg(windows)]
     {
-        // std exposes volume serial and file index on Windows.  MetadataExt's
-        // file_index is the 128-bit FILE_ID_128 represented as two u64s.
-        use std::os::windows::fs::MetadataExt;
-        let left = std::fs::metadata(a)?;
-        let right = std::fs::metadata(b)?;
-        Ok(left.volume_serial_number() == right.volume_serial_number()
-            && left.file_index() == right.file_index())
+        // Stable identity check on Windows: two paths name the same file when
+        // they canonicalize to the same path. The precise volume-serial /
+        // file-index comparison needs the unstable `windows_by_handle`
+        // feature, so it is avoided here to keep the build on stable Rust.
+        let normalize = |p: &Path| std::fs::canonicalize(p).ok();
+        Ok(normalize(a) == normalize(b))
     }
     #[cfg(not(any(unix, windows)))]
     {
