@@ -8,26 +8,11 @@
 #
 # Overrides (env):
 #   BPM_REPO         git repo to clone / release source   (default: upstream)
-#   BPM_VERSION      release version to download          (default: latest, else DEFAULT_VERSION)
+#   BPM_VERSION      release version to download          (default: latest, else latest-redirect)
 #   BPM_INSTALL_DIR  binary install directory             (default: /usr/local/bin)
 set -eu
 
-# Fallback version used only if the GitHub API is unreachable/rate-limited.
-# Kept in sync with the newest release so a transient API failure can NEVER
-# silently downgrade to a stale binary. Override with BPM_VERSION if needed.
-DEFAULT_VERSION="0.1.2"
-
 BPM_REPO="${BPM_REPO:-https://github.com/Lbniese/bpm}"
-# Default to the latest published release so a stale hardcoded version can
-# never ship a broken binary. Override with BPM_VERSION if needed.
-if [ -z "${BPM_VERSION:-}" ]; then
-    BPM_VERSION=$(curl -fsSL -H "User-Agent: bpm-installer" "https://api.github.com/repos/${BPM_REPO#https://}/releases/latest" 2>/dev/null \
-        | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name":[[:space:]]*"v?([^"]+)".*/\1/')
-    if [ -z "$BPM_VERSION" ]; then
-        BPM_VERSION="$DEFAULT_VERSION"
-        print_info "Could not reach the GitHub API for the latest release; using v$BPM_VERSION"
-    fi
-fi
 BPM_INSTALL_DIR="${BPM_INSTALL_DIR:-/usr/local/bin}"
 
 INSTALL_URL="https://raw.githubusercontent.com/Lbniese/bpm/main/install.sh"
@@ -67,6 +52,30 @@ EOF
     else
         printf "  Re-run and allow the sudo prompt, or install without sudo:\n"
         printf "      BPM_INSTALL_DIR=\$HOME/.local/bin curl -fsSL %s | sh\n" "$INSTALL_URL"
+    fi
+}
+
+# Resolve the release version to download.
+# - If BPM_VERSION is set and non-empty, use it exactly (after validation).
+# - Otherwise, try the GitHub API for the latest release tag.
+# - If the API is unreachable, set BPM_VERSION to empty and use the
+#   latest-asset redirect URL in try_prebuilt.
+resolve_version() {
+    if [ -n "${BPM_VERSION:-}" ]; then
+        # Validate: reject values starting with '-' (option injection) or
+        # containing shell separators.
+        case "$BPM_VERSION" in
+            -*|*/*|*\ *)
+                die "Invalid BPM_VERSION: $BPM_VERSION"
+                ;;
+        esac
+        return 0
+    fi
+    # Try the GitHub API for the latest release tag.
+    BPM_VERSION=$(curl -fsSL -H "User-Agent: bpm-installer" "https://api.github.com/repos/${BPM_REPO#https://}/releases/latest" 2>/dev/null \
+        | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name":[[:space:]]*"v?([^"]+)".*/\1/') || true
+    if [ -z "$BPM_VERSION" ]; then
+        print_info "Could not reach the GitHub API for the latest release; using latest release redirect."
     fi
 }
 
@@ -115,26 +124,49 @@ verify_binary() {
 try_prebuilt() {
     # $1 = platform target
     platform=$1
-    release_url="$BPM_REPO/releases/download/v$BPM_VERSION/bpm-$platform.tar.gz"
-    print_info "Checking for pre-built binary (v$BPM_VERSION)..."
     tmpdir=$(mktemp -d)
-    if curl -fsSL "$release_url" 2>/dev/null | tar xz -C "$tmpdir" 2>/dev/null; then
-        if [ -f "$tmpdir/bpm" ]; then
-            # Guard against stale release assets that cannot resolve package
-            # names (they would fail every `bpm fetch <name>`). Verify first.
-            if verify_binary "$tmpdir/bpm"; then
-                print_info "Installing bpm v$BPM_VERSION..."
-                install_binary "$tmpdir/bpm" "$BPM_INSTALL_DIR/bpm" || {
-                    print_err "Installation failed."
-                    suggest_command
+
+    if [ -n "${BPM_VERSION:-}" ]; then
+        release_url="$BPM_REPO/releases/download/v$BPM_VERSION/bpm-$platform.tar.gz"
+        print_info "Checking for pre-built binary (v$BPM_VERSION)..."
+        if curl -fsSL "$release_url" 2>/dev/null | tar xz -C "$tmpdir" 2>/dev/null; then
+            if [ -f "$tmpdir/bpm" ]; then
+                if verify_binary "$tmpdir/bpm"; then
+                    print_info "Installing bpm v$BPM_VERSION..."
+                    install_binary "$tmpdir/bpm" "$BPM_INSTALL_DIR/bpm" || {
+                        print_err "Installation failed."
+                        suggest_command
+                        rm -rf "$tmpdir"
+                        exit 1
+                    }
                     rm -rf "$tmpdir"
-                    exit 1
-                }
-                rm -rf "$tmpdir"
-                print_ok "bpm installed to $BPM_INSTALL_DIR/bpm"
-                return 0
-            else
-                print_info "Pre-built v$BPM_VERSION lacks npm-name resolution; falling back to source build."
+                    print_ok "bpm installed to $BPM_INSTALL_DIR/bpm"
+                    return 0
+                else
+                    print_info "Pre-built v$BPM_VERSION lacks npm-name resolution; falling back to source build."
+                fi
+            fi
+        fi
+    else
+        # No exact version: use the immutable latest-asset redirect.
+        latest_url="$BPM_REPO/releases/latest/download/bpm-$platform.tar.gz"
+        print_info "Checking for latest pre-built binary..."
+        if curl -fsSL "$latest_url" 2>/dev/null | tar xz -C "$tmpdir" 2>/dev/null; then
+            if [ -f "$tmpdir/bpm" ]; then
+                if verify_binary "$tmpdir/bpm"; then
+                    print_info "Installing latest release binary..."
+                    install_binary "$tmpdir/bpm" "$BPM_INSTALL_DIR/bpm" || {
+                        print_err "Installation failed."
+                        suggest_command
+                        rm -rf "$tmpdir"
+                        exit 1
+                    }
+                    rm -rf "$tmpdir"
+                    print_ok "bpm installed to $BPM_INSTALL_DIR/bpm"
+                    return 0
+                else
+                    print_info "Latest release binary lacks required features; falling back to source build."
+                fi
             fi
         fi
     fi
@@ -196,6 +228,8 @@ build_from_source() {
 main() {
     print_bold "Bloom Package Manager (bpm) installer"
     echo
+
+    resolve_version
 
     platform=$(detect_platform)
     if [ -z "$platform" ]; then

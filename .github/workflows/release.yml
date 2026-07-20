@@ -44,7 +44,17 @@ jobs:
 
       - name: Install cross
         if: matrix.use_cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
+        run: cargo install cross --version '=0.2.5' --locked
+
+      - name: Verify cross version
+        if: matrix.use_cross
+        run: |
+          version=$(cross --version | grep -oP 'cross \K[0-9]+\.[0-9]+\.[0-9]+' || echo "none")
+          if [ "$version" != "0.2.5" ]; then
+            echo "cross version mismatch: expected 0.2.5, got $version"
+            exit 1
+          fi
+          echo "cross 0.2.5 verified"
 
       - name: Build (release)
         run: |
