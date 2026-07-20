@@ -91,6 +91,17 @@ See [`CONTRIBUTING.md`](https://github.com/lbniese/bpm/blob/main/CONTRIBUTING.md
 in the repository root for the pull request checklist and commit message
 conventions.
 
+## Release tool pinning
+
+The ARM Linux release cross-compiler (`cross`) is pinned to an exact
+crates.io release version (`=0.2.5`) with `--locked` in the release
+workflow to ensure reproducible builds. To update it:
+
+1. Select a new released immutable version of `cross`.
+2. Install it with `cargo install cross --version '=<new-version>' --locked`.
+3. Verify the version with `cross --version`.
+4. Build `aarch64-unknown-linux-gnu` successfully before release.
+
 ## Publishing this repository and its docs site
 
 This repository is git-initialized locally with CI (`.github/workflows/ci.yml`)
