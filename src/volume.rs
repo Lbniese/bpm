@@ -345,12 +345,12 @@ fn copy_overlay_entry(source: &Path, destination: &Path) -> Result<(), VolumeErr
             copy_overlay_entry(&entry.path(), &destination.join(entry.file_name()))?;
         }
     } else if kind.file_type().is_symlink() {
-        let target = fs::read_link(source).map_err(|error| io_err(source, error))?;
+        let _target = fs::read_link(source).map_err(|error| io_err(source, error))?;
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent).map_err(|error| io_err(parent, error))?;
         }
         #[cfg(unix)]
-        std::os::unix::fs::symlink(&target, destination)
+        std::os::unix::fs::symlink(&_target, destination)
             .map_err(|error| io_err(destination, error))?;
         #[cfg(not(unix))]
         fs::copy(source, destination)
@@ -498,7 +498,10 @@ pub fn reconcile_project_view(
 
             // Remove empty parent scoped directories.
             if let Some(parent) = full_path.parent() {
-                if parent.file_name().is_some_and(|n| n.to_string_lossy().starts_with('@')) {
+                if parent
+                    .file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with('@'))
+                {
                     let _ = fs::remove_dir(parent);
                 }
             }
@@ -556,8 +559,7 @@ pub fn attach_project_local(
     let mut stats = AttachStats::default();
     for entry in entries {
         let target = proj_nm.join(entry.file_name());
-        bpm::materializer::hardlink_tree(&entry.path(), &target)
-            .map_err(VolumeError::Materialize)?;
+        hardlink_tree(&entry.path(), &target).map_err(VolumeError::Materialize)?;
         stats.relays_created += 1;
     }
     Ok(stats)

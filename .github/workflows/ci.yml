@@ -24,12 +24,17 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The integration suite relies on Unix filesystem semantics (symlinks,
+  # executable bits, /tmp paths) and ships release binaries for macOS and
+  # Linux only, so the full `cargo test` suite runs on those platforms.
+  # Windows is still build- and lint-checked to keep the code cross-compilable
+  # there (see the `windows` job below).
   test:
     name: fmt, clippy, test, build
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
@@ -51,6 +56,30 @@ jobs:
 
       - name: cargo test
         run: cargo test --workspace
+
+      - name: cargo build --release
+        run: cargo build --release --workspace
+
+  windows:
+    name: fmt, clippy, build (windows)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: cargo build --release
         run: cargo build --release --workspace

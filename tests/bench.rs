@@ -3,12 +3,13 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+use bpm::bench::lock_setup_command_specs;
 use bpm::bench::{
     bpm_profile_filename, compare_results_against_baseline, install_command_spec,
-    lock_setup_command_specs, run_scenario_with_runner, run_suite_with_availability,
-    write_bpm_profile_manifest, BenchmarkResult, BpmProfileEntry, BpmProfileManifest,
-    CommandOutcome, CommandRunner, CommandSpec, CompareOptions, RunSuiteOptions, ScenarioKind,
-    Stats, SystemInfo, Tool, FIXTURES,
+    run_scenario_with_runner, run_suite_with_availability, write_bpm_profile_manifest,
+    BenchmarkResult, BpmProfileEntry, BpmProfileManifest, CommandOutcome, CommandRunner,
+    CommandSpec, CompareOptions, RunSuiteOptions, ScenarioKind, Stats, SystemInfo, Tool, FIXTURES,
 };
 
 #[derive(Default)]
@@ -114,6 +115,7 @@ fn tools_include_bpm_after_milestone_2() {
 }
 
 #[test]
+#[cfg(unix)]
 fn npm_and_pnpm_lock_setup_use_native_commands() {
     let work_dir = Path::new("/tmp/work");
     let store_dir = Path::new("/tmp/store");
@@ -429,7 +431,7 @@ fn reference_baseline_has_strict_expected_keys_and_versions() {
 fn profile_filenames_and_manifest_are_deterministic() {
     let temp = tempfile::tempdir().unwrap();
     let mut versions = BTreeMap::new();
-    versions.insert("bpm".to_string(), "bpm 0.1.10".to_string());
+    versions.insert("bpm".to_string(), "bpm 0.0.1".to_string());
     versions.insert("node".to_string(), "v26.0.0".to_string());
     let manifest = BpmProfileManifest {
         fixture: "minimal".to_string(),
@@ -505,7 +507,7 @@ fn result_with_tools(
         ("node".to_string(), "v26.0.0".to_string()),
         ("npm".to_string(), "11.12.1".to_string()),
         ("pnpm".to_string(), "10.13.1".to_string()),
-        ("bpm".to_string(), "bpm 0.1.10".to_string()),
+        ("bpm".to_string(), "bpm 0.0.1".to_string()),
     ]);
     BenchmarkResult {
         scenario: scenario.to_string(),

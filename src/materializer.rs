@@ -660,10 +660,10 @@ fn copy_tree_inner(source: &Path, target: &Path) -> Result<(), MaterializeError>
             fs::create_dir_all(&dst_path).map_err(|source| io_err(&dst_path, source))?;
             copy_tree_inner(&src_path, &dst_path)?;
         } else if kind.is_symlink() {
-            let link_target =
+            let _link_target =
                 fs::read_link(&src_path).map_err(|source| io_err(&src_path, source))?;
             #[cfg(unix)]
-            std::os::unix::fs::symlink(&link_target, &dst_path)
+            std::os::unix::fs::symlink(&_link_target, &dst_path)
                 .map_err(|source| io_err(&dst_path, source))?;
             #[cfg(not(unix))]
             fs::copy(&src_path, &dst_path)
@@ -672,11 +672,11 @@ fn copy_tree_inner(source: &Path, target: &Path) -> Result<(), MaterializeError>
         } else {
             fs::copy(&src_path, &dst_path).map_err(|source| io_err(&dst_path, source))?;
             // Preserve executable bit.
-            let meta = fs::metadata(&src_path).map_err(|source| io_err(&src_path, source))?;
-            let perms = meta.permissions();
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
+                let meta = fs::metadata(&src_path).map_err(|source| io_err(&src_path, source))?;
+                let perms = meta.permissions();
                 if perms.mode() & 0o111 != 0 {
                     fs::set_permissions(&dst_path, perms)
                         .map_err(|source| io_err(&dst_path, source))?;
@@ -698,6 +698,7 @@ fn same_path(a: &Path, b: &Path) -> bool {
     a.components().eq(b.components())
 }
 
+#[cfg(not(windows))]
 fn same_file(a: &Path, b: &Path) -> bool {
     let (Ok(a), Ok(b)) = (fs::metadata(a), fs::metadata(b)) else {
         return false;
