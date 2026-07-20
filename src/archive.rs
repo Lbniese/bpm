@@ -247,8 +247,8 @@ fn copy_windows_tree(
     root: &Path,
     source_rel: &Path,
     destination: PathBuf,
-    deferred: &[(PathBuf, PathBuf)],
-    visiting: &mut HashSet<PathBuf>,
+    _deferred: &[(PathBuf, PathBuf)],
+    _visiting: &mut HashSet<PathBuf>,
 ) -> Result<(), ExtractError> {
     let source = root.join(source_rel);
     fs::create_dir_all(&destination).map_err(|source| write_err(&destination, source))?;
@@ -261,7 +261,7 @@ fn copy_windows_tree(
             .map_err(|source| write_err(&entry.path(), source))?
             .is_dir()
         {
-            copy_windows_tree(root, &child_rel, child_dest, deferred, visiting)?;
+            copy_windows_tree(root, &child_rel, child_dest, _deferred, _visiting)?;
         } else {
             fs::copy(entry.path(), &child_dest).map_err(|source| write_err(&child_dest, source))?;
         }
