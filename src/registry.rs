@@ -2204,6 +2204,9 @@ mod tests {
                     }
                     Err(_) => break,
                 };
+                stream.set_nonblocking(false).ok();
+                let mut request = [0u8; 2048];
+                let _ = std::io::Read::read(&mut stream, &mut request);
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body_a.len(),
@@ -2227,6 +2230,9 @@ mod tests {
                     }
                     Err(_) => break,
                 };
+                stream.set_nonblocking(false).ok();
+                let mut request = [0u8; 2048];
+                let _ = std::io::Read::read(&mut stream, &mut request);
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body_b.len(),
