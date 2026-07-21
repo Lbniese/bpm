@@ -693,3 +693,119 @@ fn npm_git_prepare_contract() {
         );
     }
 }
+
+// === Plan 003: Additional git-prepare coverage tests ===
+
+#[test]
+fn bpm_git_prepare_failure_publishes_nothing() {
+    if !tool_available("git") || !tool_available("node") {
+        eprintln!("skipping BPM Git-prepare failure test: missing git or node");
+        return;
+    }
+    
+    let fixture = build_fixture();
+    let url = format!(
+        "git+file://{}#{}",
+        fixture.repo.display(),
+        fixture.bad_prepare
+    );
+    let dir = consumer(&url);
+    let store = tempfile::tempdir().unwrap();
+    
+    // Prepare failure should cause install to fail
+    let output = bpm_install(dir.path(), store.path(), &["--git-prepare"]);
+    assert!(
+        !output.status.success(),
+        "install should fail when prepare throws"
+    );
+    
+    // Verify no prepared image was published
+    let phases_log = dir.path().join("node_modules/gitpkg/phases.log");
+    assert!(
+        !phases_log.exists(),
+        "no prepared phases.log should exist on prepare failure"
+    );
+    
+    let built_js = dir.path().join("node_modules/gitpkg/dist/built.js");
+    assert!(
+        !built_js.exists(),
+        "no prepared dist/built.js should exist on prepare failure"
+    );
+}
+
+#[test]
+fn bpm_git_prepare_mutable_ref_pins_sha() {
+    if !tool_available("git") || !tool_available("node") {
+        eprintln!("skipping BPM Git-prepare mutable-ref test: missing git or node");
+        return;
+    }
+    
+    let fixture = build_fixture();
+    // Use a mutable reference (branch name) instead of raw SHA
+    let url = format!(
+        "git+file://{}#stable",
+        fixture.repo.display()
+    );
+    let dir = consumer(&url);
+    let store = tempfile::tempdir().unwrap();
+    
+    let output = bpm_install(dir.path(), store.path(), &["--git-prepare"]);
+    assert!(
+        output.status.success(),
+        "install should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    
+    // Verify lock pins the full SHA, not the ref string
+    let resolved = bpm_gitpkg_resolved_commit(dir.path());
+    assert!(
+        !resolved.contains("stable"),
+        "lock should pin SHA, not mutable ref 'stable': got {resolved}"
+    );
+    assert_eq!(resolved, fixture.good_rev1, "should pin good_rev1 SHA");
+    
+    // Verify prepare output exists (was actually prepared)
+    let built = built_module(dir.path()).expect("prepare output should exist");
+    assert_eq!(built["built"], true);
+}
+
+#[test]
+fn bpm_git_prepare_changed_commit_distinct_image() {
+    if !tool_available("git") || !tool_available("node") {
+        eprintln!("skipping BPM Git-prepare identity test: missing git or node");
+        return;
+    }
+    
+    let fixture = build_fixture();
+    
+    // Install with good_rev1
+    let url1 = format!(
+        "git+file://{}#{}",
+        fixture.repo.display(),
+        fixture.good_rev1
+    );
+    let dir1 = consumer(&url1);
+    let store = tempfile::tempdir().unwrap();
+    let output1 = bpm_install(dir1.path(), store.path(), &["--git-prepare"]);
+    assert!(output1.status.success(), "first install should succeed");
+    let built1 = built_module(dir1.path()).expect("first dist should exist");
+    assert_eq!(built1["REV"], 1, "first should have REV 1");
+    
+    // Install with good_rev2 (different prepare output)
+    let url2 = format!(
+        "git+file://{}#{}",
+        fixture.repo.display(),
+        fixture.good_rev2
+    );
+    let dir2 = consumer(&url2);
+    let output2 = bpm_install(dir2.path(), store.path(), &["--git-prepare"]);
+    assert!(output2.status.success(), "second install should succeed");
+    let built2 = built_module(dir2.path()).expect("second dist should exist");
+    assert_eq!(built2["REV"], 2, "second should have REV 2");
+    
+    // Verify different commits produce different prepared images
+    assert_ne!(
+        built1["REV"], built2["REV"],
+        "different commits should produce distinct prepared outputs"
+    );
+}
