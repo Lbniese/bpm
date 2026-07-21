@@ -39,6 +39,13 @@ semver = "1.0"
 # Persistent metadata index (filesystem objects remain the source of truth).
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 
+# Unix-only: copy-on-write reflink/clone syscalls for the project-local view
+# backend (macOS `clonefile(2)`, Linux `FICLONE` ioctl). The `Reflink`
+# materialize backend degrades to hardlink->copy when the filesystem lacks
+# support, so this dep only adds a faster path, never a correctness dependency.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 # Deterministic property and malformed-input regression tests.
 proptest = "1.11.0"
