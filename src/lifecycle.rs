@@ -729,7 +729,10 @@ fn run_script(
     cmd.env("npm_lifecycle_script", command);
     cmd.env("npm_package_name", &pkg.name);
     cmd.env("npm_package_version", &pkg.version);
-    cmd.env("npm_config_user_agent", "bpm/0.1.0");
+    cmd.env(
+        "npm_config_user_agent",
+        concat!("bpm/", env!("CARGO_PKG_VERSION")),
+    );
     cmd.env("npm_execpath", "bpm");
     cmd.env("INIT_CWD", project_root);
     let node = crate::platform::find_executable(

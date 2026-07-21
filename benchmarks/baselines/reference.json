@@ -7,14 +7,14 @@
       "operating_system": "26.5",
       "kernel": "25.5.0",
       "runtime_versions": {
-        "bpm": "bpm 0.1.10",
+        "bpm": "bpm 0.0.1",
         "node": "v26.0.0",
         "npm": "11.12.1",
         "pnpm": "10.13.1"
       }
     },
     "versions": {
-      "bpm": "bpm 0.1.10",
+      "bpm": "bpm 0.0.1",
       "node": "v26.0.0",
       "npm": "11.12.1",
       "pnpm": "10.13.1"
@@ -110,14 +110,14 @@
       "operating_system": "26.5",
       "kernel": "25.5.0",
       "runtime_versions": {
-        "bpm": "bpm 0.1.10",
+        "bpm": "bpm 0.0.1",
         "node": "v26.0.0",
         "npm": "11.12.1",
         "pnpm": "10.13.1"
       }
     },
     "versions": {
-      "bpm": "bpm 0.1.10",
+      "bpm": "bpm 0.0.1",
       "node": "v26.0.0",
       "npm": "11.12.1",
       "pnpm": "10.13.1"
@@ -213,14 +213,14 @@
       "operating_system": "26.5",
       "kernel": "25.5.0",
       "runtime_versions": {
-        "bpm": "bpm 0.1.10",
+        "bpm": "bpm 0.0.1",
         "node": "v26.0.0",
         "npm": "11.12.1",
         "pnpm": "10.13.1"
       }
     },
     "versions": {
-      "bpm": "bpm 0.1.10",
+      "bpm": "bpm 0.0.1",
       "node": "v26.0.0",
       "npm": "11.12.1",
       "pnpm": "10.13.1"
@@ -316,14 +316,14 @@
       "operating_system": "26.5",
       "kernel": "25.5.0",
       "runtime_versions": {
-        "bpm": "bpm 0.1.10",
+        "bpm": "bpm 0.0.1",
         "node": "v26.0.0",
         "npm": "11.12.1",
         "pnpm": "10.13.1"
       }
     },
     "versions": {
-      "bpm": "bpm 0.1.10",
+      "bpm": "bpm 0.0.1",
       "node": "v26.0.0",
       "npm": "11.12.1",
       "pnpm": "10.13.1"
@@ -419,14 +419,14 @@
       "operating_system": "26.5",
       "kernel": "25.5.0",
       "runtime_versions": {
-        "bpm": "bpm 0.1.10",
+        "bpm": "bpm 0.0.1",
         "node": "v26.0.0",
         "npm": "11.12.1",
         "pnpm": "10.13.1"
       }
     },
     "versions": {
-      "bpm": "bpm 0.1.10",
+      "bpm": "bpm 0.0.1",
       "node": "v26.0.0",
       "npm": "11.12.1",
       "pnpm": "10.13.1"
@@ -522,14 +522,14 @@
       "operating_system": "26.5",
       "kernel": "25.5.0",
       "runtime_versions": {
-        "bpm": "bpm 0.1.10",
+        "bpm": "bpm 0.0.1",
         "node": "v26.0.0",
         "npm": "11.12.1",
         "pnpm": "10.13.1"
       }
     },
     "versions": {
-      "bpm": "bpm 0.1.10",
+      "bpm": "bpm 0.0.1",
       "node": "v26.0.0",
       "npm": "11.12.1",
       "pnpm": "10.13.1"
@@ -625,14 +625,14 @@
       "operating_system": "26.5",
       "kernel": "25.5.0",
       "runtime_versions": {
-        "bpm": "bpm 0.1.10",
+        "bpm": "bpm 0.0.1",
         "node": "v26.0.0",
         "npm": "11.12.1",
         "pnpm": "10.13.1"
       }
     },
     "versions": {
-      "bpm": "bpm 0.1.10",
+      "bpm": "bpm 0.0.1",
       "node": "v26.0.0",
       "npm": "11.12.1",
       "pnpm": "10.13.1"
@@ -728,14 +728,14 @@
       "operating_system": "26.5",
       "kernel": "25.5.0",
       "runtime_versions": {
-        "bpm": "bpm 0.1.10",
+        "bpm": "bpm 0.0.1",
         "node": "v26.0.0",
         "npm": "11.12.1",
         "pnpm": "10.13.1"
       }
     },
     "versions": {
-      "bpm": "bpm 0.1.10",
+      "bpm": "bpm 0.0.1",
       "node": "v26.0.0",
       "npm": "11.12.1",
       "pnpm": "10.13.1"
@@ -831,14 +831,14 @@
       "operating_system": "26.5",
       "kernel": "25.5.0",
       "runtime_versions": {
-        "bpm": "bpm 0.1.10",
+        "bpm": "bpm 0.0.1",
         "node": "v26.0.0",
         "npm": "11.12.1",
         "pnpm": "10.13.1"
       }
     },
     "versions": {
-      "bpm": "bpm 0.1.10",
+      "bpm": "bpm 0.0.1",
       "node": "v26.0.0",
       "npm": "11.12.1",
       "pnpm": "10.13.1"
@@ -934,14 +934,14 @@
       "operating_system": "26.5",
       "kernel": "25.5.0",
       "runtime_versions": {
-        "bpm": "bpm 0.1.10",
+        "bpm": "bpm 0.0.1",
         "node": "v26.0.0",
         "npm": "11.12.1",
         "pnpm": "10.13.1"
       }
     },
     "versions": {
-      "bpm": "bpm 0.1.10",
+      "bpm": "bpm 0.0.1",
       "node": "v26.0.0",
       "npm": "11.12.1",
       "pnpm": "10.13.1"
@@ -1037,14 +1037,14 @@
       "operating_system": "26.5",
       "kernel": "25.5.0",
       "runtime_versions": {
-        "bpm": "bpm 0.1.10",
+        "bpm": "bpm 0.0.1",
         "node": "v26.0.0",
         "npm": "11.12.1",
         "pnpm": "10.13.1"
       }
     },
     "versions": {
-      "bpm": "bpm 0.1.10",
+      "bpm": "bpm 0.0.1",
       "node": "v26.0.0",
       "npm": "11.12.1",
       "pnpm": "10.13.1"
@@ -1140,14 +1140,14 @@
       "operating_system": "26.5",
       "kernel": "25.5.0",
       "runtime_versions": {
-        "bpm": "bpm 0.1.10",
+        "bpm": "bpm 0.0.1",
         "node": "v26.0.0",
         "npm": "11.12.1",
         "pnpm": "10.13.1"
       }
     },
     "versions": {
-      "bpm": "bpm 0.1.10",
+      "bpm": "bpm 0.0.1",
       "node": "v26.0.0",
       "npm": "11.12.1",
       "pnpm": "10.13.1"
