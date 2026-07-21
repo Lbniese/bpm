@@ -8,6 +8,10 @@ eliminating repeated downloads, repeated extraction, repeated dependency-graph
 work, and repeated filesystem materialization. Packages are stored immutably in
 a global content-addressed store and shared across projects.
 
+## Recent Changes
+
+- 2026-07-21: Reconciled `docs/git-prepare-design.md` with shipped slices 1/3/4/5 (Plan 001 completed)
+
 ## Quick start
 
 ```bash
