@@ -55,10 +55,19 @@ page records the architecture that is currently shipped.
    projects use shallow top-level relays for the O(top-level) fast path.
    Projects depending on `next` automatically receive a project-local hardlink
    view so tools such as Turbopack and Next.js do not reject dependency
-   realpaths outside the project. Workspace-linked installs use the same
-   hardlink backend for registry packages. `BPM_PROJECT_VIEW=relay|local`
-   overrides that choice. Windows uses a correctness-first local hardlink/copy
-   view; junctions and reflink/clone performance are deferred.
+   realpaths outside the project; the auto-detection set defaults to `next` and
+   is extended via `BPM_LOCAL_VIEW_PACKAGES` (comma-separated package names,
+   merged with the built-in default so Next.js installs never regress).
+   Workspace-linked installs use the same hardlink backend for registry
+   packages. `BPM_PROJECT_VIEW=relay|local|reflink` overrides that choice
+   (`reflink` selects the local view via the CoW reflink backend, which falls
+   back to hardlink then copy when the filesystem lacks reflink support). A
+   `Reflink` materialize backend variant and a filesystem-capability probe
+   (`probe_fs_capabilities`) are available; the actual `clonefile`/`FICLONE`
+   syscall wiring is not yet linked (the crate keeps a minimal dependency set),
+   so `Reflink` currently degrades to the hardlink→copy chain and `Auto`
+   selection is unchanged. Windows uses a correctness-first local hardlink/copy
+   view; junctions and reflink/clone performance remain deferred.
 8. **Materializer** — `src/materializer.rs` supports compatible npm-v3 layout
    and strict declared-edge validation. It has symlink, hardlink, and fallback
    copy backends; package files are never exposed as writable store symlinks
@@ -143,8 +152,11 @@ enumeration, task completion order, or network timing.
 - Integrate graph lifecycle execution with `src/derived/store.rs` for
   cross-graph derived-artifact reuse, or formally commit to graph-keyed volume
   derivation and retire the unused path.
-- Expand project-local compatibility attachment beyond the automatic Next.js
-  case, ideally using filesystem clone/reflink capabilities where available.
+- Wire a `clonefile`/`FICLONE` syscall binding (e.g. the `libc` crate) into the
+  `Reflink` materialize backend and `probe_fs_capabilities` so `Auto` can select
+  CoW reflink on supporting filesystems (macOS APFS, Linux btrfs/xfs). The
+  backend variant, capability probe, and `BPM_PROJECT_VIEW=reflink` plumbing
+  have landed; only the syscall call sites and `Auto` selection remain.
 - Windows junction/reflink attachment performance (currently correctness-first
   local hardlink/copy).
 - Combine the async resolver with the streaming install path for maximum cold
