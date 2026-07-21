@@ -27,7 +27,7 @@ use thiserror::Error;
 use crate::graph::{graph_id_with_prepared, ManagedEntry};
 use crate::integrity::ArtifactId;
 use crate::lockfile::Lockfile;
-use crate::materializer::hardlink_tree;
+use crate::materializer::{hardlink_tree, reflink_tree};
 use crate::materializer::{
     materialize_with_backend, MaterializeBackend, MaterializeError, MaterializeStats,
 };
@@ -484,7 +484,7 @@ pub fn reconcile_project_view(
                         .map(|target| target.to_string_lossy() == entry.identity.as_str())
                         .unwrap_or(false)
             }
-            "local" => meta.is_dir() && !entry.identity.is_empty(),
+            "local" | "reflink" => meta.is_dir() && !entry.identity.is_empty(),
             _ => false,
         };
 
@@ -523,6 +523,20 @@ pub fn attach_project_local(
     project_root: &Path,
     volume: &VolumeRef,
 ) -> Result<AttachStats, VolumeError> {
+    attach_project_local_with_backend(project_root, volume, MaterializeBackend::Hardlink)
+}
+
+/// Like [`attach_project_local`], but selects the per-package linking strategy
+/// from `backend`. `MaterializeBackend::Reflink` copy-on-write clones each
+/// package tree into the project (cheaper than a full copy, and isolated from
+/// the store image on filesystems that support reflink); any other backend
+/// hardlinks (the established local view). `.bin` stays relative symlinks.
+#[cfg(unix)]
+pub fn attach_project_local_with_backend(
+    project_root: &Path,
+    volume: &VolumeRef,
+    backend: MaterializeBackend,
+) -> Result<AttachStats, VolumeError> {
     let vol_nm = volume.path.join("node_modules");
     let proj_nm = project_root.join("node_modules");
     fs::create_dir_all(&proj_nm).map_err(|source| io_err(&proj_nm, source))?;
@@ -537,7 +551,11 @@ pub fn attach_project_local(
     for entry in entries {
         let source = entry.path();
         let target = proj_nm.join(entry.file_name());
-        hardlink_tree(&source, &target).map_err(VolumeError::Materialize)?;
+        if matches!(backend, MaterializeBackend::Reflink) {
+            reflink_tree(&source, &target).map_err(VolumeError::Materialize)?;
+        } else {
+            hardlink_tree(&source, &target).map_err(VolumeError::Materialize)?;
+        }
         stats.relays_created += 1;
     }
     Ok(stats)
@@ -565,10 +583,22 @@ pub fn attach_project_local(
     Ok(stats)
 }
 
+/// Windows has no reflink syscall binding; the backend argument is accepted
+/// for API symmetry but the local view always hardlinks (copy fallback).
+#[cfg(windows)]
+pub fn attach_project_local_with_backend(
+    project_root: &Path,
+    volume: &VolumeRef,
+    _backend: MaterializeBackend,
+) -> Result<AttachStats, VolumeError> {
+    attach_project_local(project_root, volume)
+}
+
 #[cfg(all(not(unix), not(windows)))]
-pub fn attach_project_local(
+pub fn attach_project_local_with_backend(
     _project_root: &Path,
     _volume: &VolumeRef,
+    _backend: MaterializeBackend,
 ) -> Result<AttachStats, VolumeError> {
     Err(VolumeError::Materialize(
         MaterializeError::SymlinksUnsupported,
@@ -687,5 +717,59 @@ mod tests {
             PathBuf::from("../foo/cli.js")
         );
         assert!(project_attached(project.path(), volume_root.path()));
+    }
+
+    /// `attach_project_local_with_backend(.., Reflink)` must produce CoW clones:
+    /// a distinct inode per file (not a hardlink) whose writes never reach the
+    /// shared graph volume. Skipped on filesystems without reflink support.
+    #[test]
+    fn reflink_attachment_isolates_writes_from_the_volume() {
+        let dir = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        let volume_root = dir.path().join("vol");
+        let volume = volume_root.join("node_modules");
+        fs::create_dir_all(volume.join("foo")).unwrap();
+        let payload = b"original volume bytes";
+        fs::write(volume.join("foo/file.txt"), payload).unwrap();
+
+        let volume_ref = VolumeRef {
+            path: volume_root.clone(),
+            cached: false,
+            stats: MaterializeStats::default(),
+        };
+
+        // Skip on filesystems without reflink support.
+        let caps = crate::materializer::probe_fs_capabilities(&volume_root);
+        if !caps.reflink {
+            eprintln!("skipping: filesystem does not support reflink");
+            return;
+        }
+
+        let stats = attach_project_local_with_backend(
+            project.path(),
+            &volume_ref,
+            MaterializeBackend::Reflink,
+        )
+        .unwrap();
+        assert_eq!(stats.relays_created, 1);
+
+        // A reflink is a distinct inode (new inode, shared data extents), not a
+        // hardlink to the volume file. This also catches a regression where
+        // reflink silently fell back to hardlink on a supporting filesystem.
+        let project_file = project.path().join("node_modules/foo/file.txt");
+        let volume_file = volume.join("foo/file.txt");
+        assert_ne!(
+            fs::metadata(&project_file).unwrap().ino(),
+            fs::metadata(&volume_file).unwrap().ino(),
+            "reflink must create a distinct inode, not a hardlink"
+        );
+
+        // CoW isolation: mutating the project clone must not touch the volume.
+        fs::write(&project_file, b"mutated project bytes").unwrap();
+        assert_eq!(
+            fs::read(&volume_file).unwrap(),
+            payload,
+            "a project-view write reached the shared graph volume (CoW broken)"
+        );
     }
 }
