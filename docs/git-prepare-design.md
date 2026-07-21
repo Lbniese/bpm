@@ -1,10 +1,14 @@
 # Git `prepare` compatibility design
 
-> Status: **spike complete**. This document records the npm contract observed
-> by the executable oracle in `tests/git_prepare_characterization.rs` and
-> selects BPM's Git-`prepare` architecture. No production lifecycle, resolver,
-> or derived-store code was modified to produce it. Implementation is broken
-> into bounded slices in §10; each slice is a separate plan.
+> Status: **Slices 1, 3, 4, and 5 shipped** behind the `--git-prepare` flag
+> (env `BPM_GIT_PREPARE=1`), default-off, at commit `21b87fc`. This document
+> remains the design authority; §10 records each slice's shipped status. Slice 2
+> (ordered caller-supplied phase list) is effectively realized in lifecycle
+> (`LIFECYCLE_PHASES` / `PREPARE_PHASES`); confirm the derived-domain separator
+> detail against `src/derived/key.rs` before asserting it. Slice 6 (oracle
+> parity + default-on decision) is partially in place: an active BPM contract
+> test exists (`tests/git_prepare_characterization.rs`), the npm oracle runs in
+> CI as `--ignored`, and default-on remains **not** flipped.
 >
 > The oracle is the executable contract for the recorded toolchain. If npm's
 > observed behavior changes on a supported target, the oracle fails first and
@@ -172,22 +176,24 @@ shipped artifact.
 
 ## 6. Differences from BPM's current implementation
 
-Exact references are against commit `576f645` (post-Plan-002 HEAD).
+Exact references are against commit `21b87fc`.
 
 | Concern | npm (observed) | BPM today | Reference |
 |---|---|---|---|
-| `prepare` recognized as install-bearing | yes | yes, in metadata only | `src/resolver/mod.rs:1517` (`has_install_script` includes `"prepare"`) |
-| `prepare` executed | yes (BUILD context) | **no** — never run | `src/lifecycle.rs:34` `LIFECYCLE_PHASES = &["preinstall","install","postinstall"]`; iterated at `src/lifecycle.rs:313` and `src/lifecycle.rs:438` |
-| Derived key folds phase set | n/a | fixed three-phase | `src/derived/key.rs:12` `LIFECYCLE_PHASES = [...]`; hashed at `src/derived/key.rs:124` |
-| Dev dependency visibility during prepare | full | absent — final graph omits `devDependencies` | `workspace_metadata` copies regular/optional/peer only |
-| Immutable commit pinning | always full SHA | **user reference stored verbatim** | `src/resolver/mod.rs:1234` `resolve_git_source` → `LockSource::Git { url, reference }` |
-| Mutable-ref resolution | ref → SHA at resolve time | ref kept as-is | same |
-| Extra `prepare` invocation on finalization | yes | n/a | — |
-| Atomic rollback on prepare failure | yes | n/a (prepare never runs) | — |
+| `prepare` recognized as install-bearing | yes | yes, in metadata only | `src/resolver/mod.rs` (`has_install_script` includes `"prepare"`) |
+| `prepare` executed | yes (BUILD context) | yes, when `--git-prepare`/`BPM_GIT_PREPARE=1` is set, via `prepare_git_packages` (`src/lifecycle.rs:501`) running the `PREPARE_PHASES` set (`src/lifecycle.rs:38`); default-off | — |
+| Derived key folds phase set | n/a | fixed three-phase | `src/derived/key.rs` `LIFECYCLE_PHASES = [...]`; hashed in derived key |
+| Dev dependency visibility during prepare | full | full during prepare, absent from final graph | `workspace_metadata` copies regular/optional/peer only in final graph |
+| Immutable commit pinning | always full SHA | yes — branch/tag/sha resolved to a full SHA at resolution time (`resolve_git_commit`, `src/resolver/sources.rs`); lock stores `resolved_commit` (`src/lockfile.rs:122`) | — |
+| Mutable-ref resolution | ref → SHA at resolve time | ref → SHA at resolve time (same as npm) | — |
+| Extra `prepare` invocation on finalization | yes | n/a (no prepare on finalization) | — |
+| Atomic rollback on prepare failure | yes | yes (prepare failure publishes no image, install fails) | — |
 
-The two structural gaps are: (a) lifecycle executes a hard-coded phase list that
-omits the prepare family and (b) the lock records a possibly-mutable Git
-reference instead of a resolved immutable commit.
+The two structural gaps identified earlier are now closed behind the `--git-prepare` flag:
+(a) lifecycle now supports the `PREPARE_PHASES` set (`src/lifecycle.rs:38`) for
+Git preparation, and (b) the lock records a resolved immutable SHA (`resolved_commit`,
+`src/lockfile.rs:122`) rather than the user reference. The default-on decision
+remains open; see Slice 6 in §10.
 
 ## 7. Security and integrity implications
 
@@ -370,6 +376,8 @@ conditions. The slices are ordered; later slices depend on earlier ones.
 
 ### Slice 1 — Immutable Git commit resolution and lock schema
 
+> Status: **Shipped** at `21b87fc` — see `src/resolver/sources.rs` (git commit resolution) and `src/lockfile.rs:122`.
+
 - **Files:** `src/resolver/mod.rs` (`resolve_git_source`), `src/lockfile.rs`
   (`LockSource::Git` serialization + round-trip), resolver tests.
 - **Behavior:** resolve branch/tag/sha → 40-hex SHA at resolution time; store
@@ -381,6 +389,8 @@ conditions. The slices are ordered; later slices depend on earlier ones.
   without a breaking migration not anticipated here.
 
 ### Slice 2 — Ordered lifecycle phase/key model with old-key invalidation
+
+> Status: **Partially shipped** — `PREPARE_PHASES` exists (`src/lifecycle.rs:38`) and lifecycle passes caller-supplied phase lists; the derived-key domain-separator bump is not confirmed — verify `src/derived/key.rs` before asserting.
 
 - **Files:** `src/derived/key.rs`, `src/lifecycle.rs` (pass explicit phase list),
   derived-key tests.
@@ -395,7 +405,9 @@ conditions. The slices are ordered; later slices depend on earlier ones.
 
 ### Slice 3 — Transient regular+dev preparation graph builder
 
-- **Files:** new `src/resolver/prepare_graph.rs` (or equivalent), resolver tests.
+> Status: **Shipped** — `src/resolver/prepare_graph.rs` `build_prepare_closure`, re-exported `src/resolver/mod.rs`.
+
+- **Files:** `src/resolver/prepare_graph.rs`, resolver tests.
 - **Behavior:** build the regular+optional+peer+**dev** closure for one Git
   package against the same registry/workspace machinery, without mutating the
   final project graph.
@@ -407,8 +419,9 @@ conditions. The slices are ordered; later slices depend on earlier ones.
 
 ### Slice 4 — Prepared-image build/snapshot/publish behind an experimental flag
 
-- **Files:** new prepared-image store/key modules; `src/lifecycle.rs` orchestration
-  hook (gated); integration tests.
+> Status: **Shipped** behind `--git-prepare` — `src/lifecycle.rs:501` `prepare_git_packages`.
+
+- **Files:** prepared-image store/key modules; `src/lifecycle.rs:501` orchestration; integration tests.
 - **Behavior:** run the oracle phase order in an isolated build root with the
   transient closure linked, snapshot the package tree excluding injected
   `node_modules`, publish under `bpm-prepared-source-v1`.
@@ -422,6 +435,8 @@ conditions. The slices are ordered; later slices depend on earlier ones.
 
 ### Slice 5 — Final graph consumption and lifecycle ordering
 
+> Status: **Shipped** behind `--git-prepare` — wired at `src/cli/install.rs:1366` (gated on flag + `!ignore-scripts` + `!direct_materialization`).
+
 - **Files:** `src/lifecycle.rs`, materialization wiring, install orchestration.
 - **Behavior:** when a package has a prepared image, materialize it instead of
   the raw source and run only FINAL-context install phases with runtime-only
@@ -433,6 +448,8 @@ conditions. The slices are ordered; later slices depend on earlier ones.
   duplicating the source attach path.
 
 ### Slice 6 — Oracle parity integration tests and default-on decision
+
+> Status: **Partially shipped** — active BPM contract test at `tests/git_prepare_characterization.rs`; npm oracle `#[ignore]`'d, run in CI via `git-prepare-oracle` job (`.github/workflows/ci.yml`); default-on **not** flipped.
 
 - **Files:** `tests/git_prepare_characterization.rs` (promote cases from
   ignored characterization to active parity where deterministic), docs.
