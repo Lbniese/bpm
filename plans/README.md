@@ -21,7 +21,7 @@ depends on 002 landing first.
 | 003  | Widen shipped `--git-prepare` end-to-end coverage | P2 | M | — | DONE |
 | 004  | Split `src/registry.rs` god module into a `src/registry/` package | P3 | M | — | DONE |
 | 005  | Unify the dual resolver and default-flip to async resolve | P1 | L | 002 (required); 004 (recommended) | PARTIAL (Phase 1 characterization done; parity corpus landed; Phases 2–5 blocked on HIGH-risk gated placement-core extraction + benchmark evidence) |
-| 006  | Generalize project-attachment backends (reflink/clone + non-Unix parity) | P2 | L | — | PARTIAL (Phase 1 backend variant+probe + Phase 4 local-view allowlist + Phase 6 docs landed; Phase 2/3 reflink syscall wiring blocked on adding `libc` dep; Phase 5 Windows junctions blocked on no Windows test box) |
+| 006  | Generalize project-attachment backends (reflink/clone + non-Unix parity) | P2 | L | — | PARTIAL (Phases 1–4 + 6 docs landed: `Reflink` backend wired to macOS `clonefile`/Linux `FICLONE` with hardlink→copy fallback, `probe_fs_capabilities` runtime probe, `BPM_PROJECT_VIEW=reflink` project view, generalized local-view trigger; `libc` dep added as unix-only. Phase 5 Windows junctions blocked on no Windows test box) |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) |
 REJECTED (with one-line rationale — finding fixed independently or approach
