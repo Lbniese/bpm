@@ -30,7 +30,10 @@ pub(super) fn run(script: &str) -> anyhow::Result<()> {
         "npm_package_version",
         manifest.version.clone().unwrap_or_default(),
     );
-    child.env("npm_config_user_agent", "bpm/0.1.0");
+    child.env(
+        "npm_config_user_agent",
+        concat!("bpm/", env!("CARGO_PKG_VERSION")),
+    );
     child.env("npm_execpath", "bpm");
     child.env("INIT_CWD", &cwd);
     let node = bpm::platform::find_executable(
