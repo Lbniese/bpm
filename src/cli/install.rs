@@ -373,11 +373,11 @@ pub(super) fn install_resolved_lockfile(
 
 fn use_local_project_view(lockfile: &Lockfile) -> bool {
     match env::var("BPM_PROJECT_VIEW").as_deref() {
-        Ok("local") => true,
+        Ok("local") | Ok("reflink") => true,
         Ok("relay") => false,
         Ok(value) if !value.is_empty() => {
             eprintln!(
-                "warning: unsupported BPM_PROJECT_VIEW={value:?}; expected relay or local; using auto"
+                "warning: unsupported BPM_PROJECT_VIEW={value:?}; expected relay, local, or reflink; using auto"
             );
             lockfile.root.dependencies.contains_key("next")
         }
@@ -385,15 +385,43 @@ fn use_local_project_view(lockfile: &Lockfile) -> bool {
     }
 }
 
+/// Packages whose presence in a resolved graph marks the project as needing
+/// a local (non-relay) view. These are tools that canonicalize dependency
+/// realpaths themselves and reject symlinked `node_modules` entries; Next.js
+/// is the canonical example (Turbopack resolves its toolchain from the project
+/// and requires those realpaths to remain project-local).
+///
+/// The default set preserves prior behavior (`["next"]` only). Operators can
+/// extend it without code changes via `BPM_LOCAL_VIEW_PACKAGES`, a
+/// comma-separated list of package names that is merged with the built-in
+/// `next` default; the built-in `next` entry is always retained so existing
+/// Next.js installs never regress even if the env list omits it.
+fn local_view_fragile_packages() -> Vec<String> {
+    let mut packages = vec!["next".to_string()];
+    if let Ok(value) = env::var("BPM_LOCAL_VIEW_PACKAGES") {
+        for name in value
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            if !packages.iter().any(|existing| existing == name) {
+                packages.push(name.to_string());
+            }
+        }
+    }
+    packages
+}
+
 fn auto_local_project_view(lockfile: &Lockfile) -> bool {
     // Check the resolved graph rather than only root declarations. Imported
     // lockfiles and workspace layouts can represent the app's Next package as
     // a transitive placement, but Next still resolves its toolchain from the
     // project and requires those realpaths to remain project-local.
+    let fragile = local_view_fragile_packages();
     lockfile
         .packages
         .iter()
-        .any(|package| package.name == "next")
+        .any(|package| fragile.iter().any(|name| &package.name == name))
 }
 
 fn adaptive_workers(requested: usize, work_items: usize, project_root: &Path) -> usize {
@@ -1584,5 +1612,43 @@ mod tests {
         });
 
         assert!(!auto_local_project_view(&lockfile));
+    }
+
+    #[test]
+    fn auto_view_detects_allowlisted_package_from_env() {
+        // The built-in `next` default must keep working even when the env list
+        // is set without it; the env list only extends the allowlist.
+        std::env::set_var("BPM_LOCAL_VIEW_PACKAGES", "turbopack,vite");
+        let mut lockfile = Lockfile::new("test");
+        lockfile.packages.push(PackageEntry {
+            path: "node_modules/turbopack".into(),
+            name: "turbopack".into(),
+            version: "1.0.0".into(),
+            ..Default::default()
+        });
+        // Env-added package triggers the local view.
+        assert!(auto_local_project_view(&lockfile));
+
+        let mut lockfile = Lockfile::new("test");
+        lockfile.packages.push(PackageEntry {
+            path: "node_modules/next".into(),
+            name: "next".into(),
+            version: "15.0.0".into(),
+            ..Default::default()
+        });
+        // Built-in `next` still triggers even though the env list omitted it.
+        assert!(auto_local_project_view(&lockfile));
+
+        let mut lockfile = Lockfile::new("test");
+        lockfile.packages.push(PackageEntry {
+            path: "node_modules/express".into(),
+            name: "express".into(),
+            version: "4.0.0".into(),
+            ..Default::default()
+        });
+        // A package neither built-in nor env-listed does not trigger.
+        assert!(!auto_local_project_view(&lockfile));
+
+        std::env::remove_var("BPM_LOCAL_VIEW_PACKAGES");
     }
 }

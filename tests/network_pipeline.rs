@@ -854,7 +854,7 @@ fn async_resolve_multiple_deps_byte_identical() {
     );
 
     let dep2_tgz = package_tgz("multi-dep-2", "2.0.0", None);
-    let server2 = same_host_registry_mock(
+    let _server2 = same_host_registry_mock(
         "multi-dep-2",
         "2.0.0",
         "tarballs/multi-dep-2-2.0.0.tgz",
@@ -874,7 +874,7 @@ fn async_resolve_multiple_deps_byte_identical() {
     write_npmrc(project.path(), &[format!("registry={}", server1.url(""))]);
 
     // Blocking resolve (should fail because dep2 doesn't exist on server1)
-    let (ok_block, _, stderr_block) =
+    let (ok_block, _, _stderr_block) =
         run_bpm(&["install"], project.path(), store_block.path(), None);
 
     // This is expected to fail, but we can still check both resolvers behave the same
@@ -927,7 +927,7 @@ fn async_resolve_multiple_deps_byte_identical() {
 fn async_resolve_transitive_dependency_byte_identical() {
     // Create dep-b first
     let dep_b_tgz = package_tgz("transitive-dep-b", "1.0.0", None);
-    let server_b = same_host_registry_mock(
+    let _server_b = same_host_registry_mock(
         "transitive-dep-b",
         "1.0.0",
         "tarballs/transitive-dep-b-1.0.0.tgz",
@@ -971,7 +971,7 @@ fn async_resolve_transitive_dependency_byte_identical() {
     write_npmrc(project.path(), &[format!("registry={}", server_a.url(""))]);
 
     // Blocking resolve
-    let (ok_block, stdout_block, stderr_block) =
+    let (ok_block, _stdout_block, _stderr_block) =
         run_bpm(&["install"], project.path(), store_block.path(), None);
     if !ok_block {
         // Transitive dependency might not be resolved - check parity by seeing if async also fails
