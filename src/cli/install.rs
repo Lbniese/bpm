@@ -371,17 +371,45 @@ pub(super) fn install_resolved_lockfile(
     )
 }
 
-fn use_local_project_view(lockfile: &Lockfile) -> bool {
-    match env::var("BPM_PROJECT_VIEW").as_deref() {
-        Ok("local") | Ok("reflink") => true,
-        Ok("relay") => false,
-        Ok(value) if !value.is_empty() => {
+/// The project's `node_modules` attachment shape, resolved from
+/// `BPM_PROJECT_VIEW` or auto-detected from the resolved graph.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProjectView {
+    /// Shallow top-level relays into the graph volume (the warm fast path).
+    Relay,
+    /// Project-local hardlink tree per package (realpaths stay project-local).
+    Local,
+    /// Project-local copy-on-write reflink tree per package; isolated from the
+    /// store image on supporting filesystems, hardlink fallback otherwise.
+    Reflink,
+}
+
+fn resolve_project_view(lockfile: &Lockfile) -> ProjectView {
+    let override_view = env::var("BPM_PROJECT_VIEW")
+        .ok()
+        .filter(|value| !value.is_empty());
+    resolve_project_view_with(lockfile, override_view.as_deref())
+}
+
+fn resolve_project_view_with(lockfile: &Lockfile, view: Option<&str>) -> ProjectView {
+    let auto = || {
+        if auto_local_project_view(lockfile) {
+            ProjectView::Local
+        } else {
+            ProjectView::Relay
+        }
+    };
+    match view {
+        Some("reflink") => ProjectView::Reflink,
+        Some("local") => ProjectView::Local,
+        Some("relay") => ProjectView::Relay,
+        Some(value) => {
             eprintln!(
                 "warning: unsupported BPM_PROJECT_VIEW={value:?}; expected relay, local, or reflink; using auto"
             );
-            lockfile.root.dependencies.contains_key("next")
+            auto()
         }
-        _ => auto_local_project_view(lockfile),
+        None => auto(),
     }
 }
 
@@ -1407,7 +1435,8 @@ fn finalize_install(
     // inside the project. Keep the O(top-level) relay fast path for ordinary
     // projects, but use a local hardlink view automatically for Next projects;
     // callers can override this with BPM_PROJECT_VIEW=relay|local.
-    let local_project_view = use_local_project_view(lockfile);
+    let project_view = resolve_project_view(lockfile);
+    let local_project_view = !matches!(project_view, ProjectView::Relay);
     let (volume, mut view_entry_count) = if direct_materialization {
         bpm::materializer::materialize_lockfile_with_backend(
             project_root,
@@ -1415,10 +1444,10 @@ fn finalize_install(
             lockfile,
             artifact_ids,
             bpm::materializer::MaterializeMode::Compatible,
-            if local_project_view {
-                bpm::materializer::MaterializeBackend::Hardlink
-            } else {
-                bpm::materializer::MaterializeBackend::Auto
+            match project_view {
+                ProjectView::Reflink => bpm::materializer::MaterializeBackend::Reflink,
+                ProjectView::Local => bpm::materializer::MaterializeBackend::Hardlink,
+                ProjectView::Relay => bpm::materializer::MaterializeBackend::Auto,
             },
         )?;
         (None, 0usize)
@@ -1459,7 +1488,12 @@ fn finalize_install(
     )?;
     if local_project_view {
         if let Some(volume) = volume.as_ref() {
-            let attached = bpm::volume::attach_project_local(project_root, volume)?;
+            let backend = match project_view {
+                ProjectView::Reflink => bpm::materializer::MaterializeBackend::Reflink,
+                _ => bpm::materializer::MaterializeBackend::Hardlink,
+            };
+            let attached =
+                bpm::volume::attach_project_local_with_backend(project_root, volume, backend)?;
             view_entry_count = attached.relays_created + attached.relays_unchanged;
         }
     }
@@ -1585,7 +1619,7 @@ impl std::error::Error for FetchFail {
 
 #[cfg(test)]
 mod tests {
-    use super::auto_local_project_view;
+    use super::{auto_local_project_view, resolve_project_view_with, ProjectView};
     use bpm::lockfile::{Lockfile, PackageEntry};
 
     #[test]
@@ -1650,5 +1684,32 @@ mod tests {
         assert!(!auto_local_project_view(&lockfile));
 
         std::env::remove_var("BPM_LOCAL_VIEW_PACKAGES");
+    }
+
+    #[test]
+    fn resolve_project_view_maps_env_values() {
+        let lockfile = Lockfile::new("test");
+        assert_eq!(
+            resolve_project_view_with(&lockfile, Some("reflink")),
+            ProjectView::Reflink
+        );
+        assert_eq!(
+            resolve_project_view_with(&lockfile, Some("local")),
+            ProjectView::Local
+        );
+        assert_eq!(
+            resolve_project_view_with(&lockfile, Some("relay")),
+            ProjectView::Relay
+        );
+        // No override on a graph with no fragile package stays relay.
+        assert_eq!(
+            resolve_project_view_with(&lockfile, None),
+            ProjectView::Relay
+        );
+        // An unrecognized value warns and falls back to auto (relay here).
+        assert_eq!(
+            resolve_project_view_with(&lockfile, Some("bogus")),
+            ProjectView::Relay
+        );
     }
 }
