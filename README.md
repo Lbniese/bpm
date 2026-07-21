@@ -14,6 +14,9 @@ a global content-addressed store and shared across projects.
 - 2026-07-21: Added active git-prepare failure/rerun/ref-pinning/identity tests (Plan 003 completed)
 - 2026-07-21: Split registry.rs into registry/ package (Plan 004 completed)
 - 2026-07-21: Added disjunctive/multiple-dep/transitive parity tests (Plan 002 completed)
+- 2026-07-21: Added multi-package parity tests for transitive/peer/cycle/optional graphs (Plan 002 corpus extended)
+- 2026-07-21: Added `Reflink` materialize backend variant + `probe_fs_capabilities` and generalized the local-view trigger with `BPM_LOCAL_VIEW_PACKAGES`/`BPM_PROJECT_VIEW=reflink` (Plan 006 partial; reflink syscall wiring and Windows junctions deferred)
+- 2026-07-21: Characterized dual-resolver placement cores and confirmed async/blocking byte-identical output across the full parity corpus (Plan 005 Phase 1; extraction + default-flip deferred as HIGH-risk gated work)
 
 ## Quick start
 

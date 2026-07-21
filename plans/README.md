@@ -17,11 +17,11 @@ depends on 002 landing first.
 | Plan | Title | Priority | Effort | Depends on | Status |
 |------|-------|----------|--------|------------|--------|
 | 001  | Fix `git-prepare-design.md` doc drift (reconcile with shipped slices 1/3/4/5) | P1 | S | — | DONE |
-| 002  | Widen async-vs-blocking resolver parity test coverage | P1 | M | — | DONE |
+| 002  | Widen async-vs-blocking resolver parity test coverage | P1 | M | — | DONE (corpus: single/multi/transitive/peer/cycle/optional/disjunctive; byte-identical for success + failure parity) |
 | 003  | Widen shipped `--git-prepare` end-to-end coverage | P2 | M | — | DONE |
 | 004  | Split `src/registry.rs` god module into a `src/registry/` package | P3 | M | — | DONE |
-| 005  | Unify the dual resolver and default-flip to async resolve | P1 | L | 002 (required); 004 (recommended) | TODO |
-| 006  | Generalize project-attachment backends (reflink/clone + non-Unix parity) | P2 | L | — | TODO |
+| 005  | Unify the dual resolver and default-flip to async resolve | P1 | L | 002 (required); 004 (recommended) | PARTIAL (Phase 1 characterization done; parity corpus landed; Phases 2–5 blocked on HIGH-risk gated placement-core extraction + benchmark evidence) |
+| 006  | Generalize project-attachment backends (reflink/clone + non-Unix parity) | P2 | L | — | PARTIAL (Phase 1 backend variant+probe + Phase 4 local-view allowlist + Phase 6 docs landed; Phase 2/3 reflink syscall wiring blocked on adding `libc` dep; Phase 5 Windows junctions blocked on no Windows test box) |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) |
 REJECTED (with one-line rationale — finding fixed independently or approach
