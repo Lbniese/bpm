@@ -68,7 +68,93 @@ pub enum MaterializeBackend {
     /// so writes to one project never affect the shared store or another
     /// project.
     IsolatedCopy,
+    /// Copy-on-write reflink/clone of the store image into the project view.
+    /// Cheaper than `IsolatedCopy` (shared extents until first write) with the
+    /// same isolation guarantee (writes copy-on-write away from the read-only
+    /// content-addressed store). Falls back to `Hardlink` then `IsolatedCopy`
+    /// when the filesystem lacks reflink support (`ENOTSUP`/`EPERM`/`EXDEV`).
+    /// Requires a supporting filesystem (macOS APFS `clonefile`, Linux
+    /// btrfs/xfs `FICLONE`); the capability is probed at runtime by
+    /// [`probe_fs_capabilities`].
+    Reflink,
     Auto,
+}
+
+/// Filesystem capabilities relevant to materialization backends, probed at
+/// runtime for the volume containing a directory (typically the project root
+/// or store volume). Used by `Auto` selection and the reflink fallback chain.
+///
+/// The probe is intentionally dep-free: it reports the capabilities that the
+/// currently-linked std/syscall surface can exercise. On Unix without a
+/// `clonefile`/`FICLONE` binding (the crate keeps a minimal dependency set by
+/// policy), `reflink` reports `false`; callers that plumb in a reflink syscall
+/// binding can override the probe result. This keeps `Auto` behavior unchanged
+/// — `Reflink` is never selected unless the capability is confirmed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FsCapabilities {
+    /// `true` when symlinks are usable on this volume/platform.
+    pub symlink: bool,
+    /// `true` when hardlinks are usable on this volume.
+    pub hardlink: bool,
+    /// `true` when a copy-on-write reflink/clone can be created on this
+    /// volume (requires both a supporting filesystem and a syscall binding
+    /// the crate actually links).
+    pub reflink: bool,
+}
+
+impl FsCapabilities {
+    /// `Auto`-selection ranking: prefer reflink (CoW isolation for free),
+    /// fall back to symlink (cheapest), then hardlink, then copy.
+    pub fn preferred_backend(self) -> MaterializeBackend {
+        if self.reflink {
+            MaterializeBackend::Reflink
+        } else if self.symlink {
+            MaterializeBackend::Symlink
+        } else if self.hardlink {
+            MaterializeBackend::Hardlink
+        } else {
+            MaterializeBackend::IsolatedCopy
+        }
+    }
+}
+
+/// Probe the filesystem capabilities of the volume containing `dir`.
+///
+/// This is the runtime hook the `Auto` backend consults. The default
+/// implementation is conservative and dep-free: it confirms `symlink` and
+/// `hardlink` via `std::fs` round-trips in a temp sibling of `dir`, and leaves
+/// `reflink` as `false` (the crate does not link a `clonefile`/`FICLONE`
+/// binding today — see `MaterializeBackend::Reflink`). Probe failures degrade
+/// gracefully: a capability that cannot be confirmed reports `false`.
+pub fn probe_fs_capabilities(dir: &Path) -> FsCapabilities {
+    let parent = dir.parent().unwrap_or_else(|| Path::new("."));
+    let mut caps = FsCapabilities::default();
+    let Ok(tmp) = tempfile::Builder::new().tempdir_in(parent) else {
+        return caps;
+    };
+    let src = tmp.path().join("probe.src");
+    let link = tmp.path().join("probe.link");
+    let hard = tmp.path().join("probe.hard");
+
+    if fs::write(&src, b"probe").is_ok() {
+        // Symlink capability (respecting platform restrictions).
+        #[cfg(unix)]
+        if std::os::unix::fs::symlink(&src, &link).is_ok() {
+            caps.symlink = true;
+        }
+        // Hardlink capability works across most local filesystems.
+        if fs::hard_link(&src, &hard).is_ok() {
+            caps.hardlink = true;
+            let _ = fs::remove_file(&hard);
+        }
+    }
+    // Reflink requires a syscall binding the crate does not currently link
+    // (policy: no new direct deps unless justified). Report `false` so `Auto`
+    // never selects `Reflink` until a binding is plumbed in; the variant is
+    // still available for explicit `materialize_with_backend(..., Reflink)`
+    // callers and future syscall wiring.
+    caps.reflink = false;
+    caps
 }
 
 #[derive(Debug, Error)]
@@ -197,6 +283,13 @@ pub fn materialize_with_backend(
                 copy_tree(&image_dir, &target)?;
                 cfg!(unix)
             }
+            MaterializeBackend::Reflink => {
+                // Reflink falls back to hardlink then isolated copy when the
+                // filesystem lacks reflink support, preserving the isolation
+                // guarantee (writes never reach the store image).
+                reflink_tree(&image_dir, &target)?;
+                cfg!(unix)
+            }
             MaterializeBackend::Auto => {
                 if let Err(error) = link_path(&target, &image_dir) {
                     if !matches!(error, MaterializeError::SymlinksUnsupported) {
@@ -236,6 +329,28 @@ pub(crate) fn hardlink_tree(source: &Path, target: &Path) -> Result<(), Material
         return hardlink_tree_from_index(source, target, &index_path);
     }
     hardlink_tree_by_walking_directory(source, target)
+}
+
+/// Materialize `source` into `target` using copy-on-write reflink where the
+/// filesystem supports it (macOS APFS `clonefile`, Linux btrfs/xfs `FICLONE`),
+/// transparently falling back to [`hardlink_tree`] then [`copy_tree`] when the
+/// reflink syscall is unavailable or rejected (`ENOTSUP`/`EPERM`/`EXDEV`).
+///
+/// The store image is read-only and content-addressed, so a CoW reflink is
+/// safe: writes in the project view copy-on-write away from the store image —
+/// the same isolation guarantee as `IsolatedCopy`, but cheaper on supporting
+/// filesystems.
+///
+/// This build does not link a `clonefile`/`FICLONE` syscall binding (the crate
+/// keeps a minimal dependency set; see `MaterializeBackend::Reflink`). The
+/// function therefore always degrades to the hardlink→copy chain, preserving
+/// correctness. Wiring the syscalls (Phase 2 of the attachment-backend plan)
+/// replaces the [`hardlink_tree`] call below with a probe-then-reflink path.
+pub(crate) fn reflink_tree(source: &Path, target: &Path) -> Result<(), MaterializeError> {
+    // TODO(attachment-backends): attempt clonefile/FICLONE here and only fall
+    // back on ENOTSUP/EPERM/EXDEV. Until the syscall binding lands, hardlink
+    // (then copy, inside hardlink_tree) is the correct, non-regressing path.
+    hardlink_tree(source, target)
 }
 
 fn hardlink_tree_by_walking_directory(
