@@ -789,8 +789,12 @@ fn malformed_integrity_fails_async_streaming() {
 #[test]
 fn async_resolve_disjunctive_range_byte_identical() {
     let pkg_tgz = package_tgz("disjunctive-pkg", "1.2.0", None);
-    let server =
-        same_host_registry_mock("disjunctive-pkg", "1.2.0", "tarballs/disjunctive-pkg-1.2.0.tgz", pkg_tgz);
+    let server = same_host_registry_mock(
+        "disjunctive-pkg",
+        "1.2.0",
+        "tarballs/disjunctive-pkg-1.2.0.tgz",
+        pkg_tgz,
+    );
 
     let project = tempfile::tempdir().unwrap();
     let store_block = tempfile::tempdir().unwrap();
@@ -842,12 +846,20 @@ fn async_resolve_disjunctive_range_byte_identical() {
 #[test]
 fn async_resolve_multiple_deps_byte_identical() {
     let dep1_tgz = package_tgz("multi-dep-1", "1.0.0", None);
-    let server1 =
-        same_host_registry_mock("multi-dep-1", "1.0.0", "tarballs/multi-dep-1-1.0.0.tgz", dep1_tgz);
+    let server1 = same_host_registry_mock(
+        "multi-dep-1",
+        "1.0.0",
+        "tarballs/multi-dep-1-1.0.0.tgz",
+        dep1_tgz,
+    );
 
     let dep2_tgz = package_tgz("multi-dep-2", "2.0.0", None);
-    let server2 =
-        same_host_registry_mock("multi-dep-2", "2.0.0", "tarballs/multi-dep-2-2.0.0.tgz", dep2_tgz);
+    let server2 = same_host_registry_mock(
+        "multi-dep-2",
+        "2.0.0",
+        "tarballs/multi-dep-2-2.0.0.tgz",
+        dep2_tgz,
+    );
 
     let project = tempfile::tempdir().unwrap();
     let store_block = tempfile::tempdir().unwrap();
@@ -864,7 +876,7 @@ fn async_resolve_multiple_deps_byte_identical() {
     // Blocking resolve (should fail because dep2 doesn't exist on server1)
     let (ok_block, _, stderr_block) =
         run_bpm(&["install"], project.path(), store_block.path(), None);
-    
+
     // This is expected to fail, but we can still check both resolvers behave the same
     if !ok_block {
         // If blocking fails, async should also fail
@@ -915,8 +927,13 @@ fn async_resolve_multiple_deps_byte_identical() {
 fn async_resolve_transitive_dependency_byte_identical() {
     // Create dep-b first
     let dep_b_tgz = package_tgz("transitive-dep-b", "1.0.0", None);
-    let server_b = same_host_registry_mock("transitive-dep-b", "1.0.0", "tarballs/transitive-dep-b-1.0.0.tgz", dep_b_tgz);
-    
+    let server_b = same_host_registry_mock(
+        "transitive-dep-b",
+        "1.0.0",
+        "tarballs/transitive-dep-b-1.0.0.tgz",
+        dep_b_tgz,
+    );
+
     // Create dep-a that depends on dep-b
     let dep_a_tgz = build_tgz(|b| {
         common::add_file(
@@ -929,10 +946,17 @@ fn async_resolve_transitive_dependency_byte_identical() {
                 "dependencies": {
                     "transitive-dep-b": "^1.0.0"
                 }
-            })).expect("serialize package.json").as_slice(),
+            }))
+            .expect("serialize package.json")
+            .as_slice(),
         );
     });
-    let server_a = same_host_registry_mock("transitive-dep-a", "1.0.0", "tarballs/transitive-dep-a-1.0.0.tgz", dep_a_tgz);
+    let server_a = same_host_registry_mock(
+        "transitive-dep-a",
+        "1.0.0",
+        "tarballs/transitive-dep-a-1.0.0.tgz",
+        dep_a_tgz,
+    );
 
     let project = tempfile::tempdir().unwrap();
     let store_block = tempfile::tempdir().unwrap();
@@ -940,13 +964,15 @@ fn async_resolve_transitive_dependency_byte_identical() {
     fs::write(
         project.path().join("package.json"),
         r#"{"name":"app","version":"1.0.0","dependencies":{"transitive-dep-a":"^1.0.0"}}"#,
-    ).unwrap();
+    )
+    .unwrap();
 
     // Use server_a as the registry (it should handle requests for both)
     write_npmrc(project.path(), &[format!("registry={}", server_a.url(""))]);
 
     // Blocking resolve
-    let (ok_block, stdout_block, stderr_block) = run_bpm(&["install"], project.path(), store_block.path(), None);
+    let (ok_block, stdout_block, stderr_block) =
+        run_bpm(&["install"], project.path(), store_block.path(), None);
     if !ok_block {
         // Transitive dependency might not be resolved - check parity by seeing if async also fails
         let store_async = tempfile::tempdir().unwrap();
@@ -956,24 +982,36 @@ fn async_resolve_transitive_dependency_byte_identical() {
             .env("BPM_STORE", store_async.path())
             .env("BPM_ASYNC_RESOLVE", "1");
         let out = cmd.output().expect("run bpm with async resolver");
-        assert!(!out.status.success(), "async should also fail when blocking fails");
+        assert!(
+            !out.status.success(),
+            "async should also fail when blocking fails"
+        );
         return;
     }
-    
-    let blocking_lock = fs::read_to_string(project.path().join("bpm.lock")).expect("bpm.lock should exist");
+
+    let blocking_lock =
+        fs::read_to_string(project.path().join("bpm.lock")).expect("bpm.lock should exist");
 
     // Async resolve
     let store_async = tempfile::tempdir().unwrap();
     let _ = fs::remove_file(project.path().join("bpm.lock"));
-    
+
     let mut cmd = std::process::Command::new(bin());
     cmd.args(["install"])
         .current_dir(project.path())
         .env("BPM_STORE", store_async.path())
         .env("BPM_ASYNC_RESOLVE", "1");
     let out = cmd.output().expect("run bpm with async resolver");
-    assert!(out.status.success(), "async install failed: {}", String::from_utf8_lossy(&out.stderr));
-    let async_lock = fs::read_to_string(project.path().join("bpm.lock")).expect("bpm.lock should exist");
+    assert!(
+        out.status.success(),
+        "async install failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let async_lock =
+        fs::read_to_string(project.path().join("bpm.lock")).expect("bpm.lock should exist");
 
-    assert_eq!(blocking_lock, async_lock, "blocking and async must produce byte-identical bpm.lock");
+    assert_eq!(
+        blocking_lock, async_lock,
+        "blocking and async must produce byte-identical bpm.lock"
+    );
 }
