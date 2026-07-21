@@ -84,7 +84,8 @@ pub struct ManagedEntry {
     /// `node_modules/@scope/bar`).
     pub path: String,
     /// How this entry was attached: "relay" (symlink to volume),
-    /// "local" (hardlink/copy), or "direct" (workspace symlink).
+    /// "local" (hardlink/copy), "reflink" (copy-on-write clone), or
+    /// "direct" (workspace symlink).
     pub mode: String,
     /// Old volume or symlink target at the time of recording, for identity
     /// preflight before removal.
