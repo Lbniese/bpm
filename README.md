@@ -12,7 +12,8 @@ a global content-addressed store and shared across projects.
 
 - 2026-07-21: Reconciled `docs/git-prepare-design.md` with shipped slices 1/3/4/5 (Plan 001 completed)
 - 2026-07-21: Added active git-prepare failure/rerun/ref-pinning/identity tests (Plan 003 completed)
-- 2026-07-21: Split registry.rs into registry/ package (Plan 004 partial - module structure created)
+- 2026-07-21: Split registry.rs into registry/ package (Plan 004 completed)
+- 2026-07-21: Added disjunctive/multiple-dep/transitive parity tests (Plan 002 completed)
 
 ## Quick start
 
