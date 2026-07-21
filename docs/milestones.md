@@ -5,7 +5,7 @@ title: Milestones
 
 # Milestones
 
-Status against the plan in `IMPLEMENTATION.md` (local, not committed).
+Status of each milestone.
 This page is updated as work lands; if it disagrees with the commit history,
 the commit history wins.
 
@@ -37,7 +37,7 @@ The benchmark harness is implemented and has a checked-in reference baseline
 (`benchmarks/baselines/reference.json`). Refresh it whenever the materialization
 or lifecycle strategy changes, and do not compare results across different
 toolchain/version maps. The current reference baseline (arm64 / macOS 26.5,
-node v26.0.0, npm 11.12.1, pnpm 10.13.1, **bpm 0.1.10**) covers five fixtures:
+node v26.0.0, npm 11.12.1, pnpm 10.13.1, **bpm 0.0.1**) covers five fixtures:
 `large-frontend`, `many-small-files`, and `native-addon` across `true_cold`,
 `resolved_cold`, and `repeat_install`; plus `minimal` (`repeat_install`) and
 `monorepo` (`repeat_install`, `resolved_cold`). Regenerate a single cell with
@@ -391,5 +391,5 @@ benchmarked against the blocking resolver on `true_cold` `large-frontend` and
 1.05× speedup (median 24,992 → 23,873 ms), below the 1.10× bar;
 `native-addon` showed 1.23× speedup (6,768 → 5,514 ms), meeting the bar.
 The default remains blocking (`BPM_ASYNC_RESOLVE=1` opt-in) because both
-fixtures must meet the 10% minimum. See commit `6cb572b` for the full evidence table. The async resolver stays available for continued
+fixtures must meet the 10% minimum. The async resolver stays available for continued
 measurement and refinement.
