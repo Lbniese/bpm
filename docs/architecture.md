@@ -59,20 +59,22 @@ page records the architecture that is currently shipped.
    is extended via `BPM_LOCAL_VIEW_PACKAGES` (comma-separated package names,
    merged with the built-in default so Next.js installs never regress).
    Workspace-linked installs use the same hardlink backend for registry
-   packages. `BPM_PROJECT_VIEW=relay|local|reflink` overrides that choice
-   (`reflink` selects the local view via the CoW reflink backend, which falls
-   back to hardlink then copy when the filesystem lacks reflink support). A
-   `Reflink` materialize backend variant and a filesystem-capability probe
-   (`probe_fs_capabilities`) are available; the actual `clonefile`/`FICLONE`
-   syscall wiring is not yet linked (the crate keeps a minimal dependency set),
-   so `Reflink` currently degrades to the hardlink→copy chain and `Auto`
-   selection is unchanged. Windows uses a correctness-first local hardlink/copy
-   view; junctions and reflink/clone performance remain deferred.
+   packages. `BPM_PROJECT_VIEW=relay|local|reflink` overrides that choice:
+   `reflink` selects the project-local view via the copy-on-write `Reflink`
+   backend, which clones each package file with macOS `clonefile(2)` / Linux
+   `FICLONE` (distinct inode, shared data extents) so writes in the project
+   view never reach the read-only store image — the same isolation as a full
+   copy, cheaper on APFS/btrfs/xfs. A filesystem-capability probe
+   (`probe_fs_capabilities`) confirms reflink at runtime; on unsupported
+   filesystems (ext4, HFS+, cross-device) the backend transparently degrades
+   to hardlink then copy. Windows uses a correctness-first local hardlink/copy
+   view; junctions and ReFS reflink performance remain deferred.
 8. **Materializer** — `src/materializer.rs` supports compatible npm-v3 layout
-   and strict declared-edge validation. It has symlink, hardlink, and fallback
-   copy backends; package files are never exposed as writable store symlinks
-   in graph volumes. On Windows, safe archive symlinks are materialized as
-   copied content, and `.cmd`/`.ps1` bin shims are generated.
+   and strict declared-edge validation. It has symlink, hardlink, copy, and
+   copy-on-write reflink (`clonefile`/`FICLONE`) backends; package files are
+   never exposed as writable store symlinks in graph volumes. On Windows, safe
+   archive symlinks are materialized as copied content, and `.cmd`/`.ps1` bin
+   shims are generated.
 9. **Platform primitives** — `src/platform.rs` provides `find_executable`,
    `script_command`, and `same_file_identity` shared by lifecycle and CLI
    execution. The platform script command produces `sh -c` on Unix and
@@ -152,13 +154,16 @@ enumeration, task completion order, or network timing.
 - Integrate graph lifecycle execution with `src/derived/store.rs` for
   cross-graph derived-artifact reuse, or formally commit to graph-keyed volume
   derivation and retire the unused path.
-- Wire a `clonefile`/`FICLONE` syscall binding (e.g. the `libc` crate) into the
-  `Reflink` materialize backend and `probe_fs_capabilities` so `Auto` can select
-  CoW reflink on supporting filesystems (macOS APFS, Linux btrfs/xfs). The
-  backend variant, capability probe, and `BPM_PROJECT_VIEW=reflink` plumbing
-  have landed; only the syscall call sites and `Auto` selection remain.
+- Auto-select the CoW reflink project view (`MaterializeBackend::Reflink` via
+  `probe_fs_capabilities`/`preferred_backend`) for the local view on
+  supporting filesystems, instead of requiring an explicit
+  `BPM_PROJECT_VIEW=reflink`. The syscall binding (`clonefile`/`FICLONE`),
+  capability probe, fallback chain, and `BPM_PROJECT_VIEW=reflink` path have
+  landed; only routing the *automatic* local view (Next.js-style detection)
+  through reflink remains, gated on not regressing the warm path.
 - Windows junction/reflink attachment performance (currently correctness-first
-  local hardlink/copy).
+  local hardlink/copy; `attach_project_local_with_backend` accepts a backend
+  for API symmetry but ignores it on Windows).
 - Combine the async resolver with the streaming install path for maximum cold
   overlap.
 - Default-flip the async resolver to `BPM_ASYNC_RESOLVE=1` once the A/B
