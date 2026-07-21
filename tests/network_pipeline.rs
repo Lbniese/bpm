@@ -216,6 +216,60 @@ fn same_host_registry_mock(
     server
 }
 
+/// A multi-package registry mock: serves an arbitrary set of packages from a
+/// single server, keyed by packument path (`/<url-encoded-name>`) and
+/// tarball path (`/<tarball_path>`). Use this for transitive / peer / cycle /
+/// override parity graphs that `same_host_registry_mock` (single-package) cannot
+/// represent. Each entry is `(name, version, tarball_path, tgz)`.
+fn multi_registry_mock(packages: Vec<(&str, &str, &str, Vec<u8>)>) -> MiniServer {
+    // Pre-compute the (metadata path, tarball path, integ, version, tgz) tuples.
+    struct Pkg {
+        metadata_path: String,
+        tarball_path: String,
+        version: String,
+        integrity: String,
+        tarball: Vec<u8>,
+    }
+    let mut entries: Vec<Pkg> = Vec::new();
+    for (name, version, tarball_path, tgz) in packages {
+        let integrity = integrity_of(&tgz);
+        entries.push(Pkg {
+            metadata_path: format!("/{}", name.replace('/', "%2F")),
+            tarball_path: format!("/{}", tarball_path.trim_start_matches('/')),
+            version: version.to_string(),
+            integrity,
+            tarball: tgz,
+        });
+    }
+    let entries = Arc::new(entries);
+    let base = Arc::new(Mutex::new(String::new()));
+    let base_thread = base.clone();
+
+    let server = MiniServer::start_keep_alive_routed(move |path| {
+        let base = base_thread.lock().unwrap().clone();
+        for pkg in entries.iter() {
+            if path == pkg.metadata_path {
+                let tarball_url = format!("{}{}", base.trim_end_matches('/'), pkg.tarball_path);
+                return Some(RouteBody(
+                    serde_json::to_vec(&packument(
+                        &pkg.version,
+                        tarball_url,
+                        pkg.integrity.clone(),
+                    ))
+                    .unwrap(),
+                    "application/json",
+                ));
+            }
+            if path == pkg.tarball_path {
+                return Some(RouteBody(pkg.tarball.clone(), "application/gzip"));
+            }
+        }
+        None
+    });
+    *base.lock().unwrap() = server.url("");
+    server
+}
+
 fn metadata_only_registry_mock(
     name: &str,
     version: &str,
@@ -1013,5 +1067,302 @@ fn async_resolve_transitive_dependency_byte_identical() {
     assert_eq!(
         blocking_lock, async_lock,
         "blocking and async must produce byte-identical bpm.lock"
+    );
+}
+
+// === Plan 002: full-corpus parity tests using a multi-package mock ===
+
+/// Real transitive-success parity: app -> A -> B, both served by one server.
+/// Both blocking and async must succeed and produce byte-identical bpm.lock.
+#[test]
+fn async_resolve_transitive_success_byte_identical() {
+    let dep_b_tgz = package_tgz("trans-b", "1.0.0", None);
+    // A depends on B.
+    let dep_a_tgz = build_tgz(|b| {
+        common::add_file(
+            b,
+            "package.json",
+            0o644,
+            serde_json::to_vec(&serde_json::json!({
+                "name": "trans-a",
+                "version": "1.0.0",
+                "dependencies": { "trans-b": "^1.0.0" }
+            }))
+            .expect("serialize package.json")
+            .as_slice(),
+        );
+    });
+    let server = multi_registry_mock(vec![
+        ("trans-a", "1.0.0", "tarballs/trans-a-1.0.0.tgz", dep_a_tgz),
+        ("trans-b", "1.0.0", "tarballs/trans-b-1.0.0.tgz", dep_b_tgz),
+    ]);
+
+    let project = tempfile::tempdir().unwrap();
+    let store_block = tempfile::tempdir().unwrap();
+
+    fs::write(
+        project.path().join("package.json"),
+        r#"{"name":"app","version":"1.0.0","dependencies":{"trans-a":"^1.0.0"}}"#,
+    )
+    .unwrap();
+    write_npmrc(project.path(), &[format!("registry={}", server.url(""))]);
+
+    // Blocking resolve must succeed.
+    let (ok_block, stdout_block, stderr_block) =
+        run_bpm(&["install"], project.path(), store_block.path(), None);
+    assert!(
+        ok_block,
+        "blocking install failed\nstdout: {stdout_block}\nstderr: {stderr_block}"
+    );
+    let blocking_lock =
+        fs::read_to_string(project.path().join("bpm.lock")).expect("bpm.lock after blocking");
+
+    // Async resolve must succeed and match byte-for-byte.
+    let store_async = tempfile::tempdir().unwrap();
+    let _ = fs::remove_file(project.path().join("bpm.lock"));
+    let mut cmd = std::process::Command::new(bin());
+    cmd.args(["install"])
+        .current_dir(project.path())
+        .env("BPM_STORE", store_async.path())
+        .env("BPM_ASYNC_RESOLVE", "1");
+    let out = cmd.output().expect("run bpm with async resolver");
+    assert!(
+        out.status.success(),
+        "async install failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let async_lock =
+        fs::read_to_string(project.path().join("bpm.lock")).expect("bpm.lock after async");
+
+    assert_eq!(
+        blocking_lock, async_lock,
+        "blocking and async resolve must produce byte-identical bpm.lock for a transitive graph"
+    );
+}
+
+/// Peer-dependency parity: app -> pkg -> (dep with peerDependency). Both
+/// blocking and async must resolve identically.
+#[test]
+fn async_resolve_peer_dependency_success_byte_identical() {
+    // dep-with-peer declares a peer on "react" (not installed).
+    let dep_with_peer = build_tgz(|b| {
+        common::add_file(
+            b,
+            "package.json",
+            0o644,
+            serde_json::to_vec(&serde_json::json!({
+                "name": "dep-with-peer",
+                "version": "1.0.0",
+                "peerDependencies": { "react": "^18.0.0" }
+            }))
+            .expect("serialize package.json")
+            .as_slice(),
+        );
+    });
+    // react is installed as a normal dep so the peer is satisfiable.
+    let react_tgz = package_tgz("react", "18.2.0", None);
+    let server = multi_registry_mock(vec![
+        (
+            "dep-with-peer",
+            "1.0.0",
+            "tarballs/dep-with-peer-1.0.0.tgz",
+            dep_with_peer,
+        ),
+        ("react", "18.2.0", "tarballs/react-18.2.0.tgz", react_tgz),
+    ]);
+
+    let project = tempfile::tempdir().unwrap();
+    let store_block = tempfile::tempdir().unwrap();
+    fs::write(
+        project.path().join("package.json"),
+        r#"{"name":"app","version":"1.0.0","dependencies":{"dep-with-peer":"^1.0.0","react":"^18.0.0"}}"#,
+    )
+    .unwrap();
+    write_npmrc(project.path(), &[format!("registry={}", server.url(""))]);
+
+    let (ok_block, stdout_block, stderr_block) =
+        run_bpm(&["install"], project.path(), store_block.path(), None);
+    assert!(
+        ok_block,
+        "blocking install failed\nstdout: {stdout_block}\nstderr: {stderr_block}"
+    );
+    let blocking_lock =
+        fs::read_to_string(project.path().join("bpm.lock")).expect("bpm.lock after blocking");
+
+    let store_async = tempfile::tempdir().unwrap();
+    let _ = fs::remove_file(project.path().join("bpm.lock"));
+    let mut cmd = std::process::Command::new(bin());
+    cmd.args(["install"])
+        .current_dir(project.path())
+        .env("BPM_STORE", store_async.path())
+        .env("BPM_ASYNC_RESOLVE", "1");
+    let out = cmd.output().expect("run bpm with async resolver");
+    assert!(
+        out.status.success(),
+        "async install failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let async_lock =
+        fs::read_to_string(project.path().join("bpm.lock")).expect("bpm.lock after async");
+
+    assert_eq!(
+        blocking_lock, async_lock,
+        "blocking and async must produce byte-identical bpm.lock for a peer-dependency graph"
+    );
+}
+
+/// Version-cycle parity: A -> B -> A. Both blocking and async must break the
+/// cycle deterministically and produce byte-identical output.
+#[test]
+fn async_resolve_version_cycle_success_byte_identical() {
+    let pkg_a_tgz = build_tgz(|b| {
+        common::add_file(
+            b,
+            "package.json",
+            0o644,
+            serde_json::to_vec(&serde_json::json!({
+                "name": "cycle-a",
+                "version": "1.0.0",
+                "dependencies": { "cycle-b": "^1.0.0" }
+            }))
+            .expect("serialize package.json")
+            .as_slice(),
+        );
+    });
+    let pkg_b_tgz = build_tgz(|b| {
+        common::add_file(
+            b,
+            "package.json",
+            0o644,
+            serde_json::to_vec(&serde_json::json!({
+                "name": "cycle-b",
+                "version": "1.0.0",
+                "dependencies": { "cycle-a": "^1.0.0" }
+            }))
+            .expect("serialize package.json")
+            .as_slice(),
+        );
+    });
+    let server = multi_registry_mock(vec![
+        ("cycle-a", "1.0.0", "tarballs/cycle-a-1.0.0.tgz", pkg_a_tgz),
+        ("cycle-b", "1.0.0", "tarballs/cycle-b-1.0.0.tgz", pkg_b_tgz),
+    ]);
+
+    let project = tempfile::tempdir().unwrap();
+    let store_block = tempfile::tempdir().unwrap();
+    fs::write(
+        project.path().join("package.json"),
+        r#"{"name":"app","version":"1.0.0","dependencies":{"cycle-a":"^1.0.0"}}"#,
+    )
+    .unwrap();
+    write_npmrc(project.path(), &[format!("registry={}", server.url(""))]);
+
+    let (ok_block, stdout_block, stderr_block) =
+        run_bpm(&["install"], project.path(), store_block.path(), None);
+    assert!(
+        ok_block,
+        "blocking install failed\nstdout: {stdout_block}\nstderr: {stderr_block}"
+    );
+    let blocking_lock =
+        fs::read_to_string(project.path().join("bpm.lock")).expect("bpm.lock after blocking");
+
+    let store_async = tempfile::tempdir().unwrap();
+    let _ = fs::remove_file(project.path().join("bpm.lock"));
+    let mut cmd = std::process::Command::new(bin());
+    cmd.args(["install"])
+        .current_dir(project.path())
+        .env("BPM_STORE", store_async.path())
+        .env("BPM_ASYNC_RESOLVE", "1");
+    let out = cmd.output().expect("run bpm with async resolver");
+    assert!(
+        out.status.success(),
+        "async install failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let async_lock =
+        fs::read_to_string(project.path().join("bpm.lock")).expect("bpm.lock after async");
+
+    assert_eq!(
+        blocking_lock, async_lock,
+        "blocking and async must produce byte-identical bpm.lock for a cyclic dependency graph"
+    );
+}
+
+/// Optional-dependency parity: app -> provider, provider declares an
+/// optionalDependencies on "opt-extra" which IS available. Both blocking and
+/// async must absorb the optional dependency and produce byte-identical output.
+#[test]
+fn async_resolve_optional_dependency_success_byte_identical() {
+    let provider_tgz = build_tgz(|b| {
+        common::add_file(
+            b,
+            "package.json",
+            0o644,
+            serde_json::to_vec(&serde_json::json!({
+                "name": "opt-provider",
+                "version": "1.0.0",
+                "optionalDependencies": { "opt-extra": "^1.0.0" }
+            }))
+            .expect("serialize package.json")
+            .as_slice(),
+        );
+    });
+    let opt_extra_tgz = package_tgz("opt-extra", "1.2.0", None);
+    let server = multi_registry_mock(vec![
+        (
+            "opt-provider",
+            "1.0.0",
+            "tarballs/opt-provider-1.0.0.tgz",
+            provider_tgz,
+        ),
+        (
+            "opt-extra",
+            "1.2.0",
+            "tarballs/opt-extra-1.2.0.tgz",
+            opt_extra_tgz,
+        ),
+    ]);
+
+    let project = tempfile::tempdir().unwrap();
+    let store_block = tempfile::tempdir().unwrap();
+    fs::write(
+        project.path().join("package.json"),
+        r#"{"name":"app","version":"1.0.0","dependencies":{"opt-provider":"^1.0.0"}}"#,
+    )
+    .unwrap();
+    write_npmrc(project.path(), &[format!("registry={}", server.url(""))]);
+
+    let (ok_block, stdout_block, stderr_block) =
+        run_bpm(&["install"], project.path(), store_block.path(), None);
+    assert!(
+        ok_block,
+        "blocking install failed\nstdout: {stdout_block}\nstderr: {stderr_block}"
+    );
+    let blocking_lock =
+        fs::read_to_string(project.path().join("bpm.lock")).expect("bpm.lock after blocking");
+
+    let store_async = tempfile::tempdir().unwrap();
+    let _ = fs::remove_file(project.path().join("bpm.lock"));
+    let mut cmd = std::process::Command::new(bin());
+    cmd.args(["install"])
+        .current_dir(project.path())
+        .env("BPM_STORE", store_async.path())
+        .env("BPM_ASYNC_RESOLVE", "1");
+    let out = cmd.output().expect("run bpm with async resolver");
+    assert!(
+        out.status.success(),
+        "async install failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let async_lock =
+        fs::read_to_string(project.path().join("bpm.lock")).expect("bpm.lock after async");
+
+    assert_eq!(
+        blocking_lock, async_lock,
+        "blocking and async must produce byte-identical bpm.lock for an optional-dependency graph"
     );
 }
