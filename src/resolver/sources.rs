@@ -9,6 +9,7 @@ use base64::Engine;
 use sha2::Digest;
 
 use super::workspace_metadata;
+use crate::download::MAX_ARTIFACT_BYTES;
 use crate::http::redact_url;
 use crate::lockfile::LockSource;
 use crate::manifest::PackageManifest;
@@ -123,8 +124,7 @@ fn resolve_file_source(base_dir: &Path, path: &Path) -> Result<SourceResolution,
 }
 
 fn resolve_tarball_file(path: &Path) -> Result<SourceResolution, String> {
-    let bytes =
-        fs::read(path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let bytes = read_file_bounded(path)?;
     let url = format!("file://{}", path.display());
     source_from_tarball_bytes(&url, bytes, LockSource::Tarball { url: url.clone() })
 }
@@ -146,16 +146,66 @@ pub(crate) fn read_source_bytes(
     url: &str,
 ) -> Result<Vec<u8>, String> {
     if let Some(path) = url.strip_prefix("file://") {
-        return fs::read(path).map_err(|error| format!("cannot read {path}: {error}"));
+        return read_file_bounded(Path::new(path))
+            .map_err(|error| format!("cannot read {path}: {error}"));
     }
     if !url.contains("://") {
-        return fs::read(url).map_err(|error| format!("cannot read {url}: {error}"));
+        return read_file_bounded(Path::new(url))
+            .map_err(|error| format!("cannot read {url}: {error}"));
     }
     let mut response = http.stream(url).map_err(|error| error.to_string())?;
+    read_bounded_to_vec(&mut response, MAX_ARTIFACT_BYTES)
+        .map_err(|error| format!("cannot read tarball response: {error}"))
+}
+
+/// Read a file into memory, bounded by the compressed-artifact policy. A
+/// metadata length check is a fast rejection for regular files, but the read
+/// itself is still bounded because the file can change shape or be a
+/// non-regular stream behind the same path.
+pub(crate) fn read_file_bounded(path: &Path) -> Result<Vec<u8>, String> {
+    read_file_bounded_with_limit(path, MAX_ARTIFACT_BYTES)
+}
+
+/// Read a file into memory, bounded by `limit`. A metadata length check is a
+/// fast rejection for regular files, but the read itself is still bounded
+/// because the file can change shape or be a non-regular stream behind the
+/// same path. Production callers use [`read_file_bounded`] (the
+/// [`MAX_ARTIFACT_BYTES`] policy); a smaller `limit` exists for tests.
+pub(crate) fn read_file_bounded_with_limit(path: &Path, limit: u64) -> Result<Vec<u8>, String> {
+    if let Ok(meta) = fs::metadata(path) {
+        if meta.len() > limit {
+            return Err(format!(
+                "artifact {} exceeds the {}-byte compressed source limit",
+                path.display(),
+                limit
+            ));
+        }
+    }
+    let mut file = fs::File::open(path).map_err(|error| error.to_string())?;
+    read_bounded_to_vec(&mut file, limit).map_err(|error| error.to_string())
+}
+
+/// Read `reader` into a `Vec`, failing once `limit` bytes are exceeded. Bytes
+/// are counted with checked arithmetic so an overflow is also an error.
+pub(crate) fn read_bounded_to_vec<R: Read>(reader: &mut R, limit: u64) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
-    response
-        .read_to_end(&mut bytes)
-        .map_err(|error| format!("cannot read tarball response: {error}"))?;
+    let mut total: u64 = 0;
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut buf).map_err(|error| error.to_string())?;
+        if n == 0 {
+            break;
+        }
+        total = total
+            .checked_add(n as u64)
+            .ok_or_else(|| format!("artifact exceeded the {limit}-byte compressed source limit"))?;
+        if total > limit {
+            return Err(format!(
+                "artifact exceeded the {limit}-byte compressed source limit"
+            ));
+        }
+        bytes.extend_from_slice(&buf[..n]);
+    }
     Ok(bytes)
 }
 
@@ -221,7 +271,7 @@ pub(crate) fn resolve_git_source(
     let fetch_reference = reference.unwrap_or("HEAD");
     let tarball = git_archive_tarball(url, fetch_reference, &resolved_commit)?;
     let cache_url = format!("file://{}", tarball.display());
-    let bytes = fs::read(&tarball)
+    let bytes = read_file_bounded(&tarball)
         .map_err(|error| format!("cannot read git archive {}: {error}", tarball.display()))?;
     let mut resolution = source_from_tarball_bytes(
         &cache_url,
@@ -697,4 +747,43 @@ fn hosted_tarball(base: &str, rest: &str, suffix: &str, reference: &str) -> Opti
         suffix,
         reference
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn read_bounded_accepts_exactly_at_limit() {
+        let payload = b"hello"; // 5 bytes
+        let mut cursor = Cursor::new(payload);
+        let bytes = read_bounded_to_vec(&mut cursor, 5).expect("exactly-at-limit succeeds");
+        assert_eq!(bytes, payload);
+    }
+
+    #[test]
+    fn read_bounded_rejects_one_byte_over_limit() {
+        let payload = b"hello!"; // 6 bytes
+        let mut cursor = Cursor::new(payload);
+        let err = read_bounded_to_vec(&mut cursor, 5).expect_err("one byte over must fail");
+        assert!(
+            err.contains("exceeded"),
+            "expected an over-limit error; got: {err}"
+        );
+    }
+
+    #[test]
+    fn read_file_bounded_metadata_rejects_an_oversized_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = b"oversized";
+        let path = dir.path().join("big.tgz");
+        fs::write(&path, payload).unwrap();
+        let err = read_file_bounded_with_limit(&path, 4)
+            .expect_err("must reject via the metadata fast path");
+        assert!(
+            err.contains("exceeds"),
+            "expected an oversized-file error; got: {err}"
+        );
+    }
 }

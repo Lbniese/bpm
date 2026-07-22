@@ -31,6 +31,14 @@ use crate::integrity::Sha512Digest;
 const BUF_BYTES: usize = 64 * 1024;
 const FILE_SCHEME: &str = "file://";
 
+/// Maximum **compressed bytes** read from any artifact source (registry
+/// tarball, direct local/file dependency, hosted-Git tarball, or remote-cache
+/// download) before integrity verification. This bounds disk/memory growth a
+/// malicious or compromised source can force before the SHA-512 check fails;
+/// it is NOT the extracted package size (the extraction trust boundary enforces
+/// its own limits). One policy governs every artifact read path.
+pub(crate) const MAX_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
+
 /// Process-wide default client used by compatibility callers that do not
 /// supply effective npm configuration explicitly.
 static DEFAULT_HTTP_CLIENT: OnceLock<HttpClient> = OnceLock::new();
@@ -71,46 +79,79 @@ fn has_scheme(url: &str) -> bool {
     }
 }
 
-/// Copy bytes from `reader` to a fresh file at `dest`, hashing with SHA-512.
+/// Copy bytes from `reader` to a fresh file at `dest`, hashing with SHA-512,
+/// failing once `limit` compressed bytes have been exceeded.
 ///
 /// `dest` must not exist (the caller manages a unique temp path). The file is
-/// created fresh, written fully, and flushed before returning; the caller
-/// performs the final atomic rename. The destination path is reported in any
-/// IO error so the failure is locatable.
+/// created fresh, written fully, and flushed only on complete success. On any
+/// read, write, flush, or size-limit error the partial destination is removed
+/// so no truncated artifact lingers in the store's temp directory. The digest
+/// is computed for exactly the bytes kept; nothing is truncated to fit. `limit`
+/// is always [`MAX_ARTIFACT_BYTES`] in production; a smaller value is used by
+/// tests to avoid allocating hundreds of megabytes.
 fn stream_to_dest_and_hash<R: Read>(
     reader: &mut R,
     dest: &Path,
+    limit: u64,
 ) -> Result<Sha512Digest, DownloadError> {
     let dest_str = dest.display().to_string();
     let file = File::create(dest).map_err(|source| DownloadError::Io {
         path: dest_str.clone(),
         source,
     })?;
-    let mut writer = BufWriter::new(file);
+    // Cleanup guard: remove the partial destination on any error after the
+    // file was created, so no truncated artifact lingers in the store's temp
+    // directory. On success the complete file stays for the caller's atomic
+    // rename.
+    let result = stream_to_dest_and_hash_inner(reader, &mut BufWriter::new(file), limit).map_err(
+        |mut error| {
+            // Annotate an IO error path so the failure stays locatable.
+            if let DownloadError::Io { path, .. } = &mut error {
+                *path = dest_str.clone();
+            }
+            error
+        },
+    );
+    if result.is_err() {
+        let _ = std::fs::remove_file(dest);
+    }
+    result
+}
 
+fn stream_to_dest_and_hash_inner<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    limit: u64,
+) -> Result<Sha512Digest, DownloadError> {
     let mut hasher = Sha512::new();
+    let mut total: u64 = 0;
     let mut buf = vec![0u8; BUF_BYTES];
     loop {
         let n = reader.read(&mut buf).map_err(|source| DownloadError::Io {
-            path: dest_str.clone(),
+            path: String::new(),
             source,
         })?;
         if n == 0 {
             break;
         }
+        total = total
+            .checked_add(n as u64)
+            .ok_or(DownloadError::TooLarge { limit })?;
+        if total > limit {
+            return Err(DownloadError::TooLarge { limit });
+        }
         hasher.update(&buf[..n]);
         writer
             .write_all(&buf[..n])
             .map_err(|source| DownloadError::Io {
-                path: dest_str.clone(),
+                path: String::new(),
                 source,
             })?;
     }
     writer.flush().map_err(|source| DownloadError::Io {
-        path: dest_str,
+        path: String::new(),
         source,
     })?;
-
     let mut digest = [0u8; 64];
     digest.copy_from_slice(&hasher.finalize());
     Ok(Sha512Digest::from_bytes(digest))
@@ -134,23 +175,35 @@ pub fn download(url: &str, dest: &Path) -> Result<Sha512Digest, DownloadError> {
 /// HTTP sources inherit the client's configured authentication, redirects,
 /// timeouts, and bounded retries. Local paths and `file://` sources never use
 /// the client and preserve the same open, stream, hash, and error behavior as
-/// [`download`].
+/// [`download`]. Every source is bounded by [`MAX_ARTIFACT_BYTES`].
 pub fn download_with_client(
     client: &HttpClient,
     url: &str,
     dest: &Path,
 ) -> Result<Sha512Digest, DownloadError> {
+    download_with_client_bounded(client, url, dest, MAX_ARTIFACT_BYTES)
+}
+
+/// Bounded retrieval with an explicit limit. Production callers must use
+/// [`download_with_client`] (the [`MAX_ARTIFACT_BYTES`] policy); this entry
+/// point exists so tests can exercise the boundary with a tiny limit.
+pub(crate) fn download_with_client_bounded(
+    client: &HttpClient,
+    url: &str,
+    dest: &Path,
+    limit: u64,
+) -> Result<Sha512Digest, DownloadError> {
     match classify(url) {
         Source::Http(u) => {
             let mut reader = client.stream(u).map_err(map_http_error)?;
-            stream_to_dest_and_hash(&mut reader, dest)
+            stream_to_dest_and_hash(&mut reader, dest, limit)
         }
         Source::File(path) => {
             let mut reader = File::open(&path).map_err(|source| DownloadError::Io {
                 path: path.display().to_string(),
                 source,
             })?;
-            stream_to_dest_and_hash(&mut reader, dest)
+            stream_to_dest_and_hash(&mut reader, dest, limit)
         }
     }
 }
@@ -194,6 +247,8 @@ pub enum DownloadError {
     },
     #[error("io error at {path}: {source}")]
     Io { path: String, source: io::Error },
+    #[error("artifact exceeded the {limit}-byte compressed source limit")]
+    TooLarge { limit: u64 },
 }
 
 #[cfg(test)]
@@ -290,5 +345,81 @@ mod tests {
         let msg = format!("{err}");
         assert!(msg.contains("nope.tgz"), "error lacks source path: {msg}");
         assert!(!dest.exists(), "dest must not be created on source failure");
+    }
+
+    // === Plan 012: bounded artifact reads ===
+
+    #[test]
+    fn bounded_read_succeeds_exactly_at_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = b"abcdef"; // 6 bytes
+        let src = write_known_file(dir.path(), "at.tgz", payload);
+        let dest = dir.path().join("at.out");
+        let digest = download_with_client_bounded(
+            DEFAULT_HTTP_CLIENT.get_or_init(|| HttpClient::new(NpmConfig::default())),
+            &format!("file://{}", src.display()),
+            &dest,
+            payload.len() as u64,
+        )
+        .expect("exactly-at-limit must succeed");
+        assert_eq!(digest, Sha512Digest::hash_bytes(payload));
+        assert_eq!(std::fs::read(&dest).unwrap(), payload);
+    }
+
+    #[test]
+    fn bounded_read_fails_one_byte_over_limit_and_cleans_dest() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = b"abcdefg"; // 7 bytes
+        let src = write_known_file(dir.path(), "over.tgz", payload);
+        let dest = dir.path().join("over.out");
+        let err = download_with_client_bounded(
+            DEFAULT_HTTP_CLIENT.get_or_init(|| HttpClient::new(NpmConfig::default())),
+            &format!("file://{}", src.display()),
+            &dest,
+            (payload.len() - 1) as u64, // limit = 6
+        )
+        .expect_err("one byte over the limit must fail");
+        assert!(
+            matches!(err, DownloadError::TooLarge { limit: 6 }),
+            "expected TooLarge(6), got {err:?}"
+        );
+        assert!(
+            !dest.exists(),
+            "the partial destination must be removed on a size-limit failure"
+        );
+    }
+
+    /// A reader that errors after emitting one chunk, to prove the partial
+    /// destination is cleaned up on a mid-stream read error.
+    struct ErrorAfterReader {
+        emitted: bool,
+    }
+    impl Read for ErrorAfterReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if !self.emitted {
+                self.emitted = true;
+                buf[..3].copy_from_slice(b"abc");
+                Ok(3)
+            } else {
+                Err(io::Error::other("boom"))
+            }
+        }
+    }
+
+    #[test]
+    fn partial_reader_error_removes_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("partial.out");
+        let mut reader = ErrorAfterReader { emitted: false };
+        let err = stream_to_dest_and_hash(&mut reader, &dest, MAX_ARTIFACT_BYTES)
+            .expect_err("reader error must propagate");
+        assert!(
+            matches!(err, DownloadError::Io { .. }),
+            "expected Io error, got {err:?}"
+        );
+        assert!(
+            !dest.exists(),
+            "a mid-stream read error must remove the partial destination"
+        );
     }
 }
