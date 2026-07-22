@@ -33,6 +33,18 @@ because both edit `src/resolver/sources.rs`; the other new plans are logically
 independent, though 010 should land first as the smallest user-visible
 correctness fix.
 
+**Re-run (2026-07-22, commit `82ee33c`).** A standard hotspot-weighted pass over
+~46.4K Rust LoC rechecked frozen-lock correctness, production GC ownership,
+the default async resolver's persistent-cache/retry behavior, async streaming
+recovery, release provenance, and status documentation. The user selected all
+seven vetted findings, recorded as Plans 015–021. Baseline verification passed:
+`cargo fmt --all --check`, `cargo clippy --workspace --all-targets
+--all-features -- -D warnings`, `cargo test --workspace`, `cargo build --release
+--workspace`, and `cargo deny check advisories`. The working tree was clean at
+the audit commit. This was not an exhaustive line-by-line audit; Windows runtime
+behavior, live-registry benchmarks, and the ignored npm Git-prepare oracle were
+not executed. No subagents were configured, so the pass was performed directly.
+
 ## Execution order & status
 
 | Plan | Title | Priority | Effort | Depends on | Status |
@@ -51,6 +63,13 @@ correctness fix.
 | 012  | Constrain registry artifact sources and bound every artifact read | P1 | M | — | DONE |
 | 013  | Make Git and patch source caches race-safe | P2 | M | 012 | DONE |
 | 014  | Stream package-image metadata without loading file payloads | P2 | M | — | DONE |
+| 015  | Reject dependency-specification drift during frozen installs | P1 | S | — | DONE |
+| 016  | Make async metadata caching correct and persistent | P1 | M | — | TODO |
+| 017  | Protect installed graphs with durable ownership and active leases | P1 | L | — | TODO |
+| 018  | Honor npm retry policy in the async resolver | P1 | M | 016 | TODO |
+| 019  | Keep async streaming overflow on the concurrent cache-aware pipeline | P2 | M | 016, 018 | TODO |
+| 020  | Verify signed release checksums before executing prebuilt binaries | P1 | M | — | TODO |
+| 021  | Reconcile documentation with shipped behavior | P2 | S | 015–020 | TODO |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) |
 REJECTED (with one-line rationale — finding fixed independently or approach
@@ -165,6 +184,52 @@ abandoned).
 - **014 is independent** of 010–013. It preserves the `BPMIMG01` format and
   changes only metadata consumption, so it can run in parallel if branches are
   isolated.
+- **015 is the first new-plan pick and is independent.** It is the smallest
+  user-visible correctness fix: frozen installs previously compared dependency
+  names but not changed specifications. It changes only the shared frozen guard
+  and deterministic offline install tests.
+  **Done (2026-07-23):** `enforce_frozen` in `src/cli/install.rs` now compares
+  the full canonical root declaration map (`manifest.root_dependency_declarations()`
+  vs `lockfile.root.dependencies`) instead of name-only key sets. Shared names
+  whose declared specification changed are reported deterministically as
+  `name (package.json: <new>, <lock_label>: <old>)` alongside the existing
+  added/removed-name diagnostics; the selected lock is labeled with
+  `lock_label` (not a hardcoded `bpm.lock`). Comparison remains textual (no
+  semver normalization). Same-name spec-drift regressions added for both
+  `bpm.lock` (`bpm install --frozen`) and npm v3 `package-lock.json` (`bpm ci`).
+- **016 must precede 018.** Plan 016 establishes one correct async
+  request/response/cache boundary (`200` persistence, `304` body reuse, exact
+  endpoint parity, offline fail-closed). Plan 018 then wraps retry/backoff around
+  that boundary without duplicating or caching transient responses.
+- **017 is independent but deletion-sensitive.** It must fail closed for legacy
+  or incomplete ownership, persist graph inventory and project registration so
+  `store.db` remains rebuildable, and coordinate leases/deletion with the same
+  object locks as publishers. It should land before any derived-store
+  default-on/promotion decision.
+- **019 follows 016 and 018.** It changes the default async+streaming path after
+  metadata transport parity is stable. Overflow units must remain on the same
+  concurrent remote-cache-aware pipeline; it must not restore an origin-only
+  recovery path.
+- **020 is independent, with a human provisioning gate.** The executor may add
+  only public trust material. A maintainer must choose/provision the protected
+  release signing key/environment and confirm verifier portability; absent that,
+  the plan stops rather than shipping unsigned-checksum theater.
+- **021 runs last and depends on 015–020.** It is documentation-only and must
+  describe live, tested behavior—not TODO plan intent. Historical benchmark/A-B
+  evidence remains labeled rather than deleted.
+
+## Audit summary (2026-07-22 at `82ee33c`)
+
+The selected findings are: full dependency-spec comparison in frozen mode;
+production-safe GC ownership and leases; async persistent-cache `200`/`304`
+semantics; async retry parity; non-lossy cache-aware streaming overflow;
+signed release verification before execution; and documentation reconciliation.
+The recommended execution order is 015, 016, 017, 018, 019, 020, then 021,
+although 017 and 020 can proceed independently on isolated branches. No
+high/critical dependency advisory was present. Documented decisions—cold
+resolver performance, Git-prepare default-off, derived-store default-off,
+remote-cache upload, and automatic reflink selection—remain direction options,
+not defects.
 
 ## Audit summary (for a returning reader)
 
@@ -180,21 +245,20 @@ reported — it is a documented deferred decision. The cold-resolver perf gap wa
 NOT reported as a bug — it is a documented known gap (`docs/milestones.md`
 M7), surfaced only as the evidence base for plan 005's default-flip rationale.
 
-## Deferred findings from the `5caa64f` audit
+## Deferred findings and direction options
 
-These were vetted but were not part of the user-selected recommended top five;
-they are not rejected and may be planned later:
+All seven vetted findings from the `82ee33c` audit were selected for Plans
+015–021. One earlier finding remains deliberately unplanned:
 
 - Detect inner-file drift in local/reflink project views without regressing the
   warm plan-cache path. Plan 011 intentionally establishes ownership identity
   first but does not add full warm-hit tree validation.
-- Reconcile documentation that still describes async resolution as opt-in and
-  contains stale transport/Windows attachment status.
-- Publish and verify release checksums/signatures or provenance before
-  `install.sh` executes downloaded binaries.
-- Direction options remain unplanned: authenticated remote-cache upload,
-  Git-prepare parity/default-on decision, cross-graph derived-artifact reuse,
-  and automatic reflink selection.
+
+Direction options remain unplanned: authenticated remote-cache upload,
+Git-prepare parity/default-on decision, derived-store default-on and key/runtime
+environment policy, and automatic reflink selection. These are product choices,
+not defects. GC Plan 017 should land before promoting cross-graph derived
+artifacts.
 
 ## Findings considered and rejected
 
