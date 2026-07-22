@@ -340,14 +340,22 @@ fn link_tree(
     target: &Path,
     link_file: fn(&Path, &Path) -> Result<(), MaterializeError>,
 ) -> Result<(), MaterializeError> {
+    let index_path = source.with_extension("bpi");
+    // Parse and validate the sidecar metadata BEFORE mutating the target so a
+    // corrupt index cannot destroy an otherwise usable local view. The metadata
+    // decoder skips file payloads (only paths/symlink targets are needed); the
+    // actual file bytes still come from the extracted immutable image.
+    let parsed_index = if index_path.is_file() {
+        Some(parse_image_index(&index_path)?)
+    } else {
+        None
+    };
     if target.exists() || symlink_exists(target) {
         remove_any(target)?;
     }
-    let index_path = source.with_extension("bpi");
-    if index_path.is_file() {
-        link_tree_from_index(source, target, &index_path, link_file)
-    } else {
-        link_tree_by_walking_directory(source, target, link_file)
+    match parsed_index {
+        Some(entries) => link_entries_from_index(source, target, &entries, link_file),
+        None => link_tree_by_walking_directory(source, target, link_file),
     }
 }
 
@@ -441,31 +449,42 @@ fn link_tree_by_walking_directory(
     Ok(())
 }
 
-fn link_tree_from_index(
-    source: &Path,
-    target: &Path,
+/// Open and fully validate the `.bpi` sidecar metadata without reading file
+/// payloads into memory (the seekable metadata decoder skips payload extents).
+/// Errors map to an `InvalidData` I/O error carrying the sidecar path.
+fn parse_image_index(
     index_path: &Path,
-    link_file: fn(&Path, &Path) -> Result<(), MaterializeError>,
-) -> Result<(), MaterializeError> {
-    let bytes = fs::read(index_path).map_err(|source| io_err(index_path, source))?;
-    let entries = crate::package_image::decode(&bytes).map_err(|error| MaterializeError::Io {
+) -> Result<Vec<crate::package_image::IndexEntry>, MaterializeError> {
+    let mut file = fs::File::open(index_path).map_err(|source| io_err(index_path, source))?;
+    crate::package_image::decode_index(&mut file).map_err(|error| MaterializeError::Io {
         path: index_path.display().to_string(),
         source: std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()),
-    })?;
+    })
+}
+
+/// Link a validated package-image index into `target`. File entries source
+/// their bytes from the extracted immutable `source` image (via `link_file`),
+/// not from any payload embedded in the sidecar.
+fn link_entries_from_index(
+    source: &Path,
+    target: &Path,
+    entries: &[crate::package_image::IndexEntry],
+    link_file: fn(&Path, &Path) -> Result<(), MaterializeError>,
+) -> Result<(), MaterializeError> {
     fs::create_dir_all(target).map_err(|source| io_err(target, source))?;
     for entry in entries {
         match entry {
-            crate::package_image::Entry::File { path, .. } => {
-                let from = safe_relative_join(source, &path)?;
-                let to = safe_relative_join(target, &path)?;
+            crate::package_image::IndexEntry::File { path } => {
+                let from = safe_relative_join(source, path)?;
+                let to = safe_relative_join(target, path)?;
                 link_file(&from, &to)?;
             }
-            crate::package_image::Entry::Symlink { path, target: link } => {
-                let to = safe_relative_join(target, &path)?;
+            crate::package_image::IndexEntry::Symlink { path, target: link } => {
+                let to = safe_relative_join(target, path)?;
                 if let Some(parent) = to.parent() {
                     fs::create_dir_all(parent).map_err(|source| io_err(parent, source))?;
                 }
-                make_symlink(Path::new(&link), &to)?;
+                make_symlink(Path::new(link), &to)?;
             }
         }
     }
@@ -1507,5 +1526,149 @@ mod tests {
         assert_eq!(caps.preferred_backend(), MaterializeBackend::Reflink);
         assert!(caps.symlink);
         assert!(caps.hardlink);
+    }
+
+    // === Plan 014: metadata-streamed index linking ===
+
+    #[cfg(unix)]
+    #[test]
+    fn index_driven_hardlink_tree_links_files_and_symlinks() {
+        use crate::package_image::{decode_index, Entry};
+        use std::os::unix::fs::MetadataExt;
+
+        let tmp = tempdir().unwrap();
+        let source = tmp.path().join("src");
+        fs::create_dir_all(source.join("sub")).unwrap();
+        fs::write(source.join("a.txt"), b"alpha").unwrap();
+        fs::write(source.join("sub/b.txt"), b"beta").unwrap();
+        let entries = vec![
+            Entry::File {
+                path: "a.txt".into(),
+                bytes: b"alpha".to_vec(),
+            },
+            Entry::File {
+                path: "sub/b.txt".into(),
+                bytes: b"beta".to_vec(),
+            },
+            Entry::Symlink {
+                path: "sub/l".into(),
+                target: "../a.txt".into(),
+            },
+        ];
+        let image = crate::package_image::encode(&entries).unwrap();
+        fs::write(source.with_extension("bpi"), &image).unwrap();
+
+        let target = tmp.path().join("out");
+        hardlink_tree(&source, &target).unwrap();
+
+        assert_eq!(fs::read(target.join("a.txt")).unwrap(), b"alpha");
+        assert_eq!(fs::read(target.join("sub/b.txt")).unwrap(), b"beta");
+        let src_ino = fs::metadata(source.join("a.txt")).unwrap().ino();
+        let dst_ino = fs::metadata(target.join("a.txt")).unwrap().ino();
+        assert_eq!(
+            src_ino, dst_ino,
+            "indexed file must be hardlinked from the source image"
+        );
+        assert!(fs::symlink_metadata(target.join("sub/l"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        // The generated sidecar still decodes through both decoders.
+        assert_eq!(
+            crate::package_image::decode(&image).unwrap().len(),
+            entries.len()
+        );
+        let mut cursor = std::io::Cursor::new(&image);
+        assert_eq!(decode_index(&mut cursor).unwrap().len(), entries.len());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn index_driven_tree_uses_source_image_bytes_not_sidecar_payload() {
+        use crate::package_image::Entry;
+        let tmp = tempdir().unwrap();
+        let source = tmp.path().join("src");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("f.txt"), b"from-source-image").unwrap();
+        // The sidecar deliberately embeds DIFFERENT payload bytes; the result
+        // must come from the extracted source image, not the sidecar payload.
+        let image = crate::package_image::encode(&[Entry::File {
+            path: "f.txt".into(),
+            bytes: b"from-sidecar-payload".to_vec(),
+        }])
+        .unwrap();
+        fs::write(source.with_extension("bpi"), &image).unwrap();
+
+        let target = tmp.path().join("out");
+        hardlink_tree(&source, &target).unwrap();
+        assert_eq!(
+            fs::read(target.join("f.txt")).unwrap(),
+            b"from-source-image",
+            "materialization must use source image bytes, not the sidecar payload"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn corrupt_index_fails_before_removing_an_existing_target() {
+        let tmp = tempdir().unwrap();
+        let source = tmp.path().join("src");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("f.txt"), b"x").unwrap();
+        // A corrupt sidecar: a file payload extent declared beyond EOF.
+        let mut bad = Vec::new();
+        bad.extend_from_slice(b"BPMIMG01");
+        bad.extend_from_slice(&1u32.to_le_bytes());
+        bad.push(0);
+        bad.extend_from_slice(&1u32.to_le_bytes());
+        bad.extend_from_slice(b"f.txt");
+        bad.extend_from_slice(&9999u32.to_le_bytes());
+        bad.extend_from_slice(b"o");
+        fs::write(source.with_extension("bpi"), &bad).unwrap();
+
+        // A pre-existing target that a corrupt sidecar must NOT destroy.
+        let target = tmp.path().join("out");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("preserve.txt"), b"keep-me").unwrap();
+
+        assert!(hardlink_tree(&source, &target).is_err());
+        assert!(
+            target.exists(),
+            "existing target must be preserved on a corrupt sidecar"
+        );
+        assert_eq!(fs::read(target.join("preserve.txt")).unwrap(), b"keep-me");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn index_driven_tree_rejects_unsafe_indexed_path() {
+        let tmp = tempdir().unwrap();
+        let source = tmp.path().join("src");
+        fs::create_dir_all(&source).unwrap();
+        let mut bad = Vec::new();
+        bad.extend_from_slice(b"BPMIMG01");
+        bad.extend_from_slice(&1u32.to_le_bytes());
+        bad.push(0);
+        let p = "../escape.txt";
+        bad.extend_from_slice(&(p.len() as u32).to_le_bytes());
+        bad.extend_from_slice(p.as_bytes());
+        bad.extend_from_slice(&0u32.to_le_bytes());
+        fs::write(source.with_extension("bpi"), &bad).unwrap();
+        let target = tmp.path().join("out");
+        assert!(hardlink_tree(&source, &target).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn no_index_falls_back_to_directory_walk() {
+        let tmp = tempdir().unwrap();
+        let source = tmp.path().join("src");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("f.txt"), b"walked").unwrap();
+        // No .bpi sidecar present.
+        let target = tmp.path().join("out");
+        hardlink_tree(&source, &target).unwrap();
+        assert_eq!(fs::read(target.join("f.txt")).unwrap(), b"walked");
     }
 }
