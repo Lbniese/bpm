@@ -134,8 +134,17 @@ pub(super) fn run(mut options: Options) -> anyhow::Result<()> {
             };
             let store = ArtifactStore::open(&store_root_path)?;
             let mut metrics = Metrics::new();
-            // Combined streaming+async: non-blocking resolver feeding the
-            // download pipeline through a non-blocking sink adapter.
+            // Async resolve (default since Phase 4); the blocking resolver is the BPM_ASYNC_RESOLVE=0 kill-switch path.
+            // Fresh-install resolver/streaming mode matrix. Every row honors the
+            // CLI-selected peer_mode (strict unless --legacy-peer-deps) so a
+            // legacy install never fails on a peer conflict legacy mode exists
+            // to ignore:
+            //   streaming + async     -> async resolver + download pipeline sink
+            //   streaming + blocking  -> blocking resolver + download pipeline sink
+            //   non-streaming + async -> async resolver, then install pipeline
+            //   non-streaming + blocking -> blocking resolver, then install
+            //   pipeline. The two non-streaming rows share the lockfile write +
+            //   install_resolved_lockfile handoff below.
             if streaming_install_enabled() && async_resolve_enabled() {
                 return run_streaming_async_install(
                     &root,
@@ -163,79 +172,40 @@ pub(super) fn run(mut options: Options) -> anyhow::Result<()> {
                     &options,
                 );
             }
-            // Async resolve: opt-in experimental path using the non-blocking
-            // resolver from src/async_resolver.rs. The output bpm.lock is
-            // byte-identical to the blocking path; only the I/O model differs.
-            if async_resolve_enabled() {
-                let lockfile = metrics
-                    .measure("dependency_resolution", || -> anyhow::Result<(Lockfile, (u64, u64, u64))> {
-                        let diag_cell = std::cell::Cell::new((0u64, 0u64, 0u64));
-                        let result = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()
-                            .expect("failed to build tokio runtime")
-                            .block_on(async {
-                                let async_cache = bpm::metadata_cache::MetadataCache::open(
-                                    store.root(),
-                                )
-                                .ok();
-                                let mut async_registry =
-                                    bpm::async_resolver::AsyncRegistryClient::new(config);
-                                if let Some(cache) = async_cache {
-                                    async_registry = async_registry.with_metadata_cache(
-                                        std::sync::Arc::new(cache),
-                                        options.cache_mode,
-                                    );
-                                }
-                                let result = bpm::async_resolver::resolve_manifest_with_workspaces_async(
-                                    &manifest,
-                                    &async_registry,
-                                    "bpm",
-                                    Some(&workspace_index),
-                                )
-                                .await?;
-                                diag_cell.set(async_registry.take_diagnostics());
-                                Ok::<_, anyhow::Error>(result)
-                            })?;
-                        let diag = diag_cell.into_inner();
-                        Ok((result, diag))
-                    })
-                    .map(|(lockfile, (hits, fetches, fetch_bytes))| {
-                        metrics.record_resolver_diagnostics(hits, 0, fetches, 0, fetch_bytes, 0);
-                        lockfile
-                    })
-                    .map_err(|error| anyhow::anyhow!("dependency resolution failed: {error}"))?;
-                let path = root.join(bpm::lockfile::BPM_LOCK_FILE);
-                lockfile.write_to(&path)?;
-                eprintln!(
-                    "resolved {} package(s) (async) and wrote {}",
-                    lockfile.packages.len(),
-                    path.display()
-                );
-                (path, lockfile, root, ProjectLockKind::Bpm)
+            // Non-streaming: resolve the whole graph before downloading. Route
+            // on the async kill-switch so BPM_ASYNC_RESOLVE=0 selects the
+            // blocking resolver instead of silently using async. Both rows
+            // share the lockfile write + install_resolved_lockfile handoff.
+            let async_mode = async_resolve_enabled();
+            let lockfile = if async_mode {
+                resolve_fresh_manifest_async(
+                    &manifest,
+                    &workspace_index,
+                    peer_mode,
+                    &store,
+                    config,
+                    options.cache_mode,
+                    &mut metrics,
+                )?
             } else {
-                // Streaming disabled (BPM_STREAM_INSTALL=0): resolve the whole
-                // graph first, then let the shared download pipeline below run.
-                let lockfile = metrics
-                    .measure("dependency_resolution", || {
-                        resolver::resolve_manifest_with_options(
-                            &manifest,
-                            &client,
-                            "bpm",
-                            Some(&workspace_index),
-                            peer_mode,
-                        )
-                    })
-                    .map_err(|error| anyhow::anyhow!("dependency resolution failed: {error}"))?;
-                let path = root.join(bpm::lockfile::BPM_LOCK_FILE);
-                lockfile.write_to(&path)?;
-                eprintln!(
-                    "resolved {} package(s) and wrote {}",
-                    lockfile.packages.len(),
-                    path.display()
-                );
-                (path, lockfile, root, ProjectLockKind::Bpm)
-            }
+                resolve_fresh_manifest_blocking(
+                    &manifest,
+                    &client,
+                    &workspace_index,
+                    peer_mode,
+                    &http,
+                    &mut metrics,
+                )?
+            };
+            let path = root.join(bpm::lockfile::BPM_LOCK_FILE);
+            lockfile.write_to(&path)?;
+            eprintln!(
+                "resolved {} package(s){} and wrote {}",
+                lockfile.packages.len(),
+                if async_mode { " (async)" } else { "" },
+                path.display()
+            );
+            (path, lockfile, root, ProjectLockKind::Bpm)
         }
     };
     install_resolved_lockfile(
@@ -352,10 +322,6 @@ pub(super) fn install_resolved_lockfile(
     let fetched = outcomes.len() - cached;
     let artifact_ids = outcomes_to_artifact_ids(&outcomes, &lockfile);
     metrics.add_requests(http.request_count());
-    let prior_owned = cached_plan
-        .as_ref()
-        .map(|p| p.owned_entries.as_slice())
-        .unwrap_or(&[]);
     finalize_install(
         project_root,
         &store,
@@ -367,7 +333,7 @@ pub(super) fn install_resolved_lockfile(
         options,
         lockfile_path,
         &registry,
-        prior_owned,
+        cached_plan.as_ref(),
     )
 }
 
@@ -1051,15 +1017,125 @@ fn streaming_install_enabled() -> bool {
     )
 }
 
-/// Experimental non-blocking resolver (`BPM_ASYNC_RESOLVE=1`). Uses the async
-/// resolver in `src/async_resolver.rs` instead of the blocking one. The
-/// resolved `bpm.lock` is byte-for-byte identical to the blocking path; only
-/// the I/O model differs. Opt-in while the async path is being measured.
+/// Whether the async resolver is enabled (default: yes since Phase 5).
+///
+/// Async resolution is the default; set `BPM_ASYNC_RESOLVE=0` or
+/// `BPM_ASYNC_RESOLVE=false` to force the blocking resolver (the kill-switch
+/// path — not retired). The four-case fresh-install matrix that consumes this
+/// flag lives in `run`.
 fn async_resolve_enabled() -> bool {
-    matches!(
+    !matches!(
         std::env::var("BPM_ASYNC_RESOLVE").as_deref(),
-        Ok("1") | Ok("true")
+        Ok("0") | Ok("false")
     )
+}
+
+/// Resolve a fresh manifest with the async resolver (non-streaming) on a
+/// current-thread tokio runtime. Honors the CLI-selected `peer_mode`; the
+/// resulting lockfile is byte-identical to the blocking resolver's output for
+/// the same manifest/peer-mode (see the `tests/network_pipeline.rs` parity
+/// corpus). Records packument-cache diagnostics.
+fn resolve_fresh_manifest_async(
+    manifest: &PackageManifest,
+    workspace_index: &bpm::resolver::workspaces::WorkspaceIndex,
+    peer_mode: bpm::resolver::peer::PeerMode,
+    store: &ArtifactStore,
+    config: NpmConfig,
+    cache_mode: bpm::metadata_cache::CacheMode,
+    metrics: &mut Metrics,
+) -> anyhow::Result<Lockfile> {
+    metrics
+        .measure(
+            "dependency_resolution",
+            || -> anyhow::Result<(Lockfile, (u64, u64, u64))> {
+                let diag_cell = std::cell::Cell::new((0u64, 0u64, 0u64));
+                let result = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("failed to build tokio runtime")
+                    .block_on(async {
+                        let async_cache =
+                            bpm::metadata_cache::MetadataCache::open(store.root()).ok();
+                        let mut async_registry =
+                            bpm::async_resolver::AsyncRegistryClient::new(config);
+                        if let Some(cache) = async_cache {
+                            async_registry = async_registry
+                                .with_metadata_cache(std::sync::Arc::new(cache), cache_mode);
+                        }
+                        let result =
+                            bpm::async_resolver::resolve_manifest_with_options_and_target_async(
+                                manifest,
+                                &async_registry,
+                                "bpm",
+                                Some(workspace_index),
+                                peer_mode,
+                                bpm::resolver::current_target_platform(),
+                            )
+                            .await?;
+                        diag_cell.set(async_registry.take_diagnostics());
+                        Ok::<_, anyhow::Error>(result)
+                    })?;
+                let diag = diag_cell.into_inner();
+                Ok((result, diag))
+            },
+        )
+        .map(|(lockfile, (hits, fetches, fetch_bytes))| {
+            metrics.record_resolver_diagnostics(hits, 0, fetches, 0, fetch_bytes, 0);
+            lockfile
+        })
+        .map_err(|error| anyhow::anyhow!("dependency resolution failed: {error}"))
+}
+
+/// Resolve a fresh manifest with the blocking resolver (non-streaming) — the
+/// `BPM_ASYNC_RESOLVE=0` kill-switch path. Honors the CLI-selected `peer_mode`.
+/// Records the same resolver-diagnostic vocabulary as the blocking streaming
+/// path so metrics stay comparable across all four matrix rows.
+fn resolve_fresh_manifest_blocking(
+    manifest: &PackageManifest,
+    client: &bpm::registry::RegistryClient,
+    workspace_index: &bpm::resolver::workspaces::WorkspaceIndex,
+    peer_mode: bpm::resolver::peer::PeerMode,
+    http: &HttpClient,
+    metrics: &mut Metrics,
+) -> anyhow::Result<Lockfile> {
+    let lockfile = metrics
+        .measure("dependency_resolution", || {
+            bpm::resolver::resolve_manifest_with_options(
+                manifest,
+                client,
+                "bpm",
+                Some(workspace_index),
+                peer_mode,
+            )
+        })
+        .map_err(|error| anyhow::anyhow!("dependency resolution failed: {error}"))?;
+    let diag = client.take_diagnostics();
+    metrics.record(
+        "resolver_network_wait",
+        std::time::Duration::from_nanos(diag.resolver_fetch_nanos),
+    );
+    metrics.record_resolver_diagnostics(
+        diag.cache_hits,
+        diag.cache_waits,
+        diag.inline_fetches,
+        diag.prefetch_fetches,
+        diag.fetch_bytes,
+        diag.resolver_fetch_nanos,
+    );
+    metrics.record_batch_prefetch(diag.batch_prefetch_fetches);
+    metrics.record(
+        "http_observed_http2",
+        if http.observed_http2() {
+            std::time::Duration::from_nanos(1)
+        } else {
+            std::time::Duration::ZERO
+        },
+    );
+    metrics.record(
+        "http_peak_concurrency",
+        std::time::Duration::from_nanos(http.max_concurrent_requests()),
+    );
+    Ok(lockfile)
 }
 
 /// A non-blocking variant of [`ChannelSink`] that uses `try_send` instead of
@@ -1088,7 +1164,7 @@ fn run_streaming_async_install(
     root: &Path,
     manifest: &PackageManifest,
     workspace_index: &bpm::resolver::workspaces::WorkspaceIndex,
-    _peer_mode: bpm::resolver::peer::PeerMode,
+    peer_mode: bpm::resolver::peer::PeerMode,
     concurrency: usize,
     store: &ArtifactStore,
     http: &HttpClient,
@@ -1115,8 +1191,8 @@ fn run_streaming_async_install(
         None
     };
     let workers = adaptive_workers(concurrency, usize::MAX, root);
-    let (lockfile, mut outcomes) =
-        std::thread::scope(|scope| -> anyhow::Result<(Lockfile, Vec<FetchOutcome>)> {
+    let (lockfile, mut outcomes) = std::thread::scope(
+        |scope| -> anyhow::Result<(Lockfile, Vec<FetchOutcome>)> {
             let (unit_tx, unit_rx) =
                 std::sync::mpsc::sync_channel::<InstallWork>(workers.max(1) * 2);
             let unit_rx = std::sync::Arc::new(std::sync::Mutex::new(unit_rx));
@@ -1145,11 +1221,13 @@ fn run_streaming_async_install(
                                 );
                             }
                             let result =
-                                bpm::async_resolver::resolve_manifest_with_workspaces_async_sink(
+                                bpm::async_resolver::resolve_manifest_with_options_and_target_async_sink(
                                     manifest,
                                     &registry,
                                     "bpm",
                                     Some(workspace_index),
+                                    peer_mode,
+                                    bpm::resolver::current_target_platform(),
                                     Some(&sink as &dyn resolver::ResolveSink),
                                 )
                                 .await;
@@ -1164,7 +1242,8 @@ fn run_streaming_async_install(
             metrics.record_resolver_diagnostics(hits, 0, fetches, 0, fetch_bytes, 0);
             let outcomes = join_pipeline(downloaders, extractors, metrics)?;
             Ok((lockfile, outcomes))
-        })?;
+        },
+    )?;
     // Post-resolution pass: fetch any packages the pipeline missed.
     fetch_missing_outcomes(&lockfile, &mut outcomes, store, http, metrics)?;
     let path = root.join(bpm::lockfile::BPM_LOCK_FILE);
@@ -1193,7 +1272,7 @@ fn run_streaming_async_install(
         options,
         &path,
         &bpm::registry::RegistryClient::new(config),
-        &[],
+        None,
     )
 }
 
@@ -1382,7 +1461,7 @@ fn run_streaming_install(
         options,
         &path,
         client,
-        &[],
+        None,
     )
 }
 
@@ -1401,8 +1480,22 @@ fn finalize_install(
     options: &Options,
     lockfile_path: &Path,
     registry: &bpm::registry::RegistryClient,
-    prior_owned: &[bpm::graph::ManagedEntry],
+    prior_plan: Option<&bpm::graph::InstallPlan>,
 ) -> anyhow::Result<()> {
+    // Prior ownership for stale-entry reconciliation. A pre-fix (version-2)
+    // plan persists `owned_entries` empty; in that one case conservatively
+    // infer ownership from the live prior graph volume so a single generation
+    // of stale entries still clears, claiming only entries whose live state
+    // exactly matches the prior volume.
+    let prior_owned_vec: Vec<bpm::graph::ManagedEntry> = match prior_plan {
+        Some(plan) if plan.owned_entries.is_empty() => bpm::volume::infer_prior_ownership(
+            project_root,
+            &store.graph_volume_path(&plan.graph_id_hex),
+        ),
+        Some(plan) => plan.owned_entries.clone(),
+        None => Vec::new(),
+    };
+    let prior_owned = prior_owned_vec.as_slice();
     let git_prepare_enabled = options.git_prepare
         && lockfile
             .resolution
@@ -1437,6 +1530,13 @@ fn finalize_install(
     // callers can override this with BPM_PROJECT_VIEW=relay|local.
     let project_view = resolve_project_view(lockfile);
     let local_project_view = !matches!(project_view, ProjectView::Relay);
+    // `final_ownership` is the sorted `ManagedEntry` set BPM actually created
+    // this install, used both as the reconciliation desired set and persisted
+    // into the next plan. For graph-volume views it is the final attachment
+    // result (the local-view outcome supersedes the transient relay set when
+    // local/reflink is selected). Direct materialization synthesizes no
+    // graph-volume ownership (see plan 011 Scope).
+    let mut final_ownership: Vec<bpm::graph::ManagedEntry> = Vec::new();
     let (volume, mut view_entry_count) = if direct_materialization {
         bpm::materializer::materialize_lockfile_with_backend(
             project_root,
@@ -1460,15 +1560,10 @@ fn finalize_install(
             metrics,
         )?;
         let attach = bpm::volume::attach_project(project_root, &volume)?;
-        // Reconcile stale project-view entries from the prior install.
-        if !prior_owned.is_empty() {
-            let new_desired: std::collections::BTreeSet<String> =
-                lockfile.packages.iter().map(|p| p.path.clone()).collect();
-            let _ = bpm::volume::reconcile_project_view(project_root, prior_owned, &new_desired);
-        }
+        final_ownership.clone_from(&attach.owned);
         (
             Some(volume),
-            attach.relays_created + attach.relays_unchanged,
+            attach.stats.relays_created + attach.stats.relays_unchanged,
         )
     };
     let lifecycle = run_lifecycle_if_enabled(
@@ -1494,12 +1589,41 @@ fn finalize_install(
             };
             let attached =
                 bpm::volume::attach_project_local_with_backend(project_root, volume, backend)?;
-            view_entry_count = attached.relays_created + attached.relays_unchanged;
+            view_entry_count = attached.stats.relays_created + attached.stats.relays_unchanged;
+            // The local view replaces the transient relay set as the final
+            // ownership: it is what BPM created and what reconciliation must
+            // preserve/remove on the next graph change.
+            final_ownership = attached.owned;
+        }
+    }
+
+    // Reconcile stale project-view entries from the prior install AFTER the
+    // final view is attached, using the final ownership set as the desired set.
+    // Propagate filesystem errors; warn (do not fail) on entries BPM could not
+    // prove it still owned — they are preserved, never deleted on assumption.
+    // For direct materialization (`volume == None`) there is no new graph-
+    // volume ownership to reconcile against; a prior graph-volume owner that we
+    // cannot safely attribute is preserved rather than deleted.
+    if !prior_owned.is_empty() && volume.is_some() {
+        let new_desired: std::collections::BTreeSet<String> =
+            final_ownership.iter().map(|e| e.path.clone()).collect();
+        let outcome = bpm::volume::reconcile_project_view(project_root, prior_owned, &new_desired)
+            .map_err(|error| anyhow::anyhow!("project-view reconciliation failed: {error}"))?;
+        for path in &outcome.preserved {
+            eprintln!(
+                "warning: preserved project-view entry {} (identity no longer matches; not removed)",
+                path
+            );
         }
     }
 
     let plan_path = graph::plan_path_for(lockfile_path);
-    let mut plan = graph::build_plan(lockfile, artifact_ids, &lifecycle.derived_paths);
+    let mut plan = graph::build_plan(
+        lockfile,
+        artifact_ids,
+        &lifecycle.derived_paths,
+        final_ownership.clone(),
+    );
     let prepared_keys = prepared
         .iter()
         .map(|(path, image)| (path.clone(), *image.key.as_bytes()))

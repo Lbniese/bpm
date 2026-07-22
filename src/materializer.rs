@@ -132,6 +132,7 @@ pub fn probe_fs_capabilities(dir: &Path) -> FsCapabilities {
         return caps;
     };
     let src = tmp.path().join("probe.src");
+    #[cfg(unix)]
     let link = tmp.path().join("probe.link");
     let hard = tmp.path().join("probe.hard");
 
@@ -377,6 +378,35 @@ pub(crate) fn reflink_tree(source: &Path, target: &Path) -> Result<(), Materiali
     hardlink_tree(source, target)
 }
 
+/// Materialize `source` into `target` using a directory junction (reparse
+/// point) on Windows, transparently falling back to hardlink→copy when the
+/// filesystem or OS version does not support it.
+///
+/// Junctions work at the directory level only — for individual files the
+/// callback naturally falls through to `hardlink_or_copy_file`.
+#[cfg(windows)]
+pub(crate) fn junction_tree(source: &Path, target: &Path) -> Result<(), MaterializeError> {
+    use std::os::windows::fs::symlink_dir;
+
+    // Only attempt a junction on directories; files use the hardlink/copy path.
+    if source.is_dir() {
+        // `symlink_dir` on modern Windows creates a directory reparse point
+        // (junction-like).  If it fails (e.g. no Developer Mode, cross-volume)
+        // the error is silently ignored and we fall through to hardlink/copy.
+        if symlink_dir(source, target).is_ok() {
+            return Ok(());
+        }
+    }
+    hardlink_tree(source, target)
+}
+
+/// Non-Windows platforms use hardlink→copy for everything (no junctions).
+#[cfg(not(windows))]
+#[allow(dead_code)]
+pub(crate) fn junction_tree(source: &Path, target: &Path) -> Result<(), MaterializeError> {
+    hardlink_tree(source, target)
+}
+
 fn link_tree_by_walking_directory(
     source: &Path,
     target: &Path,
@@ -487,10 +517,13 @@ fn copy_mode(from: &Path, to: &Path) -> Result<(), MaterializeError> {
 /// here" (so the caller should fall back) rather than a hard failure.
 #[cfg(unix)]
 fn is_reflink_unsupported(error: &std::io::Error) -> bool {
-    matches!(
-        error.raw_os_error(),
-        Some(libc::ENOTSUP) | Some(libc::EOPNOTSUPP) | Some(libc::EPERM) | Some(libc::EXDEV)
-    )
+    // Compared with `==` rather than a `|` match pattern because on Linux
+    // `ENOTSUP` and `EOPNOTSUPP` are the same value (95), which would make a
+    // duplicate pattern unreachable under `-D warnings`.
+    let Some(code) = error.raw_os_error() else {
+        return false;
+    };
+    code == libc::ENOTSUP || code == libc::EOPNOTSUPP || code == libc::EPERM || code == libc::EXDEV
 }
 
 /// Attempt a single copy-on-write reflink of `from` → `to` via macOS
