@@ -53,7 +53,7 @@ pub enum AsyncResolveError {
         package: String,
         spec: String,
         #[source]
-        source: RegistryError,
+        source: Box<RegistryError>,
     },
     #[error("HTTP request failed for {url}: {message}")]
     Http { url: String, message: String },
@@ -259,10 +259,10 @@ async fn async_fetch_packument(
             return serde_json::from_str(&body).map_err(|source| AsyncResolveError::Registry {
                 package: name.to_string(),
                 spec: "latest".to_string(),
-                source: RegistryError::BadJson {
+                source: Box::new(RegistryError::BadJson {
                     package: name.to_string(),
                     source,
-                },
+                }),
             });
         }
         let body = async_fetch_url_with_validators(client, &url, config, true, etag, last_modified)
@@ -271,10 +271,10 @@ async fn async_fetch_packument(
         return serde_json::from_str(&body).map_err(|source| AsyncResolveError::Registry {
             package: name.to_string(),
             spec: "latest".to_string(),
-            source: RegistryError::BadJson {
+            source: Box::new(RegistryError::BadJson {
                 package: name.to_string(),
                 source,
-            },
+            }),
         });
     }
 
@@ -283,10 +283,10 @@ async fn async_fetch_packument(
     serde_json::from_str(&body).map_err(|source| AsyncResolveError::Registry {
         package: name.to_string(),
         spec: "latest".to_string(),
-        source: RegistryError::BadJson {
+        source: Box::new(RegistryError::BadJson {
             package: name.to_string(),
             source,
-        },
+        }),
     })
 }
 
@@ -311,18 +311,18 @@ async fn async_fetch_version_packument(
                 serde_json::from_str(&body).map_err(|source| AsyncResolveError::Registry {
                     package: name.to_string(),
                     spec: version.to_string(),
-                    source: RegistryError::BadJson {
+                    source: Box::new(RegistryError::BadJson {
                         package: name.to_string(),
                         source,
-                    },
+                    }),
                 })?;
             let metadata = version_metadata(name, &version.to_string(), wire).ok_or_else(|| {
                 AsyncResolveError::Registry {
                     package: name.to_string(),
                     spec: version.to_string(),
-                    source: RegistryError::NoVersions {
+                    source: Box::new(RegistryError::NoVersions {
                         package: name.to_string(),
-                    },
+                    }),
                 }
             })?;
             return Ok(Packument {
@@ -339,18 +339,18 @@ async fn async_fetch_version_packument(
         serde_json::from_str(&body).map_err(|source| AsyncResolveError::Registry {
             package: name.to_string(),
             spec: version.to_string(),
-            source: RegistryError::BadJson {
+            source: Box::new(RegistryError::BadJson {
                 package: name.to_string(),
                 source,
-            },
+            }),
         })?;
     let metadata = version_metadata(name, &version.to_string(), wire).ok_or_else(|| {
         AsyncResolveError::Registry {
             package: name.to_string(),
             spec: version.to_string(),
-            source: RegistryError::NoVersions {
+            source: Box::new(RegistryError::NoVersions {
                 package: name.to_string(),
-            },
+            }),
         }
     })?;
     Ok(Packument {
@@ -425,7 +425,7 @@ impl AsyncRegistryClient {
             AsyncResolveError::Registry {
                 package: spec.name.clone(),
                 spec: spec.name.clone(),
-                source,
+                source: Box::new(source),
             }
         })
     }
@@ -650,7 +650,7 @@ impl<'a> AsyncGraphResolver<'a> {
                     AsyncResolveError::Registry {
                         package: name.to_owned(),
                         spec: spec.clone(),
-                        source,
+                        source: Box::new(source),
                     }
                 })?;
             let registry_base = self
@@ -670,10 +670,10 @@ impl<'a> AsyncGraphResolver<'a> {
                             spec: _,
                             source,
                         } => source,
-                        other => RegistryError::Network {
+                        other => Box::new(RegistryError::Network {
                             package: name.to_owned(),
                             source: other.to_string().into(),
-                        },
+                        }),
                     },
                 })?;
             let mut resolved =
@@ -681,7 +681,7 @@ impl<'a> AsyncGraphResolver<'a> {
                     AsyncResolveError::Registry {
                         package: name.to_owned(),
                         spec: spec.clone(),
-                        source,
+                        source: Box::new(source),
                     }
                 })?;
 
@@ -703,7 +703,7 @@ impl<'a> AsyncGraphResolver<'a> {
                         |source| AsyncResolveError::Registry {
                             package: name.to_owned(),
                             spec: spec.clone(),
-                            source,
+                            source: Box::new(source),
                         },
                     )?;
                     if self.peer_candidate_matches(&candidate.metadata, parent) {
