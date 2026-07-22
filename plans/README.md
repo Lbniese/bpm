@@ -49,7 +49,7 @@ correctness fix.
 | 010  | Honor resolver mode and peer options on every fresh-install path | P1 | M | — | DONE |
 | 011  | Record project-view ownership and remove stale entries safely | P1 | M | — | DONE |
 | 012  | Constrain registry artifact sources and bound every artifact read | P1 | M | — | DONE |
-| 013  | Make Git and patch source caches race-safe | P2 | M | 012 | TODO |
+| 013  | Make Git and patch source caches race-safe | P2 | M | 012 | DONE |
 | 014  | Stream package-image metadata without loading file payloads | P2 | M | — | TODO |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) |
@@ -128,6 +128,22 @@ abandoned).
   enum bounded after adding the variant. Explicit user-selected local
   tarball/`file:` dependencies still work; cross-origin CDN tarballs still
   work.
+- **013 done (2026-07-22).** Every deterministic Git/patch cache key in
+  `src/resolver/sources.rs` now has a cross-process advisory lock (`source_lock`
+  with distinct namespaces `patch`/`source-tree`/`archive`/`clone` so the
+  archive→clone fallback does not re-enter the same lock file), an under-lock
+  recheck + validation of the final object (patched tarball by SHA-512 content,
+  source tree by `package.json`/`package/package.json` layout, git archive by a
+  decodable gzip+tar manifest), a process-unique scratch path (`unique_scratch`:
+  counter + nanos + pid) with RAII `ScratchGuard` cleanup-on-drop disarmed only
+  after successful atomic rename, and clone-cache mutation serialized through
+  archive completion (clone into a unique sibling, validate `.git`, rename).
+  No builder writes to, removes, or reuses a deterministic shared `.tmp` staging
+  path. Final cache paths and returned lockfile URLs remain deterministic;
+  credential-bearing URLs never appear in lock/scratch filenames. Concurrent
+  (8/4-thread) and corrupt-cache-recovery tests added for each cache; the clone
+  fallback over a non-directory remote is covered structurally + via the
+  archive-cache and existing `git_prepare_characterization` integration tests.
 - **013 requires 012.** Both change `src/resolver/sources.rs`: 012 establishes
   bounded artifact readers; 013 must rebase on and preserve those limits while
   adding source-cache locking/publication safety.
