@@ -740,8 +740,7 @@ fn enforce_frozen(
         }
     };
     let root_declarations = manifest.root_dependency_declarations();
-    let declared: BTreeSet<String> = root_declarations.keys().cloned().collect();
-    let locked: BTreeSet<String> = lockfile.root.dependencies.keys().cloned().collect();
+    let locked = &lockfile.root.dependencies;
     let expected_overrides = resolver::overrides::OverrideSet::from_manifest(
         &manifest.overrides,
         &root_declarations,
@@ -751,25 +750,49 @@ fn enforce_frozen(
     .as_map()
     .clone();
     let root_resolution = &lockfile.resolution.root;
-    if declared == locked
+    // Frozen mode compares the complete canonical root declaration map
+    // (`name -> spec`), not just dependency names. Editing `"greet": "^1.0.0"`
+    // to `"greet": "^2.0.0"` keeps the name set unchanged but must be rejected
+    // because the lockfile records the exact declared specification.
+    if root_declarations == *locked
         && root_resolution.dev_dependencies == manifest.dev_dependencies
         && root_resolution.optional_dependencies == manifest.optional_dependencies
         && root_resolution.overrides == expected_overrides
     {
         return Ok(());
     }
-    let only_manifest = declared
-        .difference(&locked)
+    let only_manifest = root_declarations
+        .keys()
+        .filter(|name| !locked.contains_key(*name))
         .map(String::as_str)
         .collect::<Vec<_>>();
     let only_lock = locked
-        .difference(&declared)
+        .keys()
+        .filter(|name| !root_declarations.contains_key(*name))
         .map(String::as_str)
+        .collect::<Vec<_>>();
+    // Shared names whose declared specification changed. BTreeMap iteration is
+    // sorted by key, so this list is deterministic. Comparison is textual only:
+    // frozen drift is declared-input drift, so `1.0.0` and `=1.0.0` are
+    // different declarations even if semantically equivalent.
+    let changed_specs = root_declarations
+        .iter()
+        .filter_map(|(name, manifest_spec)| {
+            let locked_spec = locked.get(name)?;
+            if manifest_spec == locked_spec {
+                None
+            } else {
+                Some(format!(
+                    "{name} (package.json: {manifest_spec}, {lock_label}: {locked_spec})"
+                ))
+            }
+        })
         .collect::<Vec<_>>();
     anyhow::bail!(
         "frozen install refused: package.json and {lock_label} disagree on root dependencies\n  \
          in package.json but not {lock_label}: {}\n  \
          in {lock_label} but not package.json: {}\n  \
+         changed specifications: {}\n  \
          re-run `bpm import` after editing package.json",
         if only_manifest.is_empty() {
             "(none)".to_string()
@@ -780,6 +803,11 @@ fn enforce_frozen(
             "(none)".to_string()
         } else {
             only_lock.join(", ")
+        },
+        if changed_specs.is_empty() {
+            "(none)".to_string()
+        } else {
+            changed_specs.join(", ")
         }
     );
 }
