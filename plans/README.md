@@ -50,7 +50,7 @@ correctness fix.
 | 011  | Record project-view ownership and remove stale entries safely | P1 | M | — | DONE |
 | 012  | Constrain registry artifact sources and bound every artifact read | P1 | M | — | DONE |
 | 013  | Make Git and patch source caches race-safe | P2 | M | 012 | DONE |
-| 014  | Stream package-image metadata without loading file payloads | P2 | M | — | TODO |
+| 014  | Stream package-image metadata without loading file payloads | P2 | M | — | DONE |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) |
 REJECTED (with one-line rationale — finding fixed independently or approach
@@ -147,6 +147,21 @@ abandoned).
 - **013 requires 012.** Both change `src/resolver/sources.rs`: 012 establishes
   bounded artifact readers; 013 must rebase on and preserve those limits while
   adding source-cache locking/publication safety.
+- **014 done (2026-07-22).** Added a metadata-only package-image decoder
+  `decode_index<R: Read + Seek>` and `IndexEntry` (`File { path }` /
+  `Symlink { path, target }`) in `src/package_image.rs`. It validates magic,
+  entry count, and every kind/path/target, bounds allocations (entry count and
+  string-length caps, plus a per-entry minimum-byte count check), and **skips
+  file payloads via `Seek`** (rejecting extents past the recorded stream end and
+  trailing bytes). The full payload `decode`/`to_directory` are unchanged. The
+  hardlink/reflink indexed branch in `src/materializer.rs` now opens the `.bpi`
+  sidecar with `File::open`, parses `Vec<IndexEntry>` **before** removing or
+  creating any target (so a corrupt sidecar cannot destroy a usable local
+  view), and sources file bytes from the extracted immutable image rather than
+  the sidecar payload; error mapping to `InvalidData` with the sidecar path is
+  preserved. `.bpi` magic/encoding and store layout are unchanged. A
+  counting-reader test proves read volume stays at metadata size and does not
+  scale with payload length.
 - **014 is independent** of 010–013. It preserves the `BPMIMG01` format and
   changes only metadata consumption, so it can run in parallel if branches are
   isolated.
