@@ -475,6 +475,85 @@ fn frozen_refuses_when_manifest_and_lock_disagree() {
 }
 
 #[test]
+fn frozen_refuses_when_dependency_specification_drifts() {
+    let (project, store, _tgz) = setup_project();
+
+    // Same dependency name, but the declared range changes. The name set is
+    // unchanged, so a name-only comparison would silently accept the stale
+    // lockfile. Frozen mode must reject any change to the canonical
+    // `name -> specification` map.
+    fs::write(
+        project.path().join("package.json"),
+        r#"{"name":"app","dependencies":{"greet":"^2.0.0"}}"#,
+    )
+    .unwrap();
+
+    let out = run_install(project.path(), store.path());
+    assert!(
+        !out.status.success(),
+        "same-name spec drift should fail (bpm.lock)"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("frozen install refused"),
+        "expected frozen refusal, stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("greet"),
+        "should name the drifted dep: {stderr}"
+    );
+    assert!(
+        stderr.contains("^2.0.0"),
+        "should show the new manifest spec: {stderr}"
+    );
+    assert!(
+        stderr.contains("^1.0.0"),
+        "should show the locked spec: {stderr}"
+    );
+}
+
+#[test]
+fn ci_refuses_when_dependency_specification_drifts() {
+    let (project, store, _tgz) = setup_package_lock_project();
+
+    // Same dependency name, but the declared range changes. `bpm ci` must
+    // reject this for the npm v3 package-lock.json authority using the same
+    // shared frozen guard as bpm.lock.
+    fs::write(
+        project.path().join("package.json"),
+        r#"{"name":"app","dependencies":{"greet":"^2.0.0"}}"#,
+    )
+    .unwrap();
+
+    let out = run_ci(project.path(), store.path());
+    assert!(
+        !out.status.success(),
+        "same-name spec drift should fail (package-lock.json)"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("frozen install refused"),
+        "expected frozen refusal, stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("package-lock.json"),
+        "should identify the selected lock authority: {stderr}"
+    );
+    assert!(
+        stderr.contains("greet"),
+        "should name the drifted dep: {stderr}"
+    );
+    assert!(
+        stderr.contains("^2.0.0"),
+        "should show the new manifest spec: {stderr}"
+    );
+    assert!(
+        stderr.contains("^1.0.0"),
+        "should show the locked spec: {stderr}"
+    );
+}
+
+#[test]
 fn install_runs_offline_without_network() {
     // Pure marker: the whole flow above used file:// sources only; there is no
     // exercise of any HTTP path, so installs are reproducible offline.
