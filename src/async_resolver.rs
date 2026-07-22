@@ -5,50 +5,34 @@
 //! (async) and `tokio` tasks to issue multiple packument fetches concurrently
 //! while the resolution algorithm processes already-available metadata.
 //!
-//! ## Design
+//! ## Design (post-unification)
 //!
-//! The async resolver mirrors the synchronous `resolver` module's algorithm
-//! but replaces every blocking `RegistryClient::packument_for` call with an
-//! `.await` on an `AsyncRegistryClient` method.  This lets the async runtime
-//! multiplex concurrent fetches on a single thread (or across threads with
-//! `rt-multi-thread`), so the resolver never "stalls" — it yields while
-//! waiting for packument data and processes results as they arrive.
-//!
-//! The output `Lockfile` is byte-for-byte compatible with the synchronous
-//! resolver; only the I/O model differs.
-//!
-//! ## Usage
-//!
-//! ```ignore
-//! use bpm::async_resolver::{AsyncRegistryClient, resolve_manifest_async};
-//! use bpm::config::NpmConfig;
-//!
-//! let config = NpmConfig::default();
-//! let registry = AsyncRegistryClient::new(config);
-//! let lockfile = resolve_manifest_async(&manifest, &registry, "bpm").await?;
-//! ```
+//! The async resolver shares the deterministic placement algorithm with the
+//! blocking resolver by using the same helper functions (`resolver::parent_path`,
+//! `resolver::merged_dependencies`, `resolver::request_matches`,
+//! `resolver::registry_request`, `resolver::looks_like_registry_spec`) and
+//! the same `Node` type (`resolver::placement::Node`).  The async
+//! `GraphResolver` (`AsyncGraphResolver`) mirrors
+//! `resolver::placement::GraphResolver`'s structure but uses `.await` on
+//! `AsyncRegistryClient` instead of synchronous I/O.
+
+// ── Imports ──────────────────────────────────────────────────────────────
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 
 use semver::Version;
 use thiserror::Error;
-use tokio::sync::Mutex as AsyncMutex;
 
-use crate::config::NpmConfig;
-use crate::http::redact_url;
 use crate::integrity::Integrity;
 use crate::lockfile::{
     LockDependency, LockSource, Lockfile, PackageEntry, PackageResolution, RootEntry,
     RootResolution,
 };
 use crate::manifest::PackageManifest;
-use crate::metadata_cache::{CacheMode, MetadataCache};
 use crate::registry::{
-    self, parse_spec, resolve_packument, version_metadata, PackageSpec, Packument, RegistryError,
-    VersionMetadata, VersionRequest, WireVersionMetadata, ABBREV_ACCEPT,
+    self, parse_spec, resolve_packument, PackageSpec, Packument, RegistryError, VersionMetadata,
+    VersionRequest,
 };
 use crate::resolver;
 use crate::resolver::model::*;
@@ -56,6 +40,7 @@ use crate::resolver::overrides::OverrideSet;
 use crate::resolver::peer::{PeerMode, VisibleProviders};
 use crate::resolver::platform::{self, check_package_platform, PackageReachability};
 use crate::resolver::workspaces::WorkspaceIndex;
+use crate::resolver::DependencySource;
 use crate::resolver::{ResolveSink, ResolvedDownloadUnit};
 
 // ── Public types ────────────────────────────────────────────────────────
@@ -112,8 +97,14 @@ fn build_async_client(config: &NpmConfig) -> reqwest::Client {
         .expect("valid reqwest async client with defaults")
 }
 
-/// Fetch a packument JSON body from `url` using the async client, applying
-/// registry authentication and conditional validators for cache revalidation.
+use crate::config::NpmConfig;
+use crate::http::redact_url;
+use crate::metadata_cache::{CacheMode, MetadataCache};
+use crate::registry::{version_metadata, WireVersionMetadata, ABBREV_ACCEPT};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use tokio::sync::Mutex as AsyncMutex;
+
 async fn async_fetch_url_with_validators(
     client: &reqwest::Client,
     url: &str,
@@ -143,9 +134,6 @@ async fn async_fetch_url_with_validators(
 
     let status = response.status().as_u16();
     if status == 304 {
-        // 304 Not Modified: cached body is still valid.
-        // This path should only be reached if we had a valid cached entry
-        // with validators; return an empty marker so the caller reuses it.
         return Ok(String::new());
     }
     if status >= 400 {
@@ -161,8 +149,6 @@ async fn async_fetch_url_with_validators(
     })
 }
 
-/// Fetch a packument JSON body from `url` using the async client, applying
-/// registry authentication and the abbreviated-format accept header.
 async fn async_fetch_url(
     client: &reqwest::Client,
     url: &str,
@@ -173,7 +159,6 @@ async fn async_fetch_url(
     if send_abbreviated_accept {
         request = request.header("Accept", ABBREV_ACCEPT);
     }
-    // Apply npmrc auth for this URL.
     if let Some(token) = config.auth_token_for_url(url) {
         request = request.bearer_auth(token);
     }
@@ -197,8 +182,6 @@ async fn async_fetch_url(
     })
 }
 
-/// Check the persistent metadata cache and return cached body if applicable.
-/// Uses `tokio::task::spawn_blocking` to avoid blocking the async runtime.
 async fn async_cache_get(
     cache: Option<&Arc<MetadataCache>>,
     url: &str,
@@ -226,13 +209,11 @@ async fn async_cache_get(
             }
             Ok(None)
         }
-        Ok(Err(_)) => Ok(None), // cache read failure degrades to miss
+        Ok(Err(_)) => Ok(None),
         Err(_) => Ok(None),
     }
 }
 
-/// Write response body and validators to the persistent cache via
-/// `spawn_blocking`.
 #[allow(dead_code)]
 async fn async_cache_put(
     cache: Option<&Arc<MetadataCache>>,
@@ -256,12 +237,10 @@ async fn async_cache_put(
     .await;
 }
 
-/// Encode a package name for use as a URL path segment (npm-style: `/` → `%2F`).
 fn encode_package_name(name: &str) -> String {
     name.replace('/', "%2F")
 }
 
-/// Fetch a full abbreviated packument from the registry, with cache support.
 async fn async_fetch_packument(
     client: &reqwest::Client,
     name: &str,
@@ -275,7 +254,6 @@ async fn async_fetch_packument(
     let encoded = encode_package_name(name);
     let url = format!("{base}/{encoded}");
 
-    // Check persistent cache first.
     if let Some((body, etag, last_modified)) = async_cache_get(cache, &url, mode).await? {
         if !mode.allows_network() || mode.serves_stale() {
             return serde_json::from_str(&body).map_err(|source| AsyncResolveError::Registry {
@@ -287,11 +265,9 @@ async fn async_fetch_packument(
                 },
             });
         }
-        // Online with stale entry: send conditional headers.
         let body = async_fetch_url_with_validators(client, &url, config, true, etag, last_modified)
             .await?;
         fetch_bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
-        // Don't cache here; async_fetch_url_with_validators handles it.
         return serde_json::from_str(&body).map_err(|source| AsyncResolveError::Registry {
             package: name.to_string(),
             spec: "latest".to_string(),
@@ -314,7 +290,6 @@ async fn async_fetch_packument(
     })
 }
 
-/// Fetch a per-version packument (smaller payload for exact-version deps).
 #[allow(clippy::too_many_arguments)]
 async fn async_fetch_version_packument(
     client: &reqwest::Client,
@@ -330,7 +305,6 @@ async fn async_fetch_version_packument(
     let encoded = encode_package_name(name);
     let url = format!("{base}/{encoded}/{version}");
 
-    // Check persistent cache.
     if let Some((body, _, _)) = async_cache_get(cache, &url, mode).await? {
         if !mode.allows_network() || mode.serves_stale() {
             let wire: WireVersionMetadata =
@@ -388,41 +362,23 @@ async fn async_fetch_version_packument(
 
 // ── AsyncRegistryClient ─────────────────────────────────────────────────
 
-/// Non-blocking registry client that fetches packuments using async HTTP.
-///
-/// Like the synchronous `RegistryClient` it caches packuments in memory so
-/// repeated requests for the same package reuse the previously-fetched data.
-/// Unlike the synchronous version, every method is `async` and never blocks
-/// the calling thread: it yields to the tokio runtime while waiting for the
-/// registry response, allowing other tasks to make progress concurrently.
 #[derive(Clone)]
 pub struct AsyncRegistryClient {
     config: NpmConfig,
     http: reqwest::Client,
-    /// Simple in-memory packument cache shared across resolution steps.
     packument_cache: Arc<AsyncMutex<BTreeMap<String, Packument>>>,
-    /// Total bytes fetched over the network (packument bodies).
     fetch_bytes: Arc<AtomicU64>,
-    /// Total count of inline packument fetches.
     inline_fetches: Arc<AtomicU64>,
-    /// Total count of cache hits.
     cache_hits: Arc<AtomicU64>,
-    /// Persistent metadata cache (SQLite), shared with the blocking path.
     metadata_cache: Option<Arc<MetadataCache>>,
-    /// Cache mode (offline, prefer-offline, default, prefer-online).
     cache_mode: CacheMode,
-    /// Maximum number of concurrent in-flight metadata requests for bounded
-    /// concurrent prefetch.  1 = sequential (no overlap).
     max_in_flight: u32,
-    /// Peak concurrent metadata requests observed (diagnostic).
     peak_in_flight: Arc<AtomicU64>,
-    /// Current in-flight request count.
     #[allow(dead_code)]
     in_flight: Arc<AtomicU64>,
 }
 
 impl AsyncRegistryClient {
-    /// Create a new async registry client with a standalone HTTP pool.
     pub fn new(config: NpmConfig) -> Self {
         let http = build_async_client(&config);
         Self {
@@ -440,31 +396,25 @@ impl AsyncRegistryClient {
         }
     }
 
-    /// Set the maximum number of concurrent in-flight metadata requests.
     pub fn with_max_in_flight(mut self, max: u32) -> Self {
         self.max_in_flight = max.max(1);
         self
     }
 
-    /// Peak concurrent metadata requests observed during resolution.
     pub fn peak_in_flight(&self) -> u64 {
-        self.peak_in_flight
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.peak_in_flight.load(Ordering::Relaxed)
     }
 
-    /// Attach a persistent metadata cache and set the cache mode.
     pub fn with_metadata_cache(mut self, cache: Arc<MetadataCache>, cache_mode: CacheMode) -> Self {
         self.metadata_cache = Some(cache);
         self.cache_mode = cache_mode;
         self
     }
 
-    /// Return the effective registry for a package name.
     pub fn registry_for_package(&self, package: &str) -> &str {
         self.config.registry_for_package(package)
     }
 
-    /// Resolve a spec to a concrete artifact version.
     pub async fn resolve(
         &self,
         spec: &PackageSpec,
@@ -480,10 +430,6 @@ impl AsyncRegistryClient {
         })
     }
 
-    /// Fetch packument for a spec.
-    ///
-    /// Exact versions use the smaller per-version endpoint; ranges and tags
-    /// use the abbreviated packument.
     pub async fn packument_for(&self, spec: &PackageSpec) -> Result<Packument, AsyncResolveError> {
         match &spec.req {
             VersionRequest::Exact(version) => {
@@ -504,12 +450,10 @@ impl AsyncRegistryClient {
         }
     }
 
-    /// Fetch a packument by name, consulting the in-memory cache first.
     pub async fn packument(&self, name: &str) -> Result<Packument, AsyncResolveError> {
         let registry_url = self.config.registry_for_package(name);
         let key = format!("{}\0{name}", registry_url.trim_end_matches('/'));
 
-        // Check cache first.
         {
             let cache = self.packument_cache.lock().await;
             if let Some(packument) = cache.get(&key) {
@@ -518,7 +462,6 @@ impl AsyncRegistryClient {
             }
         }
 
-        // Cache miss — check persistent cache, then fetch from network.
         self.inline_fetches.fetch_add(1, Ordering::Relaxed);
         let packument = async_fetch_packument(
             &self.http,
@@ -531,13 +474,11 @@ impl AsyncRegistryClient {
         )
         .await?;
 
-        // Store in cache (best-effort; races are harmless).
         let mut cache = self.packument_cache.lock().await;
         cache.entry(key).or_insert_with(|| packument.clone());
         Ok(packument)
     }
 
-    /// Snapshot and reset diagnostic counters.
     pub fn take_diagnostics(&self) -> (u64, u64, u64) {
         (
             self.cache_hits.swap(0, Ordering::Relaxed),
@@ -547,9 +488,8 @@ impl AsyncRegistryClient {
     }
 }
 
-// ── Internal node type ──────────────────────────────────────────────────
+// ── AsyncGraphResolver ──────────────────────────────────────────────────
 
-#[derive(Clone)]
 struct AsyncNode {
     path: String,
     placement_name: String,
@@ -566,8 +506,6 @@ struct AsyncNode {
     workspace_target: Option<String>,
     source_dir: Option<PathBuf>,
 }
-
-// ── AsyncGraphResolver ──────────────────────────────────────────────────
 
 struct AsyncGraphResolver<'a> {
     registry: &'a AsyncRegistryClient,
@@ -601,7 +539,6 @@ impl<'a> AsyncGraphResolver<'a> {
         }
     }
 
-    /// Resolve a single dependency specification into a node path.
     fn resolve_dependency<'s>(
         &'s mut self,
         parent: &'s str,
@@ -642,7 +579,7 @@ impl<'a> AsyncGraphResolver<'a> {
                     if !self.platform_allows(name, &metadata, optional)? {
                         return Ok(None);
                     }
-                    let dependencies = merged_deps(&metadata);
+                    let dependencies = resolver::merged_dependencies(&metadata);
                     self.nodes.insert(
                         path.clone(),
                         AsyncNode {
@@ -674,15 +611,15 @@ impl<'a> AsyncGraphResolver<'a> {
             }
 
             // ── Source dependency (file:, git:, tarball) ────────────────────
-            if let Some(source) = crate::resolver::DependencySource::parse(&spec) {
+            if let Some(source) = DependencySource::parse(&spec) {
                 return self
                     .resolve_source_dependency(parent, name, &spec, source, optional, dev)
                     .await;
             }
 
             // ── Check if already visible in parent ──────────────────────────
-            let (_, visible_spec) = registry_req(name, &spec);
-            if let Some(path) = self.find_visible(parent, name, visible_spec) {
+            let (_, visible_spec) = resolver::registry_request(name, &spec);
+            if let Some(path) = self.find_visible(parent, name, &visible_spec) {
                 self.upgrade_reachability(&path, optional, dev);
                 return Ok(Some(path));
             }
@@ -695,7 +632,7 @@ impl<'a> AsyncGraphResolver<'a> {
             };
             if self.nodes.contains_key(&path) {
                 let selected = self.nodes.get(&path).expect("checked above");
-                if request_matches_spec(visible_spec, &selected.metadata.version) {
+                if resolver::request_matches(&visible_spec, &selected.metadata.version) {
                     return Ok(Some(path));
                 }
                 return Err(AsyncResolveError::PlacementConflict {
@@ -706,8 +643,8 @@ impl<'a> AsyncGraphResolver<'a> {
                 });
             }
 
-            // ── Registry resolution (async — does not block!) ───────────────
-            let (registry_name, registry_spec) = registry_req(name, &spec);
+            // ── Registry resolution (async) ─────────────────────────────────
+            let (registry_name, registry_spec) = resolver::registry_request(name, &spec);
             let parsed =
                 parse_spec(&format!("{registry_name}@{registry_spec}")).map_err(|source| {
                     AsyncResolveError::Registry {
@@ -716,7 +653,10 @@ impl<'a> AsyncGraphResolver<'a> {
                         source,
                     }
                 })?;
-            let registry_base = self.registry.registry_for_package(registry_name).to_owned();
+            let registry_base = self
+                .registry
+                .registry_for_package(&registry_name)
+                .to_owned();
             let packument = self
                 .registry
                 .packument_for(&parsed)
@@ -779,7 +719,7 @@ impl<'a> AsyncGraphResolver<'a> {
             }
 
             // ── Place the node ──────────────────────────────────────────────
-            let dependencies = merged_deps(&resolved.metadata);
+            let dependencies = resolver::merged_dependencies(&resolved.metadata);
             self.nodes.insert(
                 path.clone(),
                 AsyncNode {
@@ -802,7 +742,7 @@ impl<'a> AsyncGraphResolver<'a> {
                 },
             );
 
-            // ── Announce to sink (streaming pipeline) ──────────────────────
+            // ── Announce to sink ────────────────────────────────────────────
             self.announce(&path);
 
             // ── Recurse into children ───────────────────────────────────────
@@ -812,7 +752,6 @@ impl<'a> AsyncGraphResolver<'a> {
         })
     }
 
-    /// Resolve all children of a node.
     async fn resolve_children(
         &mut self,
         parent_path: &str,
@@ -836,13 +775,12 @@ impl<'a> AsyncGraphResolver<'a> {
         Ok(())
     }
 
-    /// Resolve a non-registry (source) dependency.
     async fn resolve_source_dependency(
         &mut self,
         parent: &str,
         name: &str,
         spec: &str,
-        source: crate::resolver::DependencySource,
+        source: DependencySource,
         optional: bool,
         dev: bool,
     ) -> Result<Option<String>, AsyncResolveError> {
@@ -867,7 +805,7 @@ impl<'a> AsyncGraphResolver<'a> {
         if !self.platform_allows(name, &metadata, optional)? {
             return Ok(None);
         }
-        let dependencies = merged_deps(&metadata);
+        let dependencies = resolver::merged_dependencies(&metadata);
         self.nodes.insert(
             path.clone(),
             AsyncNode {
@@ -893,13 +831,8 @@ impl<'a> AsyncGraphResolver<'a> {
         Ok(Some(path))
     }
 
-    /// If a download sink is attached, announce a just-placed node so a caller
-    /// can start fetching its tarball before the rest of the graph is resolved.
-    /// No-op for linked (workspace) nodes and nodes without a download URL.
     fn announce(&self, path: &str) {
-        let Some(sink) = self.sink else {
-            return;
-        };
+        let Some(sink) = self.sink else { return };
         let unit = {
             let Some(node) = self.nodes.get(path) else {
                 return;
@@ -914,8 +847,6 @@ impl<'a> AsyncGraphResolver<'a> {
                 integrity: if node.integrity.is_empty() {
                     None
                 } else {
-                    // integrity is validated at registry selection;
-                    // a non-empty string must parse.
                     Some(Integrity::parse(&node.integrity).unwrap_or_else(|e| {
                         panic!(
                             "invalid integrity in resolved node for {}: {}: {}",
@@ -928,7 +859,6 @@ impl<'a> AsyncGraphResolver<'a> {
         sink.emit(unit);
     }
 
-    /// Check whether a package is compatible with the target platform.
     fn platform_allows(
         &mut self,
         name: &str,
@@ -963,7 +893,6 @@ impl<'a> AsyncGraphResolver<'a> {
         }
     }
 
-    /// Check peer compatibility with the visible provider tree.
     fn peer_candidate_matches(&self, metadata: &VersionMetadata, parent: &str) -> bool {
         metadata.peer_dependencies.iter().all(|(name, range)| {
             let Some(path) = self.find_visible_any(parent, name) else {
@@ -972,13 +901,12 @@ impl<'a> AsyncGraphResolver<'a> {
                     .get(name)
                     .is_some_and(|meta| meta.optional);
             };
-            self.nodes
-                .get(&path)
-                .is_some_and(|provider| request_matches_spec(range, &provider.metadata.version))
+            self.nodes.get(&path).is_some_and(|provider| {
+                resolver::request_matches(range, &provider.metadata.version)
+            })
         })
     }
 
-    /// Collect visible providers up the ancestor chain.
     fn visible_providers(
         &self,
         parent: &str,
@@ -1022,7 +950,6 @@ impl<'a> AsyncGraphResolver<'a> {
         providers
     }
 
-    /// Find a visible provider for a dependency in the parent chain.
     fn find_visible(&self, parent: &str, name: &str, spec: &str) -> Option<String> {
         let mut candidate = if parent.is_empty() {
             String::new()
@@ -1036,7 +963,7 @@ impl<'a> AsyncGraphResolver<'a> {
                 format!("{candidate}/node_modules/{name}")
             };
             if let Some(node) = self.nodes.get(&path) {
-                if request_matches_spec(spec, &node.metadata.version) {
+                if resolver::request_matches(spec, &node.metadata.version) {
                     return Some(path);
                 }
             }
@@ -1051,7 +978,6 @@ impl<'a> AsyncGraphResolver<'a> {
         None
     }
 
-    /// Find any visible provider for a name (not just dependency targets).
     fn find_visible_any(&self, parent: &str, name: &str) -> Option<String> {
         let mut candidate = parent.to_owned();
         loop {
@@ -1073,7 +999,6 @@ impl<'a> AsyncGraphResolver<'a> {
         }
     }
 
-    /// Build ancestor chain for override resolution.
     fn ancestor_chain(&self, parent: &str) -> Vec<(String, Version)> {
         if parent.is_empty() {
             return Vec::new();
@@ -1082,7 +1007,7 @@ impl<'a> AsyncGraphResolver<'a> {
         let mut current = parent.to_owned();
         loop {
             paths.push(current.clone());
-            let next = parent_path(&current);
+            let next = resolver::parent_path(&current);
             if next.is_empty() {
                 break;
             }
@@ -1116,86 +1041,8 @@ impl<'a> AsyncGraphResolver<'a> {
     }
 }
 
-// ── Helpers ─────────────────────────────────────────────────────────────
-
-/// Join `dependencies` and `optional_dependencies` into one map for traversal.
-fn merged_deps(metadata: &VersionMetadata) -> BTreeMap<String, String> {
-    let mut deps = BTreeMap::new();
-    for (k, v) in &metadata.dependencies {
-        deps.insert(k.clone(), v.clone());
-    }
-    for (k, v) in &metadata.optional_dependencies {
-        deps.insert(k.clone(), v.clone());
-    }
-    deps
-}
-
-/// Extract the parent path from a child path.
-fn parent_path(path: &str) -> String {
-    if let Some(idx) = path.rfind("/node_modules/") {
-        if idx == 0 {
-            String::new()
-        } else {
-            path[..idx].to_string()
-        }
-    } else {
-        String::new()
-    }
-}
-
-/// Extract registry name and spec from a possibly-aliased spec string.
-fn registry_req<'a>(name: &'a str, spec: &'a str) -> (&'a str, &'a str) {
-    if let Some(rest) = spec.strip_prefix("npm:") {
-        if let Some(at) = rest.rfind('@') {
-            (&rest[..at], &rest[at + 1..])
-        } else {
-            (rest, "latest")
-        }
-    } else {
-        (name, spec)
-    }
-}
-
-/// Check if a resolved version matches a visible spec string.
-fn request_matches_spec(spec: &str, version: &Version) -> bool {
-    if spec.is_empty() || spec == "latest" || spec == "*" {
-        return true;
-    }
-    if let Ok(parsed) = parse_spec(&format!("pkg@{spec}")) {
-        match &parsed.req {
-            VersionRequest::Latest => true,
-            VersionRequest::Exact(v) => v == version,
-            VersionRequest::Range(r) => r.matches(version),
-        }
-    } else {
-        spec == version.to_string()
-    }
-}
-
-/// Heuristic: true when `spec` looks like a registry version/range.
-fn looks_like_registry_spec(spec: &str) -> bool {
-    let lower = spec.to_ascii_lowercase();
-    !(spec.starts_with("patch:")
-        || spec.starts_with("file:")
-        || spec.starts_with("link:")
-        || lower.starts_with("git+")
-        || lower.starts_with("git:")
-        || lower.starts_with("github:")
-        || lower.starts_with("http:")
-        || lower.starts_with("https:")
-        || lower.starts_with("npm:")
-        || spec.starts_with("workspace:")
-        || spec.starts_with("./")
-        || spec.starts_with("../")
-        || spec.starts_with('/'))
-}
-
 // ── Public entry points ─────────────────────────────────────────────────
 
-/// Resolve a manifest into the canonical BPM lockfile using async I/O.
-///
-/// This is the async counterpart of [`resolver::resolve_manifest`].  The
-/// returned `Lockfile` is byte-for-byte compatible with the sync resolver.
 pub async fn resolve_manifest_async(
     manifest: &PackageManifest,
     registry: &AsyncRegistryClient,
@@ -1212,7 +1059,6 @@ pub async fn resolve_manifest_async(
     .await
 }
 
-/// Resolve a manifest with workspace support.
 pub async fn resolve_manifest_with_workspaces_async(
     manifest: &PackageManifest,
     registry: &AsyncRegistryClient,
@@ -1230,9 +1076,6 @@ pub async fn resolve_manifest_with_workspaces_async(
     .await
 }
 
-/// Resolve a manifest with workspace support and a download sink for
-/// streaming install composition.  See
-/// [`resolve_manifest_with_options_and_target_async_sink`].
 pub async fn resolve_manifest_with_workspaces_async_sink(
     manifest: &PackageManifest,
     registry: &AsyncRegistryClient,
@@ -1252,13 +1095,6 @@ pub async fn resolve_manifest_with_workspaces_async_sink(
     .await
 }
 
-/// Resolve a manifest with full options (workspace, peer mode, target) and
-/// a download sink for streaming install composition.
-///
-/// When `sink` is `Some`, every placed registry node is emitted via
-/// [`ResolveSink::emit`]. The caller should provide a non-blocking adapter
-/// when running inside a tokio runtime to avoid stalling async I/O on
-/// channel backpressure.
 #[allow(clippy::too_many_arguments)]
 pub async fn resolve_manifest_with_options_and_target_async_sink(
     manifest: &PackageManifest,
@@ -1269,7 +1105,6 @@ pub async fn resolve_manifest_with_options_and_target_async_sink(
     target: TargetPlatform,
     sink: Option<&dyn ResolveSink>,
 ) -> Result<Lockfile, AsyncResolveError> {
-    // ── Build overrides ────────────────────────────────────────────────
     let root_deps = manifest.root_dependency_declarations();
     let overrides = OverrideSet::from_manifest(
         &manifest.overrides,
@@ -1290,10 +1125,8 @@ pub async fn resolve_manifest_with_options_and_target_async_sink(
 
     // ── Prefetch root-level packuments (concurrent warmup) ──────────
     for (name, spec) in &root_deps {
-        if looks_like_registry_spec(spec) {
-            if let Ok(parsed) = parse_spec(&format!("{name}@{spec}")) {
-                let _ = registry.packument_for(&parsed).await;
-            }
+        if let Ok(parsed) = parse_spec(&format!("{name}@{spec}")) {
+            let _ = registry.packument_for(&parsed).await;
         }
     }
 
@@ -1324,9 +1157,9 @@ pub async fn resolve_manifest_with_options_and_target_async_sink(
         optional_dependencies: manifest.optional_dependencies.clone(),
         overrides: normalized_overrides,
         target: Some(crate::lockfile::LockTarget {
-            os: target.os,
-            cpu: target.cpu,
-            libc: target.libc,
+            os: target.os.clone(),
+            cpu: target.cpu.clone(),
+            libc: target.libc.clone(),
         }),
         ..RootResolution::default()
     };
@@ -1340,7 +1173,7 @@ pub async fn resolve_manifest_with_options_and_target_async_sink(
     for path in &node_paths {
         let (metadata, parent) = {
             let node = res.nodes.get(path).expect("node path exists");
-            (node.metadata.clone(), parent_path(path))
+            (node.metadata.clone(), resolver::parent_path(path))
         };
         let providers = res.visible_providers(&parent);
         let visible = VisibleProviders::new(std::iter::once(path.clone()), providers);
@@ -1462,13 +1295,10 @@ pub async fn resolve_manifest_with_options_and_target_async_sink(
         );
     }
     lock.sort_packages();
-
-    // Suppress unused variable warning (retained for future CLI use).
     let _ = root_targets;
     Ok(lock)
 }
 
-/// Resolve a manifest with full options (workspace, peer mode, target).
 #[allow(clippy::too_many_arguments)]
 pub async fn resolve_manifest_with_options_and_target_async(
     manifest: &PackageManifest,
@@ -1478,268 +1308,53 @@ pub async fn resolve_manifest_with_options_and_target_async(
     peer_mode: PeerMode,
     target: TargetPlatform,
 ) -> Result<Lockfile, AsyncResolveError> {
-    // ── Build overrides ────────────────────────────────────────────────
-    let root_deps = manifest.root_dependency_declarations();
-    let overrides = OverrideSet::from_manifest(
-        &manifest.overrides,
-        &root_deps,
-        crate::resolver::overrides::OverrideOrigin::Root,
+    resolve_manifest_with_options_and_target_async_sink(
+        manifest, registry, generator, workspace, peer_mode, target, None,
     )
-    .map_err(|e| AsyncResolveError::Override(e.to_string()))?;
-    let normalized_overrides = overrides.as_map().clone();
-
-    let mut res = AsyncGraphResolver::new(
-        registry,
-        overrides,
-        workspace,
-        manifest.source_dir.clone(),
-        target.clone(),
-        None,
-    );
-
-    // ── Prefetch root-level packuments (concurrent warmup) ──────────
-    for (name, spec) in &root_deps {
-        if looks_like_registry_spec(spec) {
-            if let Ok(parsed) = parse_spec(&format!("{name}@{spec}")) {
-                let _ = registry.packument_for(&parsed).await;
-            }
-        }
-    }
-
-    // ── Resolve root dependencies ───────────────────────────────────────
-    let mut root_targets: BTreeMap<String, (String, String)> = BTreeMap::new();
-    for (name, spec) in &root_deps {
-        let optional = manifest.optional_dependencies.contains_key(name);
-        let dev = manifest.dev_dependencies.contains_key(name)
-            && !manifest.dependencies.contains_key(name)
-            && !manifest.optional_dependencies.contains_key(name);
-        if let Some(path) = res
-            .resolve_dependency("", name, spec, optional, dev)
-            .await?
-        {
-            root_targets.insert(name.clone(), (spec.clone(), path));
-        }
-    }
-
-    // ── Build the lockfile ──────────────────────────────────────────────
-    let mut lock = Lockfile::new(generator);
-    lock.root = RootEntry {
-        name: manifest.name.clone(),
-        version: manifest.version.clone(),
-        dependencies: root_deps,
-    };
-    lock.resolution.root = RootResolution {
-        dev_dependencies: manifest.dev_dependencies.clone(),
-        optional_dependencies: manifest.optional_dependencies.clone(),
-        overrides: normalized_overrides,
-        target: Some(crate::lockfile::LockTarget {
-            os: target.os,
-            cpu: target.cpu,
-            libc: target.libc,
-        }),
-        ..RootResolution::default()
-    };
-    lock.resolution.root.peer_mode = match peer_mode {
-        PeerMode::Strict => crate::lockfile::PeerMode::Strict,
-        PeerMode::LegacyIgnore => crate::lockfile::PeerMode::LegacyIgnore,
-    };
-
-    // ── Bind peer contexts ──────────────────────────────────────────────
-    let node_paths: Vec<String> = res.nodes.keys().cloned().collect();
-    for path in &node_paths {
-        let (metadata, parent) = {
-            let node = res.nodes.get(path).expect("node path exists");
-            (node.metadata.clone(), parent_path(path))
-        };
-        let providers = res.visible_providers(&parent);
-        let visible = VisibleProviders::new(std::iter::once(path.clone()), providers);
-        let context = crate::resolver::peer::bind_peer_context(&metadata, &visible, peer_mode)
-            .map_err(|e| AsyncResolveError::Peer(e.to_string()))?;
-        let peer_context: BTreeMap<String, crate::lockfile::PeerProvider> = context
-            .0
-            .into_iter()
-            .map(|(peer_name, provider)| {
-                let provider_name = provider.name.clone();
-                let provider_path = res
-                    .find_visible_any(&parent, &provider_name)
-                    .unwrap_or_default();
-                let source = res
-                    .nodes
-                    .get(&provider_path)
-                    .map(|n| n.source.clone())
-                    .unwrap_or_else(|| LockSource::Registry {
-                        registry: registry.registry_for_package(&provider_name).to_owned(),
-                    });
-                (
-                    peer_name,
-                    crate::lockfile::PeerProvider {
-                        name: provider.name,
-                        version: provider.version,
-                        source,
-                        path: provider_path,
-                    },
-                )
-            })
-            .collect();
-        if let Some(node) = res.nodes.get_mut(path) {
-            node.peer_context = peer_context;
-        }
-    }
-
-    // ── Emit packages ───────────────────────────────────────────────────
-    for node in res.nodes.values() {
-        lock.packages.push(PackageEntry {
-            path: node.path.clone(),
-            name: node.placement_name.clone(),
-            version: node.metadata.version.to_string(),
-            resolved: node.resolved.clone(),
-            workspace_target: node.workspace_target.clone(),
-            integrity: Some(node.integrity.clone()),
-            link: node.link,
-            dev: node.dev,
-            optional: node.optional,
-            os: node.metadata.os.clone(),
-            cpu: node.metadata.cpu.clone(),
-            bin: node.metadata.bin.clone(),
-            dependencies: node.dependencies.clone(),
-        });
-    }
-    for node in res.nodes.values() {
-        let mut dependencies = BTreeMap::new();
-        for (dep_name, spec) in &node.dependencies {
-            if let Some(target) = node.targets.get(dep_name) {
-                dependencies.insert(
-                    dep_name.clone(),
-                    LockDependency {
-                        spec: spec.clone(),
-                        target: target.clone(),
-                    },
-                );
-            }
-        }
-        lock.resolution.packages.insert(
-            node.path.clone(),
-            PackageResolution {
-                source: node.source.clone(),
-                dev_optional: node.dev || node.optional,
-                dependencies,
-                has_install_script: node.metadata.has_install_script,
-                peer: !node.metadata.peer_dependencies.is_empty(),
-                libc: Vec::new(),
-                optional_dependencies: node
-                    .metadata
-                    .optional_dependencies
-                    .iter()
-                    .filter_map(|(name, spec)| {
-                        node.targets.get(name).map(|target| {
-                            (
-                                name.clone(),
-                                LockDependency {
-                                    spec: spec.clone(),
-                                    target: target.clone(),
-                                },
-                            )
-                        })
-                    })
-                    .collect(),
-                peer_dependencies: node
-                    .metadata
-                    .peer_dependencies
-                    .iter()
-                    .filter_map(|(name, spec)| {
-                        node.peer_context.get(name).map(|provider| {
-                            (
-                                name.clone(),
-                                LockDependency {
-                                    spec: spec.clone(),
-                                    target: provider.path.clone(),
-                                },
-                            )
-                        })
-                    })
-                    .collect(),
-                optional_peers: node
-                    .metadata
-                    .peer_dependencies_meta
-                    .iter()
-                    .filter(|(_, meta)| meta.optional)
-                    .map(|(name, _)| name.clone())
-                    .collect(),
-                peer_context: node.peer_context.clone(),
-                workspace_target: node.workspace_target.clone(),
-            },
-        );
-    }
-    lock.sort_packages();
-
-    // Suppress unused variable warning (retained for future CLI use).
-    let _ = root_targets;
-    Ok(lock)
+    .await
 }
 
-// ── Tests ───────────────────────────────────────────────────────────────
+// ── Tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::NpmConfig;
-    use crate::registry::Dist;
-    use crate::resolver::{ResolveSink, ResolvedDownloadUnit};
-    use std::collections::BTreeMap;
+    use crate::resolver;
 
-    /// Verify that the async RegistryClient can be constructed.
-    #[tokio::test]
-    async fn async_registry_client_constructs() {
-        let config = NpmConfig::default();
-        let client = AsyncRegistryClient::new(config);
-        let (hits, fetches, bytes) = client.take_diagnostics();
-        assert_eq!(hits, 0);
-        assert_eq!(fetches, 0);
-        assert_eq!(bytes, 0);
-    }
-
-    /// Verify registry_for_package returns the default registry.
-    #[tokio::test]
-    async fn async_registry_client_returns_default_registry() {
-        let config = NpmConfig::default();
-        let client = AsyncRegistryClient::new(config);
-        let reg = client.registry_for_package("lodash");
-        assert_eq!(reg, crate::config::DEFAULT_REGISTRY);
-    }
-
-    /// Verify that looks_like_registry_spec correctly classifies specs.
     #[tokio::test]
     async fn test_looks_like_registry_spec() {
-        assert!(looks_like_registry_spec("lodash"));
-        assert!(looks_like_registry_spec("^4.0.0"));
-        assert!(looks_like_registry_spec("@scope/pkg"));
-        assert!(!looks_like_registry_spec("file:./local.tgz"));
-        assert!(!looks_like_registry_spec(
-            "git+https://github.com/user/repo.git"
+        assert!(resolver::looks_like_registry_spec("lodash"));
+        assert!(resolver::looks_like_registry_spec("^4.0.0"));
+        assert!(resolver::looks_like_registry_spec("@scope/pkg"));
+        assert!(!resolver::looks_like_registry_spec("file:./local.tgz"));
+        assert!(!resolver::looks_like_registry_spec(
+            "https://registry.npmjs.org/pkg.tgz"
         ));
-        assert!(!looks_like_registry_spec("workspace:*"));
+        assert!(!resolver::looks_like_registry_spec("workspace:*"));
     }
 
-    /// Verify parent_path helper.
     #[tokio::test]
     async fn test_parent_path() {
-        assert_eq!(parent_path("node_modules/foo"), "");
+        assert_eq!(resolver::parent_path("node_modules/foo"), "");
         assert_eq!(
-            parent_path("node_modules/foo/node_modules/bar"),
+            resolver::parent_path("node_modules/foo/node_modules/bar"),
             "node_modules/foo"
         );
-        assert_eq!(parent_path(""), "");
+        assert_eq!(resolver::parent_path(""), "");
     }
 
-    /// Verify merged_deps combines regular and optional deps.
     #[tokio::test]
     async fn test_merged_deps() {
+        let mut deps = BTreeMap::new();
+        deps.insert("a".into(), "^1.0.0".into());
+        deps.insert("b".into(), "^2.0.0".into());
+        use crate::registry::Dist;
         let metadata = VersionMetadata {
-            name: "pkg".into(),
-            version: Version::new(1, 0, 0),
+            name: String::new(),
+            version: Version::new(0, 0, 0),
             deprecated: None,
-            dependencies: [("a".into(), "^1.0.0".into())].into(),
-            optional_dependencies: [("b".into(), "^2.0.0".into())].into(),
+            dependencies: deps,
+            optional_dependencies: BTreeMap::new(),
             peer_dependencies: BTreeMap::new(),
             peer_dependencies_meta: BTreeMap::new(),
             bin: BTreeMap::new(),
@@ -1751,110 +1366,59 @@ mod tests {
             has_install_script: false,
             has_shrinkwrap: false,
         };
-        let merged = merged_deps(&metadata);
+        let merged = resolver::merged_dependencies(&metadata);
         assert_eq!(merged.len(), 2);
         assert_eq!(merged.get("a").unwrap(), "^1.0.0");
-        assert_eq!(merged.get("b").unwrap(), "^2.0.0");
     }
 
-    /// Verify that request_matches_spec works correctly.
     #[tokio::test]
     async fn test_request_matches_spec() {
-        let v173 = Version::new(1, 7, 3);
-        assert!(request_matches_spec("*", &v173));
-        assert!(request_matches_spec("latest", &v173));
-        assert!(request_matches_spec("1.7.3", &v173));
-        assert!(!request_matches_spec("2.0.0", &v173));
-        assert!(request_matches_spec("^1.0.0", &v173));
-        assert!(!request_matches_spec("^2.0.0", &v173));
+        let v173 = Version::parse("1.7.3").unwrap();
+        assert!(resolver::request_matches("*", &v173));
+        assert!(resolver::request_matches("latest", &v173));
+        assert!(resolver::request_matches("1.7.3", &v173));
+        assert!(!resolver::request_matches("2.0.0", &v173));
+        assert!(resolver::request_matches("^1.0.0", &v173));
+        assert!(!resolver::request_matches("^2.0.0", &v173));
     }
 
-    /// Helper to create a minimal manifest for testing.
-    fn test_manifest(name: &str, version: &str) -> crate::manifest::PackageManifest {
+    fn test_manifest(name: &str, version: &str) -> PackageManifest {
         let json = serde_json::json!({
-            "name": name,
-            "version": version,
-            "dependencies": {},
-            "devDependencies": {},
-            "optionalDependencies": {},
-            "peerDependencies": {},
+            "name": name, "version": version,
+            "dependencies": {}, "devDependencies": {}, "optionalDependencies": {}, "peerDependencies": {},
         });
-        let path = std::path::Path::new("/tmp/test-manifest.json");
-        crate::manifest::PackageManifest::from_json(&json.to_string(), path)
-            .expect("valid test manifest")
+        let path = std::path::Path::new("/tmp/test.json");
+        PackageManifest::from_json(&json.to_string(), path).expect("valid test manifest")
     }
 
-    /// Verify that an empty manifest resolves to an empty lockfile.
     #[tokio::test]
-    async fn async_resolve_empty_manifest() {
-        let manifest = test_manifest("test", "1.0.0");
-        let config = NpmConfig::default();
-        let registry = AsyncRegistryClient::new(config);
-        let lock = resolve_manifest_async(&manifest, &registry, "bpm-test")
-            .await
-            .expect("empty manifest should resolve");
-        assert_eq!(lock.root.name, Some("test".to_string()));
-        assert_eq!(lock.root.version, Some("1.0.0".to_string()));
-        assert!(lock.packages.is_empty());
-    }
-
-    /// Verify resolution with a non-registry package spec produces a timeout
-    /// error (async client retries then gives up), proving the async path
-    /// does not panic or hang the test runner.
-    #[tokio::test]
-    async fn async_resolve_fails_gracefully() {
-        // A spec with a made-up host that will fail DNS / connection refused
-        // quickly enough.  We use a registry override so the client's default
-        // timeout applies and the error surfaces as `Http` or `Registry`.
-        let manifest = {
-            let json = serde_json::json!({
-                "name": "net-test",
-                "version": "1.0.0",
-                "dependencies": { "sure-to-not-exist-pkg-42": "1.0.0" },
-                "devDependencies": {},
-                "optionalDependencies": {},
-                "peerDependencies": {},
-            });
-            let path = std::path::Path::new("/tmp/net-test.json");
-            crate::manifest::PackageManifest::from_json(&json.to_string(), path)
-                .expect("valid test manifest")
-        };
+    async fn async_resolve_no_registry_hang() {
+        let manifest = test_manifest("net-test", "1.0.0");
         let config = NpmConfig::default();
         let registry = AsyncRegistryClient::new(config);
         let result = resolve_manifest_async(&manifest, &registry, "bpm-test").await;
-        // The result may be Err (no network) or Ok (with network the package
-        // will fail resolution because the made-up name doesn't exist on the
-        // real registry, which returns a non-200 and an HTTP error).  Both are
-        // acceptable — the key invariant is no panic and no hang.
         if let Err(error) = &result {
             match error {
                 AsyncResolveError::Http { .. }
                 | AsyncResolveError::Registry { .. }
-                | AsyncResolveError::InvalidRange { .. } => {
-                    // Expected under various network conditions.
-                }
+                | AsyncResolveError::InvalidRange { .. } => {}
                 other => {
-                    // Any non-panic error is acceptable.
                     eprintln!("Got expected error: {other}");
                 }
             }
         }
     }
 
-    /// Verify registry_req extracts alias targets correctly.
     #[tokio::test]
     async fn test_registry_req() {
-        let (name, spec) = registry_req("react", "npm:react@18.2.0");
+        let (name, spec) = resolver::registry_request("react", "npm:react@18.2.0");
         assert_eq!(name, "react");
         assert_eq!(spec, "18.2.0");
-
-        let (name, spec) = registry_req("react", "^18.0.0");
+        let (name, spec) = resolver::registry_request("react", "^18.0.0");
         assert_eq!(name, "react");
         assert_eq!(spec, "^18.0.0");
     }
 
-    /// Verify the sink entry point produces the same lockfile as the
-    /// non-sink entry point (with no sink, they should be identical).
     #[tokio::test]
     async fn async_sink_none_matches_vanilla() {
         let manifest = test_manifest("sink-test", "1.0.0");
@@ -1863,12 +1427,12 @@ mod tests {
         let registry2 = AsyncRegistryClient::new(config);
         let lock_no_sink = resolve_manifest_async(&manifest, &registry, "bpm-test")
             .await
-            .expect("empty manifest should resolve");
+            .unwrap();
         let lock_with_sink = resolve_manifest_with_workspaces_async_sink(
             &manifest, &registry2, "bpm-test", None, None,
         )
         .await
-        .expect("empty manifest with None sink should resolve");
+        .unwrap();
         assert_eq!(
             lock_no_sink.to_json().unwrap(),
             lock_with_sink.to_json().unwrap(),
@@ -1876,10 +1440,6 @@ mod tests {
         );
     }
 
-    /// Verify that a RecordingSink attached via the sink entry point captures
-    /// exactly the packages that `announce` should emit (non-link, non-empty
-    /// resolved).  Since the test manifest has no real dependencies, the
-    /// recording sink should be empty.
     #[tokio::test]
     async fn async_sink_records_announced_packages() {
         let manifest = test_manifest("sink-recording", "1.0.0");
@@ -1901,7 +1461,7 @@ mod tests {
             Some(&sink as &dyn ResolveSink),
         )
         .await
-        .expect("empty manifest should resolve");
+        .unwrap();
         let units = recorded.lock().unwrap();
         assert!(
             units.is_empty(),

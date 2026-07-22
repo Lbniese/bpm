@@ -613,6 +613,195 @@ fn remove_strips_a_dependency_and_rewrites_lock() {
     assert!(manifest["dependencies"].get("lodash").is_none());
 }
 
+/// Read the persisted `.bpm-state` ownership list (project-relative paths).
+fn read_owned_paths(project: &Path) -> Vec<String> {
+    let text = fs::read_to_string(project.join(".bpm-state")).expect(".bpm-state");
+    let state: serde_json::Value = serde_json::from_str(&text).expect("parse .bpm-state");
+    state["owned_entries"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|e| e["path"].as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Plan 011: after add, `.bpm-state` persists nonempty, sorted ownership that
+/// includes the package's shallow entry; after remove, the view entry is gone,
+/// the plan no longer owns it, and an unrelated user-created entry survives.
+#[test]
+fn remove_deletes_owned_view_entry_and_persists_ownership() {
+    let registry = MockRegistry::new(vec![one_package("lodash", "4.17.21", &BTreeMap::new())]);
+    let project = tempfile::tempdir().unwrap();
+    let store = tempfile::tempdir().unwrap();
+    write_manifest(
+        project.path(),
+        r#"{"name":"app","version":"1.0.0","dependencies":{"lodash":"^4.17.21"}}"#,
+    );
+
+    let (ok, _stdout, stderr) = run_bpm(
+        &["add", "lodash", "--registry", registry.url()],
+        project.path(),
+        store.path(),
+    );
+    assert!(ok, "{stderr}");
+    assert!(
+        project.path().join("node_modules/lodash").is_dir(),
+        "lodash view entry must exist after add"
+    );
+
+    // Ownership is nonempty, sorted, and includes the shallow lodash entry.
+    let owned = read_owned_paths(project.path());
+    assert!(
+        !owned.is_empty(),
+        ".bpm-state ownership must be nonempty after add"
+    );
+    assert_eq!(
+        owned,
+        {
+            let mut s = owned.clone();
+            s.sort();
+            s
+        },
+        "ownership must be sorted"
+    );
+    assert!(
+        owned.iter().any(|p| p == "node_modules/lodash"),
+        "ownership must include the shallow lodash entry"
+    );
+
+    // An unrelated user-created entry must survive the remove.
+    fs::create_dir_all(project.path().join("node_modules/user-kept")).unwrap();
+    fs::write(
+        project.path().join("node_modules/user-kept/README"),
+        b"do not touch",
+    )
+    .unwrap();
+
+    let (rm_ok, _stdout, stderr) = run_bpm(
+        &["remove", "lodash", "--registry", registry.url()],
+        project.path(),
+        store.path(),
+    );
+    assert!(rm_ok, "{stderr}");
+
+    assert!(
+        !project.path().join("node_modules/lodash").exists(),
+        "removed package's view entry must disappear"
+    );
+    let owned_after = read_owned_paths(project.path());
+    assert!(
+        !owned_after.iter().any(|p| p == "node_modules/lodash"),
+        "rewritten plan must not retain the removed owned path"
+    );
+    assert!(
+        project
+            .path()
+            .join("node_modules/user-kept/README")
+            .exists(),
+        "unrelated user-created entry must survive reconciliation"
+    );
+}
+
+/// Plan 011: a local-view (`BPM_PROJECT_VIEW=local`) remove must delete the
+/// stale package directory, proving local/reflink ownership reconciliation.
+fn run_bpm_with_env(
+    args: &[&str],
+    cwd: &Path,
+    store: &Path,
+    env: &[(&str, &str)],
+) -> (bool, String, String) {
+    let mut cmd = Command::new(bin());
+    cmd.args(args)
+        .current_dir(cwd)
+        .env("BPM_STORE", store)
+        .env("BPM_STREAM_INSTALL", "0");
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let output = cmd.output().expect("run bpm");
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    )
+}
+
+#[test]
+fn local_view_remove_deletes_stale_package_directory() {
+    let registry = MockRegistry::new(vec![one_package("lodash", "4.17.21", &BTreeMap::new())]);
+    let project = tempfile::tempdir().unwrap();
+    let store = tempfile::tempdir().unwrap();
+    write_manifest(
+        project.path(),
+        r#"{"name":"app","version":"1.0.0","dependencies":{"lodash":"^4.17.21"}}"#,
+    );
+
+    let (ok, _stdout, stderr) = run_bpm_with_env(
+        &["add", "lodash", "--registry", registry.url()],
+        project.path(),
+        store.path(),
+        &[("BPM_PROJECT_VIEW", "local")],
+    );
+    assert!(ok, "{stderr}");
+    let pkg = project.path().join("node_modules/lodash");
+    assert!(pkg.is_dir(), "local view must materialize lodash");
+    // A local view entry is a real directory, not a relay symlink.
+    assert!(!fs::symlink_metadata(&pkg).unwrap().file_type().is_symlink());
+
+    let (rm_ok, _stdout, stderr) = run_bpm_with_env(
+        &["remove", "lodash", "--registry", registry.url()],
+        project.path(),
+        store.path(),
+        &[("BPM_PROJECT_VIEW", "local")],
+    );
+    assert!(rm_ok, "{stderr}");
+    assert!(
+        !pkg.exists(),
+        "local-view remove must delete the stale directory"
+    );
+}
+
+/// Plan 011: a recorded local directory that the user replaced before the next
+/// graph change must NOT be recursively deleted — BPM cannot prove it still
+/// owns the mismatched tree.
+#[test]
+fn reconcile_refuses_to_delete_a_user_replaced_local_directory() {
+    let registry = MockRegistry::new(vec![one_package("lodash", "4.17.21", &BTreeMap::new())]);
+    let project = tempfile::tempdir().unwrap();
+    let store = tempfile::tempdir().unwrap();
+    write_manifest(
+        project.path(),
+        r#"{"name":"app","version":"1.0.0","dependencies":{"lodash":"^4.17.21"}}"#,
+    );
+
+    let (ok, _stdout, stderr) = run_bpm_with_env(
+        &["add", "lodash", "--registry", registry.url()],
+        project.path(),
+        store.path(),
+        &[("BPM_PROJECT_VIEW", "local")],
+    );
+    assert!(ok, "{stderr}");
+    let pkg = project.path().join("node_modules/lodash");
+    // User replaces the recorded tree after install, so its live fingerprint no
+    // longer matches the recorded identity.
+    fs::write(pkg.join("INJECTED-BY-USER"), b"important").unwrap();
+
+    let (rm_ok, stdout, stderr) = run_bpm_with_env(
+        &["remove", "lodash", "--registry", registry.url()],
+        project.path(),
+        store.path(),
+        &[("BPM_PROJECT_VIEW", "local")],
+    );
+    assert!(rm_ok, "remove must still succeed overall\n{stderr}");
+    assert!(
+        pkg.join("INJECTED-BY-USER").exists(),
+        "the mismatched/replaced directory must be preserved, not deleted;\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let _ = stdout;
+}
+
 #[test]
 fn remove_aliases_all_work() {
     let registry = MockRegistry::new(vec![one_package("lodash", "4.17.21", &BTreeMap::new())]);

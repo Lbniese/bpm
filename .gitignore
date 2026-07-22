@@ -25,6 +25,9 @@ docs/.jekyll-cache/
 # local implementation plan — not part of the public repository
 IMPLEMENTATION.md
 
+# local commit policy — not part of the public repository
+/COMMIT_POLICY.md
+
 # local, machine-specific benchmark run output — not checked in, but curated
 # baseline/profile summaries committed by the project (reference.json,
 # profiles/README.md) are explicitly re-included below
