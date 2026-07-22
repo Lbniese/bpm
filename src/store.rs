@@ -382,9 +382,15 @@ impl ArtifactStore {
                 let tmp = self.unique_tmp(&format!("dl-{}", id.to_hex()))?;
                 let computed = metrics
                     .measure("artifact_download", || retrieve(url, &tmp))
-                    .map_err(|source| StoreError::Download {
-                        url: redact_url(url),
-                        source,
+                    .map_err(|source| {
+                        // Second correctness layer: download.rs already removes
+                        // its own destination on failure, but a retrieval error
+                        // surfaced here must never leave a scratch file behind.
+                        let _ = fs::remove_file(&tmp);
+                        StoreError::Download {
+                            url: redact_url(url),
+                            source,
+                        }
                     })?;
                 let ok = metrics.measure("integrity_verify", || computed == id);
                 if !ok {
@@ -406,9 +412,12 @@ impl ArtifactStore {
                 let tmp = self.unique_tmp(&format!("dl-anon-{}", sanitize_hint(url)))?;
                 let computed = metrics
                     .measure("artifact_download", || retrieve(url, &tmp))
-                    .map_err(|source| StoreError::Download {
-                        url: redact_url(url),
-                        source,
+                    .map_err(|source| {
+                        let _ = fs::remove_file(&tmp);
+                        StoreError::Download {
+                            url: redact_url(url),
+                            source,
+                        }
                     })?;
                 let dest = self.artifact_path(&computed);
                 if dest.exists() {
