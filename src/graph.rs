@@ -31,7 +31,12 @@ pub const PLAN_FILE: &str = ".bpm-state";
 
 /// Bumped when the plan encoding or materialization semantics change. A plan
 /// with a different version is treated as invalid and regenerated.
-pub const PLAN_VERSION: u32 = 2;
+///
+/// Version 3 makes `ManagedEntry` ownership enforceable: paths are validated
+/// as project-relative `node_modules/...` entries and identities carry a
+/// versioned encoding (`relay:<target>` or `tree-blake3-v1:<hex>`). Existing
+/// version-2 plans remain readable but never cache-hit.
+pub const PLAN_VERSION: u32 = 3;
 
 /// Bumped when the materializer's output semantics change (e.g. bin linking
 /// strategy, symlink vs hardlink volume layout). Incompatible materializer
@@ -77,19 +82,62 @@ pub struct PlanEntry {
     pub bin: BTreeMap<String, String>,
 }
 
+/// Identity prefix for relay/direct symlink entries: the exact `read_link`
+/// target follows this prefix, so a recorded entry is removable only when the
+/// live link still points there.
+pub const IDENTITY_RELAY: &str = "relay:";
+
+/// Identity prefix for local/reflink directory views: a deterministic BLAKE3
+/// tree fingerprint follows as `tree-blake3-v1:<hex>` (see
+/// [`crate::volume::tree_fingerprint`]). A recorded entry is removable only
+/// when the live fingerprint still matches.
+pub const IDENTITY_TREE: &str = "tree-blake3-v1:";
+
 /// A project-view entry that BPM created and therefore may safely remove.
+///
+/// `path` is unambiguously **project-relative** (`node_modules/foo`,
+/// `node_modules/@scope`, `node_modules/.bin`): never absolute, never
+/// containing `..`. Reconciliation joins it onto `project_root`, not
+/// `project_root/node_modules`. `identity` is a versioned, re-verifiable
+/// encoding — not an arbitrary nonempty string — so removal proves BPM still
+/// owns exactly this entry.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ManagedEntry {
     /// Exact project-relative path (e.g. `node_modules/foo`,
-    /// `node_modules/@scope/bar`).
+    /// `node_modules/@scope/bar`, `node_modules/.bin`).
     pub path: String,
     /// How this entry was attached: "relay" (symlink to volume),
     /// "local" (hardlink/copy), "reflink" (copy-on-write clone), or
     /// "direct" (workspace symlink).
     pub mode: String,
-    /// Old volume or symlink target at the time of recording, for identity
-    /// preflight before removal.
+    /// Versioned identity for removal preflight: `relay:<read_link target>` for
+    /// symlink/junction relays, or `tree-blake3-v1:<hex>` for local/reflink
+    /// directory views.
     pub identity: String,
+}
+
+impl ManagedEntry {
+    /// True iff `path` is a project-relative `node_modules/...` entry safe to
+    /// join onto `project_root`: it starts with `node_modules/`, is not
+    /// absolute, and has no empty/`.`/`..` components. `node_modules` alone is
+    /// rejected (it is the container, not a managed entry).
+    pub fn path_is_valid(path: &str) -> bool {
+        if path.is_empty() || Path::new(path).is_absolute() {
+            return false;
+        }
+        let mut components = path.split('/');
+        if components.next() != Some("node_modules") {
+            return false;
+        }
+        let mut count = 0;
+        for component in components {
+            if component.is_empty() || component == ".." || component == "." {
+                return false;
+            }
+            count += 1;
+        }
+        count >= 1
+    }
 }
 
 /// A compiled install plan for one graph (IMPLEMENTATION §9).
@@ -399,6 +447,7 @@ pub fn build_plan(
     lockfile: &Lockfile,
     artifact_ids: &[Option<ArtifactId>],
     lifecycle_paths: &[String],
+    owned_entries: Vec<ManagedEntry>,
 ) -> InstallPlan {
     let entries = lockfile
         .packages
@@ -425,7 +474,7 @@ pub fn build_plan(
         materializer_version: MATERIALIZER_VERSION,
         graph_id_hex: graph_id(lockfile).to_hex(),
         lifecycle_paths: lifecycle_paths.to_vec(),
-        owned_entries: Vec::new(),
+        owned_entries,
         entries,
     }
 }
@@ -656,10 +705,51 @@ mod tests {
         let path = dir.path().join(PLAN_FILE);
         let l = lf();
         let id = ArtifactId::from_bytes([0x9; 64]);
-        let plan = build_plan(&l, &[Some(id)], &[]);
+        let plan = build_plan(&l, &[Some(id)], &[], Vec::new());
         write_plan(&plan, &path).unwrap();
         let back = read_plan(&path).unwrap().unwrap();
         assert_eq!(plan, back);
+    }
+
+    #[test]
+    fn plan_roundtrips_with_nonempty_sorted_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(PLAN_FILE);
+        let l = lf();
+        let id = ArtifactId::from_bytes([0x9; 64]);
+        let owned = vec![
+            ManagedEntry {
+                path: "node_modules/.bin".into(),
+                mode: "relay".into(),
+                identity: "relay:/store/graphs/x/node_modules/.bin".into(),
+            },
+            ManagedEntry {
+                path: "node_modules/left-pad".into(),
+                mode: "local".into(),
+                identity: "tree-blake3-v1:deadbeef".into(),
+            },
+        ];
+        let plan = build_plan(&l, &[Some(id)], &[], owned.clone());
+        write_plan(&plan, &path).unwrap();
+        let back = read_plan(&path).unwrap().unwrap();
+        assert_eq!(back.owned_entries, owned);
+        assert!(!back.owned_entries.is_empty());
+    }
+
+    #[test]
+    fn managed_entry_validates_project_relative_node_modules_paths() {
+        assert!(ManagedEntry::path_is_valid("node_modules/foo"));
+        assert!(ManagedEntry::path_is_valid("node_modules/@scope"));
+        assert!(ManagedEntry::path_is_valid("node_modules/@scope/pkg"));
+        assert!(ManagedEntry::path_is_valid("node_modules/.bin"));
+        assert!(!ManagedEntry::path_is_valid("node_modules"));
+        assert!(!ManagedEntry::path_is_valid("node_modules/"));
+        assert!(!ManagedEntry::path_is_valid("foo"));
+        assert!(!ManagedEntry::path_is_valid("/abs/node_modules/foo"));
+        assert!(!ManagedEntry::path_is_valid("node_modules/../x"));
+        assert!(!ManagedEntry::path_is_valid("node_modules/foo/.."));
+        assert!(!ManagedEntry::path_is_valid("../node_modules/foo"));
+        assert!(!ManagedEntry::path_is_valid(""));
     }
 
     #[test]
@@ -673,7 +763,12 @@ mod tests {
         let l = lf();
         let dir = tempfile::tempdir().unwrap();
         let store = ArtifactStore::open(dir.path()).unwrap();
-        let mut plan = build_plan(&l, &[Some(ArtifactId::from_bytes([0x1; 64]))], &[]);
+        let mut plan = build_plan(
+            &l,
+            &[Some(ArtifactId::from_bytes([0x1; 64]))],
+            &[],
+            Vec::new(),
+        );
         plan.plan_version = 999;
         assert_eq!(
             validate_plan(&plan, &l, dir.path(), &store).unwrap_err(),
@@ -686,7 +781,12 @@ mod tests {
         let l = lf();
         let dir = tempfile::tempdir().unwrap();
         let store = ArtifactStore::open(dir.path()).unwrap();
-        let mut plan = build_plan(&l, &[Some(ArtifactId::from_bytes([0x1; 64]))], &[]);
+        let mut plan = build_plan(
+            &l,
+            &[Some(ArtifactId::from_bytes([0x1; 64]))],
+            &[],
+            Vec::new(),
+        );
         plan.graph_id_hex = "deadbeef".into();
         assert_eq!(
             validate_plan(&plan, &l, dir.path(), &store).unwrap_err(),

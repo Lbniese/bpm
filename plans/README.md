@@ -12,6 +12,27 @@ Plans 002 and 004 are independent refactors. Plans 005 (resolver unification +
 default-flip) and 006 (attachment backends) are the large direction items; 005
 depends on 002 landing first.
 
+**Re-run (2026-07-22, commit `6db8f49`).** A fresh standard-level pass re-checked
+the newest + highest-trust-boundary code (reflink FFI in `materializer.rs`,
+the `remote_cache.rs` client, `path_safety.rs`, the `BPM_LOCAL_VIEW_PACKAGES`
+env parser, `install.sh`, and signal handling in `cli/exec.rs`) and found **no
+new correctness or security bug** — that surface remains expert-level. It
+surfaced three new, independent, low-risk findings → plans 007–009. What was
+*not* audited this run: the full ~34.6K LoC was not re-read exhaustively and
+the suite was not re-executed; the original pass below still stands for
+everything outside the freshest surface.
+
+**Re-run (2026-07-22, commit `5caa64f`).** A new standard-level pass covered the
+current ~43.5K Rust LoC with emphasis on fresh-install resolver routing,
+project-view ownership, artifact-source trust, non-registry source caches, and
+package-image materialization. The user selected the recommended top five
+findings, recorded as plans 010–014. Baseline verification passed:
+`cargo fmt --all --check`, clippy with `-D warnings`, `cargo test --workspace`
+(537 passed, 1 ignored), and `cargo deny check advisories`. Plan 013 follows 012
+because both edit `src/resolver/sources.rs`; the other new plans are logically
+independent, though 010 should land first as the smallest user-visible
+correctness fix.
+
 ## Execution order & status
 
 | Plan | Title | Priority | Effort | Depends on | Status |
@@ -20,8 +41,16 @@ depends on 002 landing first.
 | 002  | Widen async-vs-blocking resolver parity test coverage | P1 | M | — | DONE (corpus: single/multi/transitive/peer/cycle/optional/disjunctive; byte-identical for success + failure parity) |
 | 003  | Widen shipped `--git-prepare` end-to-end coverage | P2 | M | — | DONE |
 | 004  | Split `src/registry.rs` god module into a `src/registry/` package | P3 | M | — | DONE |
-| 005  | Unify the dual resolver and default-flip to async resolve | P1 | L | 002 (required); 004 (recommended) | PARTIAL (Phase 1 characterization done; parity corpus landed; Phases 2–5 blocked on HIGH-risk gated placement-core extraction + benchmark evidence) |
-| 006  | Generalize project-attachment backends (reflink/clone + non-Unix parity) | P2 | L | — | PARTIAL (Phases 1–4 + 6 docs landed: `Reflink` backend wired to macOS `clonefile`/Linux `FICLONE` with hardlink→copy fallback, `probe_fs_capabilities` runtime probe, `BPM_PROJECT_VIEW=reflink` project view, generalized local-view trigger; `libc` dep added as unix-only. Phase 5 Windows junctions blocked on no Windows test box) |
+| 005  | Unify the dual resolver and default-flip to async resolve | P1 | L | 002 (required); 004 (recommended) | DONE (Phases 2–5 completed 2026-07-22: placement core extracted to `src/resolver/placement.rs` + `fetch.rs`, async resolver routes through async GraphResolver with shared helpers, dual install branches collapsed, async resolution is default-on with `BPM_ASYNC_RESOLVE=0` kill-switch, docs updated) |
+| 006  | Generalize project-attachment backends (reflink/clone + non-Unix parity) | P2 | L | — | DONE (All phases complete. Phase 5: Windows `attach_project_local` now uses `junction_tree` (directory symlink via `std::os::windows::fs::symlink_dir`) with hardlink→copy fallback; `windows-sys` dep added for future reflink support. ReFS reflink remains best-effort/deferred on NTFS-only CI runners) |
+| 007  | Add dependency-advisory scanning (cargo-deny) to CI | P1 | S | — | DONE |
+| 008  | Add property tests for the path-safety validators | P3 | S | — | DONE |
+| 009  | Actually gitignore the local-only COMMIT_POLICY.md | P3 | S | — | DONE |
+| 010  | Honor resolver mode and peer options on every fresh-install path | P1 | M | — | DONE |
+| 011  | Record project-view ownership and remove stale entries safely | P1 | M | — | DONE |
+| 012  | Constrain registry artifact sources and bound every artifact read | P1 | M | — | TODO |
+| 013  | Make Git and patch source caches race-safe | P2 | M | 012 | TODO |
+| 014  | Stream package-image metadata without loading file payloads | P2 | M | — | TODO |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) |
 REJECTED (with one-line rationale — finding fixed independently or approach
@@ -44,6 +73,51 @@ abandoned).
   and `src/cli/install.rs` (attachment + local-view trigger), which 005 and 004
   do not touch — no merge conflict expected, but run sequentially if both land
   to keep reviews focused.
+- **007 / 008 / 009 are mutually independent** and independent of 005 and 006.
+  007 touches `.github/workflows/ci.yml` + `Makefile` + a new `deny.toml` +
+  `CONTRIBUTING.md`; 008 adds tests only inside `src/path_safety.rs`; 009 edits
+  `.gitignore`. None overlap with the resolver (005) or materializer/volume
+  (006) paths. All three are safe to land in any order and are good
+  first-executor picks (low risk, clean verification).
+- **010 is the first new-plan pick.** It restores the documented resolver-mode
+  matrix and fixes a user-visible `--legacy-peer-deps` correctness bug while
+  repairing the parity gate that should protect later resolver changes.
+  **Done (2026-07-22):** the fresh-manifest branch in `install.rs` is now an
+  explicit four-case streaming/async matrix; both async call sites honor the
+  CLI-selected `peer_mode`; `BPM_ASYNC_RESOLVE=0 + BPM_STREAM_INSTALL=0` routes
+  to a restored blocking non-streaming path (`resolve_fresh_manifest_blocking`).
+  The parity corpus now sets `BPM_ASYNC_RESOLVE` explicitly on both sides (new
+  `run_bpm_with_env` + `RESOLVE_BLOCKING` const). Note for future peer tests:
+  the resolver binds peers from the **packument** version entry, not the
+  tarball `package.json`, so a mock must use `packument_with_peers`/
+  `multi_registry_mock_with_peers` (added in `tests/network_pipeline.rs`) to
+  exercise strict peer rejection; the minimal `packument()` helper omits
+  `peerDependencies`, leaving strict mode trivially satisfied.
+- **011 is independent but deletion-sensitive.** It must preserve unknown or
+  identity-mismatched project paths. Its ownership model should land before any
+  future plan that deepens local/reflink project-view drift validation.
+  **Done (2026-07-22):** `PLAN_VERSION` bumped to 3. `ManagedEntry` is now a
+  validated, re-verifiable contract — `path` is project-relative
+  (`node_modules/...`, validated before joining) and `identity` is versioned
+  (`relay:<read_link target>` or `tree-blake3-v1:<hex>`). Attachment returns an
+  `AttachOutcome` carrying the sorted `ManagedEntry` set BPM actually created
+  (per shallow top-level entry incl. `.bin`/`@scope`), derived from live state
+  on every cfg branch (Unix relay/local/reflink + Windows junction fallback,
+  labeled by the actual result). `finalize_install` reconciles AFTER final
+  attachment using that set as the desired set, propagates errors with `?`, and
+  persists ownership. A pre-fix (v2) plan with empty ownership is migrated via
+  conservative `infer_prior_ownership` (claims a relay only on exact target
+  match, a local dir only on exact fingerprint match, never from the lockfile).
+  Reconciliation removes only on exact identity, preserves+warns on mismatch /
+  unknown mode / invalid path, and tidies empty `@scope` parents with
+  non-recursive `remove_dir`. Direct materialization synthesizes no graph-
+  volume ownership and reconciles prior graph-volume entries conservatively.
+- **013 requires 012.** Both change `src/resolver/sources.rs`: 012 establishes
+  bounded artifact readers; 013 must rebase on and preserve those limits while
+  adding source-cache locking/publication safety.
+- **014 is independent** of 010–013. It preserves the `BPMIMG01` format and
+  changes only metadata consumption, so it can run in parallel if branches are
+  isolated.
 
 ## Audit summary (for a returning reader)
 
@@ -58,6 +132,22 @@ default-flip, attachment backends). Derived-store "unused" path was NOT
 reported — it is a documented deferred decision. The cold-resolver perf gap was
 NOT reported as a bug — it is a documented known gap (`docs/milestones.md`
 M7), surfaced only as the evidence base for plan 005's default-flip rationale.
+
+## Deferred findings from the `5caa64f` audit
+
+These were vetted but were not part of the user-selected recommended top five;
+they are not rejected and may be planned later:
+
+- Detect inner-file drift in local/reflink project views without regressing the
+  warm plan-cache path. Plan 011 intentionally establishes ownership identity
+  first but does not add full warm-hit tree validation.
+- Reconcile documentation that still describes async resolution as opt-in and
+  contains stale transport/Windows attachment status.
+- Publish and verify release checksums/signatures or provenance before
+  `install.sh` executes downloaded binaries.
+- Direction options remain unplanned: authenticated remote-cache upload,
+  Git-prepare parity/default-on decision, cross-graph derived-artifact reuse,
+  and automatic reflink selection.
 
 ## Findings considered and rejected
 
@@ -75,3 +165,15 @@ M7), surfaced only as the evidence base for plan 005's default-flip rationale.
   store is empty on cold install by design). Not a finding.
 - **Cold-resolver ~6.8× gap vs pnpm**: a documented known gap, not a bug.
   Surfaced only as the rationale grounding plan 005's default-flip phase.
+- **"No fuzz/property testing of the archive extraction boundary"**: **rejected
+  after vetting** — `tests/extraction.rs` already property-tests the extraction
+  trust boundary (`property_rejects_bounded_unsafe_paths_without_escape_writes`,
+  `_unsafe_symlink_targets`, `_malformed_gzip_or_tar_streams` via proptest). The
+  real gap was narrower: `src/path_safety.rs` validators had example tests only
+  → that became plan 008 (scoped to `path_safety.rs`; the archive boundary is
+  left alone). Recorded here so nobody re-audits the extraction-coverage claim.
+- **`src/registry.rs` referenced in plan 005's drift-check command**: minor
+  staleness — plan 004 split that file into `src/registry/`. The 005 drift-check
+  `git diff ... src/registry.rs` silently yields no output now. Not worth a
+  plan; fix the path to `src/registry/` in 005's drift-check line when 005 is
+  next opened.

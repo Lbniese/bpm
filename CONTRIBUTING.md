@@ -46,6 +46,7 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
 cargo build --release --workspace
+cargo deny check advisories      # requires: cargo install cargo-deny --locked
 ```
 
 For performance-sensitive changes, benchmark before and after with a

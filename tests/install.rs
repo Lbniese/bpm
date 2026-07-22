@@ -635,6 +635,44 @@ fn plan_cache_invalidates_when_a_symlink_disappears() {
     assert!(target.exists(), "package symlink should be restored");
 }
 
+/// Plan 011: a fresh frozen install persists nonempty, sorted project-view
+/// ownership (the relay set) into `.bpm-state`, so a later graph change can
+/// reconcile stale entries by exact identity rather than guesswork.
+#[test]
+fn fresh_install_persists_nonempty_sorted_project_view_ownership() {
+    let (project, store, _tgz) = setup_project();
+    let first = run_install(project.path(), store.path());
+    assert!(first.status.success());
+
+    let state = fs::read_to_string(project.path().join(".bpm-state")).expect(".bpm-state");
+    let json: serde_json::Value = serde_json::from_str(&state).expect("parse .bpm-state");
+    let owned: Vec<String> = json["owned_entries"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|e| e["path"].as_str().map(String::from))
+                .collect()
+        })
+        .expect("owned_entries array");
+    assert!(
+        !owned.is_empty(),
+        "ownership must be nonempty after install"
+    );
+    assert_eq!(
+        owned,
+        {
+            let mut s = owned.clone();
+            s.sort();
+            s
+        },
+        "ownership must be persisted sorted"
+    );
+    assert!(
+        owned.iter().any(|p| p == "node_modules/greet"),
+        "ownership must include the shallow greet entry; got: {owned:?}"
+    );
+}
+
 #[test]
 fn next_build_uses_a_project_local_dependency_view() {
     let project = tempdir().unwrap();

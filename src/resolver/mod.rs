@@ -12,28 +12,22 @@ pub(crate) use sources::{
     git_clone_url, hosted_git_tarball_url, is_full_git_commit, looks_like_hosted_git,
     reject_git_option_value, resolve_git_source,
 };
-pub(crate) use sources::{
-    read_source_bytes, source_from_tarball_bytes, write_patched_tarball, DependencySource,
-    SourceResolution,
-};
 pub mod workspaces;
+pub(crate) use sources::DependencySource;
+pub(crate) mod fetch;
+pub(crate) mod placement;
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::collections::BTreeMap;
 
 use semver::Version;
 use thiserror::Error;
 
 use crate::integrity::Integrity;
 use crate::lockfile::{
-    LockDependency, LockSource, Lockfile, PackageEntry, PackageResolution, RootEntry,
-    RootResolution,
+    LockDependency, Lockfile, PackageEntry, PackageResolution, RootEntry, RootResolution,
 };
 use crate::manifest::PackageManifest;
-use crate::registry::{
-    parse_spec, resolve_packument, RegistryClient, RegistryError, VersionMetadata,
-};
+use crate::registry::{parse_spec, RegistryClient, RegistryError, VersionMetadata};
 
 pub use model::*;
 
@@ -71,24 +65,6 @@ pub enum ResolveError {
         requested: String,
         selected: String,
     },
-}
-
-#[derive(Clone)]
-struct Node {
-    path: String,
-    placement_name: String,
-    metadata: VersionMetadata,
-    resolved: String,
-    integrity: String,
-    dependencies: BTreeMap<String, String>,
-    targets: BTreeMap<String, String>,
-    optional: bool,
-    dev: bool,
-    peer_context: BTreeMap<String, crate::lockfile::PeerProvider>,
-    source: LockSource,
-    link: bool,
-    workspace_target: Option<String>,
-    source_dir: Option<PathBuf>,
 }
 
 /// A resolved package available for download, emitted by the resolver the
@@ -264,16 +240,14 @@ pub fn resolve_manifest_with_options_and_target_sink(
     .map_err(|error| ResolveError::Override(error.to_string()))?;
     let normalized_overrides = overrides.as_map().clone();
 
-    let mut resolver = GraphResolver {
-        registry,
+    let mut resolver = placement::GraphResolver::new(
+        fetch::RegistrySource { client: registry },
         overrides,
-        nodes: BTreeMap::new(),
-        diagnostics: Vec::new(),
         workspace,
-        root_dir: manifest.source_dir.clone(),
-        target: target.clone(),
+        manifest.source_dir.clone(),
+        target.clone(),
         sink,
-    };
+    );
     let mut root_targets = BTreeMap::new();
 
     // ── Batch-prefetch dependency closure before DFS ───────────────────
@@ -455,654 +429,10 @@ pub fn resolve_manifest_with_options_and_target_sink(
     let _ = root_targets;
     Ok(lock)
 }
-
-struct GraphResolver<'a> {
-    registry: &'a RegistryClient,
-    overrides: crate::resolver::overrides::OverrideSet,
-    nodes: BTreeMap<String, Node>,
-    diagnostics: Vec<String>,
-    workspace: Option<&'a crate::resolver::workspaces::WorkspaceIndex>,
-    root_dir: Option<PathBuf>,
-    target: TargetPlatform,
-    sink: Option<&'a dyn ResolveSink>,
-}
-
-impl<'a> GraphResolver<'a> {
-    fn resolve_dependency(
-        &mut self,
-        parent: &str,
-        name: &str,
-        requested: &str,
-        optional: bool,
-        dev: bool,
-    ) -> Result<Option<String>, ResolveError> {
-        let ancestors = self.ancestor_chain(parent);
-        let spec = self
-            .overrides
-            .effective_spec_for(name, requested, &ancestors)
-            .to_owned();
-        if let Some(workspace) = self.workspace {
-            if let crate::resolver::workspaces::WorkspaceResolution::Link(edge) = workspace
-                .resolve(name, &spec)
-                .map_err(|error| ResolveError::Peer(error.to_string()))?
-            {
-                let relative_path = match edge.target.source {
-                    crate::resolver::model::PackageSource::Workspace { relative_path } => {
-                        relative_path
-                    }
-                    _ => unreachable!(),
-                };
-                let path = format!("node_modules/{name}");
-                if self.nodes.contains_key(&path) {
-                    self.upgrade_reachability(&path, optional, dev);
-                    return Ok(Some(path));
-                }
-
-                let metadata = workspace_metadata(
-                    name,
-                    &edge.target.version,
-                    workspace
-                        .get(name)
-                        .and_then(|workspace| workspace.manifest.as_ref()),
-                );
-                if !self.platform_allows(name, &metadata, optional)? {
-                    return Ok(None);
-                }
-                let dependencies = merged_dependencies(&metadata);
-                self.nodes.insert(
-                    path.clone(),
-                    Node {
-                        path: path.clone(),
-                        placement_name: name.to_owned(),
-                        metadata,
-                        resolved: String::new(),
-                        integrity: String::new(),
-                        dependencies: dependencies.clone(),
-                        targets: BTreeMap::new(),
-                        optional,
-                        dev,
-                        peer_context: BTreeMap::new(),
-                        source: LockSource::Workspace {
-                            relative_path: relative_path.clone(),
-                        },
-                        link: true,
-                        workspace_target: Some(relative_path.clone()),
-                        source_dir: workspace
-                            .get(name)
-                            .and_then(|workspace| workspace.manifest.as_ref())
-                            .and_then(|manifest| manifest.source_dir.clone()),
-                    },
-                );
-                for (child, child_spec) in dependencies {
-                    let child_optional = self.nodes.get(&path).is_some_and(|node| {
-                        optional || node.metadata.optional_dependencies.contains_key(&child)
-                    });
-                    if let Some(target) =
-                        self.resolve_dependency(&path, &child, &child_spec, child_optional, dev)?
-                    {
-                        if let Some(node) = self.nodes.get_mut(&path) {
-                            node.targets.insert(child, target);
-                        }
-                    }
-                }
-                return Ok(Some(path));
-            }
-        }
-        if let Some(source) = DependencySource::parse(&spec) {
-            return self.resolve_source_dependency(parent, name, &spec, source, optional, dev);
-        }
-        let (_, visible_spec) = registry_request(name, &spec);
-        if let Some(path) = self.find_visible(parent, name, &visible_spec) {
-            self.upgrade_reachability(&path, optional, dev);
-            return Ok(Some(path));
-        }
-        let path = if parent.is_empty() {
-            format!("node_modules/{name}")
-        } else {
-            format!("{parent}/node_modules/{name}")
-        };
-        if self.nodes.contains_key(&path) {
-            let selected = self.nodes.get(&path).expect("checked above");
-            if request_matches(&visible_spec, &selected.metadata.version) {
-                return Ok(Some(path));
-            }
-            return Err(ResolveError::PlacementConflict {
-                path,
-                package: name.to_owned(),
-                requested: spec,
-                selected: selected.metadata.version.to_string(),
-            });
-        }
-        let (registry_name, registry_spec) = registry_request(name, &spec);
-        let parsed = parse_spec(&format!("{registry_name}@{registry_spec}")).map_err(|source| {
-            ResolveError::Registry {
-                package: name.to_owned(),
-                spec: spec.clone(),
-                source,
-            }
-        })?;
-        let registry_base = self
-            .registry
-            .registry_for_package(&registry_name)
-            .to_owned();
-        let packument =
-            self.registry
-                .packument_for(&parsed)
-                .map_err(|source| ResolveError::Registry {
-                    package: name.to_owned(),
-                    spec: spec.clone(),
-                    source,
-                })?;
-        let mut resolved =
-            resolve_packument(&parsed, &packument, &registry_base).map_err(|source| {
-                ResolveError::Registry {
-                    package: name.to_owned(),
-                    spec: spec.clone(),
-                    source,
-                }
-            })?;
-        // If a visible provider already exists, try lower published versions
-        // before accepting a peer-incompatible highest version. This is the
-        // bounded backtracking point: candidates are deterministic semver
-        // versions from one packument and no network request is repeated.
-        if !self.peer_candidate_matches(&resolved.metadata, parent) {
-            let mut versions: Vec<Version> = packument
-                .versions
-                .keys()
-                .filter_map(|version| Version::parse(version).ok())
-                .collect();
-            versions.sort();
-            versions.reverse();
-            for version in versions {
-                let exact = crate::registry::PackageSpec {
-                    name: registry_name.clone(),
-                    req: crate::registry::VersionRequest::Exact(version),
-                };
-                let candidate =
-                    resolve_packument(&exact, &packument, &registry_base).map_err(|source| {
-                        ResolveError::Registry {
-                            package: name.to_owned(),
-                            spec: spec.clone(),
-                            source,
-                        }
-                    })?;
-                if self.peer_candidate_matches(&candidate.metadata, parent) {
-                    resolved = candidate;
-                    break;
-                }
-            }
-        }
-        if !self.platform_allows(name, &resolved.metadata, optional)? {
-            return Ok(None);
-        }
-        let dependencies = merged_dependencies(&resolved.metadata);
-        self.nodes.insert(
-            path.clone(),
-            Node {
-                path: path.clone(),
-                placement_name: name.to_owned(),
-                metadata: resolved.metadata,
-                resolved: resolved.tarball_url,
-                integrity: resolved.integrity,
-                dependencies: dependencies.clone(),
-                targets: BTreeMap::new(),
-                optional,
-                dev,
-                peer_context: BTreeMap::new(),
-                source: LockSource::Registry {
-                    registry: registry_base,
-                },
-                link: false,
-                workspace_target: None,
-                source_dir: None,
-            },
-        );
-        self.announce(&path);
-        // Submit prefetches for this node's registry-typed children so sibling
-        // packument fetches overlap while depth-first placement proceeds.
-        self.prefetch_children(&dependencies);
-        for (child, child_spec) in dependencies {
-            let child_optional = self.nodes.get(&path).is_some_and(|node| {
-                optional || node.metadata.optional_dependencies.contains_key(&child)
-            });
-            if let Some(target) =
-                self.resolve_dependency(&path, &child, &child_spec, child_optional, dev)?
-            {
-                if let Some(node) = self.nodes.get_mut(&path) {
-                    node.targets.insert(child, target);
-                }
-            }
-        }
-        Ok(Some(path))
-    }
-
-    /// If a download sink is attached, announce a just-placed node so a caller
-    /// can start fetching its tarball before the rest of the graph is resolved.
-    /// No-op for linked (workspace) nodes and nodes without a download URL.
-    fn announce(&self, path: &str) {
-        let Some(sink) = self.sink else {
-            return;
-        };
-        let unit = {
-            let Some(node) = self.nodes.get(path) else {
-                return;
-            };
-            if node.link || node.resolved.is_empty() {
-                return;
-            }
-            ResolvedDownloadUnit {
-                path: node.path.clone(),
-                name: node.placement_name.clone(),
-                url: node.resolved.clone(),
-                integrity: if node.integrity.is_empty() {
-                    None
-                } else {
-                    // integrity is validated at registry selection;
-                    // a non-empty string must parse.
-                    Some(Integrity::parse(&node.integrity).unwrap_or_else(|e| {
-                        panic!(
-                            "invalid integrity in resolved node for {}: {}: {}",
-                            node.placement_name, node.integrity, e
-                        )
-                    }))
-                },
-            }
-        };
-        sink.emit(unit);
-    }
-
-    /// Submit best-effort packument prefetches for registry-typed children.
-    ///
-    /// Source (`file:`/`git:`/`tarball`) and workspace dependencies are skipped
-    /// so prefetch never issues a registry request the resolver would not make
-    /// itself. Idempotent and a no-op when prefetching is disabled on the
-    /// registry client.
-    fn prefetch_children(&self, dependencies: &BTreeMap<String, String>) {
-        for (child, child_spec) in dependencies {
-            if DependencySource::parse(child_spec).is_none()
-                && self
-                    .workspace
-                    .and_then(|workspace| workspace.get(child))
-                    .is_none()
-            {
-                self.registry.prefetch_packument(child, Some(child_spec));
-            }
-        }
-    }
-
-    fn resolve_source_dependency(
-        &mut self,
-        parent: &str,
-        name: &str,
-        spec: &str,
-        source: DependencySource,
-        optional: bool,
-        dev: bool,
-    ) -> Result<Option<String>, ResolveError> {
-        let path = if parent.is_empty() {
-            format!("node_modules/{name}")
-        } else {
-            format!("{parent}/node_modules/{name}")
-        };
-        if self.nodes.contains_key(&path) {
-            self.upgrade_reachability(&path, optional, dev);
-            return Ok(Some(path));
-        }
-        let base_dir = self.base_dir_for(parent);
-        let resolved = match source {
-            DependencySource::Patch { inner, patch } => self
-                .resolve_patch_dependency(name, &inner, &patch, &base_dir)
-                .map_err(|reason| ResolveError::Source {
-                    package: name.to_owned(),
-                    spec: spec.to_owned(),
-                    reason,
-                })?,
-            source => source
-                .resolve(&base_dir)
-                .map_err(|reason| ResolveError::Source {
-                    package: name.to_owned(),
-                    spec: spec.to_owned(),
-                    reason,
-                })?,
-        };
-        let metadata = resolved.metadata;
-        if !self.platform_allows(name, &metadata, optional)? {
-            return Ok(None);
-        }
-        let dependencies = merged_dependencies(&metadata);
-        self.nodes.insert(
-            path.clone(),
-            Node {
-                path: path.clone(),
-                placement_name: name.to_owned(),
-                metadata,
-                resolved: resolved.resolved.clone(),
-                integrity: resolved.integrity.clone().unwrap_or_default(),
-                dependencies: dependencies.clone(),
-                targets: BTreeMap::new(),
-                optional,
-                dev,
-                peer_context: BTreeMap::new(),
-                source: resolved.source,
-                link: resolved.link,
-                workspace_target: resolved.workspace_target,
-                source_dir: resolved.source_dir,
-            },
-        );
-        self.announce(&path);
-        for (child, child_spec) in dependencies {
-            let child_optional = self.nodes.get(&path).is_some_and(|node| {
-                optional || node.metadata.optional_dependencies.contains_key(&child)
-            });
-            if let Some(target) =
-                self.resolve_dependency(&path, &child, &child_spec, child_optional, dev)?
-            {
-                if let Some(node) = self.nodes.get_mut(&path) {
-                    node.targets.insert(child, target);
-                }
-            }
-        }
-        Ok(Some(path))
-    }
-
-    fn resolve_patch_dependency(
-        &self,
-        name: &str,
-        inner: &str,
-        patch: &Path,
-        base_dir: &Path,
-    ) -> Result<SourceResolution, String> {
-        let patch_path = if patch.is_absolute() {
-            patch.to_path_buf()
-        } else {
-            base_dir.join(patch)
-        };
-        let patch_text = fs::read_to_string(&patch_path)
-            .map_err(|error| format!("cannot read patch {}: {error}", patch_path.display()))?;
-        let (source_resolution, source_bytes) = self.resolve_patch_inner(name, inner, base_dir)?;
-        if source_resolution.link {
-            return Err("patch: currently supports tarball, registry, and git sources, not linked directories".into());
-        }
-        let patched = crate::patch::apply_unified_patch_to_tgz(&source_bytes, &patch_text)
-            .map_err(|error| error.to_string())?;
-        let url = write_patched_tarball(base_dir, &patched)?;
-        let mut resolved = source_from_tarball_bytes(
-            &url,
-            patched,
-            LockSource::Patch {
-                source: Box::new(source_resolution.source),
-                patch: patch_path.display().to_string(),
-            },
-        )?;
-        resolved.resolved = url;
-        Ok(resolved)
-    }
-
-    fn resolve_patch_inner(
-        &self,
-        name: &str,
-        inner: &str,
-        base_dir: &Path,
-    ) -> Result<(SourceResolution, Vec<u8>), String> {
-        if let Some(source) = DependencySource::parse(inner) {
-            if matches!(source, DependencySource::Patch { .. }) {
-                return Err("nested patch: sources are not supported".into());
-            }
-            let resolution = source.resolve(base_dir)?;
-            let bytes = read_source_bytes(self.registry.http(), &resolution.resolved)?;
-            return Ok((resolution, bytes));
-        }
-        let requested = if inner.trim().is_empty() {
-            "*"
-        } else {
-            inner.trim()
-        };
-        let (registry_name, _registry_spec, parsed) = match parse_spec(requested) {
-            Ok(parsed) if parsed.name == name => {
-                let request = version_request_to_string(&parsed.req);
-                (parsed.name.clone(), request, parsed)
-            }
-            _ => {
-                let (registry_name, registry_spec) = registry_request(name, requested);
-                let parsed = parse_spec(&format!("{registry_name}@{registry_spec}")).map_err(
-                    |error| {
-                        format!(
-                            "invalid patched registry source {registry_name}@{registry_spec}: {error}"
-                        )
-                    },
-                )?;
-                (registry_name, registry_spec, parsed)
-            }
-        };
-        let registry_base = self
-            .registry
-            .registry_for_package(&registry_name)
-            .to_owned();
-        let packument = self
-            .registry
-            .packument_for(&parsed)
-            .map_err(|error| error.to_string())?;
-        let resolved = resolve_packument(&parsed, &packument, &registry_base)
-            .map_err(|error| error.to_string())?;
-        let bytes = read_source_bytes(self.registry.http(), &resolved.tarball_url)?;
-        let resolution = SourceResolution {
-            metadata: resolved.metadata,
-            resolved: resolved.tarball_url,
-            integrity: Some(resolved.integrity),
-            source: LockSource::Registry {
-                registry: registry_base,
-            },
-            link: false,
-            workspace_target: None,
-            source_dir: None,
-        };
-        Ok((resolution, bytes))
-    }
-
-    fn ancestor_chain(&self, parent: &str) -> Vec<(String, Version)> {
-        if parent.is_empty() {
-            return Vec::new();
-        }
-        let mut paths = Vec::new();
-        let mut current = parent.to_owned();
-        loop {
-            paths.push(current.clone());
-            let next = parent_path(&current);
-            if next.is_empty() {
-                break;
-            }
-            current = next;
-        }
-        paths.reverse();
-        paths
-            .into_iter()
-            .filter_map(|path| {
-                self.nodes
-                    .get(&path)
-                    .map(|node| (node.placement_name.clone(), node.metadata.version.clone()))
-            })
-            .collect()
-    }
-
-    fn base_dir_for(&self, parent: &str) -> PathBuf {
-        if parent.is_empty() {
-            return self.root_dir.clone().unwrap_or_else(|| PathBuf::from("."));
-        }
-        self.nodes
-            .get(parent)
-            .and_then(|node| node.source_dir.clone())
-            .unwrap_or_else(|| self.root_dir.clone().unwrap_or_else(|| PathBuf::from(".")))
-    }
-
-    fn upgrade_reachability(&mut self, path: &str, optional: bool, dev: bool) {
-        if let Some(node) = self.nodes.get_mut(path) {
-            // A package is optional/dev only when every path reaching it has
-            // that property. A later required or production edge therefore
-            // upgrades an already-created placement in place.
-            node.optional &= optional;
-            node.dev &= dev;
-        }
-    }
-
-    fn platform_allows(
-        &mut self,
-        name: &str,
-        metadata: &VersionMetadata,
-        optional: bool,
-    ) -> Result<bool, ResolveError> {
-        let constraints = crate::resolver::model::PlatformConstraints {
-            os: metadata.os.iter().cloned().collect::<BTreeSet<_>>(),
-            cpu: metadata.cpu.iter().cloned().collect::<BTreeSet<_>>(),
-            libc: metadata.libc.iter().cloned().collect::<BTreeSet<_>>(),
-        };
-        match crate::resolver::platform::check_package_platform(
-            &format!("{}@{}", name, metadata.version),
-            &constraints,
-            &self.target,
-            if optional {
-                crate::resolver::platform::PackageReachability::OptionalOnly
-            } else {
-                crate::resolver::platform::PackageReachability::Required
-            },
-        ) {
-            Ok(crate::resolver::platform::PlatformDisposition::Compatible) => Ok(true),
-            Ok(crate::resolver::platform::PlatformDisposition::SkipOptional(diagnostic)) => {
-                self.diagnostics.push(diagnostic.message);
-                Ok(false)
-            }
-            Err(_) => Err(ResolveError::Platform {
-                package: name.to_owned(),
-                version: metadata.version.to_string(),
-            }),
-        }
-    }
-
-    fn find_visible(&self, parent: &str, name: &str, spec: &str) -> Option<String> {
-        let mut candidate = if parent.is_empty() {
-            String::new()
-        } else {
-            parent.to_owned()
-        };
-        loop {
-            let path = if candidate.is_empty() {
-                format!("node_modules/{name}")
-            } else {
-                format!("{candidate}/node_modules/{name}")
-            };
-            if let Some(node) = self.nodes.get(&path) {
-                if request_matches(spec, &node.metadata.version) {
-                    return Some(path);
-                }
-            }
-            if candidate.is_empty() {
-                break;
-            }
-            candidate = candidate
-                .rsplit_once("/node_modules/")
-                .map(|(prefix, _)| prefix.to_owned())
-                .unwrap_or_default();
-        }
-        None
-    }
-
-    fn find_visible_any(&self, parent: &str, name: &str) -> Option<String> {
-        let mut candidate = parent.to_owned();
-        loop {
-            let path = if candidate.is_empty() {
-                format!("node_modules/{name}")
-            } else {
-                format!("{candidate}/node_modules/{name}")
-            };
-            if self.nodes.contains_key(&path) {
-                return Some(path);
-            }
-            if candidate.is_empty() {
-                return None;
-            }
-            candidate = candidate
-                .rsplit_once("/node_modules/")
-                .map(|(prefix, _)| prefix.to_owned())
-                .unwrap_or_default();
-        }
-    }
-
-    fn peer_candidate_matches(&self, metadata: &VersionMetadata, parent: &str) -> bool {
-        metadata.peer_dependencies.iter().all(|(name, range)| {
-            let Some(path) = self.find_visible_any(parent, name) else {
-                return metadata
-                    .peer_dependencies_meta
-                    .get(name)
-                    .is_some_and(|meta| meta.optional);
-            };
-            self.nodes
-                .get(&path)
-                .is_some_and(|provider| request_matches(range, &provider.metadata.version))
-        })
-    }
-
-    fn visible_providers(
-        &self,
-        parent: &str,
-    ) -> BTreeMap<String, crate::resolver::peer::VisibleProvider> {
-        let mut providers = BTreeMap::new();
-        let mut candidate = parent.to_owned();
-        loop {
-            for node in self.nodes.values() {
-                let expected = if candidate.is_empty() {
-                    format!("node_modules/{}", node.placement_name)
-                } else {
-                    format!("{candidate}/node_modules/{}", node.placement_name)
-                };
-                if node.path == expected {
-                    providers
-                        .entry(node.metadata.name.clone())
-                        .or_insert_with(|| crate::resolver::peer::VisibleProvider {
-                            identity: crate::resolver::model::ProviderIdentity {
-                                name: node.metadata.name.clone(),
-                                version: node.metadata.version.to_string(),
-                                source: package_source_for_node(
-                                    node,
-                                    self.registry.registry_for_package(&node.metadata.name),
-                                ),
-                            },
-                            path: node.path.clone(),
-                            competing_requester: None,
-                        });
-                }
-            }
-            if candidate.is_empty() {
-                break;
-            }
-            candidate = candidate
-                .rsplit_once("/node_modules/")
-                .map(|(prefix, _)| prefix.to_owned())
-                .unwrap_or_default();
-        }
-        providers
-    }
-}
-
-fn parent_path(path: &str) -> String {
+pub(crate) fn parent_path(path: &str) -> String {
     path.rsplit_once("/node_modules/")
         .map(|(parent, _)| parent.to_owned())
         .unwrap_or_default()
-}
-
-fn package_source_for_node(node: &Node, registry: &str) -> crate::resolver::model::PackageSource {
-    match &node.source {
-        LockSource::Workspace { relative_path } => {
-            crate::resolver::model::PackageSource::Workspace {
-                relative_path: relative_path.clone(),
-            }
-        }
-        LockSource::Registry { .. }
-        | LockSource::File { .. }
-        | LockSource::Tarball { .. }
-        | LockSource::Git { .. }
-        | LockSource::Patch { .. } => crate::resolver::model::PackageSource::Registry {
-            registry: registry.to_owned(),
-        },
-    }
 }
 
 pub(crate) fn merged_dependencies(metadata: &VersionMetadata) -> BTreeMap<String, String> {
@@ -1209,6 +539,25 @@ pub(crate) fn registry_request(name: &str, spec: &str) -> (String, String) {
         Ok(parsed) => (parsed.name, version_request_to_string(&parsed.req)),
         Err(_) => (name.to_owned(), spec.to_owned()),
     }
+}
+
+/// Heuristic: true when `spec` looks like a registry version/range.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn looks_like_registry_spec(spec: &str) -> bool {
+    let lower = spec.to_ascii_lowercase();
+    !(spec.starts_with("patch:")
+        || spec.starts_with("file:")
+        || spec.starts_with("link:")
+        || lower.starts_with("git+")
+        || lower.starts_with("git:")
+        || lower.starts_with("github:")
+        || lower.starts_with("http:")
+        || lower.starts_with("https:")
+        || lower.starts_with("npm:")
+        || spec.starts_with("workspace:")
+        || spec.starts_with("./")
+        || spec.starts_with("../")
+        || spec.starts_with('/'))
 }
 
 fn version_request_to_string(request: &crate::registry::VersionRequest) -> String {
@@ -1843,7 +1192,7 @@ mod tests {
         assert_eq!(local.dependencies["b"], "^1.0.0");
         assert!(matches!(
             &lock.resolution.packages["node_modules/local"].source,
-            LockSource::File { .. }
+            crate::lockfile::LockSource::File { .. }
         ));
     }
 
@@ -1914,7 +1263,7 @@ mod tests {
         assert!(package.resolved.contains("patches"));
         assert!(matches!(
             &lock.resolution.packages["node_modules/local-tar"].source,
-            LockSource::Patch { .. }
+            crate::lockfile::LockSource::Patch { .. }
         ));
         assert_eq!(
             read_tgz_file(&package.resolved, "package/cli.js"),

@@ -192,6 +192,7 @@ pub fn scoped_string_bin_name(scoped_name: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     // ── validate_package_path ────────────────────────────────────────
 
@@ -333,5 +334,64 @@ mod tests {
     fn rejects_traversal_workspace_target() {
         assert!(validate_workspace_target("../escape").is_err());
         assert!(validate_workspace_target("packages/../escape").is_err());
+    }
+
+    // ── Property tests (proptest invariants) ──────────────────────────
+
+    /// A single safe path component: lowercase alnum start, then alnum/`.`/`_`/`-`.
+    fn safe_component_strategy() -> impl Strategy<Value = String> {
+        "[a-z0-9][a-z0-9._-]{0,30}"
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 256,
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        /// Any path with a `..` segment is rejected by every relative-path validator.
+        #[test]
+        fn prop_traversal_segment_always_rejected(path in r"([a-z0-9._-]+/)*\.\.(/[a-z0-9._-]+)*") {
+            prop_assert!(validate_package_path(&path).is_err());
+            prop_assert!(validate_workspace_target(&path).is_err());
+            prop_assert!(validate_bin_target(&path).is_err());
+        }
+
+        /// Any path with leading slash, backslash, drive prefix, or backslash
+        /// component is rejected by every relative-path validator.
+        #[test]
+        fn prop_absolute_drive_or_backslash_rejected(path in r"(/|\\|[A-Za-z]:\\?)[a-z0-9._/\\-]*") {
+            prop_assert!(validate_package_path(&path).is_err());
+            prop_assert!(validate_workspace_target(&path).is_err());
+            prop_assert!(validate_bin_target(&path).is_err());
+        }
+
+        /// A bin name containing a path separator or colon is always rejected.
+        #[test]
+        fn prop_bin_name_rejects_separator_or_colon(name in "[ -~]{1,16}") {
+            let has_separator = name.contains('/') || name.contains('\\') || name.contains(':');
+            if has_separator {
+                prop_assert!(validate_bin_name(&name).is_err());
+            }
+        }
+
+        /// A package path assembled only from safe components under
+        /// `node_modules/` is always accepted and round-trips unchanged.
+        #[test]
+        fn prop_well_formed_package_path_roundtrips(
+            comps in prop::collection::vec(safe_component_strategy(), 1..4)
+        ) {
+            let mut path = String::from("node_modules/");
+            for (i, c) in comps.iter().enumerate() {
+                if i > 0 {
+                    path.push_str("/node_modules/");
+                }
+                path.push_str(c);
+            }
+            let ok = validate_package_path(&path)
+                .expect("well-formed node_modules path is accepted");
+            prop_assert_eq!(ok, path);
+        }
     }
 }

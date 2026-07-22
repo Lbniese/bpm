@@ -1,6 +1,6 @@
 SHELL := /bin/bash
 
-.PHONY: build test run lint fmt fmt-check clippy bench
+.PHONY: build test run lint fmt fmt-check clippy bench audit
 
 build:
 	cargo build
@@ -24,3 +24,6 @@ clippy:
 
 bench:
 	cargo build --release && ./target/release/bpm bench --runs 3 --json results.json $(ARGS)
+
+audit:
+	cargo deny check advisories

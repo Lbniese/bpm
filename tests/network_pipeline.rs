@@ -96,6 +96,40 @@ fn run_bpm(
     )
 }
 
+/// Env vars for the blocking resolver side of a parity test: async resolver
+/// disabled (BPM_ASYNC_RESOLVE=0) and streaming disabled (BPM_STREAM_INSTALL=0).
+/// Passing these explicitly makes the "blocking" side genuinely exercise the
+/// blocking resolver kill-switch path instead of silently inheriting the async
+/// default, so the parity corpus proves the two resolvers are distinct *and*
+/// produce byte-identical lockfiles.
+const RESOLVE_BLOCKING: &[(&str, &str)] =
+    &[("BPM_ASYNC_RESOLVE", "0"), ("BPM_STREAM_INSTALL", "0")];
+
+/// Like [`run_bpm`] but with extra environment pairs, so parity tests can pin
+/// resolver/streaming modes explicitly instead of relying on defaults.
+fn run_bpm_with_env(
+    args: &[&str],
+    cwd: &Path,
+    store: &Path,
+    bin_dir: Option<&Path>,
+    env: &[(&str, &str)],
+) -> (bool, String, String) {
+    let mut cmd = Command::new(bin());
+    cmd.args(args).current_dir(cwd).env("BPM_STORE", store);
+    if let Some(bin_dir) = bin_dir {
+        cmd.env("BPM_BIN", bin_dir);
+    }
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("run bpm");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
 fn packument(version: &str, tarball_url: String, integrity: String) -> serde_json::Value {
     let mut versions = serde_json::Map::new();
     let mut dist = serde_json::Map::new();
@@ -255,6 +289,92 @@ fn multi_registry_mock(packages: Vec<(&str, &str, &str, Vec<u8>)>) -> MiniServer
                         &pkg.version,
                         tarball_url,
                         pkg.integrity.clone(),
+                    ))
+                    .unwrap(),
+                    "application/json",
+                ));
+            }
+            if path == pkg.tarball_path {
+                return Some(RouteBody(pkg.tarball.clone(), "application/gzip"));
+            }
+        }
+        None
+    });
+    *base.lock().unwrap() = server.url("");
+    server
+}
+
+/// Like [`packument`] but includes `peerDependencies` in the version entry — the
+/// field the resolver reads to bind peers. The minimal [`packument`] helper
+/// omits it, so peers are invisible to resolution and strict mode trivially
+/// succeeds; this helper lets a mock package declare peers the resolver enforces.
+fn packument_with_peers(
+    version: &str,
+    tarball_url: String,
+    integrity: String,
+    peer_deps: &BTreeMap<String, String>,
+) -> serde_json::Value {
+    let mut versions = serde_json::Map::new();
+    let mut dist = serde_json::Map::new();
+    dist.insert("tarball".into(), serde_json::json!(tarball_url));
+    dist.insert("integrity".into(), serde_json::json!(integrity));
+    let mut entry = serde_json::Map::new();
+    entry.insert("dist".into(), serde_json::Value::Object(dist));
+    if !peer_deps.is_empty() {
+        entry.insert("peerDependencies".into(), serde_json::json!(peer_deps));
+    }
+    versions.insert(version.to_string(), serde_json::Value::Object(entry));
+
+    let mut root = serde_json::Map::new();
+    let mut tags = serde_json::Map::new();
+    tags.insert("latest".into(), serde_json::json!(version));
+    root.insert("dist-tags".into(), serde_json::Value::Object(tags));
+    root.insert("versions".into(), serde_json::Value::Object(versions));
+    serde_json::Value::Object(root)
+}
+
+/// Multi-package registry mock where each package may declare `peerDependencies`
+/// in its packument (the resolver binds peers from the packument, not the
+/// tarball). Each entry is `(name, version, tarball_path, tgz, peer_deps)`.
+#[allow(clippy::type_complexity)]
+fn multi_registry_mock_with_peers(
+    packages: Vec<(&str, &str, &str, Vec<u8>, BTreeMap<String, String>)>,
+) -> MiniServer {
+    struct Pkg {
+        metadata_path: String,
+        tarball_path: String,
+        version: String,
+        integrity: String,
+        tarball: Vec<u8>,
+        peer_deps: BTreeMap<String, String>,
+    }
+    let mut entries: Vec<Pkg> = Vec::new();
+    for (name, version, tarball_path, tgz, peer_deps) in packages {
+        let integrity = integrity_of(&tgz);
+        entries.push(Pkg {
+            metadata_path: format!("/{}", name.replace('/', "%2F")),
+            tarball_path: format!("/{}", tarball_path.trim_start_matches('/')),
+            version: version.to_string(),
+            integrity,
+            tarball: tgz,
+            peer_deps,
+        });
+    }
+    let entries = Arc::new(entries);
+    let base = Arc::new(Mutex::new(String::new()));
+    let base_thread = base.clone();
+
+    let server = MiniServer::start_keep_alive_routed(move |path| {
+        let base = base_thread.lock().unwrap().clone();
+        for pkg in entries.iter() {
+            if path == pkg.metadata_path {
+                let tarball_url = format!("{}{}", base.trim_end_matches('/'), pkg.tarball_path);
+                return Some(RouteBody(
+                    serde_json::to_vec(&packument_with_peers(
+                        &pkg.version,
+                        tarball_url,
+                        pkg.integrity.clone(),
+                        &pkg.peer_deps,
                     ))
                     .unwrap(),
                     "application/json",
@@ -529,8 +649,10 @@ fn frozen_install_uses_direct_tarball_urls_without_registry_lookups() {
 }
 
 /// Verify that the async resolver (`BPM_ASYNC_RESOLVE=1`) produces the same
-/// `bpm.lock` bytes as the default blocking resolver. Uses a local registry
-/// server for deterministic, offline resolution.
+/// `bpm.lock` bytes as the blocking resolver (`BPM_ASYNC_RESOLVE=0`). Both
+/// sides set their mode explicitly so the corpus proves the resolvers are
+/// distinct rather than both inheriting the async default. Uses a local
+/// registry server for deterministic, offline resolution.
 #[test]
 fn async_resolve_produces_byte_identical_lockfile() {
     let dep_tgz = package_tgz("test-dep", "1.0.0", None);
@@ -550,9 +672,14 @@ fn async_resolve_produces_byte_identical_lockfile() {
     // Point the project's registry at our local mock server.
     write_npmrc(project.path(), &[format!("registry={}", server.url(""))]);
 
-    // ---- Blocking resolve (default) ----
-    let (ok_block, stdout_block, stderr_block) =
-        run_bpm(&["install"], project.path(), store_block.path(), None);
+    // ---- Blocking resolve (BPM_ASYNC_RESOLVE=0, no streaming) ----
+    let (ok_block, stdout_block, stderr_block) = run_bpm_with_env(
+        &["install"],
+        project.path(),
+        store_block.path(),
+        None,
+        RESOLVE_BLOCKING,
+    );
     assert!(
         ok_block,
         "blocking install failed\nstdout: {stdout_block}\nstderr: {stderr_block}"
@@ -602,9 +729,14 @@ fn async_streaming_resolve_produces_byte_identical_lockfile() {
 
     write_npmrc(project.path(), &[format!("registry={}", server.url(""))]);
 
-    // ---- Blocking resolve (default, no streaming) ----
-    let (ok_block, stdout_block, stderr_block) =
-        run_bpm(&["install"], project.path(), store_block.path(), None);
+    // ---- Blocking resolve (BPM_ASYNC_RESOLVE=0, no streaming) ----
+    let (ok_block, stdout_block, stderr_block) = run_bpm_with_env(
+        &["install"],
+        project.path(),
+        store_block.path(),
+        None,
+        RESOLVE_BLOCKING,
+    );
     assert!(
         ok_block,
         "blocking install failed\nstdout: {stdout_block}\nstderr: {stderr_block}"
@@ -861,9 +993,14 @@ fn async_resolve_disjunctive_range_byte_identical() {
 
     write_npmrc(project.path(), &[format!("registry={}", server.url(""))]);
 
-    // Blocking resolve
-    let (ok_block, stdout_block, stderr_block) =
-        run_bpm(&["install"], project.path(), store_block.path(), None);
+    // Blocking resolve (BPM_ASYNC_RESOLVE=0, no streaming)
+    let (ok_block, stdout_block, stderr_block) = run_bpm_with_env(
+        &["install"],
+        project.path(),
+        store_block.path(),
+        None,
+        RESOLVE_BLOCKING,
+    );
     assert!(
         ok_block,
         "blocking install failed\nstdout: {stdout_block}\nstderr: {stderr_block}"
@@ -871,7 +1008,7 @@ fn async_resolve_disjunctive_range_byte_identical() {
     let blocking_lock = fs::read_to_string(project.path().join("bpm.lock"))
         .expect("bpm.lock should exist after blocking install");
 
-    // Async resolve
+    // Async resolve (BPM_ASYNC_RESOLVE=1)
     let store_async = tempfile::tempdir().unwrap();
     let _ = fs::remove_file(project.path().join("bpm.lock"));
 
@@ -927,9 +1064,14 @@ fn async_resolve_multiple_deps_byte_identical() {
     // Use server1 as the registry - we'll only use dep1 in the test
     write_npmrc(project.path(), &[format!("registry={}", server1.url(""))]);
 
-    // Blocking resolve (should fail because dep2 doesn't exist on server1)
-    let (ok_block, _, _stderr_block) =
-        run_bpm(&["install"], project.path(), store_block.path(), None);
+    // Blocking resolve (BPM_ASYNC_RESOLVE=0, no streaming; should fail because dep2 doesn't exist on server1)
+    let (ok_block, _, _stderr_block) = run_bpm_with_env(
+        &["install"],
+        project.path(),
+        store_block.path(),
+        None,
+        RESOLVE_BLOCKING,
+    );
 
     // This is expected to fail, but we can still check both resolvers behave the same
     if !ok_block {
@@ -1024,9 +1166,14 @@ fn async_resolve_transitive_dependency_byte_identical() {
     // Use server_a as the registry (it should handle requests for both)
     write_npmrc(project.path(), &[format!("registry={}", server_a.url(""))]);
 
-    // Blocking resolve
-    let (ok_block, _stdout_block, _stderr_block) =
-        run_bpm(&["install"], project.path(), store_block.path(), None);
+    // Blocking resolve (BPM_ASYNC_RESOLVE=0, no streaming)
+    let (ok_block, _stdout_block, _stderr_block) = run_bpm_with_env(
+        &["install"],
+        project.path(),
+        store_block.path(),
+        None,
+        RESOLVE_BLOCKING,
+    );
     if !ok_block {
         // Transitive dependency might not be resolved - check parity by seeing if async also fails
         let store_async = tempfile::tempdir().unwrap();
@@ -1107,9 +1254,14 @@ fn async_resolve_transitive_success_byte_identical() {
     .unwrap();
     write_npmrc(project.path(), &[format!("registry={}", server.url(""))]);
 
-    // Blocking resolve must succeed.
-    let (ok_block, stdout_block, stderr_block) =
-        run_bpm(&["install"], project.path(), store_block.path(), None);
+    // Blocking resolve succeeds (BPM_ASYNC_RESOLVE=0, no streaming).
+    let (ok_block, stdout_block, stderr_block) = run_bpm_with_env(
+        &["install"],
+        project.path(),
+        store_block.path(),
+        None,
+        RESOLVE_BLOCKING,
+    );
     assert!(
         ok_block,
         "blocking install failed\nstdout: {stdout_block}\nstderr: {stderr_block}"
@@ -1181,8 +1333,14 @@ fn async_resolve_peer_dependency_success_byte_identical() {
     .unwrap();
     write_npmrc(project.path(), &[format!("registry={}", server.url(""))]);
 
-    let (ok_block, stdout_block, stderr_block) =
-        run_bpm(&["install"], project.path(), store_block.path(), None);
+    // Blocking resolve (BPM_ASYNC_RESOLVE=0, no streaming)
+    let (ok_block, stdout_block, stderr_block) = run_bpm_with_env(
+        &["install"],
+        project.path(),
+        store_block.path(),
+        None,
+        RESOLVE_BLOCKING,
+    );
     assert!(
         ok_block,
         "blocking install failed\nstdout: {stdout_block}\nstderr: {stderr_block}"
@@ -1259,8 +1417,14 @@ fn async_resolve_version_cycle_success_byte_identical() {
     .unwrap();
     write_npmrc(project.path(), &[format!("registry={}", server.url(""))]);
 
-    let (ok_block, stdout_block, stderr_block) =
-        run_bpm(&["install"], project.path(), store_block.path(), None);
+    // Blocking resolve (BPM_ASYNC_RESOLVE=0, no streaming)
+    let (ok_block, stdout_block, stderr_block) = run_bpm_with_env(
+        &["install"],
+        project.path(),
+        store_block.path(),
+        None,
+        RESOLVE_BLOCKING,
+    );
     assert!(
         ok_block,
         "blocking install failed\nstdout: {stdout_block}\nstderr: {stderr_block}"
@@ -1335,8 +1499,14 @@ fn async_resolve_optional_dependency_success_byte_identical() {
     .unwrap();
     write_npmrc(project.path(), &[format!("registry={}", server.url(""))]);
 
-    let (ok_block, stdout_block, stderr_block) =
-        run_bpm(&["install"], project.path(), store_block.path(), None);
+    // Blocking resolve (BPM_ASYNC_RESOLVE=0, no streaming)
+    let (ok_block, stdout_block, stderr_block) = run_bpm_with_env(
+        &["install"],
+        project.path(),
+        store_block.path(),
+        None,
+        RESOLVE_BLOCKING,
+    );
     assert!(
         ok_block,
         "blocking install failed\nstdout: {stdout_block}\nstderr: {stderr_block}"
@@ -1364,5 +1534,229 @@ fn async_resolve_optional_dependency_success_byte_identical() {
     assert_eq!(
         blocking_lock, async_lock,
         "blocking and async must produce byte-identical bpm.lock for an optional-dependency graph"
+    );
+}
+
+// === Plan 010: resolver-mode/peer-option matrix regressions ===
+
+/// Plan 010 regression: a required peer absent from the tree must fail strict
+/// installs but succeed under `--legacy-peer-deps` across all three resolver
+/// paths (blocking, async streaming, async non-streaming). The successful
+/// legacy lockfile must record `resolution.root.peerMode = legacy-ignore` with
+/// no bound provider for the ignored peer, and the three legacy lockfiles must
+/// be byte-identical.
+#[test]
+fn legacy_peer_deps_succeeds_across_resolver_modes_and_records_legacy_mode() {
+    // dep-with-peer declares a required peer on "react"; the app does not
+    // install react, so the peer is strictly missing. The peer is declared in
+    // the packument (the resolver binds peers from the packument, not the
+    // tarball), so strict mode must reject the missing required peer.
+    let dep_with_peer = package_tgz("dep-with-peer", "1.0.0", None);
+    let mut peer_deps = BTreeMap::new();
+    peer_deps.insert("react".to_string(), "^18.0.0".to_string());
+    let server = multi_registry_mock_with_peers(vec![(
+        "dep-with-peer",
+        "1.0.0",
+        "tarballs/dep-with-peer-1.0.0.tgz",
+        dep_with_peer,
+        peer_deps,
+    )]);
+
+    let project = tempfile::tempdir().unwrap();
+    fs::write(
+        project.path().join("package.json"),
+        r#"{"name":"app","version":"1.0.0","dependencies":{"dep-with-peer":"^1.0.0"}}"#,
+    )
+    .unwrap();
+    write_npmrc(project.path(), &[format!("registry={}", server.url(""))]);
+
+    fn parse_lock(project: &Path) -> serde_json::Value {
+        let text = fs::read_to_string(project.join("bpm.lock")).expect("bpm.lock");
+        serde_json::from_str(&text).expect("parse bpm.lock")
+    }
+
+    // Strict blocking install must fail on the missing required peer.
+    let store = tempfile::tempdir().unwrap();
+    let (ok, _, stderr) = run_bpm_with_env(
+        &["install"],
+        project.path(),
+        store.path(),
+        None,
+        RESOLVE_BLOCKING,
+    );
+    assert!(
+        !ok,
+        "strict blocking install must fail on the missing peer\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("peer"),
+        "strict blocking failure must mention a peer conflict; got: {stderr}"
+    );
+    assert!(
+        !project.path().join("bpm.lock").exists(),
+        "a failed strict install must not write bpm.lock"
+    );
+
+    // Strict async+streaming install must fail with equivalent peer behavior.
+    let store = tempfile::tempdir().unwrap();
+    let mut cmd = std::process::Command::new(bin());
+    cmd.args(["install"])
+        .current_dir(project.path())
+        .env("BPM_STORE", store.path())
+        .env("BPM_ASYNC_RESOLVE", "1")
+        .env("BPM_STREAM_INSTALL", "1");
+    let out = cmd.output().expect("run bpm strict async streaming");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "strict async+streaming install must fail on the missing peer\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("peer"),
+        "strict async+streaming failure must mention a peer conflict; got: {stderr}"
+    );
+
+    // Legacy blocking install must succeed.
+    let store_block = tempfile::tempdir().unwrap();
+    let _ = fs::remove_file(project.path().join("bpm.lock"));
+    let (ok, stdout, stderr) = run_bpm_with_env(
+        &["install", "--legacy-peer-deps"],
+        project.path(),
+        store_block.path(),
+        None,
+        RESOLVE_BLOCKING,
+    );
+    assert!(
+        ok,
+        "legacy blocking install must succeed\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let blocking_lock = fs::read_to_string(project.path().join("bpm.lock"))
+        .expect("bpm.lock after legacy blocking");
+
+    // Legacy async+streaming install must succeed and match byte-for-byte.
+    let store_async = tempfile::tempdir().unwrap();
+    let _ = fs::remove_file(project.path().join("bpm.lock"));
+    let mut cmd = std::process::Command::new(bin());
+    cmd.args(["install", "--legacy-peer-deps"])
+        .current_dir(project.path())
+        .env("BPM_STORE", store_async.path())
+        .env("BPM_ASYNC_RESOLVE", "1")
+        .env("BPM_STREAM_INSTALL", "1");
+    let out = cmd.output().expect("run bpm legacy async streaming");
+    assert!(
+        out.status.success(),
+        "legacy async+streaming install must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let async_streaming_lock =
+        fs::read_to_string(project.path().join("bpm.lock")).expect("bpm.lock after legacy async");
+    assert_eq!(
+        blocking_lock, async_streaming_lock,
+        "legacy blocking and legacy async+streaming must produce byte-identical bpm.lock"
+    );
+
+    // Legacy async non-streaming install must also succeed and match.
+    let store_async_ns = tempfile::tempdir().unwrap();
+    let _ = fs::remove_file(project.path().join("bpm.lock"));
+    let mut cmd = std::process::Command::new(bin());
+    cmd.args(["install", "--legacy-peer-deps"])
+        .current_dir(project.path())
+        .env("BPM_STORE", store_async_ns.path())
+        .env("BPM_ASYNC_RESOLVE", "1")
+        .env("BPM_STREAM_INSTALL", "0");
+    let out = cmd.output().expect("run bpm legacy async non-streaming");
+    assert!(
+        out.status.success(),
+        "legacy async non-streaming install must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let async_ns_lock = fs::read_to_string(project.path().join("bpm.lock"))
+        .expect("bpm.lock after legacy async non-streaming");
+    assert_eq!(
+        blocking_lock, async_ns_lock,
+        "legacy blocking and legacy async non-streaming must produce byte-identical bpm.lock"
+    );
+
+    // The successful lockfile records legacy-ignore peer mode and no bound
+    // provider for the ignored peer.
+    let lock = parse_lock(project.path());
+    assert_eq!(
+        lock["resolution"]["root"]["peerMode"], "legacy-ignore",
+        "legacy lockfile must record resolution.root.peerMode = legacy-ignore"
+    );
+    let packages = lock["resolution"]["packages"]
+        .as_object()
+        .expect("resolution.packages object");
+    let peer_entry = packages
+        .get("node_modules/dep-with-peer")
+        .expect("dep-with-peer resolution entry present");
+    assert!(
+        peer_entry
+            .get("peerContext")
+            .is_none_or(|v| v.is_null() || v.as_object().is_some_and(|o| o.is_empty())),
+        "legacy mode must leave no bound provider for the ignored peer"
+    );
+}
+
+/// Plan 010 regression: the non-streaming kill-switch matrix must print a
+/// resolver label that distinguishes blocking (`BPM_ASYNC_RESOLVE=0`) from
+/// async (`BPM_ASYNC_RESOLVE=1`). Asserts on the stable "(async)" tag emitted
+/// by `install.rs`, not on test-only output.
+#[test]
+fn fresh_install_mode_matrix_labels_blocking_vs_async() {
+    let dep_tgz = package_tgz("matrix-dep", "1.0.0", None);
+    let server = same_host_registry_mock(
+        "matrix-dep",
+        "1.0.0",
+        "tarballs/matrix-dep-1.0.0.tgz",
+        dep_tgz,
+    );
+
+    let project = tempfile::tempdir().unwrap();
+    fs::write(
+        project.path().join("package.json"),
+        r#"{"name":"app-matrix","version":"1.0.0","dependencies":{"matrix-dep":"^1.0.0"}}"#,
+    )
+    .unwrap();
+    write_npmrc(project.path(), &[format!("registry={}", server.url(""))]);
+
+    // Non-streaming blocking (BPM_ASYNC_RESOLVE=0): no "(async)" tag.
+    let store_block = tempfile::tempdir().unwrap();
+    let (ok, _, stderr) = run_bpm_with_env(
+        &["install"],
+        project.path(),
+        store_block.path(),
+        None,
+        RESOLVE_BLOCKING,
+    );
+    assert!(
+        ok,
+        "blocking non-streaming install failed\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("resolved") && !stderr.contains("(async)"),
+        "blocking non-streaming must emit the blocking label (no (async) tag); got: {stderr}"
+    );
+
+    // Non-streaming async (BPM_ASYNC_RESOLVE=1, BPM_STREAM_INSTALL=0): "(async)" tag.
+    let store_async = tempfile::tempdir().unwrap();
+    let _ = fs::remove_file(project.path().join("bpm.lock"));
+    let mut cmd = std::process::Command::new(bin());
+    cmd.args(["install"])
+        .current_dir(project.path())
+        .env("BPM_STORE", store_async.path())
+        .env("BPM_ASYNC_RESOLVE", "1")
+        .env("BPM_STREAM_INSTALL", "0");
+    let out = cmd.output().expect("run bpm async non-streaming");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "async non-streaming install failed\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("(async)"),
+        "async non-streaming must emit the (async) label; got: {stderr}"
     );
 }

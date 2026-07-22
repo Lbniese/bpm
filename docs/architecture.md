@@ -166,6 +166,10 @@ enumeration, task completion order, or network timing.
   for API symmetry but ignores it on Windows).
 - Combine the async resolver with the streaming install path for maximum cold
   overlap.
-- Default-flip the async resolver to `BPM_ASYNC_RESOLVE=1` once the A/B
-  evidence and streaming composition are settled.
+- ~~Default-flip the async resolver to `BPM_ASYNC_RESOLVE=1`~~ **DONE** (Plan 005,
+  Phase 5).  Async resolution is now the default; `BPM_ASYNC_RESOLVE=0` remains
+  as a kill-switch.  The blocking and async placement cores were unified into
+  `src/resolver/placement.rs` with an I/O-agnostic `PackumentSource` trait
+  (`src/resolver/fetch.rs`).  Cold-perf improvement vs the old baseline is
+  recorded in `docs/milestones.md` M7.
 - Upload support and conditional-PUT idempotent writes for the remote cache.

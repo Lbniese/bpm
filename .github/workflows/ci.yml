@@ -27,8 +27,8 @@ jobs:
   # The integration suite relies on Unix filesystem semantics (symlinks,
   # executable bits, /tmp paths) and ships release binaries for macOS and
   # Linux only, so the full `cargo test` suite runs on those platforms.
-  # Windows is still build- and lint-checked to keep the code cross-compilable
-  # there (see the `windows` job below).
+  # Windows is build-, lint-, and windows-gated-test-checked to keep the
+  # code cross-compilable and exercised there (see the `windows` job below).
   test:
     name: fmt, clippy, test, build
     strategy:
@@ -61,7 +61,7 @@ jobs:
         run: cargo build --release --workspace
 
   windows:
-    name: fmt, clippy, build (windows)
+    name: fmt, clippy, build, test (windows)
     runs-on: windows-latest
     steps:
       - name: Checkout
@@ -83,6 +83,14 @@ jobs:
 
       - name: cargo build --release
         run: cargo build --release --workspace
+
+      # Runs only the deliberately windows-gated suite
+      # (`tests/install_windows.rs`, `#![cfg(windows)]`); the Unix-oriented
+      # integration suites rely on symlink/exec-bit/`/tmp` semantics and are
+      # not run here. Covers Windows bin shims and the
+      # `attach_project_local_with_backend` reflink→hardlink fallback.
+      - name: cargo test (windows-gated suite)
+        run: cargo test --test install_windows
 
   benchmark-smoke:
     name: benchmark harness smoke
@@ -150,3 +158,16 @@ jobs:
           test "$(npm --version)" = "11.12.1"
       - name: Run the ignored git-prepare oracle
         run: cargo test --test git_prepare_characterization -- --ignored --nocapture --test-threads=1
+
+  advisory-scan:
+    name: cargo-deny advisories
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run cargo-deny (advisories)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command-arguments: advisories
