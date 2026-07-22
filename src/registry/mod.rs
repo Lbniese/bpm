@@ -1038,6 +1038,12 @@ pub enum RegistryError {
     VersionNotFound { package: String, req: String },
     #[error("packument for {package}@{version} is missing a tarball URL or integrity")]
     MissingDist { package: String, version: String },
+    #[error("packument for {package}@{version} declared an unsupported tarball source (scheme '{scheme}'); only HTTP/HTTPS or registry-relative URLs are accepted")]
+    UnsupportedTarballSource {
+        package: String,
+        version: String,
+        scheme: String,
+    },
     #[error("packument for {package}@{version} has malformed integrity: {detail}")]
     InvalidIntegrity {
         package: String,
@@ -1155,24 +1161,57 @@ pub fn resolve_packument(
         }
     })?;
 
+    let tarball_url = resolve_tarball_url(
+        registry,
+        &metadata.dist.tarball,
+        &spec.name,
+        &version.to_string(),
+    )?;
+
     Ok(ResolvedArtifact {
         name: metadata.name.clone(),
         version,
-        tarball_url: resolve_tarball_url(registry, &metadata.dist.tarball),
+        tarball_url,
         integrity: metadata.dist.integrity.clone(),
         metadata,
     })
 }
 
-fn resolve_tarball_url(registry: &str, tarball: &str) -> String {
-    if tarball.contains("://") || tarball.starts_with("file:") {
-        tarball.to_string()
-    } else {
-        format!(
-            "{}/{}",
-            registry.trim_end_matches('/'),
-            tarball.trim_start_matches('/')
-        )
+/// Resolve a registry packument's `dist.tarball` into the artifact URL BPM will
+/// download, validating its provenance first.
+///
+/// Only absolute `http://`/`https://` URLs (cross-origin allowed, query
+/// strings preserved for signed CDNs) and paths relative to the configured
+/// registry base are accepted. Every other form — `file:`/bare local paths,
+/// `ftp:`/`gopher:`/etc. — is rejected before any artifact request, because a
+/// registry must not redirect a client to an unintended local source. The
+/// error carries the scheme and package/version, never the raw (possibly
+/// credential-bearing) URL.
+fn resolve_tarball_url(
+    registry: &str,
+    tarball: &str,
+    package: &str,
+    version: &str,
+) -> Result<String, RegistryError> {
+    match reqwest::Url::parse(tarball) {
+        Ok(url) => match url.scheme() {
+            "http" | "https" => Ok(tarball.to_string()),
+            scheme => Err(RegistryError::UnsupportedTarballSource {
+                package: package.to_string(),
+                version: version.to_string(),
+                scheme: scheme.to_string(),
+            }),
+        },
+        Err(_) => {
+            // No absolute scheme: a registry-relative path. Resolve it against
+            // the configured registry base, preserving the established
+            // same-registry behavior.
+            Ok(format!(
+                "{}/{}",
+                registry.trim_end_matches('/'),
+                tarball.trim_start_matches('/')
+            ))
+        }
     }
 }
 
@@ -1609,6 +1648,58 @@ mod tests {
         let resolved = resolve_packument(&spec, &packument, "https://example.test/").unwrap();
         assert_eq!(resolved.tarball_url, "https://example.test/p/-/p-1.2.3.tgz");
         assert_eq!(resolved.integrity, valid_integrity);
+    }
+
+    /// Plan 012: registry `dist.tarball` provenance matrix.
+    fn resolve_tarball(registry: &str, tarball: &str) -> Result<String, RegistryError> {
+        super::resolve_tarball_url(registry, tarball, "p", "1.2.3")
+    }
+
+    #[test]
+    fn registry_tarball_relative_path_resolves_against_registry() {
+        let url = resolve_tarball("https://example.test", "p/-/p-1.2.3.tgz").unwrap();
+        assert_eq!(url, "https://example.test/p/-/p-1.2.3.tgz");
+    }
+
+    #[test]
+    fn registry_tarball_accepts_same_and_cross_origin_http_https() {
+        assert_eq!(
+            resolve_tarball("https://reg.test", "http://127.0.0.1:9/x.tgz").unwrap(),
+            "http://127.0.0.1:9/x.tgz"
+        );
+        // Cross-origin HTTPS with a signed query string is preserved.
+        let signed = "https://cdn.other.test/p.tgz?token=secret";
+        assert_eq!(resolve_tarball("https://reg.test", signed).unwrap(), signed);
+    }
+
+    #[test]
+    fn registry_tarball_rejects_file_and_non_http_schemes() {
+        let err = resolve_tarball("https://reg.test", "file:///etc/passwd").unwrap_err();
+        assert!(
+            format!("{err}").contains("unsupported tarball source"),
+            "expected unsupported-source rejection; got: {err}"
+        );
+        assert!(
+            format!("{err}").contains("file"),
+            "scheme must be reported; got: {err}"
+        );
+        assert!(
+            !format!("{err}").contains("/etc/passwd"),
+            "the raw URL/path must not appear in the error"
+        );
+        // Bare non-http scheme.
+        resolve_tarball("https://reg.test", "gopher://x/y").unwrap_err();
+        // file: without //
+        resolve_tarball("https://reg.test", "file:rel/x").unwrap_err();
+    }
+
+    #[test]
+    fn registry_tarball_joins_a_relative_local_path() {
+        // A bare relative path (no scheme, no host) is treated as
+        // registry-relative and joined; it is NOT accepted as an absolute
+        // local source.
+        let url = resolve_tarball("https://reg.test", "local.tgz").unwrap();
+        assert_eq!(url, "https://reg.test/local.tgz");
     }
 
     #[test]

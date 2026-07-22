@@ -1760,3 +1760,128 @@ fn fresh_install_mode_matrix_labels_blocking_vs_async() {
         "async non-streaming must emit the (async) label; got: {stderr}"
     );
 }
+
+// === Plan 012: registry trust-boundary regression tests ===
+
+/// A registry that returns a packument whose dist.tarball is a `file://` URL
+/// must be rejected with an UnsupportedTarballSource error.
+#[test]
+fn registry_tarball_rejects_local_source() {
+    let tgz = package_tgz("innocent", "1.0.0", None);
+    let local_path = "file:///tmp/innocent-1.0.0.tgz".to_string();
+    let registry = metadata_only_registry_mock("innocent", "1.0.0", local_path.clone(), tgz);
+
+    let project = tempfile::tempdir().unwrap();
+    let store = tempfile::tempdir().unwrap();
+    write_project(project.path());
+    write_npmrc(project.path(), &[format!("registry={}", registry.url(""))]);
+
+    let (ok, _stdout, stderr) = run_bpm(
+        &[
+            "fetch",
+            "innocent",
+            "--registry",
+            &registry.url(""),
+            "--store",
+            store.path().to_str().unwrap(),
+            "--no-extract",
+        ],
+        project.path(),
+        store.path(),
+        None,
+    );
+
+    // Must fail with an unsupported-source error before any tarball request.
+    assert!(!ok, "expected fetch to fail; stderr: {stderr}");
+    assert!(
+        stderr.contains("unsupported tarball source"),
+        "error must mention unsupported tarball source; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("file"),
+        "error must mention the scheme; got: {stderr}"
+    );
+
+    // Only the metadata request was made — no tarball request.
+    assert_eq!(registry.requests().len(), 1, "only metadata request");
+    assert_eq!(
+        registry.requests()[0].path,
+        format!("/{}", "innocent".replace('/', "%2F")),
+        "must be the metadata path"
+    );
+
+    // Stderr must not contain the local file path or contents.
+    assert!(
+        !stderr.contains("/tmp/innocent"),
+        "stderr must not contain the raw local path; got: {stderr}"
+    );
+
+    // No scratch files linger in the store's tmp directory.
+    let tmp_dir = store.path().join("tmp");
+    if tmp_dir.is_dir() {
+        let tmp_count = fs::read_dir(&tmp_dir)
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(tmp_count, 0, "no temp scratch should remain after failure");
+    }
+}
+
+/// A cross-origin HTTP tarball URL from the registry mock must still resolve
+/// and download successfully — CDN compatibility must not regress.
+#[test]
+fn registry_tarball_accepts_cross_origin_http() {
+    let tgz = package_tgz("cdn-pkg", "1.0.0", None);
+
+    // A separate server for the tarball (cross-origin relative to metadata).
+    let tarball_server = MiniServer::start_keep_alive_routed({
+        let tgz = Arc::new(tgz.clone());
+        move |path| {
+            if path == "/tarballs/cdn-pkg-1.0.0.tgz" {
+                Some(RouteBody((*tgz).clone(), "application/gzip"))
+            } else {
+                None
+            }
+        }
+    });
+
+    // The metadata server points to a cross-origin tarball URL.
+    let registry = metadata_only_registry_mock(
+        "cdn-pkg",
+        "1.0.0",
+        tarball_server.url("tarballs/cdn-pkg-1.0.0.tgz"),
+        tgz,
+    );
+
+    let project = tempfile::tempdir().unwrap();
+    let store = tempfile::tempdir().unwrap();
+    write_project(project.path());
+    write_npmrc(project.path(), &[format!("registry={}", registry.url(""))]);
+
+    let (ok, stdout, stderr) = run_bpm(
+        &[
+            "fetch",
+            "cdn-pkg",
+            "--registry",
+            &registry.url(""),
+            "--store",
+            store.path().to_str().unwrap(),
+            "--no-extract",
+        ],
+        project.path(),
+        store.path(),
+        None,
+    );
+
+    assert!(
+        ok,
+        "cross-origin CDN tarball must succeed; stderr: {stderr}\nstdout: {stdout}"
+    );
+
+    // One metadata request and one tarball request.
+    assert_eq!(registry.requests().len(), 1, "one metadata request");
+    assert_eq!(
+        tarball_server.requests().len(),
+        1,
+        "one tarball request to cross-origin server"
+    );
+}

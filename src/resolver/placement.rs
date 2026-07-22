@@ -196,7 +196,7 @@ impl<'a, S: PackumentSource> GraphResolver<'a, S> {
             ResolveError::Registry {
                 package: name.to_owned(),
                 spec: spec.clone(),
-                source,
+                source: Box::new(source),
             }
         })?;
         let registry_base = self.source.registry_for_package(&registry_name).to_owned();
@@ -206,14 +206,14 @@ impl<'a, S: PackumentSource> GraphResolver<'a, S> {
                 .map_err(|source| ResolveError::Registry {
                     package: name.to_owned(),
                     spec: spec.clone(),
-                    source,
+                    source: Box::new(source),
                 })?;
         let mut resolved =
             resolve_packument(&parsed, &packument, &registry_base).map_err(|source| {
                 ResolveError::Registry {
                     package: name.to_owned(),
                     spec: spec.clone(),
-                    source,
+                    source: Box::new(source),
                 }
             })?;
         // If a visible provider already exists, try lower published versions
@@ -238,7 +238,7 @@ impl<'a, S: PackumentSource> GraphResolver<'a, S> {
                         ResolveError::Registry {
                             package: name.to_owned(),
                             spec: spec.clone(),
-                            source,
+                            source: Box::new(source),
                         }
                     })?;
                 if self.peer_candidate_matches(&candidate.metadata, parent) {

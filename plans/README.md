@@ -48,7 +48,7 @@ correctness fix.
 | 009  | Actually gitignore the local-only COMMIT_POLICY.md | P3 | S | — | DONE |
 | 010  | Honor resolver mode and peer options on every fresh-install path | P1 | M | — | DONE |
 | 011  | Record project-view ownership and remove stale entries safely | P1 | M | — | DONE |
-| 012  | Constrain registry artifact sources and bound every artifact read | P1 | M | — | TODO |
+| 012  | Constrain registry artifact sources and bound every artifact read | P1 | M | — | DONE |
 | 013  | Make Git and patch source caches race-safe | P2 | M | 012 | TODO |
 | 014  | Stream package-image metadata without loading file payloads | P2 | M | — | TODO |
 
@@ -112,6 +112,22 @@ abandoned).
   unknown mode / invalid path, and tidies empty `@scope` parents with
   non-recursive `remove_dir`. Direct materialization synthesizes no graph-
   volume ownership and reconciles prior graph-volume entries conservatively.
+- **012 done (2026-07-22).** One crate-internal `MAX_ARTIFACT_BYTES`
+  (512 MiB compressed-byte) policy in `src/download.rs` now governs streaming
+  downloads, direct tarball/Git source reads (`src/resolver/sources.rs`), and
+  the remote-cache client (`src/remote_cache.rs` reuses the constant). Every
+  reader counts chunks with checked arithmetic and fails at limit-plus-one
+  without truncating; partial store scratch files are removed on every
+  retrieval error (second correctness layer in `src/store.rs`). Registry
+  `dist.tarball` provenance is validated in `resolve_tarball_url` — only
+  HTTP/HTTPS absolute URLs (cross-origin + signed query strings allowed) and
+  registry-relative paths are accepted; `file:`/bare-local/non-HTTP schemes
+  are rejected as `RegistryError::UnsupportedTarballSource` (scheme +
+  package/version only, never the raw URL) before any artifact request.
+  `RegistryError` is now boxed in resolver/async error variants to keep the
+  enum bounded after adding the variant. Explicit user-selected local
+  tarball/`file:` dependencies still work; cross-origin CDN tarballs still
+  work.
 - **013 requires 012.** Both change `src/resolver/sources.rs`: 012 establishes
   bounded artifact readers; 013 must rebase on and preserve those limits while
   adding source-cache locking/publication safety.

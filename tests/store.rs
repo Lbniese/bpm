@@ -114,6 +114,33 @@ fn integrity_mismatch_is_rejected_and_tmp_cleaned() {
     assert_eq!(server.hits(), 1);
 }
 
+/// Plan 012: a retrieval error (not just an integrity mismatch) must not leave a
+/// scratch file in the store's temp directory.
+#[test]
+fn retrieval_error_leaves_no_tmp_scratch() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = ArtifactStore::open(store_dir.path()).unwrap();
+
+    // A file:// URL that points at a non-existent file: the download layer
+    // fails before any bytes are written, surfacing StoreError::Download.
+    let missing = store_dir.path().join("does-not-exist.tgz");
+    let url = format!("file://{}", missing.display());
+    let mut m = Metrics::new();
+    let err = store
+        .ensure_artifact(&url, None, &mut m)
+        .expect_err("retrieval of a missing source must fail");
+    assert!(
+        format!("{err}").contains("download"),
+        "expected a download error; got: {err}"
+    );
+
+    let tmp_count = fs::read_dir(store.root().join("tmp")).unwrap().count();
+    assert_eq!(
+        tmp_count, 0,
+        "temp scratch not cleaned after retrieval error"
+    );
+}
+
 #[test]
 fn interrupted_writes_do_not_block_refetch() {
     let tgz = fixture_tgz();

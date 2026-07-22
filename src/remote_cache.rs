@@ -14,9 +14,8 @@ use reqwest::blocking::{Client, ClientBuilder};
 use reqwest::redirect::Policy;
 use thiserror::Error;
 
+use crate::download::MAX_ARTIFACT_BYTES;
 use crate::integrity::ArtifactId;
-
-const MAX_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Clone)]
 struct RemoteCacheToken(String);

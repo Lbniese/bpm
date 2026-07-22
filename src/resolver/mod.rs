@@ -38,7 +38,7 @@ pub enum ResolveError {
         package: String,
         spec: String,
         #[source]
-        source: RegistryError,
+        source: Box<RegistryError>,
     },
     #[error("package {package}@{version} is incompatible with the current platform")]
     Platform { package: String, version: String },

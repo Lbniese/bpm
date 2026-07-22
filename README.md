@@ -10,6 +10,7 @@ a global content-addressed store and shared across projects.
 
 ## Recent Changes
 
+- 2026-07-22: Constrained registry artifact provenance and bounded every artifact read — registry `dist.tarball` is now validated to HTTP/HTTPS or registry-relative URLs (rejecting `file:`/non-HTTP schemes before download), a single 512 MiB compressed-byte policy governs all download/source/remote-cache reads with limit-plus-one failure and scratch cleanup, and explicit local tarball/`file:` dependencies plus cross-origin CDN tarballs still work (Plan 012 completed)
 - 2026-07-21: Reconciled `docs/git-prepare-design.md` with shipped slices 1/3/4/5 (Plan 001 completed)
 - 2026-07-21: Added active git-prepare failure/rerun/ref-pinning/identity tests (Plan 003 completed)
 - 2026-07-21: Split registry.rs into registry/ package (Plan 004 completed)
