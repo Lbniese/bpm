@@ -288,6 +288,22 @@ pub(super) fn install_resolved_lockfile(
             .iter()
             .map(|entry| entry.bin.len())
             .sum::<usize>();
+        // A plan-cache hit performs no fetch/materialization, but it must still
+        // refresh ownership so a concurrent `bpm gc` cannot age out the cached
+        // graph or its dependencies: re-lease the graph's durable inventory,
+        // record access, and rewrite the durable project registration + SQLite
+        // reference. A legacy/incomplete cached volume returns an error here so
+        // the caller takes the normal rebuild/migration path instead of
+        // trusting an unprotected cache hit.
+        let graph_hex = graph::graph_id_for_project(&lockfile, project_root).to_hex();
+        if let Err(error) = bpm::metadata::InstallSession::open(store.root())
+            .and_then(|mut session| session.refresh_cached_graph(project_root, &graph_hex))
+        {
+            eprintln!(
+                "warning: could not refresh graph ownership for {}: {error}",
+                graph::graph_id_for_project(&lockfile, project_root).to_hex_short(),
+            );
+        }
         println!(
             "nothing to install — graph {} unchanged ({} package(s), {} bin(s) already materialized)",
             graph::graph_id_for_project(&lockfile, project_root).to_hex_short(),
@@ -1552,6 +1568,23 @@ fn finalize_install(
     } else {
         BTreeMap::new()
     };
+    // Open the metadata ownership/lease session for this install. It records
+    // publication of every store object the install reads, holds a renewable
+    // lease over them so a concurrent `bpm gc` cannot reclaim them mid-install,
+    // records the graph's inventory edges, and publishes the durable project
+    // registration after attachment. Failures propagate with `?` so an install
+    // never reports success with an unprotected graph.
+    let mut session = bpm::metadata::InstallSession::open(store.root())
+        .map_err(|error| anyhow::anyhow!("open metadata index failed: {error}"))?;
+    let lease_artifacts: Vec<ArtifactId> = artifact_ids
+        .iter()
+        .zip(lockfile.packages.iter())
+        .filter_map(|(maybe_id, pkg)| if pkg.link { None } else { *maybe_id })
+        .collect();
+    let prepared_derived: Vec<String> = prepared.values().map(|image| image.key.to_hex()).collect();
+    session
+        .lease_objects(&lease_artifacts, &prepared_derived)
+        .map_err(|error| anyhow::anyhow!("lease store objects failed: {error}"))?;
     // Turbopack and similar bundlers enforce that dependency realpaths remain
     // inside the project. Keep the O(top-level) relay fast path for ordinary
     // projects, but use a local hardlink view automatically for Next projects;
@@ -1565,6 +1598,7 @@ fn finalize_install(
     // local/reflink is selected). Direct materialization synthesizes no
     // graph-volume ownership (see plan 011 Scope).
     let mut final_ownership: Vec<bpm::graph::ManagedEntry> = Vec::new();
+    let mut graph_hex: Option<String> = None;
     let (volume, mut view_entry_count) = if direct_materialization {
         bpm::materializer::materialize_lockfile_with_backend(
             project_root,
@@ -1589,6 +1623,24 @@ fn finalize_install(
         )?;
         let attach = bpm::volume::attach_project(project_root, &volume)?;
         final_ownership.clone_from(&attach.owned);
+        // The graph volume is now durably published (complete inventory
+        // written atomically with the marker). Record its ownership edges and
+        // extend the install lease to cover the graph + its derived images.
+        // The graph id is read from the volume path so it always matches the
+        // volume that was actually built or reused.
+        let hex = volume
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("")
+            .to_string();
+        session
+            .record_graph(
+                &hex,
+                bpm::volume::read_graph_inventory(&volume.path).as_ref(),
+            )
+            .map_err(|error| anyhow::anyhow!("record graph ownership failed: {error}"))?;
+        graph_hex = Some(hex);
         (
             Some(volume),
             attach.stats.relays_created + attach.stats.relays_unchanged,
@@ -1663,6 +1715,20 @@ fn finalize_install(
             "warning: failed to write plan {}: {error}",
             plan_path.display()
         );
+    }
+    // Persist durable project ownership now that the graph is attached and
+    // `.bpm-state`/plan are written. The lease is checked before and after;
+    // a lost lease fails the install rather than leaving an unprotected graph.
+    // Direct workspace materialization (no graph volume) does not register a
+    // nonexistent graph; any prior registration is preserved conservatively.
+    if let Some(hex) = &graph_hex {
+        session
+            .finalize_project(project_root, hex)
+            .map_err(|error| anyhow::anyhow!("persist project ownership failed: {error}"))?;
+    } else {
+        session
+            .check()
+            .map_err(|error| anyhow::anyhow!("metadata lease lost before completion: {error}"))?;
     }
     let package_count = lockfile
         .packages

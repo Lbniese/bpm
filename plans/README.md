@@ -65,7 +65,7 @@ not executed. No subagents were configured, so the pass was performed directly.
 | 014  | Stream package-image metadata without loading file payloads | P2 | M | — | DONE |
 | 015  | Reject dependency-specification drift during frozen installs | P1 | S | — | DONE |
 | 016  | Make async metadata caching correct and persistent | P1 | M | — | DONE |
-| 017  | Protect installed graphs with durable ownership and active leases | P1 | L | — | TODO |
+| 017  | Protect installed graphs with durable ownership and active leases | P1 | L | — | DONE |
 | 018  | Honor npm retry policy in the async resolver | P1 | M | 016 | TODO |
 | 019  | Keep async streaming overflow on the concurrent cache-aware pipeline | P2 | M | 016, 018 | TODO |
 | 020  | Verify signed release checksums before executing prebuilt binaries | P1 | M | — | TODO |
@@ -220,6 +220,32 @@ abandoned).
   `store.db` remains rebuildable, and coordinate leases/deletion with the same
   object locks as publishers. It should land before any derived-store
   default-on/promotion decision.
+  **Done (2026-07-23):** production install and plan-cache-hit paths now drive
+  one `InstallSession` (`src/metadata/install.rs`) over the rebuildable index.
+  (1) **Self-describing graph inventory:** `VolumeMeta` carries a versioned,
+  sorted `(artifact_id, requires_image)` + derived-id inventory; layout bumped to
+  7 so legacy volumes rebuild with it. `repair_index` reconstructs
+  `graph_artifacts`/`graph_derived` edges from the durable inventory, marking a
+  graph `complete=1` only when the inventory is present AND every referenced
+  artifact/derived is observed. (2) **Durable project registrations:** after
+  attachment + `.bpm-state`/plan write, BPM atomically writes a BLAKE3-keyed
+  registration under `<store>/projects/<hh>/<blake3>` and replaces the SQLite
+  `project_graph_refs`; `repair_index` scans these (symlink/malformed/key-mismatch
+  records are never trusted) to rebuild ownership. (3) **Race-safe leases +
+  canonical locks:** new `src/store_lock.rs` is the single source of truth for
+  object lock names (artifact `<id>`, image `img-<id>`, derived `derived-<id>`,
+  graph `graph-<id>`, plan `plan-<id>`); `acquire_lease`/`LeaseGuard::extend`
+  hold those locks across publication+insert, and GC `collect` acquires each
+  object's lock, revalidates `is_published`, and requeries protection in the
+  deletion transaction before unlinking. Legacy/incomplete graphs (`complete=0`)
+  protect themselves and fail-close artifact/image/derived reclamation. Direct
+  workspace materialization registers no nonexistent graph and preserves prior
+  registrations. v2 forward-only schema migration adds `graphs.complete` +
+  `idx_graphs_complete`. End-to-end tests prove: install→age→`bpm gc` retains
+  the active graph + artifacts; plan-cache hit re-installs; `store.db` deletion
+  reconstructs protection; an incomplete legacy graph is preserved; an active
+  lease protects an object and, once released, the unreferenced object is
+  reclaimable.
 - **019 follows 016 and 018.** It changes the default async+streaming path after
   metadata transport parity is stable. Overflow units must remain on the same
   concurrent remote-cache-aware pipeline; it must not restore an origin-only

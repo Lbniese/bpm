@@ -974,3 +974,156 @@ fn second_project_with_same_graph_reuses_the_volume() {
         relay.display()
     );
 }
+
+// ── GC ownership integration (plan 017) ──────────────────────────────────
+
+/// Run `bpm gc --older-than <grace> --store <store>` and return its output.
+fn run_gc(store: &Path, grace: &str) -> std::process::Output {
+    Command::new(bpm_bin())
+        .arg("gc")
+        .arg("--older-than")
+        .arg(grace)
+        .arg("--store")
+        .arg(store)
+        .output()
+        .expect("failed to run bpm gc")
+}
+
+/// Set the mtime of every immutable store object (graphs, artifacts, images,
+/// derived) under `store` to `age` in the past so a small grace window makes
+/// them age-eligible for GC.
+fn age_store_objects(store: &Path, age: std::time::Duration) {
+    let old = std::time::SystemTime::now() - age;
+    for namespace in ["graphs", "artifacts", "images", "derived"] {
+        let base = store.join(namespace);
+        let Ok(entries) = fs::read_dir(&base) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            age_tree_recursive(&entry.path(), old);
+        }
+    }
+}
+
+fn age_tree_recursive(path: &Path, old: std::time::SystemTime) {
+    if let Ok(meta) = fs::symlink_metadata(path) {
+        if meta.is_dir() {
+            if let Ok(children) = fs::read_dir(path) {
+                for child in children.flatten() {
+                    age_tree_recursive(&child.path(), old);
+                }
+            }
+        }
+        if let Ok(file) = fs::File::open(path) {
+            let _ = file.set_modified(old);
+        }
+    }
+}
+
+/// Count published graph volumes under `<store>/graphs/blake3/**`.
+fn count_graph_volumes(store: &Path) -> usize {
+    let base = store.join("graphs/blake3");
+    let Ok(prefixes) = fs::read_dir(&base) else {
+        return 0;
+    };
+    let mut count = 0;
+    for prefix in prefixes.flatten() {
+        if let Ok(volumes) = fs::read_dir(prefix.path()) {
+            count += volumes.flatten().filter(|e| e.path().is_dir()).count();
+        }
+    }
+    count
+}
+
+/// Collect every published artifact tarball path under the store.
+fn collect_artifact_files(store: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let base = store.join("artifacts/sha512");
+    let Ok(prefixes) = fs::read_dir(&base) else {
+        return out;
+    };
+    for prefix in prefixes.flatten() {
+        if let Ok(files) = fs::read_dir(prefix.path()) {
+            for file in files.flatten() {
+                out.push(file.path());
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn gc_retains_active_project_graph_and_dependencies() {
+    let (project, store, _tgz) = setup_project();
+    let out = run_install(project.path(), store.path());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "install failed: {stderr}");
+
+    // The graph volume and its artifact/image were published.
+    assert_eq!(count_graph_volumes(store.path()), 1);
+    let artifacts_before = collect_artifact_files(store.path());
+    assert!(!artifacts_before.is_empty(), "store should hold artifacts");
+
+    // Age every store object well past a one-second grace window, then GC.
+    age_store_objects(store.path(), std::time::Duration::from_secs(60));
+    let out = run_gc(store.path(), "1s");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "gc failed: {stderr}\n{stdout}");
+
+    // The active project's graph volume and artifacts survive GC.
+    assert_eq!(
+        count_graph_volumes(store.path()),
+        1,
+        "active graph must survive GC; stdout: {stdout}"
+    );
+    for artifact in &artifacts_before {
+        assert!(
+            artifact.exists(),
+            "active artifact must survive GC: {}",
+            artifact.display()
+        );
+    }
+    // The project's node_modules is still usable through the retained volume.
+    assert!(project
+        .path()
+        .join("node_modules/greet/package.json")
+        .exists());
+
+    // Re-running install is a plan-cache hit and still succeeds (the retained
+    // graph remains valid).
+    let out = run_install(project.path(), store.path());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "re-install failed: {stderr}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("nothing to install"),
+        "expected plan-cache hit; stdout: {stdout}"
+    );
+}
+
+#[test]
+fn gc_rebuilds_protection_after_store_db_deleted() {
+    let (project, store, _tgz) = setup_project();
+    let out = run_install(project.path(), store.path());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "install failed: {stderr}");
+    assert_eq!(count_graph_volumes(store.path()), 1);
+
+    let db = store.path().join("store.db");
+    assert!(db.exists(), "store.db should exist after install");
+    fs::remove_file(&db).unwrap();
+
+    // Age objects and GC with no store.db: durable graph inventory + project
+    // registration must reconstruct protection so the active graph is retained.
+    age_store_objects(store.path(), std::time::Duration::from_secs(60));
+    let out = run_gc(store.path(), "1s");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "gc failed: {stderr}\n{stdout}");
+    assert_eq!(
+        count_graph_volumes(store.path()),
+        1,
+        "graph must be retained after store.db rebuild; stdout: {stdout}"
+    );
+}
