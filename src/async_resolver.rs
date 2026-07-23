@@ -170,27 +170,21 @@ async fn async_fetch_with_cache(
         }
     }
 
-    // 4. Send validators from the cached entry (scoped to this exact URL).
-    let mut request = client.get(url);
-    if send_abbreviated_accept {
-        request = request.header("Accept", ABBREV_ACCEPT);
-    }
-    if let Some(token) = config.auth_token_for_url(url) {
-        request = request.bearer_auth(token);
-    }
-    if let Some(entry) = cached.as_ref() {
-        if let Some(etag) = entry.etag.as_deref() {
-            request = request.header("If-None-Match", etag);
-        }
-        if let Some(last_modified) = entry.last_modified.as_deref() {
-            request = request.header("If-Modified-Since", last_modified);
-        }
-    }
-
-    let response = request.send().await.map_err(|e| AsyncResolveError::Http {
-        url: redact_url(url),
-        message: e.to_string(),
-    })?;
+    // 4. Send validators from the cached entry (scoped to this exact URL),
+    //    retrying transient statuses/transports per `NetworkConfig`. A fresh
+    //    request is built on each attempt so auth/Accept/validators are
+    //    retained safely; a retryable response body is drained only up to the
+    //    shared retry-body bound so a hostile server cannot stall backoff.
+    let attempts = config.network.retries.saturating_add(1);
+    let response = async_send_with_retry(
+        client,
+        url,
+        config,
+        cached.as_ref(),
+        send_abbreviated_accept,
+        attempts,
+    )
+    .await?;
 
     let status = response.status().as_u16();
 
@@ -206,12 +200,9 @@ async fn async_fetch_with_cache(
             });
     }
 
-    if status >= 400 {
-        return Err(AsyncResolveError::Http {
-            url: redact_url(url),
-            message: format!("HTTP {status}"),
-        });
-    }
+    // `async_send_with_retry` returns terminal failure statuses (including
+    // exhausted retries) as errors carrying the attempt count, so any response
+    // reaching here is a success (`< 400`).
 
     // 6. Capture validators BEFORE consuming the body, count the transferred
     //    body bytes once, and persist the response best-effort.
@@ -234,6 +225,111 @@ async fn async_fetch_with_cache(
     async_cache_put(cache, url, &body, etag, last_modified).await;
 
     Ok(body)
+}
+
+/// Build a fresh GET request (auth, optional abbreviated Accept, and cached
+/// validators scoped to this exact URL) and send it, retrying transient
+/// statuses (`408`/`429`/`5xx`) and connect/timeout transports up to `attempts`
+/// total tries. `304` and other terminal responses are returned to the caller
+/// for cache/body handling; retryable bodies are drained only up to the shared
+/// retry-body bound. Waits via `tokio::time::sleep`; never caches or parses a
+/// retryable error body.
+async fn async_send_with_retry(
+    client: &reqwest::Client,
+    url: &str,
+    config: &NpmConfig,
+    cached: Option<&crate::metadata_cache::CachedPackument>,
+    send_abbreviated_accept: bool,
+    attempts: usize,
+) -> Result<reqwest::Response, AsyncResolveError> {
+    use crate::http::retry::{
+        is_retryable_status, is_retryable_transport, parse_retry_after_at, retry_delay,
+        transport_kind,
+    };
+    use std::time::SystemTime;
+
+    let mut completed = 0usize;
+    loop {
+        let mut request = client.get(url);
+        if send_abbreviated_accept {
+            request = request.header("Accept", ABBREV_ACCEPT);
+        }
+        if let Some(token) = config.auth_token_for_url(url) {
+            request = request.bearer_auth(token);
+        }
+        if let Some(entry) = cached {
+            if let Some(etag) = entry.etag.as_deref() {
+                request = request.header("If-None-Match", etag);
+            }
+            if let Some(last_modified) = entry.last_modified.as_deref() {
+                request = request.header("If-Modified-Since", last_modified);
+            }
+        }
+        completed += 1;
+        match request.send().await {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                // `304` (conditional cache success) and other `< 400` responses
+                // are terminal success; hand them to the cache/body logic.
+                if status == 304 || status < 400 {
+                    return Ok(response);
+                }
+                // Retryable failure status with attempts remaining: honor
+                // `Retry-After`, drain the bounded body, back off, retry.
+                if is_retryable_status(status) && completed < attempts {
+                    let retry_after = response
+                        .headers()
+                        .get("Retry-After")
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(|value| parse_retry_after_at(value, SystemTime::now()));
+                    drain_bounded_async(response).await;
+                    let delay = retry_delay(&config.network, completed - 1, retry_after);
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                // Non-retryable failure or exhausted retries: report the
+                // completed attempt count with the redacted URL.
+                return Err(AsyncResolveError::Http {
+                    url: redact_url(url),
+                    message: format!("HTTP {status} after {completed} attempt(s)"),
+                });
+            }
+            Err(error) => {
+                if is_retryable_transport(&error) && completed < attempts {
+                    let delay = retry_delay(&config.network, completed - 1, None);
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                return Err(AsyncResolveError::Http {
+                    url: redact_url(url),
+                    message: format!("{} after {completed} attempt(s)", transport_kind(&error)),
+                });
+            }
+        }
+    }
+}
+
+/// Drain a retryable async response body only up to the shared retry-body
+/// bound, then drop it. Reading past the bound distinguishes a complete small
+/// body from an oversized one; dropping an oversized reader leaves bytes
+/// unread and closes the connection rather than allowing unbounded work.
+async fn drain_bounded_async(response: reqwest::Response) {
+    use crate::http::retry::RETRY_BODY_DRAIN_LIMIT;
+    use futures_util::StreamExt;
+    let limit = u64::try_from(RETRY_BODY_DRAIN_LIMIT).unwrap_or(u64::MAX);
+    let mut consumed = 0u64;
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(bytes) => {
+                consumed = consumed.saturating_add(bytes.len() as u64);
+                if consumed > limit {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
 }
 
 async fn async_cache_put(
@@ -1665,5 +1761,215 @@ mod tests {
             0,
             "cache hit must not count body bytes"
         );
+    }
+
+    // ── async retry policy (plan 018) ──────────────────────────────────
+
+    use std::collections::VecDeque;
+
+    /// One scripted HTTP response for the async retry server.
+    #[derive(Clone)]
+    struct ScriptedResponse {
+        status: u16,
+        body: String,
+        retry_after: Option<String>,
+        etag: Option<String>,
+    }
+
+    impl ScriptedResponse {
+        fn ok(body: &str) -> Self {
+            Self {
+                status: 200,
+                body: body.to_owned(),
+                retry_after: None,
+                etag: None,
+            }
+        }
+        fn status(code: u16) -> Self {
+            Self {
+                status: code,
+                body: String::new(),
+                retry_after: None,
+                etag: None,
+            }
+        }
+        fn with_retry_after(mut self, value: &str) -> Self {
+            self.retry_after = Some(value.to_owned());
+            self
+        }
+        fn with_etag(mut self, tag: &str) -> Self {
+            self.etag = Some(tag.to_owned());
+            self
+        }
+    }
+
+    /// A loopback HTTP/1.1 server that serves a fixed sequence of scripted
+    /// responses (in order) and records every raw request. When the script is
+    /// exhausted it serves `404`. Deterministic; no real network.
+    fn async_retry_server(script: Vec<ScriptedResponse>) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let registry = format!("http://{address}");
+        let requests = Arc::new(Mutex::new(Vec::<String>::new()));
+        let queue = Arc::new(Mutex::new(VecDeque::from(script)));
+        let recorded = Arc::clone(&requests);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut buf = [0_u8; 8192];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+                recorded.lock().unwrap().push(request);
+                let response = queue.lock().unwrap().pop_front();
+                let Some(resp) = response else {
+                    write!(
+                        stream,
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .ok();
+                    continue;
+                };
+                let reason = match resp.status {
+                    200 => "OK",
+                    304 => "Not Modified",
+                    404 => "Not Found",
+                    408 => "Request Timeout",
+                    429 => "Too Many Requests",
+                    500..=599 => "Server Error",
+                    _ => "Status",
+                };
+                let mut head = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Length: {len}\r\n",
+                    status = resp.status,
+                    len = resp.body.len()
+                );
+                if let Some(etag) = &resp.etag {
+                    head.push_str(&format!("ETag: {etag}\r\n"));
+                }
+                if let Some(retry_after) = &resp.retry_after {
+                    head.push_str(&format!("Retry-After: {retry_after}\r\n"));
+                }
+                head.push_str("Connection: close\r\n\r\n");
+                write!(stream, "{head}{}", resp.body).ok();
+            }
+        });
+        (registry, requests)
+    }
+
+    /// Build a client whose retry settings are 1ms/1ms so tests stay fast while
+    /// honoring `ttl >= 3*renew`-style bounds in the HTTP layer.
+    fn fast_retry_async_client(registry: &str, retries: usize) -> AsyncRegistryClient {
+        let mut config = NpmConfig::default()
+            .with_registry_override(registry)
+            .unwrap();
+        config.network.retries = retries;
+        config.network.retry_factor = 1;
+        config.network.retry_min_timeout = std::time::Duration::from_millis(1);
+        config.network.retry_max_timeout = std::time::Duration::from_millis(2);
+        AsyncRegistryClient::new(config)
+    }
+
+    const RETRY_PACKUMENT: &str = r#"{"name":"p","dist-tags":{"latest":"1.4.0"},"versions":{"1.4.0":{"name":"p","version":"1.4.0","dist":{"tarball":"https://example.test/p.tgz","integrity":"sha512-abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab"}}}}"#;
+
+    #[tokio::test]
+    async fn async_retry_503_then_200_succeeds_after_two_requests() {
+        let (registry, requests) = async_retry_server(vec![
+            ScriptedResponse::status(503),
+            ScriptedResponse::ok(RETRY_PACKUMENT),
+        ]);
+        let client = fast_retry_async_client(&registry, 2);
+        let resolved = client.resolve(&parse_spec("p").unwrap()).await.unwrap();
+        assert_eq!(resolved.version, Version::new(1, 4, 0));
+        assert_eq!(requests.lock().unwrap().len(), 2, "exactly two requests");
+    }
+
+    #[tokio::test]
+    async fn async_retry_429_with_retry_after_then_200_succeeds() {
+        let (registry, requests) = async_retry_server(vec![
+            ScriptedResponse::status(429).with_retry_after("0"),
+            ScriptedResponse::ok(RETRY_PACKUMENT),
+        ]);
+        let client = fast_retry_async_client(&registry, 2);
+        client.resolve(&parse_spec("p").unwrap()).await.unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn async_retry_exhaustion_reports_attempt_count() {
+        let (registry, requests) = async_retry_server(vec![
+            ScriptedResponse::status(503),
+            ScriptedResponse::status(503),
+            ScriptedResponse::status(503),
+        ]);
+        let client = fast_retry_async_client(&registry, 2);
+        let error = client
+            .resolve(&parse_spec("p").unwrap())
+            .await
+            .expect_err("must exhaust");
+        let text = error.to_string();
+        assert!(text.contains("after 3 attempt"), "{text}");
+        // retries=2 => 3 total attempts, all served by the script.
+        assert_eq!(requests.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn async_retry_non_retryable_404_is_single_request() {
+        let (registry, requests) = async_retry_server(vec![
+            ScriptedResponse::status(404),
+            ScriptedResponse::ok(RETRY_PACKUMENT),
+        ]);
+        let client = fast_retry_async_client(&registry, 2);
+        let _ = client.resolve(&parse_spec("p").unwrap()).await;
+        assert_eq!(requests.lock().unwrap().len(), 1, "404 must not retry");
+    }
+
+    #[tokio::test]
+    async fn async_retry_oversized_retryable_body_is_bounded_then_succeeds() {
+        // A retryable 503 with a body far larger than the drain bound must not
+        // block the retry; the second request succeeds.
+        let oversized = ScriptedResponse {
+            status: 503,
+            body: "x".repeat(512 * 1024),
+            retry_after: None,
+            etag: None,
+        };
+        let (registry, requests) =
+            async_retry_server(vec![oversized, ScriptedResponse::ok(RETRY_PACKUMENT)]);
+        let client = fast_retry_async_client(&registry, 2);
+        client.resolve(&parse_spec("p").unwrap()).await.unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn async_retry_304_from_conditional_cache_is_not_retried() {
+        let (registry, requests) = async_retry_server(vec![
+            // First fetch: 200 with ETag, persisted to the cache.
+            ScriptedResponse::ok(RETRY_PACKUMENT).with_etag("\"v1\""),
+            // Second fetch (conditional): 304 is terminal success, not retried.
+            ScriptedResponse::status(304).with_etag("\"v1\""),
+        ]);
+        let cache = Arc::new(MetadataCache::open_in_memory().unwrap());
+        let first = AsyncRegistryClient::new(
+            NpmConfig::default()
+                .with_registry_override(&registry)
+                .unwrap(),
+        )
+        .with_metadata_cache(
+            Arc::clone(&cache),
+            crate::metadata_cache::CacheMode::Default,
+        );
+        first.resolve(&parse_spec("p").unwrap()).await.unwrap();
+        let second = AsyncRegistryClient::new(
+            NpmConfig::default()
+                .with_registry_override(&registry)
+                .unwrap(),
+        )
+        .with_metadata_cache(
+            Arc::clone(&cache),
+            crate::metadata_cache::CacheMode::Default,
+        );
+        second.resolve(&parse_spec("p").unwrap()).await.unwrap();
+        // Exactly two requests: the warm-up 200 and the conditional 304.
+        assert_eq!(requests.lock().unwrap().len(), 2);
     }
 }

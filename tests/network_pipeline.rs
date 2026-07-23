@@ -1885,3 +1885,96 @@ fn registry_tarball_accepts_cross_origin_http() {
         "one tarball request to cross-origin server"
     );
 }
+
+/// `.npmrc` retry settings must reach the default async resolver: a server
+/// that answers the first metadata request with `503` then a valid packument
+/// must install successfully with `fetch-retries=1`, after exactly two metadata
+/// requests. Proves `effective_npm_config` wiring reaches the async retry loop.
+#[test]
+fn npmrc_fetch_retries_reach_async_resolver() {
+    let tgz = build_tgz(|b| {
+        common::add_file(
+            b,
+            "package/package.json",
+            0o644,
+            b"{\"name\":\"retry-pkg\"}",
+        );
+    });
+    let integrity = integrity_of(&tgz);
+    let tarball_path = "/retry-pkg/-/retry-pkg-1.0.0.tgz";
+    let base = Arc::new(Mutex::new(String::new()));
+    let base_thread = base.clone();
+    let tarball = Arc::new(tgz);
+    let tarball_thread = tarball.clone();
+    let integrity_thread = integrity.clone();
+    let expected_meta = "/retry-pkg".to_string();
+    let expected_tgz = tarball_path.to_string();
+
+    let server = MiniServer::start_routed_with_failures(
+        vec![common::TransientFailure::new(503)],
+        move |path| {
+            let base = base_thread.lock().unwrap().clone();
+            if path == expected_meta {
+                let body = serde_json::to_vec(&packument(
+                    "1.0.0",
+                    format!("{}{expected_tgz}", base.trim_end_matches('/')),
+                    integrity_thread.clone(),
+                ))
+                .unwrap();
+                Some(RouteBody(body, "application/json"))
+            } else if path == expected_tgz {
+                Some(RouteBody((*tarball_thread).clone(), "application/gzip"))
+            } else {
+                None
+            }
+        },
+    );
+    *base.lock().unwrap() = server.url("");
+
+    let project = tempfile::tempdir().unwrap();
+    let store = tempfile::tempdir().unwrap();
+    fs::write(
+        project.path().join("package.json"),
+        r#"{"name":"app","version":"1.0.0","dependencies":{"retry-pkg":"^1.0.0"}}"#,
+    )
+    .unwrap();
+    write_npmrc(
+        project.path(),
+        &[
+            format!("registry={}", server.url("")),
+            "fetch-retries=1".to_string(),
+            "fetch-retry-mintimeout=1".to_string(),
+            "fetch-retry-maxtimeout=2".to_string(),
+            "fetch-retry-factor=1".to_string(),
+        ],
+    );
+
+    let (ok, stdout, stderr) = run_bpm_with_env(
+        &["install", "--store", store.path().to_str().unwrap()],
+        project.path(),
+        store.path(),
+        None,
+        &[("BPM_ASYNC_RESOLVE", "1")],
+    );
+    assert!(
+        ok,
+        "install should succeed after retry; stderr: {stderr}\nstdout: {stdout}"
+    );
+
+    let metadata_requests = server
+        .requests()
+        .iter()
+        .filter(|req| req.path == "/retry-pkg")
+        .count();
+    assert_eq!(
+        metadata_requests, 2,
+        "expected exactly two metadata requests (503 then 200); got {metadata_requests}"
+    );
+    assert!(
+        project
+            .path()
+            .join("node_modules/retry-pkg/package.json")
+            .exists(),
+        "package must be materialized"
+    );
+}
