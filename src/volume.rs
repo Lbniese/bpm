@@ -17,7 +17,7 @@
 //! project-relative resolution keeps working (IMPLEMENTATION §13: "Begin with
 //! the shallow project-local root").
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -48,6 +48,25 @@ struct VolumeMeta {
     layout_version: u32,
     packages_materialized: usize,
     bins_linked: usize,
+    /// Inventory schema version. `0`/absent marks a legacy/incomplete volume
+    /// (built before durable inventory) that GC must protect rather than
+    /// collect. [`INVENTORY_VERSION`] is the current complete marker.
+    #[serde(default)]
+    inventory_version: u32,
+    /// Sorted `(artifact_id_hex, requires_image)` inventory. Present iff
+    /// `inventory_version >= INVENTORY_VERSION`.
+    #[serde(default)]
+    artifacts: Vec<InventoryArtifact>,
+    /// Sorted derived-image BLAKE3 hex ids published for this graph.
+    #[serde(default)]
+    derived: Vec<String>,
+}
+
+/// One artifact entry in the durable graph inventory.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct InventoryArtifact {
+    id: String,
+    requires_image: bool,
 }
 
 const META_FILE: &str = "metadata.json";
@@ -55,7 +74,24 @@ const META_FILE: &str = "metadata.json";
 /// Bumped when the on-disk volume layout changes (e.g. symlink -> hardlink
 /// materialization of package images). A cached volume whose recorded layout
 /// differs is discarded and rebuilt so every project sees the current layout.
-const VOLUME_LAYOUT_VERSION: u32 = 6;
+/// v7 also writes the complete artifact/derived inventory so the metadata
+/// index can rebuild graph edges from durable filesystem state alone.
+const VOLUME_LAYOUT_VERSION: u32 = 7;
+
+/// Current durable-inventory schema version written into [`VolumeMeta`]. A
+/// volume whose `inventory_version` is below this is treated as
+/// legacy/incomplete by GC (protected, never guessed).
+const INVENTORY_VERSION: u32 = 1;
+
+/// Complete, sorted graph membership reconstructed from a durable volume's
+/// `metadata.json`. `artifacts` is `(sha512 hex, requires_image)`; `derived`
+/// is BLAKE3 hex ids. Used by the metadata index rebuild to reconstruct
+/// `graph_artifacts`/`graph_derived` edges without walking hardlinks.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct GraphInventory {
+    pub artifacts: Vec<(String, bool)>,
+    pub derived: Vec<String>,
+}
 
 #[derive(Debug, Error)]
 pub enum VolumeError {
@@ -102,8 +138,80 @@ pub struct PendingVolume {
     final_path: PathBuf,
     graph_id_hex: String,
     stats: MaterializeStats,
+    /// Complete artifact/derived inventory written into the volume marker so
+    /// the metadata index can rebuild graph edges from durable state.
+    inventory: GraphInventory,
     /// The lock file guard.  Kept alive for the lifetime of this object.
     _lock: fs::File,
+}
+
+/// Build the complete, sorted artifact/derived inventory for a graph volume
+/// from the resolved artifact ids and prepared (lifecycle-derived) images.
+///
+/// Membership mirrors the materializer exactly: every non-link package with
+/// a resolved artifact id contributes one `(sha512 hex, requires_image=true)`
+/// entry (each materialized artifact is extracted into a store image, so its
+/// image is required); every prepared image contributes its BLAKE3 derived id.
+fn build_graph_inventory(
+    lockfile: &Lockfile,
+    artifact_ids: &[Option<ArtifactId>],
+    prepared: &BTreeMap<String, crate::lifecycle::PreparedImage>,
+) -> GraphInventory {
+    let mut artifacts: BTreeMap<String, bool> = BTreeMap::new();
+    for (maybe_id, pkg) in artifact_ids.iter().zip(lockfile.packages.iter()) {
+        if pkg.link {
+            continue;
+        }
+        if let Some(id) = maybe_id {
+            artifacts.entry(id.to_hex()).or_insert(true);
+        }
+    }
+    let mut derived: BTreeSet<String> = BTreeSet::new();
+    for image in prepared.values() {
+        derived.insert(image.key.to_hex());
+    }
+    GraphInventory {
+        artifacts: artifacts.into_iter().collect(),
+        derived: derived.into_iter().collect(),
+    }
+}
+
+/// Read a published graph volume's complete inventory, or `None` if the
+/// volume marker is missing, malformed, or legacy/incomplete (recorded
+/// `inventory_version` below [`INVENTORY_VERSION`]). The rebuildable metadata
+/// index uses this to reconstruct `graph_artifacts`/`graph_derived` edges from
+/// durable filesystem state alone; a `None` result means the graph must be
+/// treated as incomplete/protected rather than guessed.
+pub fn read_graph_inventory(volume_path: &Path) -> Option<GraphInventory> {
+    let bytes = fs::read(volume_path.join(META_FILE)).ok()?;
+    let meta: VolumeMeta = serde_json::from_slice(&bytes).ok()?;
+    if meta.inventory_version < INVENTORY_VERSION {
+        return None;
+    }
+    let mut artifacts: Vec<(String, bool)> = meta
+        .artifacts
+        .into_iter()
+        .filter(|entry| valid_hex(&entry.id, 128))
+        .map(|entry| (entry.id, entry.requires_image))
+        .collect();
+    artifacts.sort();
+    let mut derived: Vec<String> = meta
+        .derived
+        .into_iter()
+        .filter(|id| valid_hex(id, 64))
+        .collect();
+    derived.sort();
+    derived.dedup();
+    Some(GraphInventory { artifacts, derived })
+}
+
+/// Lowercase-hex validator for durable inventory ids.
+fn valid_hex(value: &str, expected_len: usize) -> bool {
+    value.len() == expected_len
+        && value
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
 }
 
 /// Ensure the graph volume for `graph_hex` exists and is complete. Idempotent:
@@ -232,6 +340,7 @@ pub fn ensure_graph_volume_with_prepared(
         final_path: volume_dir,
         graph_id_hex: graph_hex,
         stats,
+        inventory: build_graph_inventory(lockfile, artifact_ids, prepared),
         _lock: lock,
     };
     let vref = pending.publish()?;
@@ -280,6 +389,17 @@ impl PendingVolume {
             layout_version: VOLUME_LAYOUT_VERSION,
             packages_materialized: self.stats.packages_materialized,
             bins_linked: self.stats.bins_linked,
+            inventory_version: INVENTORY_VERSION,
+            artifacts: self
+                .inventory
+                .artifacts
+                .iter()
+                .map(|(id, requires_image)| InventoryArtifact {
+                    id: id.clone(),
+                    requires_image: *requires_image,
+                })
+                .collect(),
+            derived: self.inventory.derived.clone(),
         };
         let meta_bytes = serde_json::to_vec_pretty(&meta).unwrap_or_default();
         fs::write(self.staging.join(META_FILE), meta_bytes)
