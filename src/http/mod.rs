@@ -8,7 +8,6 @@
 //! the credential sensitive so reqwest never forwards it across a cross-host
 //! redirect, and retry only transient failures within configured bounds.
 
-use std::cmp;
 use std::fmt;
 use std::io::{self, Read};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -25,10 +24,15 @@ use reqwest::Version;
 /// the TLS backend is not negotiating ALPN and metadata fetches serialize.
 static SAW_HTTP2: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-use crate::config::{NetworkConfig, NpmConfig};
+use crate::config::NpmConfig;
+
+pub(crate) mod retry;
+use retry::{
+    is_retryable_status, is_retryable_transport, parse_retry_after_at, retry_delay, transport_kind,
+    RETRY_BODY_DRAIN_LIMIT,
+};
 
 const USER_AGENT: &str = concat!("bpm/", env!("CARGO_PKG_VERSION"));
-const RETRY_BODY_DRAIN_LIMIT: usize = 64 * 1024;
 
 /// A pooled, configured HTTP client suitable for cloning between consumers.
 ///
@@ -449,93 +453,12 @@ fn build_client(timeout: Duration) -> Client {
         .unwrap_or_else(|_| ClientBuilder::new().build().expect("default client builds"))
 }
 
-fn is_retryable_status(code: u16) -> bool {
-    matches!(code, 408 | 429 | 500..=599)
-}
-
-/// Coarse classification of a reqwest transport failure, for retry decisions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TransportKind {
-    /// Connection establishment failure (refused, reset, DNS, TLS handshake).
-    Connect,
-    /// Request or response timeout.
-    Timeout,
-    /// Builder/URL error — never retried.
-    Builder,
-    /// Request construction error — never retried.
-    Request,
-    /// Body transfer error.
-    Body,
-    /// Response decode error.
-    Decode,
-    /// Redirect policy error (too many redirects).
-    Redirect,
-    /// Anything else.
-    Other,
-}
-
-impl TransportKind {
-    fn from_error(error: &reqwest::Error) -> Self {
-        if error.is_connect() {
-            Self::Connect
-        } else if error.is_timeout() {
-            Self::Timeout
-        } else if error.is_builder() {
-            Self::Builder
-        } else if error.is_request() {
-            Self::Request
-        } else if error.is_body() {
-            Self::Body
-        } else if error.is_decode() {
-            Self::Decode
-        } else if error.is_redirect() {
-            Self::Redirect
-        } else {
-            Self::Other
-        }
-    }
-
-    fn is_retryable(self) -> bool {
-        matches!(self, Self::Connect | Self::Timeout)
-    }
-}
-
-fn is_retryable_transport(error: &reqwest::Error) -> bool {
-    TransportKind::from_error(error).is_retryable()
-}
-
-fn transport_kind(error: &reqwest::Error) -> String {
-    let kind = TransportKind::from_error(error);
-    match kind {
-        TransportKind::Connect => "connection failed",
-        TransportKind::Timeout => "timeout",
-        TransportKind::Builder => "invalid request",
-        TransportKind::Request => "request failed",
-        TransportKind::Body => "body transfer failed",
-        TransportKind::Decode => "response decode failed",
-        TransportKind::Redirect => "too many redirects",
-        TransportKind::Other => "transport failed",
-    }
-    .to_string()
-}
-
 fn retry_after_from(response: &Response) -> Option<Duration> {
     response
         .headers()
         .get(RETRY_AFTER)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| parse_retry_after_at(value, SystemTime::now()))
-}
-
-fn parse_retry_after_at(value: &str, now: SystemTime) -> Option<Duration> {
-    let value = value.trim();
-    if let Ok(seconds) = value.parse::<u64>() {
-        return Some(Duration::from_secs(seconds));
-    }
-
-    httpdate::parse_http_date(value)
-        .ok()
-        .map(|date| date.duration_since(now).unwrap_or(Duration::ZERO))
 }
 
 /// Drain a retryable-status response so its connection may return to the pool.
@@ -554,20 +477,6 @@ fn drain_reader_for_retry(reader: &mut dyn Read) -> io::Result<bool> {
     let mut bounded = reader.take(limit + 1);
     let consumed = io::copy(&mut bounded, &mut io::sink())?;
     Ok(consumed <= limit)
-}
-
-fn retry_delay(network: &NetworkConfig, retry: usize, retry_after: Option<Duration>) -> Duration {
-    let exponent = u32::try_from(retry).unwrap_or(u32::MAX);
-    let factor = network
-        .retry_factor
-        .checked_pow(exponent)
-        .unwrap_or(u32::MAX);
-    let exponential = network
-        .retry_min_timeout
-        .checked_mul(factor)
-        .unwrap_or(network.retry_max_timeout);
-    let requested = cmp::max(exponential, retry_after.unwrap_or_default());
-    cmp::min(requested, network.retry_max_timeout)
 }
 
 /// Collect response headers into owned `(name, value)` pairs, skipping any
@@ -603,47 +512,6 @@ pub fn redact_url(url: &str) -> String {
 mod tests {
     use super::*;
     use std::io::Cursor;
-    use std::time::UNIX_EPOCH;
-
-    #[test]
-    fn transport_retry_policy_retries_only_connect_and_timeout_kinds() {
-        // Every TransportKind is enumerated so adding a new variant forces a
-        // deliberate decision about its retry behavior.
-        let cases = [
-            (TransportKind::Connect, true),
-            (TransportKind::Timeout, true),
-            (TransportKind::Builder, false),
-            (TransportKind::Request, false),
-            (TransportKind::Body, false),
-            (TransportKind::Decode, false),
-            (TransportKind::Redirect, false),
-            (TransportKind::Other, false),
-        ];
-        assert_eq!(cases.len(), 8);
-        for (kind, expected) in cases {
-            assert_eq!(kind.is_retryable(), expected, "{kind:?}");
-        }
-    }
-
-    #[test]
-    fn retry_after_supports_delay_seconds_and_http_dates() {
-        let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-        assert_eq!(
-            parse_retry_after_at(" 17 ", now),
-            Some(Duration::from_secs(17))
-        );
-
-        let future = now + Duration::from_secs(23);
-        assert_eq!(
-            parse_retry_after_at(&httpdate::fmt_http_date(future), now),
-            Some(Duration::from_secs(23))
-        );
-        assert_eq!(
-            parse_retry_after_at(&httpdate::fmt_http_date(now - Duration::from_secs(23)), now),
-            Duration::ZERO.into()
-        );
-        assert_eq!(parse_retry_after_at("not-a-date", now), None);
-    }
 
     #[test]
     fn retry_body_drain_is_bounded_and_detects_reusable_bodies() {
@@ -738,24 +606,6 @@ mod tests {
         // "://" produces "://" since it has an empty scheme and authority.
         // This is harmless because no real URL has this shape.
         assert_eq!(redact_url("://"), "://");
-    }
-
-    #[test]
-    fn retry_delay_is_exponential_and_bounded() {
-        let network = NetworkConfig {
-            retries: 4,
-            retry_factor: 2,
-            retry_min_timeout: Duration::from_millis(10),
-            retry_max_timeout: Duration::from_millis(50),
-            fetch_timeout: Duration::from_secs(1),
-        };
-        assert_eq!(retry_delay(&network, 0, None), Duration::from_millis(10));
-        assert_eq!(retry_delay(&network, 2, None), Duration::from_millis(40));
-        assert_eq!(retry_delay(&network, 9, None), Duration::from_millis(50));
-        assert_eq!(
-            retry_delay(&network, 0, Some(Duration::from_secs(2))),
-            Duration::from_millis(50)
-        );
     }
 
     #[test]
