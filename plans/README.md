@@ -64,7 +64,7 @@ not executed. No subagents were configured, so the pass was performed directly.
 | 013  | Make Git and patch source caches race-safe | P2 | M | 012 | DONE |
 | 014  | Stream package-image metadata without loading file payloads | P2 | M | — | DONE |
 | 015  | Reject dependency-specification drift during frozen installs | P1 | S | — | DONE |
-| 016  | Make async metadata caching correct and persistent | P1 | M | — | TODO |
+| 016  | Make async metadata caching correct and persistent | P1 | M | — | DONE |
 | 017  | Protect installed graphs with durable ownership and active leases | P1 | L | — | TODO |
 | 018  | Honor npm retry policy in the async resolver | P1 | M | 016 | TODO |
 | 019  | Keep async streaming overflow on the concurrent cache-aware pipeline | P2 | M | 016, 018 | TODO |
@@ -201,6 +201,20 @@ abandoned).
   request/response/cache boundary (`200` persistence, `304` body reuse, exact
   endpoint parity, offline fail-closed). Plan 018 then wraps retry/backoff around
   that boundary without duplicating or caching transient responses.
+  **Done (2026-07-23):** `src/async_resolver.rs` now resolves both the range/tag
+  and exact-version packument forms through one private `async_fetch_with_cache`
+  helper that mirrors blocking `registry::fetch_with_cache`. Cache reads run on
+  `spawn_blocking`; a `304` reuses the stored body (an unexpected `304` with no
+  cached body is a protocol error, never empty JSON); every successful `200`
+  captures `ETag`/`Last-Modified` before consuming the body, counts transferred
+  bytes once, and best-effort persists via the now-live `async_cache_put`.
+  Offline serves a cached body or fails closed (a cache-read failure is treated
+  as no usable body and never permits network access); PreferOffline serves a
+  cached body with no round-trip; online read/write failures degrade to a fresh
+  response. Cache keys remain the full endpoint URL so `/p` and `/p/1.4.0` are
+  independent. New `async_persistent_cache_` loopback tests cover range/`304`
+  reuse, exact-version distinct-key reuse, PreferOffline no-network, offline
+  fail-closed (redacted URL), and fetch-byte accounting (only `200` bodies).
 - **017 is independent but deletion-sensitive.** It must fail closed for legacy
   or incomplete ownership, persist graph inventory and project registration so
   `store.db` remains rebuildable, and coordinate leases/deletion with the same
