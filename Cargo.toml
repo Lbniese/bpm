@@ -22,11 +22,14 @@ tar = "0.4"
 # over TLS (ALPN) so concurrent registry/tarball requests multiplex per host.
 # rustls negotiates HTTP/2 reliably across platforms; native-tls on macOS often
 # fails ALPN and silently falls back to HTTP/1.1, capping metadata throughput.
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "blocking", "http2"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "blocking", "http2", "stream"] }
 
 # Async runtime for the non-blocking resolver path. Used by `async_resolver`
 # to issue concurrent packument fetches without stalling the resolution thread.
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
+# Stream combinators used to bound retryable async response-body draining
+# (shared with the blocking client's bounded drain limit).
+futures-util = "0.3"
 httpdate = "1.0.3"
 tempfile = "3.12"
 

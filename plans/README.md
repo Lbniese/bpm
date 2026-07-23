@@ -250,6 +250,22 @@ abandoned).
   metadata transport parity is stable. Overflow units must remain on the same
   concurrent remote-cache-aware pipeline; it must not restore an origin-only
   recovery path.
+  **Done (2026-07-23):** the blocking and async transports now share one pure
+  retry policy module (`src/http/retry.rs`, `pub(crate)`): retryable status
+  classification (`408`/`429`/`5xx`), reqwest transport classification (only
+  connect/timeout retry), `Retry-After` parsing (delta-seconds + HTTP-date),
+  bounded exponential delay, and the shared `RETRY_BODY_DRAIN_LIMIT`. The post-
+  016 async metadata fetch sends via `async_send_with_retry`, which builds a
+  fresh request per attempt (auth/Accept/validators retained), retries transient
+  statuses/transports up to `network.retries + 1` total attempts, drains
+  retryable bodies only up to the shared bound (reqwest `stream` feature +
+  `futures-util`), backs off with `tokio::time::sleep` (never `std::thread`),
+  and returns terminal failures (non-retryable or exhausted) as errors carrying
+  the attempt count + redacted URL. `304` and success are terminal; retryable
+  error bodies are never parsed or cached. New `async_retry_` unit tests cover
+  `503->200`, `429`+`Retry-After`, exhaustion attempt count, non-retryable `404`,
+  oversized bounded drain, and `304`-not-retried; one CLI test proves
+  `.npmrc fetch-retries` reaches the default async path.
 - **020 is independent, with a human provisioning gate.** The executor may add
   only public trust material. A maintainer must choose/provision the protected
   release signing key/environment and confirm verifier portability; absent that,
