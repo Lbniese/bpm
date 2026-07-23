@@ -48,6 +48,7 @@ pub mod registry;
 pub mod remote_cache;
 pub mod resolver;
 pub mod store;
+pub mod store_lock;
 pub mod volume;
 pub mod workspace;
 

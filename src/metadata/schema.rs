@@ -5,7 +5,7 @@ use std::time::Duration;
 use rusqlite::{Connection, TransactionBehavior};
 
 /// Latest metadata schema understood by this BPM build.
-pub const SCHEMA_VERSION: i32 = 1;
+pub const SCHEMA_VERSION: i32 = 2;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -115,6 +115,7 @@ const REQUIRED_INDEXES: &[&str] = &[
     "idx_images_published",
     "idx_derived_published",
     "idx_graphs_published",
+    "idx_graphs_complete",
     "idx_plans_graph",
     "idx_projects_last_seen",
     "idx_project_refs_graph",
@@ -152,7 +153,13 @@ const REQUIRED_COLUMNS: &[(&str, &[&str])] = &[
     ),
     (
         "graphs",
-        &["id", "rel_path", "size_bytes", "published_at_ms"],
+        &[
+            "id",
+            "rel_path",
+            "size_bytes",
+            "published_at_ms",
+            "complete",
+        ],
     ),
     (
         "graph_artifacts",
@@ -201,6 +208,7 @@ const REQUIRED_INDEX_COLUMNS: &[(&str, &[&str])] = &[
     ("idx_images_published", &["published_at_ms", "id"]),
     ("idx_derived_published", &["published_at_ms", "id"]),
     ("idx_graphs_published", &["published_at_ms", "id"]),
+    ("idx_graphs_complete", &["complete"]),
     ("idx_plans_graph", &["graph_id", "id"]),
     ("idx_projects_last_seen", &["last_seen_at_ms", "id"]),
     ("idx_project_refs_graph", &["graph_id", "project_id"]),
@@ -288,8 +296,28 @@ pub fn migrate(connection: &mut Connection) -> Result<(), SchemaError> {
         transaction.execute_batch(V1_DDL).map_err(|error| {
             SchemaError::Malformed(format!("v0 to v1 migration failed: {error}"))
         })?;
-        verify_inventory(&transaction)?;
         transaction.pragma_update(None, "user_version", 1)?;
+        transaction.commit()?;
+    }
+
+    let version = user_version(connection)?;
+    if version < 2 {
+        // v2: graph inventory completeness marker. A graph whose durable
+        // volume metadata lacks a complete artifact/derived inventory is
+        // `complete=0` (legacy/incomplete); GC must protect it and fail closed
+        // for its potentially shared dependencies rather than guess edges.
+        // STRICT tables accept ADD COLUMN with a single-column CHECK and a
+        // non-NULL DEFAULT; existing rows backfill to `0` (incomplete).
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction
+            .execute_batch(
+                "ALTER TABLE graphs ADD COLUMN complete INTEGER NOT NULL DEFAULT 0 CHECK(complete IN (0,1));
+                 CREATE INDEX IF NOT EXISTS idx_graphs_complete ON graphs(complete);",
+            )
+            .map_err(|error| {
+                SchemaError::Malformed(format!("v1 to v2 migration failed: {error}"))
+            })?;
+        transaction.pragma_update(None, "user_version", 2)?;
         transaction.commit()?;
     }
 
@@ -482,6 +510,48 @@ mod tests {
     }
 
     #[test]
+    fn v2_migration_adds_graph_complete_column_for_legacy_databases() {
+        // Simulate a v1 database (pre-inventory) and migrate forward.
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(V1_DDL).unwrap();
+        connection
+            .execute(
+                "INSERT INTO graphs(id, rel_path, size_bytes, published_at_ms) VALUES (?1, ?2, 1, 2)",
+                ("c".repeat(64), "graphs/blake3/cc"),
+            )
+            .unwrap();
+        connection.pragma_update(None, "user_version", 1).unwrap();
+
+        migrate(&mut connection).unwrap();
+
+        assert_eq!(user_version(&connection).unwrap(), SCHEMA_VERSION);
+        // Legacy graph rows backfill to complete=0 (incomplete/protected).
+        let complete: i64 = connection
+            .query_row(
+                "SELECT complete FROM graphs WHERE id=?1",
+                ["c".repeat(64)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(complete, 0);
+        verify_inventory(&connection).unwrap();
+    }
+
+    #[test]
+    fn fresh_database_has_complete_column() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate(&mut connection).unwrap();
+        let columns: Vec<String> = connection
+            .prepare("PRAGMA table_info(graphs)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(columns.contains(&"complete".to_owned()));
+    }
+
+    #[test]
     fn malformed_existing_schema_rolls_back_migration() {
         let mut connection = Connection::open_in_memory().unwrap();
         connection
@@ -514,8 +584,8 @@ mod tests {
         assert!(matches!(
             error,
             SchemaError::UnsupportedVersion {
-                found: 2,
-                supported: 1
+                found: 3,
+                supported: 2
             }
         ));
         assert_eq!(user_version(&connection).unwrap(), SCHEMA_VERSION + 1);

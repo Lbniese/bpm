@@ -6,6 +6,7 @@
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs;
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -16,6 +17,7 @@ use rusqlite::{params, Connection, Transaction, TransactionBehavior};
 
 use super::schema;
 use crate::gc::policy::{DeletionRank, GcPolicy, PolicyCandidate, PolicyEvaluation};
+use crate::store_lock;
 
 const DATABASE_NAME: &str = "store.db";
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -35,7 +37,7 @@ impl Timestamp {
         self.0
     }
 
-    fn now() -> Result<Self, MetadataError> {
+    pub(crate) fn now() -> Result<Self, MetadataError> {
         let duration = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| MetadataError::Clock)?;
@@ -204,6 +206,23 @@ pub struct GcReport {
     pub evaluation: Option<PolicyEvaluation>,
     pub deleted: usize,
     pub deleted_bytes: u64,
+    /// Objects the collector preserved because they were protected, had
+    /// incomplete ownership, or failed a lock/recheck at deletion time.
+    pub preserved: usize,
+}
+
+/// One object discovered by a filesystem scan, with the durable metadata
+/// needed to rebuild ownership edges: a plan's owning graph, or a graph's
+/// complete inventory.
+#[derive(Debug, Clone)]
+struct ScannedObject {
+    record: ObjectRecord,
+    /// Present only for plans: the owning graph id parsed from the plan file.
+    plan_graph_id: Option<String>,
+    /// Present only for graphs whose durable `metadata.json` carries a
+    /// complete artifact/derived inventory. `None` marks a legacy/incomplete
+    /// graph that GC must protect.
+    graph_inventory: Option<crate::volume::GraphInventory>,
 }
 
 /// Repository errors never expose a database-provided deletion path.
@@ -270,7 +289,7 @@ impl MetadataRepository {
         self.ensure_published(&record.key)?;
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        upsert_object(&transaction, record, None)?;
+        upsert_object(&transaction, record, None, None)?;
         upsert_access(&transaction, &record.key, record.published_at)?;
         transaction.commit()?;
         Ok(())
@@ -293,7 +312,7 @@ impl MetadataRepository {
         self.ensure_published(&graph)?;
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        upsert_object(&transaction, record, Some(graph_id))?;
+        upsert_object(&transaction, record, Some(graph_id), None)?;
         upsert_access(&transaction, &record.key, record.published_at)?;
         transaction.commit()?;
         Ok(())
@@ -318,7 +337,8 @@ impl MetadataRepository {
 
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        upsert_object(&transaction, &record.graph, None)?;
+        upsert_object(&transaction, &record.graph, None, Some(true))?;
+        set_graph_complete(&transaction, record.graph.key.id(), true)?;
         transaction.execute(
             "DELETE FROM graph_artifacts WHERE graph_id=?1",
             [record.graph.key.id()],
@@ -373,32 +393,80 @@ impl MetadataRepository {
         }
         let graph = ObjectKey::graph(registration.graph_id.clone())?;
         self.ensure_published(&graph)?;
-        let encoded_path = path_key(&root);
-        let display = root.display().to_string();
-        let at = sqlite_u64(at.as_millis())?;
 
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute(
-            "INSERT INTO projects(path_key,path_display,last_seen_at_ms) VALUES (?1,?2,?3)
-             ON CONFLICT(path_key) DO UPDATE SET path_display=excluded.path_display,
-               last_seen_at_ms=max(projects.last_seen_at_ms,excluded.last_seen_at_ms)",
-            params![encoded_path, display, at],
-        )?;
-        let project_id: i64 = transaction.query_row(
-            "SELECT id FROM projects WHERE path_key=?1",
-            [path_key(&root)],
-            |row| row.get(0),
-        )?;
-        transaction.execute(
-            "INSERT INTO project_graph_refs(project_id,graph_id,observed_at_ms) VALUES (?1,?2,?3)
-             ON CONFLICT(project_id) DO UPDATE SET
-               graph_id=CASE WHEN excluded.observed_at_ms > project_graph_refs.observed_at_ms
-                             THEN excluded.graph_id ELSE project_graph_refs.graph_id END,
-               observed_at_ms=max(project_graph_refs.observed_at_ms,excluded.observed_at_ms)",
-            params![project_id, registration.graph_id, at],
-        )?;
+        upsert_project_ref(&transaction, &root, &registration.graph_id, at)?;
         transaction.commit()?;
+        Ok(())
+    }
+
+    /// Record publication of an object already published to the store,
+    /// deriving its size and publication timestamp from the filesystem. Used
+    /// by the install path to register fetched artifacts/images/graphs in the
+    /// rebuildable index without duplicating size/mtime logic.
+    pub fn record_published_object(&self, key: &ObjectKey) -> Result<(), MetadataError> {
+        self.ensure_published(key)?;
+        let path = self.store_root.join(key.relative_path());
+        let metadata = fs::symlink_metadata(&path).map_err(|source| io_error(&path, source))?;
+        let size_bytes = logical_size(&path)?;
+        let published_at = modified_timestamp(&metadata)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        upsert_object(
+            &transaction,
+            &ObjectRecord {
+                key: key.clone(),
+                size_bytes,
+                published_at,
+            },
+            None,
+            None,
+        )?;
+        upsert_access(&transaction, key, Timestamp::now().unwrap_or(published_at))?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Atomically publish a durable project registration under
+    /// `<store>/projects/<hh>/<blake3>`, keyed by BLAKE3 of the canonical
+    /// project root. Written after graph attachment succeeds so a failed
+    /// install never points a project at a graph it never attached.
+    /// `repair_index` rebuilds `projects`/`project_graph_refs` from these
+    /// files, so deleting only `store.db` cannot orphan an installed project.
+    pub fn write_durable_registration(
+        &self,
+        root: &Path,
+        graph_id: &str,
+    ) -> Result<(), MetadataError> {
+        write_registration_file(&self.store_root, root, graph_id)
+    }
+
+    /// Record one graph's publication (complete edges included) from its
+    /// durable inventory, deriving the graph's size and publication timestamp
+    /// from the filesystem. Used by the install path after a graph volume is
+    /// durably published so the index rebuild and protection queries see its
+    /// artifact/derived membership.
+    pub fn record_graph_with_inventory(
+        &self,
+        graph_hex: &str,
+        inventory: &crate::volume::GraphInventory,
+    ) -> Result<(), MetadataError> {
+        let graph_key = ObjectKey::graph(graph_hex)?;
+        self.ensure_published(&graph_key)?;
+        let graph_path = self.store_root.join(graph_key.relative_path());
+        let metadata =
+            fs::symlink_metadata(&graph_path).map_err(|source| io_error(&graph_path, source))?;
+        let graph_record = ObjectRecord {
+            key: graph_key,
+            size_bytes: logical_size(&graph_path)?,
+            published_at: modified_timestamp(&metadata)?,
+        };
+        self.record_graph_publication(&GraphRecord {
+            graph: graph_record,
+            artifacts: inventory.artifacts.clone(),
+            derived: inventory.derived.clone(),
+        })?;
         Ok(())
     }
 
@@ -410,6 +478,14 @@ impl MetadataRepository {
     ) -> Result<LeaseGuard, MetadataError> {
         validate_lease_options(options)?;
         let keys = canonical_keys(keys);
+        // Hold each object's canonical lock across the publication check +
+        // lease-row insert so a concurrent GC collector cannot delete an
+        // object between discovering it is published and recording the lease
+        // that protects it. The locks release at the end of this block; the
+        // durable lease rows (renewed by the heartbeat) provide ongoing
+        // protection, coordinated with GC via the same locks at delete time.
+        let _locks = store_lock::acquire_all(&self.store_root, &keys)
+            .map_err(|source| io_error(&store_lock::lock_dir(&self.store_root), source))?;
         for key in &keys {
             self.ensure_published(key)?;
         }
@@ -433,6 +509,7 @@ impl MetadataRepository {
             lease_id,
             owner_token,
             keys,
+            ttl: options.ttl,
             stop,
             lost,
             worker: Some(worker),
@@ -556,21 +633,92 @@ impl MetadataRepository {
 
     /// Reconcile fixed object namespaces and remove rows whose canonical path
     /// is no longer a safe published object. Unknown entries are reported only.
+    /// Graph edges (`graph_artifacts`/`graph_derived`) and the `complete`
+    /// marker are rebuilt from each volume's durable inventory; a graph whose
+    /// inventory is incomplete or references missing objects stays
+    /// `complete=0` (protected) and contributes no edges.
     pub fn repair_index(&self) -> Result<RepairReport, MetadataError> {
         let mut report = RepairReport::default();
         let observed = self.scan_namespaces(&mut report.unknown_entries)?;
         report.observed = observed.len();
 
+        // Index the observed object keys so a graph's inventory can be checked
+        // for complete referenced membership before edges are reconstructed.
+        let observed_keys: BTreeSet<(ObjectKind, String)> = observed
+            .iter()
+            .map(|object| (object.record.key.kind(), object.record.key.id().to_owned()))
+            .collect();
+
         let mut connection = self.connection()?;
         // Filesystem validation happens before the short write transaction.
         let stale = self.stale_rows(&connection)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        for (record, graph_id) in &observed {
-            if upsert_object(&transaction, record, graph_id.as_deref())? > 0 {
+        for object in &observed {
+            if upsert_object(
+                &transaction,
+                &object.record,
+                object.plan_graph_id.as_deref(),
+                None,
+            )? > 0
+            {
                 report.upserted += 1;
+            }
+            if object.record.key.kind() == ObjectKind::Graph {
+                // A graph is complete iff its durable inventory is present AND
+                // every artifact/derived it references is observed in the store.
+                // Missing inventory or missing referenced objects => incomplete.
+                let complete =
+                    object.graph_inventory.as_ref().is_some_and(|inventory| {
+                        inventory.artifacts.iter().all(|(id, _)| {
+                            observed_keys.contains(&(ObjectKind::Artifact, id.clone()))
+                        }) && inventory
+                            .derived
+                            .iter()
+                            .all(|id| observed_keys.contains(&(ObjectKind::Derived, id.clone())))
+                    });
+                set_graph_complete(&transaction, object.record.key.id(), complete)?;
+                if complete {
+                    let inventory = object
+                        .graph_inventory
+                        .as_ref()
+                        .expect("complete implies inventory present");
+                    upsert_graph_edges(&transaction, object.record.key.id(), inventory)?;
+                } else {
+                    // Drop any stale edges for an incomplete graph so the index
+                    // never authorizes deletion from guessed membership.
+                    transaction.execute(
+                        "DELETE FROM graph_artifacts WHERE graph_id=?1",
+                        [object.record.key.id()],
+                    )?;
+                    transaction.execute(
+                        "DELETE FROM graph_derived WHERE graph_id=?1",
+                        [object.record.key.id()],
+                    )?;
+                }
             }
         }
         report.removed_stale = remove_stale_rows(&transaction, &stale)?;
+        // Rebuild project ownership from durable registration files. Only
+        // registrations whose referenced graph was observed in this scan
+        // contribute a project_graph_ref (the FK would otherwise dangle); a
+        // registration to a missing graph is left on disk untouched, since the
+        // project may live on an unmounted filesystem.
+        let observed_graphs: BTreeSet<String> = observed
+            .iter()
+            .filter(|object| object.record.key.kind() == ObjectKind::Graph)
+            .map(|object| object.record.key.id().to_owned())
+            .collect();
+        for registration in scan_registration_files(&self.store_root)? {
+            if !observed_graphs.contains(&registration.graph_id) {
+                continue;
+            }
+            upsert_project_ref(
+                &transaction,
+                &registration.root,
+                &registration.graph_id,
+                Timestamp::from_millis(registration.updated_at_ms),
+            )?;
+        }
         transaction.commit()?;
         report.unknown_entries.sort();
         report.unknown_entries.dedup();
@@ -595,16 +743,22 @@ impl MetadataRepository {
                                    AND l.object_id=o.object_id AND l.expires_at_ms > ?1) THEN 1
                       WHEN object_kind='graph' AND EXISTS
                            (SELECT 1 FROM project_graph_refs p WHERE p.graph_id=o.object_id) THEN 1
+                      WHEN object_kind='graph' AND EXISTS
+                           (SELECT 1 FROM graphs gi WHERE gi.id=o.object_id AND gi.complete=0) THEN 1
                       WHEN object_kind='artifact' AND EXISTS
                            (SELECT 1 FROM graph_artifacts g JOIN project_graph_refs p
-                            ON p.graph_id=g.graph_id WHERE g.artifact_id=o.object_id) THEN 1
+                            ON p.graph_id=g.graph_id JOIN graphs cg ON cg.id=g.graph_id AND cg.complete=1
+                            WHERE g.artifact_id=o.object_id) THEN 1
                       WHEN object_kind='derived' AND EXISTS
                            (SELECT 1 FROM graph_derived g JOIN project_graph_refs p
-                            ON p.graph_id=g.graph_id WHERE g.derived_id=o.object_id) THEN 1
+                            ON p.graph_id=g.graph_id JOIN graphs cg ON cg.id=g.graph_id AND cg.complete=1
+                            WHERE g.derived_id=o.object_id) THEN 1
                       WHEN object_kind='image' AND EXISTS
                            (SELECT 1 FROM graph_artifacts g JOIN project_graph_refs p
-                            ON p.graph_id=g.graph_id WHERE g.artifact_id=o.object_id
-                            AND g.requires_image=1) THEN 1
+                            ON p.graph_id=g.graph_id JOIN graphs cg ON cg.id=g.graph_id AND cg.complete=1
+                            WHERE g.artifact_id=o.object_id AND g.requires_image=1) THEN 1
+                      WHEN object_kind IN ('artifact','image','derived') AND EXISTS
+                           (SELECT 1 FROM graphs WHERE complete=0) THEN 1
                       ELSE 0 END
              FROM (
                SELECT 'artifact' AS object_kind,id AS object_id, size_bytes,published_at_ms FROM artifacts
@@ -679,6 +833,30 @@ impl MetadataRepository {
                 },
                 id.clone(),
             )?;
+            // Race-safe deletion. Acquire the canonical object lock shared
+            // with publishers and lease acquirers, then revalidate type/path
+            // and requery protection in the deletion transaction immediately
+            // before unlinking. If the lock cannot be acquired, protection
+            // appeared, the object changed type, or ownership is incomplete,
+            // preserve it rather than risk deleting live data.
+            let _lock = match store_lock::acquire(&self.store_root, &key) {
+                Ok(guard) => guard,
+                Err(_) => {
+                    report.preserved += 1;
+                    continue;
+                }
+            };
+            if !self.is_published(&key)? {
+                // Already gone or no longer a safe published object of this
+                // kind: nothing to delete, and not an error.
+                continue;
+            }
+            let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if self.protection_active(&tx, &key, now)? {
+                report.preserved += 1;
+                // No row changes were made; the transaction rolls back on drop.
+                continue;
+            }
             let path = self.store_root.join(key.relative_path());
             let result = if key.kind() == ObjectKind::Artifact || key.kind() == ObjectKind::Plan {
                 fs::remove_file(&path)
@@ -690,7 +868,6 @@ impl MetadataRepository {
                     return Err(io_error(&path, error));
                 }
             }
-            let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             match key.kind() {
                 ObjectKind::Artifact => {
                     tx.execute("DELETE FROM artifacts WHERE id=?1", [id])?;
@@ -713,6 +890,51 @@ impl MetadataRepository {
             report.deleted_bytes += *size;
         }
         Ok(report)
+    }
+
+    /// Fresh, single-object protection recheck used at deletion time. Mirrors
+    /// the candidate-query `protected` CASE: an object is protected if it has
+    /// an active lease, is a graph referenced by a project (or is an
+    /// incomplete graph), is referenced by a *complete* project-attached
+    /// graph, or — for artifacts/images/derived — any incomplete graph exists
+    /// (fail closed because its dependency set is unknown). This MUST stay in
+    /// sync with the `collect` candidate query.
+    fn protection_active(
+        &self,
+        connection: &Connection,
+        key: &ObjectKey,
+        now: Timestamp,
+    ) -> Result<bool, MetadataError> {
+        let kind = key.kind().as_str();
+        let id = key.id();
+        let now_ms = sqlite_u64(now.as_millis())?;
+        let protected: i64 = connection.query_row(
+            "SELECT CASE
+               WHEN EXISTS (SELECT 1 FROM leases l WHERE l.object_kind=?1
+                            AND l.object_id=?2 AND l.expires_at_ms > ?3) THEN 1
+               WHEN ?1='graph' AND EXISTS
+                    (SELECT 1 FROM project_graph_refs p WHERE p.graph_id=?2) THEN 1
+               WHEN ?1='graph' AND EXISTS
+                    (SELECT 1 FROM graphs gi WHERE gi.id=?2 AND gi.complete=0) THEN 1
+               WHEN ?1='artifact' AND EXISTS
+                    (SELECT 1 FROM graph_artifacts g JOIN project_graph_refs p
+                     ON p.graph_id=g.graph_id JOIN graphs cg ON cg.id=g.graph_id AND cg.complete=1
+                     WHERE g.artifact_id=?2) THEN 1
+               WHEN ?1='derived' AND EXISTS
+                    (SELECT 1 FROM graph_derived g JOIN project_graph_refs p
+                     ON p.graph_id=g.graph_id JOIN graphs cg ON cg.id=g.graph_id AND cg.complete=1
+                     WHERE g.derived_id=?2) THEN 1
+               WHEN ?1='image' AND EXISTS
+                    (SELECT 1 FROM graph_artifacts g JOIN project_graph_refs p
+                     ON p.graph_id=g.graph_id JOIN graphs cg ON cg.id=g.graph_id AND cg.complete=1
+                     WHERE g.artifact_id=?2 AND g.requires_image=1) THEN 1
+               WHEN ?1 IN ('artifact','image','derived') AND EXISTS
+                    (SELECT 1 FROM graphs WHERE complete=0) THEN 1
+               ELSE 0 END",
+            params![kind, id, now_ms],
+            |row| row.get(0),
+        )?;
+        Ok(protected != 0)
     }
 
     fn stale_rows(
@@ -747,7 +969,7 @@ impl MetadataRepository {
     fn scan_namespaces(
         &self,
         unknown: &mut Vec<PathBuf>,
-    ) -> Result<Vec<(ObjectRecord, Option<String>)>, MetadataError> {
+    ) -> Result<Vec<ScannedObject>, MetadataError> {
         let mut records = Vec::new();
         for kind in [
             ObjectKind::Artifact,
@@ -804,21 +1026,30 @@ impl MetadataRepository {
                         None
                     };
                     if kind == ObjectKind::Plan && graph_id.is_none() {
-                        unknown.push(path);
+                        unknown.push(path.clone());
                         continue;
                     }
-                    records.push((
-                        ObjectRecord {
+                    // For graphs, read the durable inventory. A graph whose
+                    // volume metadata lacks a complete inventory stays
+                    // `None` (incomplete/protected) rather than guessed.
+                    let graph_inventory = if kind == ObjectKind::Graph {
+                        crate::volume::read_graph_inventory(&path)
+                    } else {
+                        None
+                    };
+                    records.push(ScannedObject {
+                        record: ObjectRecord {
                             key,
                             size_bytes,
                             published_at,
                         },
-                        graph_id,
-                    ));
+                        plan_graph_id: graph_id,
+                        graph_inventory,
+                    });
                 }
             }
         }
-        records.sort_by(|left, right| left.0.key.cmp(&right.0.key));
+        records.sort_by(|left, right| left.record.key.cmp(&right.record.key));
         Ok(records)
     }
 
@@ -886,6 +1117,7 @@ pub struct LeaseGuard {
     lease_id: String,
     owner_token: String,
     keys: Vec<ObjectKey>,
+    ttl: Duration,
     stop: Arc<(Mutex<bool>, Condvar)>,
     lost: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
@@ -895,6 +1127,32 @@ pub struct LeaseGuard {
 impl LeaseGuard {
     pub fn keys(&self) -> &[ObjectKey] {
         &self.keys
+    }
+
+    /// Extend this lease to cover additional objects published after the
+    /// initial acquisition (for example, a graph or derived images published
+    /// mid-install). The new rows share this guard's lease id and owner token,
+    /// so the existing heartbeat renews them; each new object's canonical lock
+    /// is held across its publication check + insert so GC cannot delete it
+    /// between publication and lease recording.
+    pub fn extend(&mut self, keys: &[ObjectKey]) -> Result<(), MetadataError> {
+        let new_keys = canonical_keys(keys);
+        if new_keys.is_empty() {
+            return Ok(());
+        }
+        let _locks =
+            store_lock::acquire_all(&self.repository.store_root, &new_keys).map_err(|source| {
+                io_error(&store_lock::lock_dir(&self.repository.store_root), source)
+            })?;
+        for key in &new_keys {
+            self.repository.ensure_published(key)?;
+        }
+        let now = Timestamp::now()?;
+        let expires = checked_add_duration(now, self.ttl)?;
+        self.repository
+            .insert_lease(&self.lease_id, &self.owner_token, &new_keys, now, expires)?;
+        self.keys.extend(new_keys);
+        Ok(())
     }
 
     pub fn check(&self) -> Result<(), MetadataError> {
@@ -938,6 +1196,7 @@ fn upsert_object(
     transaction: &Transaction<'_>,
     record: &ObjectRecord,
     plan_graph_id: Option<&str>,
+    graph_complete: Option<bool>,
 ) -> Result<usize, MetadataError> {
     let size = sqlite_u64(record.size_bytes)?;
     let published = sqlite_u64(record.published_at.as_millis())?;
@@ -962,10 +1221,14 @@ fn upsert_object(
             params![record.key.id(), rel_path, size, published],
         )?,
         ObjectKind::Graph => transaction.execute(
-            "INSERT INTO graphs(id,rel_path,size_bytes,published_at_ms) VALUES (?1,?2,?3,?4)
+            "INSERT INTO graphs(id,rel_path,size_bytes,published_at_ms,complete) VALUES (?1,?2,?3,?4,?5)
              ON CONFLICT(id) DO UPDATE SET rel_path=excluded.rel_path,size_bytes=excluded.size_bytes,
                published_at_ms=min(graphs.published_at_ms,excluded.published_at_ms)",
-            params![record.key.id(), rel_path, size, published],
+            // `complete` is set on insert only; conflict leaves the existing
+            // value untouched. Authoritative callers (graph publication and
+            // repair_index) set it explicitly via [`set_graph_complete`] so
+            // the filesystem-derived value always wins.
+            params![record.key.id(), rel_path, size, published, i64::from(graph_complete.unwrap_or(false))],
         )?,
         ObjectKind::Plan => {
             let graph_id = plan_graph_id.ok_or_else(|| MetadataError::InvalidId {
@@ -982,6 +1245,242 @@ fn upsert_object(
         }
     };
     Ok(changed)
+}
+
+/// Authoritatively set a graph's completeness marker. Called by graph
+/// publication (`complete=true`) and `repair_index` (derived from durable
+/// inventory + observed referenced objects) so the filesystem-derived value
+/// always overrides any prior guess.
+fn set_graph_complete(
+    transaction: &Transaction<'_>,
+    graph_id: &str,
+    complete: bool,
+) -> Result<(), MetadataError> {
+    transaction.execute(
+        "UPDATE graphs SET complete=?2 WHERE id=?1",
+        params![graph_id, i64::from(complete)],
+    )?;
+    Ok(())
+}
+
+/// Reconstruct `graph_artifacts`/`graph_derived` edges for one complete graph
+/// from its durable inventory, replacing any prior edges. Callers must have
+/// already verified every referenced artifact and derived object is published;
+/// the `ON DELETE RESTRICT` foreign keys enforce that invariant here.
+/// Upsert one project root and atomically replace its sole graph reference,
+/// using the monotonic-timestamp convergence rule shared by the live install
+/// path ([`MetadataRepository::replace_project_graph_ref`]) and the
+/// filesystem rebuild ([`MetadataRepository::repair_index`]).
+fn upsert_project_ref(
+    transaction: &Transaction<'_>,
+    root: &Path,
+    graph_id: &str,
+    at: Timestamp,
+) -> Result<(), MetadataError> {
+    let encoded_path = path_key(root);
+    let display = root.display().to_string();
+    let at = sqlite_u64(at.as_millis())?;
+    transaction.execute(
+        "INSERT INTO projects(path_key,path_display,last_seen_at_ms) VALUES (?1,?2,?3)
+         ON CONFLICT(path_key) DO UPDATE SET path_display=excluded.path_display,
+           last_seen_at_ms=max(projects.last_seen_at_ms,excluded.last_seen_at_ms)",
+        params![encoded_path, display, at],
+    )?;
+    let project_id: i64 = transaction.query_row(
+        "SELECT id FROM projects WHERE path_key=?1",
+        [path_key(root)],
+        |row| row.get(0),
+    )?;
+    transaction.execute(
+        "INSERT INTO project_graph_refs(project_id,graph_id,observed_at_ms) VALUES (?1,?2,?3)
+         ON CONFLICT(project_id) DO UPDATE SET
+           graph_id=CASE WHEN excluded.observed_at_ms > project_graph_refs.observed_at_ms
+                         THEN excluded.graph_id ELSE project_graph_refs.graph_id END,
+           observed_at_ms=max(project_graph_refs.observed_at_ms,excluded.observed_at_ms)",
+        params![project_id, graph_id, at],
+    )?;
+    Ok(())
+}
+
+/// One validated durable project registration discovered on disk.
+#[derive(Debug, Clone)]
+struct DurableRegistration {
+    root: PathBuf,
+    graph_id: String,
+    updated_at_ms: u64,
+}
+
+const REGISTRATION_VERSION: u32 = 1;
+const PROJECTS_DIR: &str = "projects";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct RegistrationFile {
+    version: u32,
+    root: PathBuf,
+    graph_id: String,
+    updated_at_ms: u64,
+}
+
+/// BLAKE3 hex filename key for a canonical project root.
+fn registration_key(canonical_root: &Path) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"bpm-project-registration-v1\0");
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        hasher.update(canonical_root.as_os_str().as_bytes());
+    }
+    #[cfg(not(unix))]
+    {
+        hasher.update(canonical_root.as_os_str().as_encoded_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+fn registration_path(store_root: &Path, canonical_root: &Path) -> PathBuf {
+    let key = registration_key(canonical_root);
+    let prefix = key.get(..2).unwrap_or("");
+    store_root.join(PROJECTS_DIR).join(prefix).join(&key)
+}
+
+/// Atomically publish one durable project registration file.
+fn write_registration_file(
+    store_root: &Path,
+    root: &Path,
+    graph_id: &str,
+) -> Result<(), MetadataError> {
+    let canonical = absolute_lexical(root)?;
+    if canonical != root {
+        return Err(MetadataError::InvalidProjectRoot(
+            root.display().to_string(),
+        ));
+    }
+    // Reject graph ids that are not valid 64-hex before writing a record that
+    // repair_index would otherwise have to distrust.
+    validate_id(ObjectKind::Graph, graph_id)?;
+    let now = Timestamp::now()?.as_millis();
+    let record = RegistrationFile {
+        version: REGISTRATION_VERSION,
+        root: canonical.clone(),
+        graph_id: graph_id.to_owned(),
+        updated_at_ms: now,
+    };
+    let body = serde_json::to_vec(&record)
+        .map_err(|_| MetadataError::InvalidProjectRoot("registration encode".to_owned()))?;
+    let target = registration_path(store_root, &canonical);
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent).map_err(|source| io_error(parent, source))?;
+    }
+    let tmp = store_root
+        .join("tmp")
+        .join(format!("project-reg-{}-{}", graph_id, now));
+    if let Some(parent) = tmp.parent() {
+        fs::create_dir_all(parent).map_err(|source| io_error(parent, source))?;
+    }
+    {
+        let mut file = fs::File::create(&tmp).map_err(|source| io_error(&tmp, source))?;
+        file.write_all(&body)
+            .map_err(|source| io_error(&tmp, source))?;
+        file.sync_all().map_err(|source| io_error(&tmp, source))?;
+    }
+    fs::rename(&tmp, &target).map_err(|source| io_error(&target, source))?;
+    Ok(())
+}
+
+/// Scan durable project registration files for `repair_index`. Only safe
+/// regular files whose stored root canonicalizes to the BLAKE3 filename key
+/// and whose graph id is valid 64-hex are trusted; everything else is skipped
+/// (never auto-deleted — a project may live on an unmounted filesystem).
+fn scan_registration_files(store_root: &Path) -> Result<Vec<DurableRegistration>, MetadataError> {
+    let base = store_root.join(PROJECTS_DIR);
+    let mut records = Vec::new();
+    let prefixes = match read_dir_sorted(&base) {
+        Ok(entries) => entries,
+        Err(error) => {
+            if let MetadataError::Io { source, .. } = &error {
+                if source.kind() == std::io::ErrorKind::NotFound {
+                    return Ok(Vec::new());
+                }
+            }
+            return Err(error);
+        }
+    };
+    for prefix in prefixes {
+        let prefix_path = prefix.path();
+        if !safe_directory(&prefix_path)? {
+            continue;
+        }
+        for entry in read_dir_sorted(&prefix_path)? {
+            let path = entry.path();
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(m) => m,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(source) => return Err(io_error(&path, source)),
+            };
+            // Never follow symlinks or trust non-regular files as authority.
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                continue;
+            }
+            let bytes = match fs::read(&path) {
+                Ok(b) => b,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(source) => return Err(io_error(&path, source)),
+            };
+            let Ok(record) = serde_json::from_slice::<RegistrationFile>(&bytes) else {
+                continue;
+            };
+            if record.version != REGISTRATION_VERSION {
+                continue;
+            }
+            // The stored root MUST canonicalize to exactly itself and its hash
+            // MUST equal the filename, else the record is untrusted.
+            let Ok(canonical) = absolute_lexical(&record.root) else {
+                continue;
+            };
+            if canonical != record.root {
+                continue;
+            }
+            if registration_key(&canonical) != entry.file_name().to_string_lossy().as_ref() {
+                continue;
+            }
+            if validate_id(ObjectKind::Graph, &record.graph_id).is_err() {
+                continue;
+            }
+            records.push(DurableRegistration {
+                root: canonical,
+                graph_id: record.graph_id,
+                updated_at_ms: record.updated_at_ms,
+            });
+        }
+    }
+    records.sort_by(|left, right| {
+        left.graph_id
+            .cmp(&right.graph_id)
+            .then(left.root.cmp(&right.root))
+    });
+    Ok(records)
+}
+
+fn upsert_graph_edges(
+    transaction: &Transaction<'_>,
+    graph_id: &str,
+    inventory: &crate::volume::GraphInventory,
+) -> Result<(), MetadataError> {
+    transaction.execute("DELETE FROM graph_artifacts WHERE graph_id=?1", [graph_id])?;
+    transaction.execute("DELETE FROM graph_derived WHERE graph_id=?1", [graph_id])?;
+    for (artifact_id, requires_image) in &inventory.artifacts {
+        transaction.execute(
+            "INSERT INTO graph_artifacts(graph_id,artifact_id,requires_image) VALUES (?1,?2,?3)",
+            params![graph_id, artifact_id, i64::from(*requires_image)],
+        )?;
+    }
+    for derived_id in &inventory.derived {
+        transaction.execute(
+            "INSERT INTO graph_derived(graph_id,derived_id) VALUES (?1,?2)",
+            params![graph_id, derived_id],
+        )?;
+    }
+    Ok(())
 }
 
 fn upsert_access(

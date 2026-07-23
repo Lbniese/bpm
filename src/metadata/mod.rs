@@ -4,9 +4,11 @@
 //! rebuildable from the filesystem without deleting valid store objects.
 //! Database rows never authorize a path outside the store.
 
+mod install;
 mod repository;
 mod schema;
 
+pub use install::InstallSession;
 pub use repository::{
     GraphRecord, LeaseGuard, LeaseOptions, MetadataError, MetadataRepository, ObjectKey,
     ObjectKind, ObjectRecord, ProjectRegistration, RepairReport, Timestamp,
