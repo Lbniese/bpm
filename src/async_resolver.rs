@@ -105,116 +105,137 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
 
-async fn async_fetch_url_with_validators(
+/// One complete async metadata fetch that honors the persistent cache
+/// contract, mirroring blocking [`crate::registry::fetch_with_cache`].
+///
+/// Returns the response body ready for JSON parsing. Behavior by
+/// [`CacheMode`]: offline serves a usable cached body or fails closed;
+/// prefer-offline serves a cached body without a round-trip; default and
+/// prefer-online revalidate with conditional requests, persisting `200`
+/// responses best-effort and reusing the stored body on `304`. Cache
+/// reads/writes in online modes degrade to a fresh response and never fail
+/// an install; an offline read failure is treated as no usable body and
+/// never permits network access.
+#[allow(clippy::too_many_arguments)]
+async fn async_fetch_with_cache(
     client: &reqwest::Client,
     url: &str,
+    package: &str,
+    spec: &str,
     config: &NpmConfig,
-    send_abbreviated_accept: bool,
-    etag: Option<String>,
-    last_modified: Option<String>,
-) -> Result<String, AsyncResolveError> {
-    let mut request = client.get(url);
-    if send_abbreviated_accept {
-        request = request.header("Accept", ABBREV_ACCEPT);
-    }
-    if let Some(token) = config.auth_token_for_url(url) {
-        request = request.bearer_auth(token);
-    }
-    if let Some(ref etag) = etag {
-        request = request.header("If-None-Match", etag);
-    }
-    if let Some(ref lm) = last_modified {
-        request = request.header("If-Modified-Since", lm);
-    }
-
-    let response = request.send().await.map_err(|e| AsyncResolveError::Http {
-        url: redact_url(url),
-        message: e.to_string(),
-    })?;
-
-    let status = response.status().as_u16();
-    if status == 304 {
-        return Ok(String::new());
-    }
-    if status >= 400 {
-        return Err(AsyncResolveError::Http {
-            url: redact_url(url),
-            message: format!("HTTP {status}"),
-        });
-    }
-
-    response.text().await.map_err(|e| AsyncResolveError::Http {
-        url: redact_url(url),
-        message: format!("body read failed: {e}"),
-    })
-}
-
-async fn async_fetch_url(
-    client: &reqwest::Client,
-    url: &str,
-    config: &NpmConfig,
-    send_abbreviated_accept: bool,
-) -> Result<String, AsyncResolveError> {
-    let mut request = client.get(url);
-    if send_abbreviated_accept {
-        request = request.header("Accept", ABBREV_ACCEPT);
-    }
-    if let Some(token) = config.auth_token_for_url(url) {
-        request = request.bearer_auth(token);
-    }
-
-    let response = request.send().await.map_err(|e| AsyncResolveError::Http {
-        url: redact_url(url),
-        message: e.to_string(),
-    })?;
-
-    let status = response.status().as_u16();
-    if status >= 400 {
-        return Err(AsyncResolveError::Http {
-            url: redact_url(url),
-            message: format!("HTTP {status}"),
-        });
-    }
-
-    response.text().await.map_err(|e| AsyncResolveError::Http {
-        url: redact_url(url),
-        message: format!("body read failed: {e}"),
-    })
-}
-
-async fn async_cache_get(
     cache: Option<&Arc<MetadataCache>>,
-    url: &str,
     mode: CacheMode,
-) -> Result<Option<(String, Option<String>, Option<String>)>, AsyncResolveError> {
-    let Some(cache) = cache else { return Ok(None) };
-    let url_owned = url.to_owned();
-    let url_for_display = url.to_owned();
-    let cache = Arc::clone(cache);
-    let result = tokio::task::spawn_blocking(move || cache.get(&url_owned)).await;
-    match result {
-        Ok(Ok(Some(entry))) => {
-            let body = String::from_utf8_lossy(&entry.body).into_owned();
-            if !mode.allows_network() || mode.serves_stale() {
-                return Ok(Some((body, entry.etag, entry.last_modified)));
+    send_abbreviated_accept: bool,
+    fetch_bytes: &Arc<AtomicU64>,
+) -> Result<String, AsyncResolveError> {
+    // 1. Read the persistent cache off the Tokio runtime. An SQLite or
+    //    spawn-task failure counts as no usable cached body.
+    let cached = match cache {
+        Some(store) => {
+            let url_owned = url.to_owned();
+            let store = Arc::clone(store);
+            match tokio::task::spawn_blocking(move || store.get(&url_owned)).await {
+                Ok(Ok(entry)) => entry,
+                Ok(Err(_)) | Err(_) => {
+                    // Read failure. Offline must fail closed; online degrades.
+                    if !mode.allows_network() {
+                        return Err(AsyncResolveError::Http {
+                            url: redact_url(url),
+                            message: format!(
+                                "offline miss: no cached metadata for {package}@{spec}"
+                            ),
+                        });
+                    }
+                    None
+                }
             }
-            Ok(Some((body, entry.etag, entry.last_modified)))
         }
-        Ok(Ok(None)) => {
-            if !mode.allows_network() {
-                return Err(AsyncResolveError::Http {
-                    url: redact_url(&url_for_display),
-                    message: format!("offline miss: no cached metadata for {url_for_display}"),
-                });
-            }
-            Ok(None)
-        }
-        Ok(Err(_)) => Ok(None),
-        Err(_) => Ok(None),
+        None => None,
+    };
+
+    // 2. Network forbidden: usable cached body or offline-miss error.
+    if !mode.allows_network() {
+        return cached
+            .map(|entry| String::from_utf8_lossy(&entry.body).into_owned())
+            .ok_or_else(|| AsyncResolveError::Http {
+                url: redact_url(url),
+                message: format!("offline miss: no cached metadata for {package}@{spec}"),
+            });
     }
+
+    // 3. PreferOffline may serve a still-cached body without any round-trip.
+    if mode.serves_stale() {
+        if let Some(entry) = cached.as_ref() {
+            return Ok(String::from_utf8_lossy(&entry.body).into_owned());
+        }
+    }
+
+    // 4. Send validators from the cached entry (scoped to this exact URL).
+    let mut request = client.get(url);
+    if send_abbreviated_accept {
+        request = request.header("Accept", ABBREV_ACCEPT);
+    }
+    if let Some(token) = config.auth_token_for_url(url) {
+        request = request.bearer_auth(token);
+    }
+    if let Some(entry) = cached.as_ref() {
+        if let Some(etag) = entry.etag.as_deref() {
+            request = request.header("If-None-Match", etag);
+        }
+        if let Some(last_modified) = entry.last_modified.as_deref() {
+            request = request.header("If-Modified-Since", last_modified);
+        }
+    }
+
+    let response = request.send().await.map_err(|e| AsyncResolveError::Http {
+        url: redact_url(url),
+        message: e.to_string(),
+    })?;
+
+    let status = response.status().as_u16();
+
+    // 5. On 304, reuse the stored body. A validator must have been sent for
+    //    the registry to answer 304, so a cached entry exists; an unexpected
+    //    304 without a cached body is a protocol error, not empty JSON.
+    if status == 304 {
+        return cached
+            .map(|entry| String::from_utf8_lossy(&entry.body).into_owned())
+            .ok_or_else(|| AsyncResolveError::Http {
+                url: redact_url(url),
+                message: format!("unexpected HTTP 304 without cached body for {package}@{spec}"),
+            });
+    }
+
+    if status >= 400 {
+        return Err(AsyncResolveError::Http {
+            url: redact_url(url),
+            message: format!("HTTP {status}"),
+        });
+    }
+
+    // 6. Capture validators BEFORE consuming the body, count the transferred
+    //    body bytes once, and persist the response best-effort.
+    let headers = response.headers();
+    let etag = headers
+        .get("ETag")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let last_modified = headers
+        .get("Last-Modified")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let body = response.text().await.map_err(|e| AsyncResolveError::Http {
+        url: redact_url(url),
+        message: format!("body read failed: {e}"),
+    })?;
+    fetch_bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
+
+    // 7. Best-effort refresh: a cache write failure must never fail an install.
+    async_cache_put(cache, url, &body, etag, last_modified).await;
+
+    Ok(body)
 }
 
-#[allow(dead_code)]
 async fn async_cache_put(
     cache: Option<&Arc<MetadataCache>>,
     url: &str,
@@ -254,32 +275,19 @@ async fn async_fetch_packument(
     let encoded = encode_package_name(name);
     let url = format!("{base}/{encoded}");
 
-    if let Some((body, etag, last_modified)) = async_cache_get(cache, &url, mode).await? {
-        if !mode.allows_network() || mode.serves_stale() {
-            return serde_json::from_str(&body).map_err(|source| AsyncResolveError::Registry {
-                package: name.to_string(),
-                spec: "latest".to_string(),
-                source: Box::new(RegistryError::BadJson {
-                    package: name.to_string(),
-                    source,
-                }),
-            });
-        }
-        let body = async_fetch_url_with_validators(client, &url, config, true, etag, last_modified)
-            .await?;
-        fetch_bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
-        return serde_json::from_str(&body).map_err(|source| AsyncResolveError::Registry {
-            package: name.to_string(),
-            spec: "latest".to_string(),
-            source: Box::new(RegistryError::BadJson {
-                package: name.to_string(),
-                source,
-            }),
-        });
-    }
+    let body = async_fetch_with_cache(
+        client,
+        &url,
+        name,
+        "latest",
+        config,
+        cache,
+        mode,
+        true,
+        fetch_bytes,
+    )
+    .await?;
 
-    let body = async_fetch_url(client, &url, config, true).await?;
-    fetch_bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
     serde_json::from_str(&body).map_err(|source| AsyncResolveError::Registry {
         package: name.to_string(),
         spec: "latest".to_string(),
@@ -305,36 +313,19 @@ async fn async_fetch_version_packument(
     let encoded = encode_package_name(name);
     let url = format!("{base}/{encoded}/{version}");
 
-    if let Some((body, _, _)) = async_cache_get(cache, &url, mode).await? {
-        if !mode.allows_network() || mode.serves_stale() {
-            let wire: WireVersionMetadata =
-                serde_json::from_str(&body).map_err(|source| AsyncResolveError::Registry {
-                    package: name.to_string(),
-                    spec: version.to_string(),
-                    source: Box::new(RegistryError::BadJson {
-                        package: name.to_string(),
-                        source,
-                    }),
-                })?;
-            let metadata = version_metadata(name, &version.to_string(), wire).ok_or_else(|| {
-                AsyncResolveError::Registry {
-                    package: name.to_string(),
-                    spec: version.to_string(),
-                    source: Box::new(RegistryError::NoVersions {
-                        package: name.to_string(),
-                    }),
-                }
-            })?;
-            return Ok(Packument {
-                name: name.to_string(),
-                dist_tags: BTreeMap::new(),
-                versions: BTreeMap::from([(version.to_string(), metadata)]),
-            });
-        }
-    }
+    let body = async_fetch_with_cache(
+        client,
+        &url,
+        name,
+        &version.to_string(),
+        config,
+        cache,
+        mode,
+        false,
+        fetch_bytes,
+    )
+    .await?;
 
-    let body = async_fetch_url(client, &url, config, false).await?;
-    fetch_bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
     let wire: WireVersionMetadata =
         serde_json::from_str(&body).map_err(|source| AsyncResolveError::Registry {
             package: name.to_string(),
@@ -1468,6 +1459,211 @@ mod tests {
             "empty manifest must not announce any packages; got {}: {:?}",
             units.len(),
             units
+        );
+    }
+
+    // ── persistent-cache revalidation (mirrors registry::tests) ───────
+
+    use crate::registry::parse_spec;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::Mutex;
+
+    /// A minimal HTTP/1.1 loopback server returning `200 + ETag: "v1"` for an
+    /// unconditional request and `304` for a request carrying `If-None-Match`.
+    /// It records every raw request over `requests` for assertion. Patterned
+    /// after `registry::tests::conditional_server`.
+    fn async_conditional_server(
+        body: &'static str,
+    ) -> (String, Arc<Mutex<Vec<String>>>, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let registry = format!("http://{address}");
+        let requests = Arc::new(Mutex::new(Vec::<String>::new()));
+        let recorded = Arc::clone(&requests);
+        let server = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut buf = [0_u8; 8192];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+                recorded.lock().unwrap().push(request.clone());
+                if request.to_ascii_lowercase().contains("if-none-match:") {
+                    write!(
+                        stream,
+                        "HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .unwrap();
+                } else {
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .unwrap();
+                }
+            }
+        });
+        (registry, requests, server)
+    }
+
+    fn async_client(
+        registry: &str,
+        cache: &Arc<MetadataCache>,
+        mode: CacheMode,
+    ) -> AsyncRegistryClient {
+        let config = NpmConfig::default()
+            .with_registry_override(registry)
+            .unwrap();
+        AsyncRegistryClient::new(config).with_metadata_cache(Arc::clone(cache), mode)
+    }
+
+    #[tokio::test]
+    async fn async_persistent_cache_range_revalidates_and_reuses_body() {
+        let body = r#"{"name":"p","dist-tags":{"latest":"1.4.0"},"versions":{"1.4.0":{"name":"p","version":"1.4.0","dist":{"tarball":"https://example.test/p.tgz","integrity":"sha512-abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab"}}}}"#;
+        let (registry, requests, _server) = async_conditional_server(body);
+        let cache = Arc::new(MetadataCache::open_in_memory().unwrap());
+
+        // First resolve: uncached, unconditional GET answered with 200.
+        let first = async_client(&registry, &cache, CacheMode::Default)
+            .resolve(&parse_spec("p").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(first.version, Version::new(1, 4, 0));
+
+        // Second resolve with a brand-new client sharing only the persistent
+        // cache: a conditional GET (`If-None-Match`) answered with 304, which
+        // must reuse the stored body byte-for-byte (identical resolution).
+        let second = async_client(&registry, &cache, CacheMode::Default)
+            .resolve(&parse_spec("p").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(second.version, Version::new(1, 4, 0));
+        assert_eq!(second.tarball_url, first.tarball_url);
+        assert_eq!(second.integrity, first.integrity);
+
+        let captured = requests.lock().unwrap().clone();
+        assert_eq!(captured.len(), 2, "{captured:?}");
+        assert!(!captured[0].to_ascii_lowercase().contains("if-none-match:"));
+        assert!(captured[1]
+            .to_ascii_lowercase()
+            .contains("if-none-match: \"v1\""));
+    }
+
+    #[tokio::test]
+    async fn async_persistent_cache_exact_version_uses_distinct_url_key() {
+        // Single-version WireVersionMetadata body, distinct from the /p packument.
+        let body = r#"{"name":"p","version":"1.4.0","dist":{"tarball":"https://example.test/p.tgz","integrity":"sha512-abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab"}}"#;
+        let (registry, requests, _server) = async_conditional_server(body);
+        let cache = Arc::new(MetadataCache::open_in_memory().unwrap());
+
+        // First resolve hits the per-version endpoint and persists under /p/1.4.0.
+        let first = async_client(&registry, &cache, CacheMode::Default)
+            .resolve(&parse_spec("p@1.4.0").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(first.version, Version::new(1, 4, 0));
+
+        // Second resolve revalidates /p/1.4.0 (not /p) and reuses the 304 body.
+        let second = async_client(&registry, &cache, CacheMode::Default)
+            .resolve(&parse_spec("p@1.4.0").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(second.tarball_url, first.tarball_url);
+        assert_eq!(second.integrity, first.integrity);
+
+        let captured = requests.lock().unwrap().clone();
+        assert_eq!(captured.len(), 2, "{captured:?}");
+        // Every request targets the per-version path, independent of /p.
+        assert!(captured[0].contains("GET /p/1.4.0 "));
+        assert!(captured[1].contains("GET /p/1.4.0 "));
+        assert!(!captured[0].to_ascii_lowercase().contains("if-none-match:"));
+        assert!(captured[1]
+            .to_ascii_lowercase()
+            .contains("if-none-match: \"v1\""));
+    }
+
+    #[tokio::test]
+    async fn async_persistent_cache_prefer_offline_skips_network() {
+        let body = r#"{"name":"p","dist-tags":{"latest":"2.0.0"},"versions":{"2.0.0":{"name":"p","version":"2.0.0","dist":{"tarball":"https://example.test/p.tgz","integrity":"sha512-ff000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"}}}}"#;
+        let (registry, requests, _server) = async_conditional_server(body);
+        let cache = Arc::new(MetadataCache::open_in_memory().unwrap());
+
+        // Warm the cache with one full fetch.
+        async_client(&registry, &cache, CacheMode::Default)
+            .resolve(&parse_spec("p").unwrap())
+            .await
+            .unwrap();
+
+        // PreferOffline must serve the cached body without any network contact.
+        let resolved = async_client(&registry, &cache, CacheMode::PreferOffline)
+            .resolve(&parse_spec("p").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resolved.version, Version::new(2, 0, 0));
+
+        // Exactly one request reached the server (the warm-up fetch).
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn async_persistent_cache_offline_miss_fails_closed() {
+        let body = r#"{"name":"p","dist-tags":{"latest":"1.4.0"},"versions":{"1.4.0":{"dist":{"tarball":"https://example.test/p.tgz","integrity":"sha512-abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab"}}}}"#;
+        let (registry, requests, _server) = async_conditional_server(body);
+        let cache = Arc::new(MetadataCache::open_in_memory().unwrap());
+
+        // An empty cache in Offline mode must fail closed without a request.
+        let error = async_client(&registry, &cache, CacheMode::Offline)
+            .resolve(&parse_spec("p").unwrap())
+            .await
+            .expect_err("offline miss must error");
+        match error {
+            AsyncResolveError::Http { url, message } => {
+                // The URL field is the redacted form (auth/query stripped).
+                assert_eq!(
+                    url,
+                    redact_url(&format!("{registry}/p")),
+                    "error url must be the redacted form"
+                );
+                assert!(
+                    message.contains("offline miss"),
+                    "unexpected message: {message}"
+                );
+            }
+            other => panic!("expected Http offline-miss error, got {other:?}"),
+        }
+        assert_eq!(requests.lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn async_persistent_cache_counts_only_network_body_bytes() {
+        let body = r#"{"name":"p","dist-tags":{"latest":"1.4.0"},"versions":{"1.4.0":{"dist":{"tarball":"https://example.test/p.tgz","integrity":"sha512-abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab"}}}}"#;
+        let (registry, _requests, _server) = async_conditional_server(body);
+        let cache = Arc::new(MetadataCache::open_in_memory().unwrap());
+
+        // First resolve: one 200 body transferred.
+        let warm = async_client(&registry, &cache, CacheMode::Default);
+        warm.resolve(&parse_spec("p").unwrap()).await.unwrap();
+        let warm_bytes = warm.fetch_bytes.load(Ordering::Relaxed);
+        assert_eq!(warm_bytes, body.len() as u64);
+
+        // Second resolve (304): zero additional body bytes.
+        let revalidate = async_client(&registry, &cache, CacheMode::Default);
+        revalidate.resolve(&parse_spec("p").unwrap()).await.unwrap();
+        assert_eq!(
+            revalidate.fetch_bytes.load(Ordering::Relaxed),
+            0,
+            "304 must not count body bytes"
+        );
+
+        // PreferOffline hit: zero additional body bytes.
+        let stale = async_client(&registry, &cache, CacheMode::PreferOffline);
+        stale.resolve(&parse_spec("p").unwrap()).await.unwrap();
+        assert_eq!(
+            stale.fetch_bytes.load(Ordering::Relaxed),
+            0,
+            "cache hit must not count body bytes"
         );
     }
 }
