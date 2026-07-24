@@ -5,6 +5,7 @@
 
 mod common;
 
+use std::fs;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -21,6 +22,7 @@ fn bin() -> String {
 struct RegistryMock {
     server: MiniServer,
     tarball_hits: Arc<AtomicUsize>,
+    requests: Arc<AtomicUsize>,
 }
 
 impl RegistryMock {
@@ -30,9 +32,12 @@ impl RegistryMock {
         let base_c = base.clone();
         let tarball_hits = Arc::new(AtomicUsize::new(0));
         let tarball_hits_c = tarball_hits.clone();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let requests_c = requests.clone();
         let integ = Arc::new(integrity);
 
         let server = MiniServer::start_routed(move |path| {
+            requests_c.fetch_add(1, Ordering::SeqCst);
             let base = base_c.lock().unwrap().clone();
             if path == "/lodash/1.0.0" {
                 let metadata = serde_json::json!({
@@ -84,6 +89,7 @@ impl RegistryMock {
         Self {
             server,
             tarball_hits,
+            requests,
         }
     }
 
@@ -95,6 +101,15 @@ impl RegistryMock {
     fn tarball_hits(&self) -> usize {
         self.tarball_hits.load(Ordering::Relaxed)
     }
+
+    fn request_count(&self) -> usize {
+        self.requests.load(Ordering::Relaxed)
+    }
+}
+
+fn corrupt_metadata_cache(store: &std::path::Path) {
+    let path = store.join("metadata-cache.db");
+    fs::write(path, b"not-sqlite").unwrap();
 }
 
 fn fixture_tgz() -> Vec<u8> {
@@ -165,6 +180,58 @@ fn fetch_resolves_exact_version() {
     assert!(ok, "{stderr}");
     assert!(stderr.contains("resolved lodash@1.0.0"), "{stderr}");
     assert_eq!(reg.tarball_hits(), 1);
+}
+
+#[test]
+fn fetch_prefer_offline_fails_if_metadata_cache_is_unusable() {
+    let tgz = fixture_tgz();
+    let integrity = integrity_of(&tgz);
+    let reg = RegistryMock::start(tgz, integrity);
+    let store = tempfile::tempdir().unwrap();
+    corrupt_metadata_cache(store.path());
+
+    let (ok, _stdout, stderr) = run_fetch(&[
+        "fetch",
+        "lodash",
+        "--prefer-offline",
+        "--registry",
+        &reg.registry_url(),
+        "--store",
+        store.path().to_str().unwrap(),
+    ]);
+    assert!(!ok, "expected failure in prefer-offline mode: {stderr}");
+    assert!(stderr.contains("metadata cache unavailable in prefer-offline mode"));
+    assert_eq!(
+        reg.request_count(),
+        0,
+        "metadata cache failure should be terminal"
+    );
+}
+
+#[test]
+fn fetch_offline_fails_if_metadata_cache_is_unusable() {
+    let tgz = fixture_tgz();
+    let integrity = integrity_of(&tgz);
+    let reg = RegistryMock::start(tgz, integrity);
+    let store = tempfile::tempdir().unwrap();
+    corrupt_metadata_cache(store.path());
+
+    let (ok, _stdout, stderr) = run_fetch(&[
+        "fetch",
+        "lodash",
+        "--offline",
+        "--registry",
+        &reg.registry_url(),
+        "--store",
+        store.path().to_str().unwrap(),
+    ]);
+    assert!(!ok, "expected failure in offline mode: {stderr}");
+    assert!(stderr.contains("metadata cache unavailable in offline mode"));
+    assert_eq!(
+        reg.request_count(),
+        0,
+        "metadata cache failure should be terminal"
+    );
 }
 
 #[test]

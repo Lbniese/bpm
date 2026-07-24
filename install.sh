@@ -121,54 +121,197 @@ verify_binary() {
         "$bin" install --help 2>&1 | grep -q -- 'bin directory'
 }
 
+# Verify a release asset before extraction or execution.
+#
+# Releases publish a detached signature over a sorted SHA256SUMS manifest.
+# The installer verifies the signature with a pinned public key, selects the
+# exact platform tarball line, verifies the archive hash, inspects the archive
+# shape, and only then extracts and executes. Any failure (missing verifier,
+# missing/invalid signature, bad checksum, unsafe archive) returns nonzero so
+# the caller falls back to a source build. Checksums alone are NOT trusted —
+# the detached signature is mandatory for prebuilt use.
+#
+# The production key lives in `.github/release-signing-public.pem` in the
+# repository and is copied into this installer to keep verification fully
+# hermetic. The `_BPM_TEST_PUBKEY_FILE` override is HERMETIC-TEST ONLY and is
+# not used by normal installs.
+release_signing_pubkey() {
+    cat <<'BPM_RELEASE_PUBKEY'
+-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEhNDYaModKhZ5vrJ9U5zWncqiusE4
+Ue2hXf/9nfdY+bb+jjb5sk1dR9626QFTSYS0KIrhKjq0zUXCYsbM8kzO7A==
+-----END PUBLIC KEY-----
+BPM_RELEASE_PUBKEY
+}
+
+# Write the pinned public key to `$1`. Returns nonzero when no usable key
+# can be loaded.
+materialize_pubkey() {
+    if [ -n "${_BPM_TEST_PUBKEY_FILE:-}" ]; then
+        cat "$_BPM_TEST_PUBKEY_FILE" >"$1" 2>/dev/null || return 1
+        return 0
+    fi
+    release_signing_pubkey >"$1"
+    # Require a PEM header before using the embedded key.
+    grep -q -- 'BEGIN PUBLIC KEY' "$1" 2>/dev/null
+}
+
+# Download `$1` into file `$2`, failing closed on any HTTP error.
+download_asset() {
+    curl -fsSL -o "$2" "$1" 2>/dev/null
+}
+
+# Verify the detached signature `$2` over manifest `$1` with public key `$3`.
+# Returns nonzero on any verification failure.
+verify_signature() {
+    openssl dgst -sha256 -verify "$3" -signature "$2" "$1" >/dev/null 2>&1
+}
+
+# Print the SHA-256 (lowercase hex) of file `$1`.
+sha256_file() {
+    # openssl dgst prints `<path>); form on some OpenSSL builds; take the last
+    # whitespace-separated token and force lowercase.
+    openssl dgst -sha256 "$1" 2>/dev/null | awk '{print $NF}' | tr '[:upper:]' '[:lower:]'
+}
+
+# Print the recorded hash for exactly one basename `$2` in manifest `$1`, or
+# empty if the entry is missing, duplicated, malformed, or carries a path
+# component. Rejects anything that is not `<64 hex><two spaces><basename>`.
+select_checksum() {
+    manifest=$1
+    want=$2
+    found=""
+    while IFS= read -r line; do
+        # Strip the trailing CR some CDNs add.
+        line=${line%"$(printf '\r')"}
+        hash=${line%% *}
+        rest=${line#*  }
+        [ "$rest" != "$line" ] || continue   # require exactly two spaces
+        case "$hash" in
+            *[!0-9a-f]*) continue ;;
+        esac
+        [ ${#hash} -eq 64 ] || continue
+        [ "$rest" = "$want" ] || continue
+        if [ -n "$found" ]; then
+            # Duplicate entry for the same basename: reject.
+            return 1
+        fi
+        found=$hash
+    done <"$manifest"
+    [ -n "$found" ] || return 1
+    printf '%s' "$found"
+}
+
+# Inspect archive `$1` and require it to contain exactly one regular file
+# named `bpm` — no absolute paths, no `..`, no links/devices, and no extras.
+# The archive is never touched before this check passes.
+inspect_archive() {
+    tarball=$1
+    entries=$(tar -tf "$tarball" 2>/dev/null) || return 1
+    [ -n "$entries" ] || return 1
+    count=0
+    while IFS= read -r entry; do
+        [ -n "$entry" ] || continue
+        [ "$entry" = "bpm" ] || return 1
+
+        # `tar -tvf` prints metadata with a one-character type flag; reject
+        # anything that is not a regular file before extraction.
+        meta=$(tar -tvf "$tarball" "$entry" 2>/dev/null)
+        [ -n "$meta" ] || return 1
+        type_char=${meta%${meta#?}}
+        [ "$type_char" = "-" ] || return 1
+        count=$((count + 1))
+    done <<EOF
+$entries
+EOF
+    [ "$count" -eq 1 ] || return 1
+}
+
 try_prebuilt() {
     # $1 = platform target
     platform=$1
     tmpdir=$(mktemp -d)
 
+    # Resolve one immutable release namespace for all three assets so exact-
+    # version and latest-redirect modes never mix versions.
     if [ -n "${BPM_VERSION:-}" ]; then
-        release_url="$BPM_REPO/releases/download/v$BPM_VERSION/bpm-$platform.tar.gz"
+        base_url="$BPM_REPO/releases/download/v$BPM_VERSION"
         print_info "Checking for pre-built binary (v$BPM_VERSION)..."
-        if curl -fsSL "$release_url" 2>/dev/null | tar xz -C "$tmpdir" 2>/dev/null; then
-            if [ -f "$tmpdir/bpm" ]; then
-                if verify_binary "$tmpdir/bpm"; then
-                    print_info "Installing bpm v$BPM_VERSION..."
-                    install_binary "$tmpdir/bpm" "$BPM_INSTALL_DIR/bpm" || {
-                        print_err "Installation failed."
-                        suggest_command
-                        rm -rf "$tmpdir"
-                        exit 1
-                    }
-                    rm -rf "$tmpdir"
-                    print_ok "bpm installed to $BPM_INSTALL_DIR/bpm"
-                    return 0
-                else
-                    print_info "Pre-built v$BPM_VERSION lacks npm-name resolution; falling back to source build."
-                fi
-            fi
-        fi
     else
-        # No exact version: use the immutable latest-asset redirect.
-        latest_url="$BPM_REPO/releases/latest/download/bpm-$platform.tar.gz"
+        base_url="$BPM_REPO/releases/latest/download"
         print_info "Checking for latest pre-built binary..."
-        if curl -fsSL "$latest_url" 2>/dev/null | tar xz -C "$tmpdir" 2>/dev/null; then
-            if [ -f "$tmpdir/bpm" ]; then
-                if verify_binary "$tmpdir/bpm"; then
-                    print_info "Installing latest release binary..."
-                    install_binary "$tmpdir/bpm" "$BPM_INSTALL_DIR/bpm" || {
-                        print_err "Installation failed."
-                        suggest_command
-                        rm -rf "$tmpdir"
-                        exit 1
-                    }
-                    rm -rf "$tmpdir"
-                    print_ok "bpm installed to $BPM_INSTALL_DIR/bpm"
-                    return 0
-                else
-                    print_info "Latest release binary lacks required features; falling back to source build."
-                fi
-            fi
-        fi
+    fi
+
+    tarball_name="bpm-$platform.tar.gz"
+    tarball="$tmpdir/$tarball_name"
+    manifest="$tmpdir/SHA256SUMS"
+    sig="$tmpdir/SHA256SUMS.sig"
+    pubkey="$tmpdir/release-signing-public.pem"
+
+    # Verification requires openssl; without it, fall back to source.
+    command -v openssl >/dev/null 2>&1 || {
+        print_info "openssl unavailable; falling back to source build."
+        rm -rf "$tmpdir"
+        return 1
+    }
+
+    # No production signing key configured: stay inert, fall back to source.
+    materialize_pubkey "$pubkey" || {
+        print_info "No release signing key configured; falling back to source build."
+        rm -rf "$tmpdir"
+        return 1
+    }
+
+    # Download the tarball, checksum manifest, and detached signature as
+    # distinct files (never pipe archive bytes into tar).
+    download_asset "$base_url/$tarball_name" "$tarball" || { rm -rf "$tmpdir"; return 1; }
+    download_asset "$base_url/SHA256SUMS" "$manifest" || { rm -rf "$tmpdir"; return 1; }
+    download_asset "$base_url/SHA256SUMS.sig" "$sig" || { rm -rf "$tmpdir"; return 1; }
+
+    # 1. Verify the detached signature over the manifest BEFORE trusting any
+    #    checksum line.
+    verify_signature "$manifest" "$sig" "$pubkey" || {
+        print_info "Release signature invalid; falling back to source build."
+        rm -rf "$tmpdir"
+        return 1
+    }
+    print_info "Release signature verified."
+
+    # 2. Select exactly this platform's line and verify the archive hash.
+    expected=$(select_checksum "$manifest" "$tarball_name") || {
+        print_info "Release manifest missing/malformed entry; falling back to source build."
+        rm -rf "$tmpdir"
+        return 1
+    }
+    actual=$(sha256_file "$tarball")
+    [ -n "$actual" ] && [ "$actual" = "$expected" ] || {
+        print_info "Release archive checksum mismatch; falling back to source build."
+        rm -rf "$tmpdir"
+        return 1
+    }
+    print_info "Release checksum verified."
+
+    # 3. Inspect the archive shape before extracting.
+    inspect_archive "$tarball" || {
+        print_info "Release archive shape unsafe; falling back to source build."
+        rm -rf "$tmpdir"
+        return 1
+    }
+    print_info "Release archive shape verified."
+
+    # Only after signature + checksum + shape pass do we extract and execute.
+    tar -xzf "$tarball" -C "$tmpdir" 2>/dev/null || { rm -rf "$tmpdir"; return 1; }
+    if [ -f "$tmpdir/bpm" ] && verify_binary "$tmpdir/bpm"; then
+        print_info "Installing ${BPM_VERSION:-latest} release binary..."
+        install_binary "$tmpdir/bpm" "$BPM_INSTALL_DIR/bpm" || {
+            print_err "Installation failed."
+            suggest_command
+            rm -rf "$tmpdir"
+            exit 1
+        }
+        rm -rf "$tmpdir"
+        print_ok "bpm installed to $BPM_INSTALL_DIR/bpm"
+        return 0
     fi
     rm -rf "$tmpdir"
     return 1

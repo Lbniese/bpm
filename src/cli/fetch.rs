@@ -157,8 +157,8 @@ fn truthy_env(name: &str) -> bool {
 }
 
 /// Build a registry client with the persistent packument cache attached when
-/// it can be opened. A cache that cannot be opened is reported but never fatal:
-/// the client falls back to the uncached path rather than blocking the install.
+/// available. For `Offline` and `PreferOffline`, a cache-open failure is
+/// fatal; other modes fall back to the uncached client path.
 pub(super) fn open_registry_client(
     store_root: &std::path::Path,
     config: NpmConfig,
@@ -171,14 +171,32 @@ pub(super) fn open_registry_client(
     // `BPM_PREFETCH_WORKERS` env var overrides the default (0 disables).
     let workers = prefetch_worker_count(cache_mode);
     let client = RegistryClient::with_client(config, http).with_prefetch(workers);
+    match open_metadata_cache(store_root, cache_mode)? {
+        Some(cache) => Ok(client.with_metadata_cache(cache, cache_mode)),
+        None => Ok(client),
+    }
+}
+
+/// Open metadata cache in strict mode for offline/pref-offline, and fallback to
+/// uncached resolution only for online modes.
+pub(super) fn open_metadata_cache(
+    store_root: &std::path::Path,
+    cache_mode: CacheMode,
+) -> anyhow::Result<Option<std::sync::Arc<MetadataCache>>> {
     match MetadataCache::open(store_root) {
-        Ok(cache) => Ok(client.with_metadata_cache(std::sync::Arc::new(cache), cache_mode)),
-        Err(error) => {
-            // The cache is a performance optimization only. Surface the issue
-            // so users can repair the database, but continue without it.
-            eprintln!("warn: metadata cache unavailable, continuing uncached: {error}");
-            Ok(client)
-        }
+        Ok(cache) => Ok(Some(std::sync::Arc::new(cache))),
+        Err(error) => match cache_mode {
+            CacheMode::Offline => Err(anyhow::anyhow!(
+                "metadata cache unavailable in offline mode: {error}"
+            )),
+            CacheMode::PreferOffline => Err(anyhow::anyhow!(
+                "metadata cache unavailable in prefer-offline mode: {error}"
+            )),
+            CacheMode::Default | CacheMode::PreferOnline => {
+                eprintln!("warn: metadata cache unavailable, continuing uncached: {error}");
+                Ok(None)
+            }
+        },
     }
 }
 
