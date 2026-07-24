@@ -7,6 +7,8 @@
 #[cfg(unix)]
 use std::io::Write;
 #[cfg(unix)]
+use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::Command;
 
 /// Helper: create a temporary directory with fake `curl` and `cargo`
@@ -172,4 +174,353 @@ fn invalid_version_override_is_rejected() {
         stdout.contains("Invalid BPM_VERSION"),
         "should report invalid version: {stdout}"
     );
+}
+
+// ── Release provenance verification (plan 020) ───────────────────────────
+//
+// Hermetic tests for install.sh's signed-checksum verification. A disposable
+// ECDSA keypair is generated in a temp directory (never committed); the
+// installer's `_BPM_TEST_PUBKEY_FILE` hook injects its public half. A fake
+// `curl` serves the tarball/manifest/signature from local fixture files keyed
+// by URL suffix. Real `openssl`/`tar` exercise the verify/inspect path. No
+// test contacts a public URL, uses a production key, installs a real bpm, or
+// needs sudo.
+
+/// Mirror install.sh's platform detection so the manifest can list the exact
+/// `bpm-<platform>.tar.gz` line the installer will request on this host.
+#[cfg(unix)]
+fn host_platform() -> String {
+    let arch = std::env::consts::ARCH;
+    let os = std::env::consts::OS;
+    match (arch, os) {
+        ("aarch64", "macos") => "aarch64-apple-darwin",
+        ("x86_64", "macos") => "x86_64-apple-darwin",
+        ("x86_64", "linux") => "x86_64-unknown-linux-gnu",
+        ("aarch64", "linux") => "aarch64-unknown-linux-gnu",
+        _ => "x86_64-unknown-linux-gnu",
+    }
+    .to_string()
+}
+
+/// Build a disposable signing keypair + a valid signed release fixture set
+/// under `root/release/`: `key.pem`, `pubkey.pem`, the platform tarball,
+/// `SHA256SUMS`, and `SHA256SUMS.sig`. Returns the fixture directory.
+#[cfg(unix)]
+fn build_signed_release(root: &Path) -> PathBuf {
+    let release = root.join("release");
+    std::fs::create_dir_all(&release).unwrap();
+    let key = release.join("key.pem");
+    let pubkey = release.join("pubkey.pem");
+    // Disposable ECDSA P-256 keypair; the private key lives only in temp and
+    // is never committed or logged.
+    let status = Command::new("openssl")
+        .args([
+            "ecparam",
+            "-genkey",
+            "-name",
+            "prime256v1",
+            "-noout",
+            "-out",
+        ])
+        .arg(&key)
+        .status()
+        .unwrap();
+    assert!(status.success(), "generate test keypair");
+    let status = Command::new("openssl")
+        .args(["ec", "-in"])
+        .arg(&key)
+        .args(["-pubout", "-out"])
+        .arg(&pubkey)
+        .status()
+        .unwrap();
+    assert!(status.success(), "extract test public key");
+
+    // Fake bpm that satisfies verify_binary (--registry on fetch, bin
+    // directory on install).
+    let staging = root.join("staging");
+    std::fs::create_dir_all(&staging).unwrap();
+    let bpm = staging.join("bpm");
+    std::fs::write(
+        &bpm,
+        "#!/bin/sh\ncase \"$1\" in\n  fetch) echo '  --registry <url>' ;;\n  install) echo '  bin directory' ;;\nesac\n",
+    )
+    .unwrap();
+    make_executable(&bpm);
+
+    let platform = host_platform();
+    let tarball_name = format!("bpm-{platform}.tar.gz");
+    let tarball = release.join(&tarball_name);
+    let status = Command::new("tar")
+        .args(["-czf"])
+        .arg(&tarball)
+        .args(["-C"])
+        .arg(&staging)
+        .arg("bpm")
+        .status()
+        .unwrap();
+    assert!(status.success(), "build test tarball");
+
+    // Sorted SHA256SUMS: one conventional `<64 hex>  <basename>` line.
+    let hash = sha256_of(&tarball);
+    let manifest = release.join("SHA256SUMS");
+    std::fs::write(&manifest, format!("{hash}  {tarball_name}\n")).unwrap();
+
+    // Detached signature over the exact manifest bytes.
+    let sig = release.join("SHA256SUMS.sig");
+    let status = Command::new("openssl")
+        .args(["dgst", "-sha256", "-sign"])
+        .arg(&key)
+        .args(["-out"])
+        .arg(&sig)
+        .arg(&manifest)
+        .status()
+        .unwrap();
+    assert!(status.success(), "sign test manifest");
+    release
+}
+
+#[cfg(unix)]
+fn sha256_of(path: &Path) -> String {
+    let out = Command::new("openssl")
+        .args(["dgst", "-sha256"])
+        .arg(path)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .last()
+        .unwrap()
+        .to_ascii_lowercase()
+}
+
+#[cfg(unix)]
+fn make_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(path, perms).unwrap();
+}
+
+/// Build a PATH with a fake `curl` that serves the signed-release fixtures by
+/// URL suffix, an optional fake `openssl` (when `fake_openssl` is true), and
+/// the rest of the real PATH (for real tar/install/openssl).
+#[cfg(unix)]
+fn release_path(fixture_dir: &Path, fake_openssl: bool) -> (tempfile::TempDir, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+
+    let curl_script = bin.join("curl");
+    let fixture = fixture_dir.to_path_buf();
+    std::fs::write(
+        &curl_script,
+        format!(
+            r#"#!/bin/sh
+# Parse `-o <dest>` and the trailing URL from a minimal curl subset.
+dest=""
+url=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) dest="$2"; shift 2 ;;
+    -*) shift ;;
+    *) url="$1"; shift ;;
+  esac
+done
+case "$url" in
+  *api.github.com*) exit 1 ;;           # API resolution fails -> latest redirect
+  *.sig) cp "{fix}/SHA256SUMS.sig" "$dest" 2>/dev/null && exit 0 || exit 1 ;;
+  *SHA256SUMS) cp "{fix}/SHA256SUMS" "$dest" 2>/dev/null && exit 0 || exit 1 ;;
+  *.tar.gz) cp "{fix}/$(basename "$url")" "$dest" 2>/dev/null && exit 0 || exit 1 ;;
+  *) exit 1 ;;
+esac
+"#,
+            fix = fixture.display()
+        ),
+    )
+    .unwrap();
+    make_executable(&curl_script);
+
+    let cargo_script = bin.join("cargo");
+    std::fs::write(&cargo_script, "#!/bin/sh\nexit 1\n").unwrap();
+    make_executable(&cargo_script);
+
+    if fake_openssl {
+        let openssl_script = bin.join("openssl");
+        std::fs::write(&openssl_script, "#!/bin/sh\nexit 1\n").unwrap();
+        make_executable(&openssl_script);
+    }
+
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    (dir, path)
+}
+
+#[cfg(unix)]
+fn run_installer(path: &str, pubkey: &Path, install_dir: &Path) -> std::process::Output {
+    Command::new("sh")
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/install.sh"))
+        .env("PATH", path)
+        .env("BPM_REPO", "https://github.com/Lbniese/bpm")
+        .env("BPM_INSTALL_DIR", install_dir.to_str().unwrap())
+        .env("_BPM_TEST_PUBKEY_FILE", pubkey)
+        .output()
+        .expect("run install.sh")
+}
+
+#[test]
+#[cfg(unix)]
+fn valid_signed_release_installs_candidate() {
+    let root = tempfile::tempdir().unwrap();
+    let fixture = build_signed_release(root.path());
+    let pubkey = fixture.join("pubkey.pem");
+    let (_fake, path) = release_path(&fixture, false);
+    let install_dir = root.path().join("install");
+    std::fs::create_dir_all(&install_dir).unwrap();
+
+    let out = run_installer(&path, &pubkey, &install_dir);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "install should succeed; stderr: {stderr}\nstdout: {stdout}"
+    );
+    assert!(
+        install_dir.join("bpm").exists(),
+        "candidate must be installed; stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("Installing"),
+        "expected install; stdout: {stdout}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn tampered_tarball_falls_back_before_execution() {
+    let root = tempfile::tempdir().unwrap();
+    let fixture = build_signed_release(root.path());
+    let pubkey = fixture.join("pubkey.pem");
+    // Corrupt the tarball so its checksum no longer matches the signed manifest.
+    let platform = host_platform();
+    let tarball = fixture.join(format!("bpm-{platform}.tar.gz"));
+    let mut bytes = std::fs::read(&tarball).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xff;
+    std::fs::write(&tarball, bytes).unwrap();
+
+    let (_fake, path) = release_path(&fixture, false);
+    let install_dir = root.path().join("install");
+    std::fs::create_dir_all(&install_dir).unwrap();
+    let out = run_installer(&path, &pubkey, &install_dir);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Checksum mismatch must fail BEFORE extraction; no candidate is installed.
+    assert!(
+        stdout.contains("checksum mismatch"),
+        "expected checksum mismatch; stdout: {stdout}"
+    );
+    assert!(
+        !install_dir.join("bpm").exists(),
+        "tampered tarball must not be installed"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn tampered_signature_falls_back_before_extraction() {
+    let root = tempfile::tempdir().unwrap();
+    let fixture = build_signed_release(root.path());
+    let pubkey = fixture.join("pubkey.pem");
+    let sig = fixture.join("SHA256SUMS.sig");
+    let mut bytes = std::fs::read(&sig).unwrap();
+    bytes[0] ^= 0xff;
+    std::fs::write(&sig, bytes).unwrap();
+
+    let (_fake, path) = release_path(&fixture, false);
+    let install_dir = root.path().join("install");
+    std::fs::create_dir_all(&install_dir).unwrap();
+    let out = run_installer(&path, &pubkey, &install_dir);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("signature invalid"),
+        "expected signature failure; stdout: {stdout}"
+    );
+    assert!(!install_dir.join("bpm").exists());
+}
+
+#[test]
+#[cfg(unix)]
+fn unsafe_archive_with_extra_file_is_rejected() {
+    let root = tempfile::tempdir().unwrap();
+    let fixture = build_signed_release(root.path());
+    let pubkey = fixture.join("pubkey.pem");
+    // Rebuild the tarball with an extra entry and re-sign a matching manifest.
+    let staging = root.path().join("unsafe-staging");
+    std::fs::create_dir_all(&staging).unwrap();
+    let bpm = staging.join("bpm");
+    std::fs::write(
+        &bpm,
+        "#!/bin/sh\ncase \"$1\" in\n  fetch) echo '  --registry <url>' ;;\n  install) echo '  bin directory' ;;\nesac\n",
+    )
+    .unwrap();
+    make_executable(&bpm);
+    std::fs::write(staging.join("evil"), "pwned").unwrap();
+    let platform = host_platform();
+    let tarball_name = format!("bpm-{platform}.tar.gz");
+    let tarball = fixture.join(&tarball_name);
+    let status = Command::new("tar")
+        .args(["-czf"])
+        .arg(&tarball)
+        .args(["-C"])
+        .arg(&staging)
+        .args(["bpm", "evil"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let hash = sha256_of(&tarball);
+    std::fs::write(
+        fixture.join("SHA256SUMS"),
+        format!("{hash}  {tarball_name}\n"),
+    )
+    .unwrap();
+    let status = Command::new("openssl")
+        .args(["dgst", "-sha256", "-sign"])
+        .arg(fixture.join("key.pem"))
+        .args(["-out"])
+        .arg(fixture.join("SHA256SUMS.sig"))
+        .arg(fixture.join("SHA256SUMS"))
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let (_fake, path) = release_path(&fixture, false);
+    let install_dir = root.path().join("install");
+    std::fs::create_dir_all(&install_dir).unwrap();
+    let out = run_installer(&path, &pubkey, &install_dir);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("archive shape unsafe"),
+        "expected unsafe-archive rejection; stdout: {stdout}"
+    );
+    assert!(!install_dir.join("bpm").exists());
+}
+
+#[test]
+#[cfg(unix)]
+fn missing_openssl_falls_back_to_source() {
+    let root = tempfile::tempdir().unwrap();
+    let fixture = build_signed_release(root.path());
+    let pubkey = fixture.join("pubkey.pem");
+    let (_fake, path) = release_path(&fixture, true); // fake openssl exits 1
+    let install_dir = root.path().join("install");
+    std::fs::create_dir_all(&install_dir).unwrap();
+    let out = run_installer(&path, &pubkey, &install_dir);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("signature invalid") || stdout.contains("openssl unavailable"),
+        "expected signature/availability fallback; stdout: {stdout}"
+    );
+    assert!(!install_dir.join("bpm").exists());
 }
