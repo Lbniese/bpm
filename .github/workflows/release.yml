@@ -10,7 +10,7 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -49,7 +49,7 @@ jobs:
       - name: Verify cross version
         if: matrix.use_cross
         run: |
-          version=$(cross --version | grep -oP 'cross \K[0-9]+\.[0-9]+\.[0-9]+' || echo "none")
+          version=$(cross --version | awk '{print $2}')
           if [ "$version" != "0.2.5" ]; then
             echo "cross version mismatch: expected 0.2.5, got $version"
             exit 1
@@ -69,15 +69,114 @@ jobs:
           staging="staging/${{ matrix.target }}"
           mkdir -p "$staging"
           cp "target/${{ matrix.target }}/release/bpm" "$staging/bpm"
-          tar -C "staging/${{ matrix.target }}" -czf "bpm-${{ matrix.target }}.tar.gz" bpm
+          tar -C "$staging" -czf "bpm-${{ matrix.target }}.tar.gz" bpm
 
-      - name: Upload to release
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bpm-${{ matrix.target }}
+          path: bpm-${{ matrix.target }}.tar.gz
+
+  publish:
+    name: publish release assets
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    environment: release
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      RELEASE_SIGNING_PRIVATE_KEY: ${{ secrets.RELEASE_SIGNING_PRIVATE_KEY }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: bpm-*
+          merge-multiple: true
+
+      - name: Verify release asset set
         run: |
-          TAG="${GITHUB_REF_NAME}"
-          # Tolerate a concurrent "create" from sibling matrix jobs: the first
-          # job to run creates the release; the rest get HTTP 422 (already
-          # exists), which we ignore, then everyone uploads their own asset.
-          gh release create "$TAG" --title "$TAG" --generate-notes 2>/dev/null || true
-          gh release upload "$TAG" "bpm-${{ matrix.target }}.tar.gz" --clobber
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          set -euo pipefail
+          cd artifacts
+
+          expected_count=4
+          actual_count=0
+          for file in bpm-*.tar.gz; do
+            actual_count=$((actual_count + 1))
+            case "$file" in
+              bpm-aarch64-apple-darwin.tar.gz|\
+              bpm-x86_64-apple-darwin.tar.gz|\
+              bpm-x86_64-unknown-linux-gnu.tar.gz|\
+              bpm-aarch64-unknown-linux-gnu.tar.gz)
+                :
+                ;;
+              *)
+                echo "Unexpected release asset: $file"
+                exit 1
+                ;;
+            esac
+          done
+
+          if [ "$actual_count" -ne "$expected_count" ]; then
+            echo "Expected $expected_count release tarballs, got $actual_count"
+            ls -1 bpm-*.tar.gz
+            exit 1
+          fi
+
+          # Preflight: protected signing secret must be present before building checksums.
+          if [ -z "${RELEASE_SIGNING_PRIVATE_KEY:-}" ]; then
+            echo "RELEASE_SIGNING_PRIVATE_KEY secret is required in release environment"
+            exit 1
+          fi
+
+          rm -f SHA256SUMS SHA256SUMS.sig
+          {
+            for file in \
+              bpm-aarch64-apple-darwin.tar.gz \
+              bpm-x86_64-apple-darwin.tar.gz \
+              bpm-x86_64-unknown-linux-gnu.tar.gz \
+              bpm-aarch64-unknown-linux-gnu.tar.gz
+            do
+              printf '%s  %s\n' "$(sha256sum "$file" | awk '{print $1}')" "$file"
+            done
+          } | sort > SHA256SUMS
+
+          key_file=$(mktemp)
+          trap 'shred -u "$key_file" 2>/dev/null || rm -f "$key_file"' EXIT
+          printf '%s' "$RELEASE_SIGNING_PRIVATE_KEY" > "$key_file"
+          chmod 0600 "$key_file"
+
+          # Validate the secret parses as a private key before signing.
+          openssl pkey -in "$key_file" >/dev/null 2>&1 || {
+            echo "RELEASE_SIGNING_PRIVATE_KEY is not a valid private key"
+            exit 1
+          }
+
+          openssl dgst -sha256 -sign "$key_file" -out SHA256SUMS.sig SHA256SUMS
+          openssl dgst -sha256 -verify .github/release-signing-public.pem -signature SHA256SUMS.sig SHA256SUMS
+
+          echo "Prepared 4 tarballs and verified SHA256SUMS signature."
+
+      - name: Publish release assets
+        run: |
+          set -euo pipefail
+          cd artifacts
+
+          tag="${GITHUB_REF_NAME}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists; adding/updating assets"
+          else
+            gh release create "$tag" --title "$tag" --notes ""
+          fi
+
+          gh release upload "$tag" \
+            bpm-aarch64-apple-darwin.tar.gz \
+            bpm-x86_64-apple-darwin.tar.gz \
+            bpm-x86_64-unknown-linux-gnu.tar.gz \
+            bpm-aarch64-unknown-linux-gnu.tar.gz \
+            SHA256SUMS SHA256SUMS.sig \
+            --clobber

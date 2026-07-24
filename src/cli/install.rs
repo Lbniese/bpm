@@ -19,7 +19,9 @@ use bpm::resolver::model::PlatformConstraints;
 use bpm::resolver::platform::{check_package_platform, PackageReachability, PlatformDisposition};
 use bpm::store::{ArtifactStore, StoreError};
 
-use super::fetch::{name_of_spec, open_registry_client, store_root, write_metrics};
+use super::fetch::{
+    name_of_spec, open_metadata_cache, open_registry_client, store_root, write_metrics,
+};
 
 pub(super) struct Options {
     pub targets: Vec<String>,
@@ -293,25 +295,40 @@ pub(super) fn install_resolved_lockfile(
         // graph or its dependencies: re-lease the graph's durable inventory,
         // record access, and rewrite the durable project registration + SQLite
         // reference. A legacy/incomplete cached volume returns an error here so
-        // the caller takes the normal rebuild/migration path instead of
-        // trusting an unprotected cache hit.
-        let graph_hex = graph::graph_id_for_project(&lockfile, project_root).to_hex();
-        if let Err(error) = bpm::metadata::InstallSession::open(store.root())
-            .and_then(|mut session| session.refresh_cached_graph(project_root, &graph_hex))
-        {
-            eprintln!(
-                "warning: could not refresh graph ownership for {}: {error}",
-                graph::graph_id_for_project(&lockfile, project_root).to_hex_short(),
-            );
+        // the caller retries a full install to avoid a false no-op success.
+        let graph_id = graph::graph_id_for_project(&lockfile, project_root);
+        let graph_hex = graph_id.to_hex();
+        let graph_hex_short = graph_id.to_hex_short();
+        let graph_path = store.graph_volume_path(&graph_hex);
+        let refreshed = bpm::metadata::InstallSession::open(store.root())
+            .and_then(|mut session| session.refresh_cached_graph(project_root, &graph_hex));
+        match refreshed {
+            Ok(()) => {
+                println!(
+                    "nothing to install — graph {} unchanged ({} package(s), {} bin(s) already materialized)",
+                    graph_hex_short,
+                    materialized,
+                    bins
+                );
+                metrics.add_requests(http.request_count());
+                return write_metrics(&metrics, options.json_metrics.clone());
+            }
+            Err(error) => {
+                let clear_cache =
+                    matches!(&error, bpm::metadata::MetadataError::MissingObject { .. });
+                eprintln!(
+                    "warning: could not refresh graph ownership for {graph_hex_short}, rebuilding from lockfile: {error}",
+                );
+                if clear_cache && graph_path.exists() {
+                    if let Err(error) = fs::remove_dir_all(&graph_path) {
+                        eprintln!(
+                            "warning: failed to clear stale graph cache at {}: {error}",
+                            graph_path.display(),
+                        );
+                    }
+                }
+            }
         }
-        println!(
-            "nothing to install — graph {} unchanged ({} package(s), {} bin(s) already materialized)",
-            graph::graph_id_for_project(&lockfile, project_root).to_hex_short(),
-            materialized,
-            bins
-        );
-        metrics.add_requests(http.request_count());
-        return write_metrics(&metrics, options.json_metrics.clone());
     }
     metrics.record("plan_cache_miss", std::time::Duration::ZERO);
 
@@ -1098,13 +1115,11 @@ fn resolve_fresh_manifest_async(
                     .build()
                     .expect("failed to build tokio runtime")
                     .block_on(async {
-                        let async_cache =
-                            bpm::metadata_cache::MetadataCache::open(store.root()).ok();
+                        let async_cache = open_metadata_cache(store.root(), cache_mode)?;
                         let mut async_registry =
                             bpm::async_resolver::AsyncRegistryClient::new(config);
                         if let Some(cache) = async_cache {
-                            async_registry = async_registry
-                                .with_metadata_cache(std::sync::Arc::new(cache), cache_mode);
+                            async_registry = async_registry.with_metadata_cache(cache, cache_mode);
                         }
                         let result =
                             bpm::async_resolver::resolve_manifest_with_options_and_target_async(
@@ -1184,25 +1199,46 @@ fn resolve_fresh_manifest_blocking(
 
 /// A non-blocking variant of [`ChannelSink`] that uses `try_send` instead of
 /// `send`, so the async resolver's tokio runtime thread never blocks on
-/// pipeline backpressure. Units that cannot be delivered (channel full) are
-/// silently dropped and fetched in a post-resolution pass.
-struct TryChannelSink(std::sync::mpsc::SyncSender<InstallWork>);
+/// pipeline backpressure. Units that cannot be delivered immediately (channel
+/// full, or the receiver disconnected because a worker failed) are retained in
+/// a thread-safe overflow vector owned by the caller, which drains them through
+/// the original concurrent pipeline after async resolution completes — they
+/// are never silently dropped and never fall back to an origin-only path.
+struct TryChannelSink {
+    tx: std::sync::mpsc::SyncSender<InstallWork>,
+    overflow: std::sync::Arc<std::sync::Mutex<Vec<InstallWork>>>,
+}
 
 impl resolver::ResolveSink for TryChannelSink {
     fn emit(&self, unit: resolver::ResolvedDownloadUnit) {
-        let _ = self.0.try_send(InstallWork {
+        let work = InstallWork {
             path: unit.path,
             name: unit.name,
             url: unit.url,
             integrity: unit.integrity,
-        });
+        };
+        if let Err(err) = self.tx.try_send(work) {
+            // Retain the unit exactly once in emission order. A `Full` channel
+            // is drained by the caller after resolution; a `Disconnected`
+            // channel means a worker already failed and `join_pipeline` will
+            // surface that failure (the completeness invariant catches any
+            // remaining gap).
+            let work = match err {
+                std::sync::mpsc::TrySendError::Full(work)
+                | std::sync::mpsc::TrySendError::Disconnected(work) => work,
+            };
+            if let Ok(mut buffer) = self.overflow.lock() {
+                buffer.push(work);
+            }
+        }
     }
 }
 
 /// Resolve a fresh manifest with the async resolver while the download/extract
-/// pipeline fetches each package via the non-blocking sink.  Any packages that
-/// the pipeline missed (channel was full during resolution) are fetched in a
-/// post-resolution sequential pass.
+/// pipeline fetches each package via the non-blocking sink. Units that
+/// overflow the live channel are retained and drained through the same
+/// concurrent, remote-cache-aware pipeline after resolution completes; there
+/// is no sequential origin-only recovery path.
 #[allow(clippy::too_many_arguments)]
 fn run_streaming_async_install(
     root: &Path,
@@ -1235,7 +1271,8 @@ fn run_streaming_async_install(
         None
     };
     let workers = adaptive_workers(concurrency, usize::MAX, root);
-    let (lockfile, mut outcomes) = std::thread::scope(
+    let overflow = std::sync::Arc::new(std::sync::Mutex::new(Vec::<InstallWork>::new()));
+    let (lockfile, outcomes) = std::thread::scope(
         |scope| -> anyhow::Result<(Lockfile, Vec<FetchOutcome>)> {
             let (unit_tx, unit_rx) =
                 std::sync::mpsc::sync_channel::<InstallWork>(workers.max(1) * 2);
@@ -1243,7 +1280,8 @@ fn run_streaming_async_install(
             let (downloaders, extractors) =
                 spawn_fetch_pipeline(scope, store, http, remote.as_ref(), unit_rx, workers);
             // Run async resolution on a tokio runtime, emitting placed nodes
-            // to the non-blocking TryChannelSink.
+            // to the non-blocking TryChannelSink. Units that overflow the live
+            // channel are retained in `overflow` rather than dropped.
             let config_clone = config.clone();
             let diag_cell = std::cell::Cell::new((0u64, 0u64, 0u64));
             let lockfile = metrics
@@ -1253,16 +1291,15 @@ fn run_streaming_async_install(
                         .build()
                         .expect("failed to build tokio runtime")
                         .block_on(async {
-                            let sink = TryChannelSink(unit_tx);
-                            let async_cache =
-                                bpm::metadata_cache::MetadataCache::open(store.root()).ok();
+                            let sink = TryChannelSink {
+                                tx: unit_tx.clone(),
+                                overflow: std::sync::Arc::clone(&overflow),
+                            };
+                            let async_cache = open_metadata_cache(store.root(), options.cache_mode)?;
                             let mut registry =
                                 bpm::async_resolver::AsyncRegistryClient::new(config_clone);
                             if let Some(cache) = async_cache {
-                                registry = registry.with_metadata_cache(
-                                    std::sync::Arc::new(cache),
-                                    options.cache_mode,
-                                );
+                                registry = registry.with_metadata_cache(cache, options.cache_mode);
                             }
                             let result =
                                 bpm::async_resolver::resolve_manifest_with_options_and_target_async_sink(
@@ -1274,22 +1311,44 @@ fn run_streaming_async_install(
                                     bpm::resolver::current_target_platform(),
                                     Some(&sink as &dyn resolver::ResolveSink),
                                 )
-                                .await;
+                                .await?;
                             let diag = registry.take_diagnostics();
                             diag_cell.set(diag);
-                            result
+                            Ok::<_, anyhow::Error>(result)
                         })
                 })
                 .map_err(|error| anyhow::anyhow!("dependency resolution failed: {error}"))?;
             // Record async resolver diagnostics.
             let (hits, fetches, fetch_bytes) = diag_cell.into_inner();
             metrics.record_resolver_diagnostics(hits, 0, fetches, 0, fetch_bytes, 0);
+            // Async resolution is complete and we are off the tokio runtime, so
+            // it is safe to block while draining every overflowed unit through
+            // the original concurrent pipeline (workers drain concurrently).
+            // This keeps overflow on the same remote-cache-aware path as
+            // immediate units — there is no sequential origin-only fallback.
+            let overflowed: Vec<InstallWork> = std::mem::take(&mut *overflow.lock().unwrap());
+            let overflow_count = overflowed.len();
+            for work in overflowed {
+                // A `Disconnected` send means a worker already failed;
+                // `join_pipeline` surfaces that failure and the completeness
+                // invariant below catches any remaining gap.
+                let _ = unit_tx.send(work);
+            }
+            drop(unit_tx);
             let outcomes = join_pipeline(downloaders, extractors, metrics)?;
+            if overflow_count > 0 {
+                metrics.record(
+                    "post_resolution_fetches",
+                    std::time::Duration::from_nanos(overflow_count as u64),
+                );
+            }
+            // Completeness invariant: every downloadable lockfile package must
+            // have an outcome. A gap is an internal pipeline error, not a
+            // reason to start a behaviorally different sequential pass.
+            assert_outcomes_complete(&lockfile, &outcomes)?;
             Ok((lockfile, outcomes))
         },
     )?;
-    // Post-resolution pass: fetch any packages the pipeline missed.
-    fetch_missing_outcomes(&lockfile, &mut outcomes, store, http, metrics)?;
     let path = root.join(bpm::lockfile::BPM_LOCK_FILE);
     lockfile.write_to(&path)?;
     eprintln!(
@@ -1320,61 +1379,29 @@ fn run_streaming_async_install(
     )
 }
 
-/// Fetch any packages in `lockfile` that are missing from `outcomes` and
-/// append their fetch results.  Used by the combined streaming+async path
-/// when the non-blocking sink dropped units due to channel backpressure.
-fn fetch_missing_outcomes(
-    lockfile: &Lockfile,
-    outcomes: &mut Vec<FetchOutcome>,
-    store: &ArtifactStore,
-    http: &HttpClient,
-    metrics: &mut Metrics,
-) -> anyhow::Result<()> {
-    // Collect present paths into an owned set so the immutable borrow on
-    // `outcomes` is dropped before the mutable push below.
-    let present: BTreeSet<String> = outcomes.iter().map(|o| o.path.clone()).collect();
-    let mut missing = 0usize;
-    for package in &lockfile.packages {
-        if package.link || package.resolved.is_empty() || present.contains(&package.path) {
-            continue;
-        }
-        let integrity = package
-            .integrity
-            .as_deref()
-            .map(|v| {
-                Integrity::parse(v).map_err(|e| {
-                    anyhow::anyhow!(
-                        "package '{}' at {} has invalid integrity \"{}\": {}",
-                        package.name,
-                        package.path,
-                        v,
-                        e
-                    )
-                })
-            })
-            .transpose()?;
-        let artifact = store.ensure_artifact_with_client(
-            http,
-            &package.resolved,
-            integrity.as_ref(),
-            metrics,
-        )?;
-        let image = store.ensure_image(&artifact.id, metrics)?;
-        outcomes.push(FetchOutcome {
-            path: package.path.clone(),
-            id: artifact.id,
-            artifact_cached: artifact.cached,
-            image_cached: image.cached,
-        });
-        missing += 1;
+/// Completeness invariant for the streaming pipeline: every lockfile package
+/// that is actually downloadable (non-link, non-empty `resolved`) must have a
+/// corresponding fetch outcome. Duplicates do not satisfy a missing different
+/// path. A gap is an internal pipeline error (worker failure or dropped unit),
+/// reported with sorted, redacted package paths/names — never credential URLs.
+fn assert_outcomes_complete(lockfile: &Lockfile, outcomes: &[FetchOutcome]) -> anyhow::Result<()> {
+    let present: BTreeSet<&str> = outcomes.iter().map(|o| o.path.as_str()).collect();
+    let mut missing: Vec<String> = lockfile
+        .packages
+        .iter()
+        .filter(|package| !package.link && !package.resolved.is_empty())
+        .filter(|package| !present.contains(package.path.as_str()))
+        .map(|package| format!("{} ({})", package.name, package.path))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
     }
-    if missing > 0 {
-        metrics.record(
-            "post_resolution_fetches",
-            std::time::Duration::from_nanos(missing as u64),
-        );
-    }
-    Ok(())
+    missing.sort();
+    anyhow::bail!(
+        "internal pipeline error: {} package(s) missing fetch outcome: {}",
+        missing.len(),
+        missing.join(", ")
+    )
 }
 
 /// Resolve a fresh manifest while the download/extract pipeline fetches each
@@ -1623,9 +1650,6 @@ fn finalize_install(
         )?;
         let attach = bpm::volume::attach_project(project_root, &volume)?;
         final_ownership.clone_from(&attach.owned);
-        // The graph volume is now durably published (complete inventory
-        // written atomically with the marker). Record its ownership edges and
-        // extend the install lease to cover the graph + its derived images.
         // The graph id is read from the volume path so it always matches the
         // volume that was actually built or reused.
         let hex = volume
@@ -1634,12 +1658,6 @@ fn finalize_install(
             .and_then(|name| name.to_str())
             .unwrap_or("")
             .to_string();
-        session
-            .record_graph(
-                &hex,
-                bpm::volume::read_graph_inventory(&volume.path).as_ref(),
-            )
-            .map_err(|error| anyhow::anyhow!("record graph ownership failed: {error}"))?;
         graph_hex = Some(hex);
         (
             Some(volume),
@@ -1695,6 +1713,15 @@ fn finalize_install(
                 path
             );
         }
+    }
+
+    if let Some(hex) = &graph_hex {
+        session
+            .record_graph(
+                hex,
+                bpm::volume::read_graph_inventory(&store.graph_volume_path(hex)).as_ref(),
+            )
+            .map_err(|error| anyhow::anyhow!("record graph ownership failed: {error}"))?;
     }
 
     let plan_path = graph::plan_path_for(lockfile_path);
@@ -1837,8 +1864,108 @@ impl std::error::Error for FetchFail {
 
 #[cfg(test)]
 mod tests {
-    use super::{auto_local_project_view, resolve_project_view_with, ProjectView};
+    use super::{
+        assert_outcomes_complete, auto_local_project_view, resolve_project_view_with, FetchOutcome,
+        InstallWork, ProjectView, TryChannelSink,
+    };
+    use bpm::integrity::ArtifactId;
     use bpm::lockfile::{Lockfile, PackageEntry};
+    use bpm::resolver::{ResolveSink, ResolvedDownloadUnit};
+    use std::sync::{mpsc::sync_channel, Arc, Mutex};
+
+    fn unit(path: &str) -> ResolvedDownloadUnit {
+        ResolvedDownloadUnit {
+            path: path.to_owned(),
+            name: path.to_owned(),
+            url: format!("https://example.test/{path}.tgz"),
+            integrity: None,
+        }
+    }
+
+    #[test]
+    fn try_channel_sink_retains_overflow_in_emission_order_without_panic() {
+        // Capacity-1 channel with no active consumer: the first unit occupies
+        // the slot, the next two must overflow exactly once and in order.
+        let (tx, rx) = sync_channel::<InstallWork>(1);
+        let overflow = Arc::new(Mutex::new(Vec::new()));
+        let sink = TryChannelSink {
+            tx: tx.clone(),
+            overflow: Arc::clone(&overflow),
+        };
+        sink.emit(unit("node_modules/p0"));
+        sink.emit(unit("node_modules/p1"));
+        sink.emit(unit("node_modules/p2"));
+        {
+            let buffered = overflow.lock().unwrap();
+            assert_eq!(
+                buffered.len(),
+                2,
+                "two units must overflow a capacity-1 channel"
+            );
+            assert_eq!(buffered[0].path, "node_modules/p1");
+            assert_eq!(buffered[1].path, "node_modules/p2");
+            // No URL/name/path field is lost in ResolvedDownloadUnit -> InstallWork.
+            assert_eq!(buffered[0].url, "https://example.test/node_modules/p1.tgz");
+            assert_eq!(buffered[0].name, "node_modules/p1");
+        }
+        // Dropping the receiver must not panic or change resolver semantics;
+        // the unit is retained so the caller can surface the worker failure.
+        drop(rx);
+        sink.emit(unit("node_modules/p3"));
+        assert_eq!(overflow.lock().unwrap().len(), 3);
+    }
+
+    fn outcome(path: &str) -> FetchOutcome {
+        FetchOutcome {
+            path: path.to_owned(),
+            id: ArtifactId::from_bytes([0; 64]),
+            artifact_cached: true,
+            image_cached: true,
+        }
+    }
+
+    fn downloadable(path: &str) -> PackageEntry {
+        let mut entry = PackageEntry {
+            path: path.to_owned(),
+            name: path.to_owned(),
+            ..Default::default()
+        };
+        entry.resolved = format!("https://example.test/{path}.tgz");
+        entry
+    }
+
+    #[test]
+    fn completeness_accepts_full_and_duplicate_coverage() {
+        let mut lockfile = Lockfile::new("test");
+        lockfile.packages.push(downloadable("node_modules/a"));
+        lockfile.packages.push(downloadable("node_modules/b"));
+        // Links and empty-resolved entries are not downloadable; ignored.
+        lockfile.packages.push(PackageEntry {
+            path: "node_modules/ws".into(),
+            name: "ws".into(),
+            link: true,
+            ..Default::default()
+        });
+        let outcomes = [
+            outcome("node_modules/a"),
+            outcome("node_modules/b"),
+            outcome("node_modules/a"),
+        ];
+        assert_outcomes_complete(&lockfile, &outcomes).unwrap();
+    }
+
+    #[test]
+    fn completeness_rejects_missing_paths_and_duplicates_do_not_satisfy() {
+        let mut lockfile = Lockfile::new("test");
+        lockfile.packages.push(downloadable("node_modules/a"));
+        lockfile.packages.push(downloadable("node_modules/b"));
+        // A duplicate of `a` does not cover the missing `b`.
+        let outcomes = [outcome("node_modules/a"), outcome("node_modules/a")];
+        let error = assert_outcomes_complete(&lockfile, &outcomes).unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("missing fetch outcome"), "{text}");
+        assert!(text.contains("node_modules/b"), "{text}");
+    }
 
     #[test]
     fn auto_view_detects_next_anywhere_in_the_resolved_graph() {

@@ -445,9 +445,79 @@ fn repeat_install_is_a_no_op_on_the_store() {
         stdout.contains("already materialized"),
         "expected plan-cache hit, stdout: {stdout}"
     );
+    let graph = single_graph_volume_path(store.path());
+    assert_eq!(
+        graph_metadata_inventory_version(&graph).unwrap_or(0),
+        1,
+        "successful refresh path should preserve complete graph inventory"
+    );
 
     let after = fs::read_link(&greet_link).unwrap();
     assert_eq!(before, after, "idempotent rerun rewrote the symlink");
+}
+
+#[test]
+fn plan_cache_hit_rebuilds_when_cached_graph_inventory_is_legacy() {
+    let (project, store, _tgz) = setup_project();
+
+    let first = run_install(project.path(), store.path());
+    assert!(first.status.success());
+
+    let graph = single_graph_volume_path(store.path());
+    degrade_graph_inventory_to_legacy(&graph);
+
+    let second = run_install(project.path(), store.path());
+    let stdout = String::from_utf8_lossy(&second.stdout);
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(
+        second.status.success(),
+        "stale graph metadata should trigger rebuild; stderr: {stderr}"
+    );
+    assert!(
+        !stdout.contains("nothing to install"),
+        "legacy inventory should not return a plan-cache no-op: {stdout}"
+    );
+    assert!(
+        stdout.contains("installed 2 package(s)"),
+        "expected full install summary after forced rebuild: {stdout}"
+    );
+    assert_eq!(
+        graph_metadata_inventory_version(&graph).unwrap_or(0),
+        1,
+        "rebuild should write a complete inventory"
+    );
+}
+
+#[test]
+fn plan_cache_hit_rebuilds_when_graph_metadata_is_missing() {
+    let (project, store, _tgz) = setup_project();
+
+    let first = run_install(project.path(), store.path());
+    assert!(first.status.success());
+
+    let graph = single_graph_volume_path(store.path());
+    fs::remove_file(graph.join("metadata.json")).unwrap();
+
+    let second = run_install(project.path(), store.path());
+    let stdout = String::from_utf8_lossy(&second.stdout);
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(
+        second.status.success(),
+        "missing graph inventory should trigger rebuild; stderr: {stderr}"
+    );
+    assert!(
+        !stdout.contains("nothing to install"),
+        "missing inventory should not return a plan-cache no-op: {stdout}"
+    );
+    assert!(
+        stdout.contains("installed 2 package(s)"),
+        "expected full install summary after rebuild: {stdout}"
+    );
+    assert_eq!(
+        graph_metadata_inventory_version(&graph).unwrap_or(0),
+        1,
+        "rebuild should rewrite graph metadata to complete inventory"
+    );
 }
 
 #[test]
@@ -1021,18 +1091,28 @@ fn age_tree_recursive(path: &Path, old: std::time::SystemTime) {
 }
 
 /// Count published graph volumes under `<store>/graphs/blake3/**`.
-fn count_graph_volumes(store: &Path) -> usize {
+fn graph_volume_paths(store: &Path) -> Vec<PathBuf> {
     let base = store.join("graphs/blake3");
     let Ok(prefixes) = fs::read_dir(&base) else {
-        return 0;
+        return Vec::new();
     };
-    let mut count = 0;
+    let mut out = Vec::new();
     for prefix in prefixes.flatten() {
         if let Ok(volumes) = fs::read_dir(prefix.path()) {
-            count += volumes.flatten().filter(|e| e.path().is_dir()).count();
+            for volume in volumes.flatten() {
+                let path = volume.path();
+                if path.is_dir() {
+                    out.push(path);
+                }
+            }
         }
     }
-    count
+    out.sort();
+    out
+}
+
+fn count_graph_volumes(store: &Path) -> usize {
+    graph_volume_paths(store).len()
 }
 
 /// Collect every published artifact tarball path under the store.
@@ -1050,6 +1130,35 @@ fn collect_artifact_files(store: &Path) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+fn single_graph_volume_path(store: &Path) -> PathBuf {
+    let mut paths = graph_volume_paths(store);
+    assert_eq!(
+        paths.len(),
+        1,
+        "expected exactly one graph volume after install fixture setup"
+    );
+    paths.pop().unwrap()
+}
+
+fn graph_metadata_inventory_version(volume: &Path) -> Option<u64> {
+    let metadata = volume.join("metadata.json");
+    let value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&metadata).ok()?).ok()?;
+    value.get("inventory_version")?.as_u64()
+}
+
+fn degrade_graph_inventory_to_legacy(volume: &Path) {
+    let metadata = volume.join("metadata.json");
+    let mut value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&metadata).unwrap()).unwrap();
+    if let Some(map) = value.as_object_mut() {
+        map.remove("inventory_version");
+        map.remove("artifacts");
+        map.remove("derived");
+    }
+    fs::write(&metadata, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
 }
 
 #[test]

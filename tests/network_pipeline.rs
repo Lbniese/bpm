@@ -77,6 +77,10 @@ fn write_npmrc(project: &Path, lines: &[String]) {
     fs::write(project.join(".npmrc"), text).unwrap();
 }
 
+fn corrupt_metadata_cache(store: &Path) {
+    fs::write(store.join("metadata-cache.db"), b"not-a-sqlite-database").unwrap();
+}
+
 fn run_bpm(
     args: &[&str],
     cwd: &Path,
@@ -460,6 +464,73 @@ fn fetch_honors_scoped_registry_precedence() {
         requests[1].header("authorization"),
         Some("Bearer registry-secret")
     );
+}
+
+#[test]
+fn install_offline_fails_if_metadata_cache_is_unusable() {
+    let tgz = package_tgz("test-dep", "1.0.0", None);
+    let server = same_host_registry_mock("test-dep", "1.0.0", "tarballs/test-dep-1.0.0.tgz", tgz);
+    let project = tempfile::tempdir().unwrap();
+    let store = tempfile::tempdir().unwrap();
+    fs::write(
+        project.path().join("package.json"),
+        r#"{"name":"app","version":"1.0.0","dependencies":{"test-dep":"^1.0.0"}}"#,
+    )
+    .unwrap();
+    write_npmrc(project.path(), &[format!("registry={}", server.url(""))]);
+    corrupt_metadata_cache(store.path());
+
+    let (ok, stdout, stderr) = run_bpm(
+        &[
+            "install",
+            "--offline",
+            "--registry",
+            &server.url(""),
+            "--store",
+            store.path().to_str().unwrap(),
+        ],
+        project.path(),
+        store.path(),
+        None,
+    );
+    assert!(!ok, "expected offline install to fail: {stdout}\n{stderr}");
+    assert!(stderr.contains("metadata cache unavailable in offline mode"));
+    assert_eq!(server.requests().len(), 0, "corrupt cache must be terminal");
+}
+
+#[test]
+fn install_prefer_offline_fails_if_metadata_cache_is_unusable() {
+    let tgz = package_tgz("test-dep", "1.0.0", None);
+    let server = same_host_registry_mock("test-dep", "1.0.0", "tarballs/test-dep-1.0.0.tgz", tgz);
+    let project = tempfile::tempdir().unwrap();
+    let store = tempfile::tempdir().unwrap();
+    fs::write(
+        project.path().join("package.json"),
+        r#"{"name":"app","version":"1.0.0","dependencies":{"test-dep":"^1.0.0"}}"#,
+    )
+    .unwrap();
+    write_npmrc(project.path(), &[format!("registry={}", server.url(""))]);
+    corrupt_metadata_cache(store.path());
+
+    let (ok, stdout, stderr) = run_bpm(
+        &[
+            "install",
+            "--prefer-offline",
+            "--registry",
+            &server.url(""),
+            "--store",
+            store.path().to_str().unwrap(),
+        ],
+        project.path(),
+        store.path(),
+        None,
+    );
+    assert!(
+        !ok,
+        "expected prefer-offline install to fail: {stdout}\n{stderr}"
+    );
+    assert!(stderr.contains("metadata cache unavailable in prefer-offline mode"));
+    assert_eq!(server.requests().len(), 0, "corrupt cache must be terminal");
 }
 
 #[cfg(unix)]
@@ -1977,4 +2048,158 @@ fn npmrc_fetch_retries_reach_async_resolver() {
             .exists(),
         "package must be materialized"
     );
+}
+
+/// Forced-overflow parity for the async+streaming pipeline (plan 019). With
+/// concurrency 1 (channel capacity 2) and six packages whose origin tarballs
+/// are served slowly, resolution emits every unit in microseconds while the
+/// single download worker is still busy, so several units must overflow the
+/// live channel. They must be retained and drained through the same pipeline
+/// (never dropped, never sent to a sequential origin-only fallback — that path
+/// no longer exists, and the completeness invariant would fail the install if a
+/// unit went missing). Asserts the install succeeds and every package is
+/// materialized.
+#[test]
+fn async_streaming_overflow_drains_through_pipeline() {
+    // Build six tiny packages served by one slow-tarball origin.
+    let packages: Vec<(String, Vec<u8>, String)> = (0..6)
+        .map(|i| {
+            let name = format!("ov{i}");
+            let tgz = build_tgz(|b| {
+                common::add_file(
+                    b,
+                    "package/package.json",
+                    0o644,
+                    format!("{{\"name\":\"{name}\"}}").as_bytes(),
+                );
+            });
+            let integrity = integrity_of(&tgz);
+            (name, tgz, integrity)
+        })
+        .collect();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let registry_url = format!("http://{addr}");
+    let pkgs = Arc::new(
+        packages
+            .iter()
+            .map(|(name, tgz, integ)| (name.clone(), tgz.clone(), integ.clone()))
+            .collect::<Vec<_>>(),
+    );
+    let base = Arc::new(Mutex::new(String::new()));
+    let base_thread = base.clone();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let pkgs = Arc::clone(&pkgs);
+            let base = base_thread.lock().unwrap().clone();
+            thread::spawn(move || {
+                serve_slow_origin(&mut stream, &pkgs, &base);
+            });
+        }
+    });
+    *base.lock().unwrap() = registry_url.clone();
+
+    let project = tempfile::tempdir().unwrap();
+    let store = tempfile::tempdir().unwrap();
+    let mut deps = serde_json::Map::new();
+    for (name, _, _) in &packages {
+        deps.insert(name.clone(), serde_json::json!("^1.0.0"));
+    }
+    let mut root = serde_json::Map::new();
+    root.insert("name".into(), serde_json::json!("ov-app"));
+    root.insert("version".into(), serde_json::json!("1.0.0"));
+    root.insert("dependencies".into(), serde_json::Value::Object(deps));
+    fs::write(
+        project.path().join("package.json"),
+        serde_json::Value::Object(root).to_string(),
+    )
+    .unwrap();
+    write_npmrc(project.path(), &[format!("registry={registry_url}")]);
+
+    // Concurrency 1 => channel capacity 2; six slow-tarball packages force
+    // overflow. Async + streaming are the defaults.
+    let (ok, stdout, stderr) = run_bpm_with_env(
+        &[
+            "install",
+            "--concurrency",
+            "1",
+            "--store",
+            store.path().to_str().unwrap(),
+        ],
+        project.path(),
+        store.path(),
+        None,
+        &[("BPM_ASYNC_RESOLVE", "1"), ("BPM_STREAM_INSTALL", "1")],
+    );
+    assert!(
+        ok,
+        "overflow install must succeed; stderr: {stderr}\nstdout: {stdout}"
+    );
+
+    // Every overflowed package must be materialized — proving overflow units
+    // were retained and drained through the pipeline rather than dropped.
+    for (name, _, _) in &packages {
+        assert!(
+            project
+                .path()
+                .join("node_modules")
+                .join(name)
+                .join("package.json")
+                .exists(),
+            "overflow package {name} must be materialized"
+        );
+    }
+}
+
+/// Serve packuments instantly and tarballs with a small delay so a single
+/// download worker cannot keep up with resolution emission (forcing overflow).
+fn serve_slow_origin(stream: &mut TcpStream, pkgs: &[(String, Vec<u8>, String)], base: &str) {
+    use std::io::{Read, Write};
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+    let mut buf = [0u8; 8192];
+    let n = stream.read(&mut buf).unwrap_or(0);
+    let request = String::from_utf8_lossy(&buf[..n]);
+    let path = request
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .unwrap_or("")
+        .to_string();
+
+    // Metadata path: /<name> (url-encoded). Serve the packument instantly.
+    for (name, tgz, integrity) in pkgs {
+        let meta_path = format!("/{}", name.replace('/', "%2F"));
+        let tgz_path = format!("/{name}/-/{name}-1.0.0.tgz");
+        if path == meta_path {
+            let body = serde_json::to_vec(&packument(
+                "1.0.0",
+                format!("{}{tgz_path}", base.trim_end_matches('/')),
+                integrity.clone(),
+            ))
+            .unwrap();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.write_all(&body);
+            return;
+        }
+        if path == tgz_path {
+            // Delay so the single worker stalls and the channel overflows.
+            thread::sleep(Duration::from_millis(30));
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                tgz.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.write_all(tgz);
+            return;
+        }
+    }
+    let _ = stream
+        .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
 }

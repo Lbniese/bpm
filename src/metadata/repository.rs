@@ -1136,7 +1136,10 @@ impl LeaseGuard {
     /// is held across its publication check + insert so GC cannot delete it
     /// between publication and lease recording.
     pub fn extend(&mut self, keys: &[ObjectKey]) -> Result<(), MetadataError> {
-        let new_keys = canonical_keys(keys);
+        let new_keys = canonical_keys(keys)
+            .into_iter()
+            .filter(|key| !self.keys.contains(key))
+            .collect::<Vec<_>>();
         if new_keys.is_empty() {
             return Ok(());
         }
