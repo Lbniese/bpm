@@ -136,7 +136,8 @@ fn package_file_list(
         .unwrap_or_default();
     let ignore_patterns = load_ignore_patterns(root)?;
     let mut files = Vec::new();
-    collect_files(root, root, &mut files)?;
+    let root_real = root.canonicalize()?;
+    collect_files(root, &root_real, root, &mut files)?;
     files.retain(|path| should_publish(path, &declared_files, &ignore_patterns));
     let mut set = files.into_iter().collect::<BTreeSet<_>>();
     for always in always_include(root) {
@@ -147,6 +148,7 @@ fn package_file_list(
 
 fn collect_files(
     root: &std::path::Path,
+    root_real: &std::path::Path,
     dir: &std::path::Path,
     out: &mut Vec<String>,
 ) -> anyhow::Result<()> {
@@ -160,16 +162,46 @@ fn collect_files(
         }
         let path = entry.path();
         if entry.file_type()?.is_dir() {
-            collect_files(root, &path, out)?;
-        } else if entry.file_type()?.is_file() || entry.file_type()?.is_symlink() {
+            collect_files(root, root_real, &path, out)?;
+        } else if entry.file_type()?.is_file() {
             let rel = path
                 .strip_prefix(root)?
                 .to_string_lossy()
                 .replace('\\', "/");
             out.push(rel);
+        } else if entry.file_type()?.is_symlink() {
+            let rel = path
+                .strip_prefix(root)?
+                .to_string_lossy()
+                .replace('\\', "/");
+            validate_publish_symlink(root_real, &path, &rel)?;
         }
     }
     Ok(())
+}
+
+fn validate_publish_symlink(
+    root_real: &std::path::Path,
+    path: &std::path::Path,
+    rel: &str,
+) -> anyhow::Result<()> {
+    let target = fs::read_link(path)
+        .map_err(|error| anyhow::anyhow!("failed to inspect symlink target for {rel}: {error}"))?;
+    let absolute_target = if target.is_absolute() {
+        target
+    } else {
+        path.parent().unwrap_or(root_real).join(target)
+    };
+
+    let absolute_target = absolute_target
+        .canonicalize()
+        .map_err(|_| anyhow::anyhow!("publish rejected dangling symlink target for {rel}"))?;
+
+    if !absolute_target.starts_with(root_real) {
+        anyhow::bail!("publish rejected symlink {rel} outside project root");
+    }
+
+    anyhow::bail!("publish does not support symlink entries: {rel}")
 }
 
 fn should_publish(path: &str, declared_files: &[String], ignore_patterns: &[String]) -> bool {

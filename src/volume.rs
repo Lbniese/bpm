@@ -188,20 +188,36 @@ pub fn read_graph_inventory(volume_path: &Path) -> Option<GraphInventory> {
     if meta.inventory_version < INVENTORY_VERSION {
         return None;
     }
-    let mut artifacts: Vec<(String, bool)> = meta
-        .artifacts
-        .into_iter()
-        .filter(|entry| valid_hex(&entry.id, 128))
-        .map(|entry| (entry.id, entry.requires_image))
-        .collect();
+    parse_graph_inventory(meta)
+}
+
+fn parse_graph_inventory(meta: VolumeMeta) -> Option<GraphInventory> {
+    let mut artifacts: Vec<(String, bool)> = Vec::with_capacity(meta.artifacts.len());
+    let mut artifact_ids: BTreeSet<String> = BTreeSet::new();
+    for entry in meta.artifacts {
+        if !valid_hex(&entry.id, 128) {
+            return None;
+        }
+        if !artifact_ids.insert(entry.id.clone()) {
+            return None;
+        }
+        artifacts.push((entry.id, entry.requires_image));
+    }
     artifacts.sort();
-    let mut derived: Vec<String> = meta
-        .derived
-        .into_iter()
-        .filter(|id| valid_hex(id, 64))
-        .collect();
+
+    let mut derived: Vec<String> = Vec::with_capacity(meta.derived.len());
+    let mut derived_ids: BTreeSet<String> = BTreeSet::new();
+    for id in meta.derived {
+        if !valid_hex(&id, 64) {
+            return None;
+        }
+        if !derived_ids.insert(id.clone()) {
+            return None;
+        }
+        derived.push(id);
+    }
     derived.sort();
-    derived.dedup();
+
     Some(GraphInventory { artifacts, derived })
 }
 
