@@ -338,6 +338,19 @@ impl ArtifactStore {
         let created = self.publish_file(&origin_tmp, &destination)?;
         metrics.record("remote_cache_download", std::time::Duration::ZERO);
         metrics.record("integrity_verify", std::time::Duration::ZERO);
+        // Best-effort upload to the remote cache (Plan 023). Only fires when
+        // push is explicitly enabled (`BPM_REMOTE_CACHE_PUSH=1`). The just-
+        // published artifact's verified SHA-512 is the push digest; a push
+        // failure is a warning + metric, never an install failure.
+        if remote.push_enabled() {
+            match fs::read(&destination) {
+                Ok(bytes) => match remote.put_artifact(&id, &bytes) {
+                    Ok(()) => metrics.record("remote_cache_push", std::time::Duration::ZERO),
+                    Err(_) => metrics.record("remote_cache_push_error", std::time::Duration::ZERO),
+                },
+                Err(_) => metrics.record("remote_cache_push_error", std::time::Duration::ZERO),
+            }
+        }
         Ok(RemoteArtifactResult {
             artifact: ArtifactRef {
                 id,

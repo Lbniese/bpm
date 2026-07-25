@@ -143,6 +143,10 @@ pub enum RemoteCacheError {
 pub struct RemoteCacheClient {
     config: RemoteCacheConfig,
     client: Client,
+    /// When `true`, the client uploads freshly origin-fetched artifacts to
+    /// the cache via `PUT` (`BPM_REMOTE_CACHE_PUSH=1`). Default `false` —
+    /// read-through only. Push is strictly best-effort.
+    push_enabled: bool,
 }
 
 impl fmt::Debug for RemoteCacheClient {
@@ -155,6 +159,19 @@ impl fmt::Debug for RemoteCacheClient {
 
 impl RemoteCacheClient {
     pub fn new(config: RemoteCacheConfig) -> Result<Self, RemoteCacheError> {
+        let push_enabled = matches!(
+            std::env::var("BPM_REMOTE_CACHE_PUSH").as_deref(),
+            Ok("1" | "true")
+        );
+        Self::with_push(config, push_enabled)
+    }
+
+    /// Construct the client with an explicit push enable flag (default
+    /// `false`). Used by tests and by callers that already resolved the flag.
+    pub fn with_push(
+        config: RemoteCacheConfig,
+        push_enabled: bool,
+    ) -> Result<Self, RemoteCacheError> {
         let client = ClientBuilder::new()
             .redirect(Policy::none())
             .timeout(Duration::from_secs(60))
@@ -163,11 +180,21 @@ impl RemoteCacheClient {
                 endpoint: config.base_url().to_string(),
                 message: "client setup failed".into(),
             })?;
-        Ok(Self { config, client })
+        Ok(Self {
+            config,
+            client,
+            push_enabled,
+        })
     }
 
     pub fn config(&self) -> &RemoteCacheConfig {
         &self.config
+    }
+
+    /// Whether artifact upload (`PUT`) is enabled. Read-through callers check
+    /// this before issuing a best-effort `put_artifact`.
+    pub fn push_enabled(&self) -> bool {
+        self.push_enabled
     }
 
     /// Stream one raw artifact into an unpublished caller-owned temp file.
@@ -245,6 +272,47 @@ impl RemoteCacheClient {
             })?;
         Ok(RemoteFetch::Hit {
             bytes_written: bytes,
+        })
+    }
+
+    /// Upload one raw artifact (`.tgz` bytes) to the cache keyed by its
+    /// verified SHA-512 digest. **Best-effort**: the caller treats any error
+    /// as a warning + metric and never fails the install. The digest in the
+    /// path must equal the artifact's verified SHA-512 (computed during store
+    /// publication) — the client does not rehash or trust a path-derived
+    /// value. `200`/`201`/`409` are success (stored / already stored); any
+    /// other status or transport failure is returned as `RemoteCacheError`.
+    pub fn put_artifact(&self, id: &ArtifactId, body: &[u8]) -> Result<(), RemoteCacheError> {
+        let endpoint = format!(
+            "{}/v1/artifacts/sha512/{}",
+            self.config.base_url().trim_end_matches('/'),
+            id.to_hex()
+        );
+        let mut request = self
+            .client
+            .put(&endpoint)
+            .header("Content-Type", "application/octet-stream")
+            .body(body.to_vec());
+        if let Some(token) = &self.config.token {
+            request = request.bearer_auth(&token.0);
+        }
+        let response = request.send().map_err(|error| RemoteCacheError::Request {
+            endpoint: endpoint.clone(),
+            message: classify_reqwest(&error),
+        })?;
+        let status = response.status().as_u16();
+        // 200/201 = stored; 409 = already exists (idempotent success). Auth
+        // errors (401/403) and any other 4xx/5xx are failures the caller
+        // reports as a redacted warning + metric.
+        if status == 200 || status == 201 || status == 409 {
+            return Ok(());
+        }
+        if (300..400).contains(&status) {
+            return Err(RemoteCacheError::Redirect { endpoint });
+        }
+        Err(RemoteCacheError::Request {
+            endpoint,
+            message: format!("HTTP status {status}"),
         })
     }
 }
