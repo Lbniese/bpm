@@ -1,6 +1,7 @@
 # Remote Artifact Cache Protocol v1
 
-> **Experimental** — read-through only. Upload is reserved for a follow-up plan.
+> **Experimental** — read-through fetch by default; best-effort upload (`PUT`)
+> is opt-in via `BPM_REMOTE_CACHE_PUSH=1` and never blocks an install.
 
 ## Base URL and path
 
@@ -9,6 +10,9 @@ GET <base>/v1/artifacts/sha512/<128-lowercase-hex>
 Authorization: Bearer <token>   # only when configured
 Accept: application/octet-stream
 ```
+
+The same path is used for both directions; only the method differs (`GET` to
+fetch, `PUT` to upload).
 
 - `<base>` is an absolute HTTPS URL.
 - The path is always `/v1/artifacts/sha512/` followed by the 128-character
@@ -27,6 +31,36 @@ Accept: application/octet-stream
 | 404 | cache miss | Clean temp file; fall back to origin registry tarball download. |
 | 401 / 403 | auth error | Warn once per command (redacted), record `remote_cache_error` metric, fall back to origin. |
 | other 4xx / 5xx / transport error | upstream failure | Warn in redacted form, record metric, fall back to origin. |
+
+## Upload (`PUT`)
+
+```
+PUT <base>/v1/artifacts/sha512/<128-lowercase-hex>
+Authorization: Bearer <token>   # only when configured
+Content-Type: application/octet-stream
+
+<raw .tgz bytes>
+```
+
+Upload is **opt-in**: it fires only when `BPM_REMOTE_CACHE_PUSH=1` is set
+(default OFF). After a successful origin fetch + store publication, BPM reads
+the just-stored artifact and streams its bytes to the cache keyed by the
+artifact's **verified SHA-512** (the digest computed during publication — the
+client never recomputes or trusts a path-derived value). Upload is strictly
+**best-effort**: any failure records a `remote_cache_push_error` metric and the
+install continues unaffected.
+
+### Upload responses
+
+| Status | Meaning | Behaviour |
+|--------|---------|----------|
+| 200 / 201 | stored | Record `remote_cache_push` metric. |
+| 409 | already exists | Idempotent success; record `remote_cache_push` metric. |
+| 401 / 403 | auth error | Record `remote_cache_push_error` metric (redacted); continue. |
+| other 4xx / 5xx / transport error | upstream failure | Record `remote_cache_push_error` metric (redacted); continue. |
+
+A redirect response to a `PUT` is rejected (the client does not follow it) and
+recorded as a push error.
 
 ## Redirects
 
