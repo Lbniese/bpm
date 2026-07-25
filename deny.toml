@@ -26,6 +26,11 @@ allow = [
     "Unicode-3.0",
     "Zlib",
     "CC0-1.0",
+    # Permissive data license covering the bundled CA root certificate bundle
+    # pulled in transitively by webpki-root-certs (via rustls-platform-verifier
+    # -> reqwest). Not OSI-approved (it governs data, not code) but permissive
+    # and standard for the rustls/webpki root-cert stack.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.8
 
