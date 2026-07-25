@@ -806,3 +806,71 @@ fn bpm_git_prepare_changed_commit_distinct_image() {
         "different commits should produce distinct prepared outputs"
     );
 }
+
+#[test]
+fn bpm_git_prepare_default_on_kill_switch() {
+    // After Plan 020, git-prepare is default-on. BPM_GIT_PREPARE=0 is the
+    // kill-switch: even without --no-git-prepare, setting the env var to "0"
+    // must suppress the prepare lifecycle.
+    if !tool_available("git") || !tool_available("node") {
+        eprintln!("skipping BPM Git-prepare kill-switch test: missing git or node");
+        return;
+    }
+
+    let fixture = build_fixture();
+    let url = format!(
+        "git+file://{}#{}",
+        fixture.repo.display(),
+        fixture.good_rev1
+    );
+    let dir = consumer(&url);
+    let store = tempfile::tempdir().unwrap();
+
+    // Run install with BPM_GIT_PREPARE=0 and WITHOUT the --git-prepare flag.
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_bpm"));
+    cmd.arg("install")
+        .arg("--store")
+        .arg(store.path())
+        .arg("--concurrency")
+        .arg("1")
+        .env("BPM_GIT_PREPARE", "0")
+        .current_dir(dir.path());
+    let output = cmd.output().expect("failed to spawn bpm");
+    eprintln!("bpm stdout: {}", String::from_utf8_lossy(&output.stdout));
+    eprintln!("bpm stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "bpm install should succeed even with kill-switch: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Prepare-specific output (dist/built.js) must NOT exist — only the
+    // standard install lifecycle runs when git-prepare is suppressed.
+    let built_js = dir.path().join("node_modules/gitpkg/dist/built.js");
+    assert!(
+        !built_js.exists(),
+        "BPM_GIT_PREPARE=0 must suppress prepare: dist/built.js should not exist"
+    );
+
+    // phases.log will exist from the standard install lifecycle
+    // (preinstall/install/postinstall) but must NOT contain prepare-family phases.
+    let phases = read_phases(dir.path());
+    eprintln!("phases under kill-switch: {phases:?}");
+    assert!(
+        !phases.is_empty(),
+        "standard install lifecycle should still run under kill-switch"
+    );
+    for p in &phases {
+        assert!(
+            !p.phase.contains("prepare"),
+            "prepare-family phases must NOT run under kill-switch, got: {}",
+            p.phase
+        );
+    }
+
+    // Raw source should still be installed.
+    assert!(
+        dir.path().join("node_modules/gitpkg").exists(),
+        "raw git source should still be installed under kill-switch"
+    );
+}

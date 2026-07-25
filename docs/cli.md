@@ -114,7 +114,7 @@ Notes:
 | `--registry <url>` | Registry base URL for spec resolution (bin-install mode only). |
 | `--store <dir>` | Store root. Defaults to `$BPM_STORE`, then `$HOME/.bpm`. |
 | `--frozen`, `--concurrency`, `--json-metrics`, `--ignore-scripts`, `--legacy-peer-deps` | Apply to the lockfile install mode (no `<target>`). `--frozen` accepts either `bpm.lock` or supported `package-lock.json` v3 and reports drift against the selected lock filename. |
-| `--git-prepare` | Run npm-compatible Git build-context `prepare` for Git dependencies using a transient regular+dev closure. Explicitly opt-in; `BPM_GIT_PREPARE=1` is equivalent. |
+| `--git-prepare` | Run npm-compatible Git build-context `prepare` for Git dependencies using a transient regular+dev closure. **Enabled by default** for Git dependencies; disable with `--no-git-prepare` or `BPM_GIT_PREPARE=0`. |
 | `--derived-store` | Reuse lifecycle-derived package images across changed graphs. Explicitly opt-in; `BPM_DERIVED_STORE=1` is equivalent. |
 
 ### Direct `package-lock.json` use and `bpm ci`
@@ -208,6 +208,39 @@ bpm outdated                       # show all outdated packages
 bpm outdated lodash                # check only lodash
 bpm outdated --json                # machine-readable output
 bpm outdated --offline             # cached metadata only
+```
+
+## `bpm why <package>`
+
+Shows why a package is present in the dependency tree by walking the lockfile
+in reverse: for each installed version of the target package, it reports which
+packages (or the root project) declare a dependency on it.
+
+The output format follows npm's convention:
+
+```
+lodash@4.17.21
+  root: lodash@^4.17.0
+```
+
+A transitive dependency shows which package requires it:
+
+```
+accepts@1.3.8
+  express@4.18.2 requires accepts@^1.3.8
+```
+
+If multiple packages depend on the same target, each is listed. If a package
+has no dependents (orphaned or direct dependency without a root entry), the
+output shows `<no parents>`.
+
+The command is lockfile-local and read-only — it never contacts the registry
+or modifies any files. A lockfile (`bpm.lock` or supported `package-lock.json`
+v3) must exist.
+
+```bash
+bpm why lodash               # show why lodash is installed
+bpm why accepts              # show who depends on accepts
 ```
 
 ## `bpm gc [flags]`
