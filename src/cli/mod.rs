@@ -13,6 +13,7 @@ mod mutate;
 mod outdated;
 mod publish;
 mod run;
+mod why;
 
 use std::process::ExitCode;
 
@@ -199,6 +200,7 @@ pub(crate) fn run() -> ExitCode {
             offline,
             json,
         } => outdated::run(target, registry, store, offline, json),
+        Commands::Why { target } => why::execute(&target),
         Commands::Uninstall {
             names,
             registry,
