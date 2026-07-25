@@ -431,7 +431,10 @@ fn reference_baseline_has_strict_expected_keys_and_versions() {
 fn profile_filenames_and_manifest_are_deterministic() {
     let temp = tempfile::tempdir().unwrap();
     let mut versions = BTreeMap::new();
-    versions.insert("bpm".to_string(), "bpm 0.0.1".to_string());
+    versions.insert(
+        "bpm".to_string(),
+        format!("bpm {}", env!("CARGO_PKG_VERSION")),
+    );
     versions.insert("node".to_string(), "v26.0.0".to_string());
     let manifest = BpmProfileManifest {
         fixture: "minimal".to_string(),
@@ -507,7 +510,10 @@ fn result_with_tools(
         ("node".to_string(), "v26.0.0".to_string()),
         ("npm".to_string(), "11.12.1".to_string()),
         ("pnpm".to_string(), "10.13.1".to_string()),
-        ("bpm".to_string(), "bpm 0.0.1".to_string()),
+        (
+            "bpm".to_string(),
+            format!("bpm {}", env!("CARGO_PKG_VERSION")),
+        ),
     ]);
     BenchmarkResult {
         scenario: scenario.to_string(),

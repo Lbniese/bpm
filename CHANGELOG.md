@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-07-25
+
+Reliability, correctness, and performance improvements on top of the initial public release.
+
+### Added
+
+- **Full frozen-lock correctness**. Frozen installs now fail fast on changed
+  dependency specifications (not just missing/added names), and the diff shown by
+  `bpm install --frozen` / `bpm ci` includes explicit spec drift details.
+- **Hardened async resolver metadata pipeline**. Async metadata fetch now supports
+  correct `200`/`304` caching semantics, shared retry behavior, bounded overflow
+  handling, and end-to-end request persistence across the streaming install path.
+- **Production-safe cache ownership**. Installed graph state now persists durable
+  ownership and lock-based leases so GC and rebuild operations remain correct under
+  concurrent operations and process crashes.
+- **Race-safe source caches**. Git/patch source caches now publish deterministically
+  under advisory locking to avoid concurrent cache corruption.
+- **Leaner materialization validation**. Package-image metadata can be decoded from
+  `.bpi` sidecars without reading file payloads, reducing disk pressure during
+  install.
+- **Tooling readiness**. Release assets keep using deterministic artifact checksums,
+  and installer/CI paths include stronger verification and regression controls for
+  release integrity.
+
 ## [0.0.1] - 2026-07-21
 
 First public release. BPM is an npm-compatible, performance-focused package
@@ -65,5 +89,6 @@ downloads, extraction, resolution, and materialization.
   package and bin path before mutation; git-source argument hardening against
   argument injection; and integrity verification before publication.
 
-[Unreleased]: https://github.com/lbniese/bpm/compare/v0.0.1...HEAD
+[Unreleased]: https://github.com/lbniese/bpm/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/lbniese/bpm/releases/tag/v0.1.0
 [0.0.1]: https://github.com/lbniese/bpm/releases/tag/v0.0.1
