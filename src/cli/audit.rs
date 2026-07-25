@@ -44,9 +44,8 @@ pub(super) fn run(
     let threshold = Severity::parse(audit_level)?;
     let cwd = env::current_dir()?;
     let root = bpm::project::find_project_root(&cwd)?;
-    let manifest: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(root.join("package.json"))?)?;
-    let body = normalized_audit_body(&root, &manifest)?;
+    let body = audit_bulk_body(&root)?;
+    let package_count = body.as_object().map(serde_json::Map::len).unwrap_or(0);
 
     if offline {
         if json_output {
@@ -60,12 +59,8 @@ pub(super) fn run(
                 }))?
             );
         } else {
-            let requires = body
-                .get("requires")
-                .and_then(|value| value.as_object())
-                .map_or(0, serde_json::Map::len);
             println!(
-                "audit offline: normalized {requires} package request(s); no advisory registry queried"
+                "audit offline: normalized {package_count} package request(s); no advisory registry queried"
             );
         }
         return Ok(());
@@ -78,7 +73,12 @@ pub(super) fn run(
         None => config,
     };
     let client = bpm::http::HttpClient::new(config.clone());
-    let endpoint = format!("{}/-/npm/v1/security/audits", config.registry());
+    // npm's modern audit uses the bulk advisory endpoint, NOT the legacy
+    // `/-/npm/v1/security/audits` path. The bulk endpoint accepts a flat
+    // `{package_name: [version, ...]}` body and returns the matched advisories.
+    // Posting a lockfile-shaped body to the old `audits` path made npm respond
+    // HTTP 400 Bad Request.
+    let endpoint = format!("{}/-/npm/v1/security/advisories/bulk", config.registry());
     let response = client
         .post_json(&endpoint, serde_json::to_vec(&body)?.as_slice())
         .map_err(|e| anyhow::anyhow!("audit failed: {e}"))?;
@@ -95,12 +95,8 @@ pub(super) fn run(
     if json_output {
         println!("{}", serde_json::to_string_pretty(&value)?);
     } else {
-        let requires = body
-            .get("requires")
-            .and_then(|value| value.as_object())
-            .map_or(0, serde_json::Map::len);
         println!(
-            "audited {requires} package requests; {total} vulnerability finding(s) ({} at or above {})",
+            "audited {package_count} package request(s); {total} vulnerability finding(s) ({} at or above {})",
             failing,
             threshold.as_str()
         );
@@ -115,69 +111,87 @@ pub(super) fn run(
     Ok(())
 }
 
-fn normalized_audit_body(
-    root: &std::path::Path,
-    manifest: &serde_json::Value,
-) -> anyhow::Result<serde_json::Value> {
-    let requires = manifest_requires(manifest);
-    let bpm_lock = root.join(bpm::lockfile::BPM_LOCK_FILE);
-    let install = if bpm_lock.is_file() {
-        normalize_bpm_lock(&bpm::lockfile::Lockfile::from_path(&bpm_lock)?)
-    } else {
-        let package_lock = root.join("package-lock.json");
-        fs::read_to_string(&package_lock)
-            .ok()
-            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-            .unwrap_or_else(|| json!({"lockfileVersion": 0, "packages": {}}))
-    };
-    Ok(json!({"requires": requires, "install": install}))
-}
+/// Build the npm bulk-audit request body: a flat JSON object mapping each
+/// dependency package **name** to the distinct set of resolved **versions**
+/// present in the tree, e.g. `{"react": ["19.2.8"], "@types/unist": ["3.0.3", "2.0.11"]}`.
+///
+/// This is exactly what `npm audit` POSTs to
+/// `/-/npm/v1/security/advisories/bulk`. The registry matches each
+/// `name@version` against its advisory database and returns the per-package
+/// advisory lists. Integrity hashes and the dependency graph are not required
+/// for the lookup.
+fn audit_bulk_body(root: &std::path::Path) -> anyhow::Result<serde_json::Value> {
+    let mut groups: BTreeMap<String, std::collections::BTreeSet<String>> = BTreeMap::new();
 
-fn manifest_requires(manifest: &serde_json::Value) -> BTreeMap<String, String> {
-    let mut requires = BTreeMap::new();
-    for group in ["dependencies", "devDependencies", "optionalDependencies"] {
-        if let Some(values) = manifest.get(group).and_then(|v| v.as_object()) {
-            for (name, spec) in values {
-                requires.insert(name.clone(), spec.as_str().unwrap_or("*").to_string());
+    let bpm_lock = root.join(bpm::lockfile::BPM_LOCK_FILE);
+    if bpm_lock.is_file() {
+        let lockfile = bpm::lockfile::Lockfile::from_path(&bpm_lock)?;
+        groups = bulk_groups_from_lockfile(&lockfile);
+    } else {
+        // Fallback: derive name -> versions from an npm package-lock.json when
+        // no bpm.lock exists. package-lock v3 keys are `node_modules/...` paths;
+        // the package name is the final path segment (handling `@scope/name`).
+        let package_lock = root.join("package-lock.json");
+        if let Ok(text) = fs::read_to_string(&package_lock) {
+            if let Ok(lock) = serde_json::from_str::<serde_json::Value>(&text) {
+                if let Some(packages) = lock.get("packages").and_then(|v| v.as_object()) {
+                    for (path, entry) in packages {
+                        if let Some(name) = package_name_from_lock_path(path) {
+                            if let Some(version) = entry.get("version").and_then(|v| v.as_str()) {
+                                groups.entry(name).or_default().insert(version.to_string());
+                            }
+                        }
+                    }
+                }
             }
         }
     }
-    requires
+
+    let body: serde_json::Map<String, serde_json::Value> = groups
+        .into_iter()
+        .map(|(name, versions)| {
+            (
+                name,
+                serde_json::Value::Array(
+                    versions.into_iter().map(serde_json::Value::from).collect(),
+                ),
+            )
+        })
+        .collect();
+    Ok(serde_json::Value::Object(body))
 }
 
-fn normalize_bpm_lock(lockfile: &bpm::lockfile::Lockfile) -> serde_json::Value {
-    let mut packages = serde_json::Map::new();
-    packages.insert(
-        "".into(),
-        json!({
-            "name": lockfile.root.name,
-            "version": lockfile.root.version,
-            "dependencies": lockfile.root.dependencies,
-        }),
-    );
+/// Group every resolved package in a bpm lockfile by name, collecting the
+/// distinct set of versions installed for each (so a package present at the
+/// same version in multiple locations contributes one entry).
+fn bulk_groups_from_lockfile(
+    lockfile: &bpm::lockfile::Lockfile,
+) -> BTreeMap<String, std::collections::BTreeSet<String>> {
+    let mut groups: BTreeMap<String, std::collections::BTreeSet<String>> = BTreeMap::new();
     for package in &lockfile.packages {
-        let mut value = json!({
-            "name": package.name,
-            "version": package.version,
-            "resolved": package.resolved,
-            "integrity": package.integrity,
-            "dependencies": package.dependencies,
-            "dev": package.dev,
-            "optional": package.optional,
-            "link": package.link,
-        });
-        if let Some(object) = value.as_object_mut() {
-            object.retain(|_, value| !value.is_null());
+        // Skip workspace/file links and entries without a resolved version.
+        if package.link || package.version.is_empty() {
+            continue;
         }
-        packages.insert(package.path.clone(), value);
+        groups
+            .entry(package.name.clone())
+            .or_default()
+            .insert(package.version.clone());
     }
-    json!({
-        "name": lockfile.root.name,
-        "version": lockfile.root.version,
-        "lockfileVersion": 3,
-        "requires": true,
-        "packages": packages,
-    })
+    groups
+}
+
+/// Derive a package name from a package-lock v3 `packages` key
+/// (`node_modules/...` path). Takes the segment after the last
+/// `node_modules/` so scoped (`@scope/name`) and nested installs resolve to
+/// the installed package's name.
+fn package_name_from_lock_path(path: &str) -> Option<String> {
+    let tail = path.rsplit("node_modules/").next()?;
+    if tail.is_empty() {
+        None
+    } else {
+        Some(tail.to_string())
+    }
 }
 
 fn severity_zeroes() -> BTreeMap<&'static str, u64> {
@@ -190,6 +204,9 @@ fn severity_zeroes() -> BTreeMap<&'static str, u64> {
     ])
 }
 
+/// Count advisory severities from a `/-/npm/v1/security/advisories/bulk`
+/// response, which maps each package name to an array of advisory objects,
+/// each carrying a `severity` field.
 fn severity_counts(value: &serde_json::Value) -> BTreeMap<Severity, u64> {
     let mut counts = BTreeMap::from([
         (Severity::Info, 0),
@@ -198,28 +215,14 @@ fn severity_counts(value: &serde_json::Value) -> BTreeMap<Severity, u64> {
         (Severity::High, 0),
         (Severity::Critical, 0),
     ]);
-    if let Some(vulnerabilities) = value
-        .get("metadata")
-        .and_then(|v| v.get("vulnerabilities"))
-        .and_then(|v| v.as_object())
-    {
-        for (severity, count) in vulnerabilities {
-            if severity == "total" {
-                continue;
-            }
-            if let (Ok(severity), Some(count)) = (Severity::parse(severity), count.as_u64()) {
-                *counts.entry(severity).or_default() += count;
-            }
-        }
-    }
-    if counts.values().all(|count| *count == 0) {
-        // Legacy audit responses can expose advisory objects instead of the
-        // metadata aggregate. Count each advisory by its severity.
-        if let Some(advisories) = value.get("advisories").and_then(|v| v.as_object()) {
-            for advisory in advisories.values() {
-                if let Some(severity) = advisory.get("severity").and_then(|v| v.as_str()) {
-                    if let Ok(severity) = Severity::parse(severity) {
-                        *counts.entry(severity).or_default() += 1;
+    if let Some(map) = value.as_object() {
+        for advisories in map.values() {
+            if let Some(arr) = advisories.as_array() {
+                for advisory in arr {
+                    if let Some(severity) = advisory.get("severity").and_then(|v| v.as_str()) {
+                        if let Ok(severity) = Severity::parse(severity) {
+                            *counts.entry(severity).or_default() += 1;
+                        }
                     }
                 }
             }
@@ -232,32 +235,131 @@ fn severity_counts(value: &serde_json::Value) -> BTreeMap<Severity, u64> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn severity_threshold_counts_at_or_above_level() {
-        let value = json!({"metadata":{"vulnerabilities":{"low":2,"moderate":1,"high":1,"critical":0,"total":4}}});
-        let counts = severity_counts(&value);
-        let threshold = Severity::Moderate;
-        let failing = counts
-            .iter()
-            .filter(|(severity, _)| **severity >= threshold)
-            .map(|(_, count)| *count)
-            .sum::<u64>();
-        assert_eq!(failing, 2);
+    fn sample_lockfile() -> bpm::lockfile::Lockfile {
+        use bpm::lockfile::{Lockfile, PackageEntry, RootEntry};
+        use std::collections::BTreeMap;
+        let mut root_deps = BTreeMap::new();
+        root_deps.insert("react".to_string(), "^19.0.0".to_string());
+        // Two distinct react placements at the SAME version (nested + hoisted)
+        // to prove the version set is deduped.
+        let react_hoisted = PackageEntry {
+            path: "node_modules/react".into(),
+            name: "react".into(),
+            version: "19.2.8".into(),
+            resolved: "https://registry.npmjs.org/react/-/react-19.2.8.tgz".into(),
+            integrity: Some("sha512-PROD".into()),
+            ..Default::default()
+        };
+        let react_nested = PackageEntry {
+            path: "node_modules/foo/node_modules/react".into(),
+            name: "react".into(),
+            version: "19.2.8".into(),
+            resolved: "https://registry.npmjs.org/react/-/react-19.2.8.tgz".into(),
+            integrity: Some("sha512-PROD".into()),
+            ..Default::default()
+        };
+        let jest = PackageEntry {
+            path: "node_modules/jest".into(),
+            name: "jest".into(),
+            version: "29.0.0".into(),
+            resolved: "https://registry.npmjs.org/jest/-/jest-29.0.0.tgz".into(),
+            integrity: Some("sha512-DEV".into()),
+            dev: true,
+            ..Default::default()
+        };
+        // A workspace link entry with no resolved version; must be skipped.
+        let linked = PackageEntry {
+            path: "node_modules/my-workspace".into(),
+            name: "my-workspace".into(),
+            version: String::new(),
+            link: true,
+            ..Default::default()
+        };
+        Lockfile {
+            lockfile_version: 3,
+            generator: "bpm-test".into(),
+            root: RootEntry {
+                name: Some("demo".into()),
+                version: Some("1.0.0".into()),
+                dependencies: root_deps,
+            },
+            packages: vec![react_hoisted, react_nested, jest, linked],
+            resolution: Default::default(),
+        }
     }
 
     #[test]
-    fn manifest_requires_is_deterministic_across_dependency_groups() {
-        let manifest = json!({
-            "optionalDependencies": {"c":"3"},
-            "dependencies": {"a":"1"},
-            "devDependencies": {"b":"2"}
-        });
+    fn audit_bulk_body_groups_and_dedupes_versions_by_name() {
+        let groups = bulk_groups_from_lockfile(&sample_lockfile());
+        let body: serde_json::Map<String, serde_json::Value> = groups
+            .into_iter()
+            .map(|(name, versions)| {
+                (
+                    name,
+                    serde_json::Value::Array(
+                        versions.into_iter().map(serde_json::Value::from).collect(),
+                    ),
+                )
+            })
+            .collect();
+        let body = serde_json::Value::Object(body);
+        // Flat {name: [versions]} shape — no lockfile wrappers.
+        assert!(body.get("packages").is_none());
+        assert!(body.get("requires").is_none());
+        assert!(body.get("metadata").is_none());
+        // react deduped to a single version despite two placements.
+        assert_eq!(body["react"].as_array().unwrap(), &vec![json!("19.2.8")]);
+        // jest kept, link-without-version skipped.
+        assert_eq!(body["jest"].as_array().unwrap(), &vec![json!("29.0.0")]);
+        assert!(body.get("my-workspace").is_none());
+        assert_eq!(body.as_object().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn package_name_from_lock_path_handles_scoped_and_nested() {
         assert_eq!(
-            manifest_requires(&manifest)
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>(),
-            ["a", "b", "c"]
+            package_name_from_lock_path("node_modules/@scope/pkg").as_deref(),
+            Some("@scope/pkg")
         );
+        assert_eq!(
+            package_name_from_lock_path("node_modules/foo").as_deref(),
+            Some("foo")
+        );
+        assert_eq!(
+            package_name_from_lock_path("node_modules/a/node_modules/b").as_deref(),
+            Some("b")
+        );
+        assert_eq!(package_name_from_lock_path(""), None);
+    }
+
+    #[test]
+    fn severity_counts_parses_bulk_response() {
+        let value = json!({
+            "@hono/node-server": [
+                {"id": 1124006, "severity": "moderate", "title": "path traversal"},
+                {"id": 1124007, "severity": "high"}
+            ],
+            "lodash": [
+                {"id": 100, "severity": "low"}
+            ],
+            "clean-pkg": []
+        });
+        let counts = severity_counts(&value);
+        let failing_at_moderate = counts
+            .iter()
+            .filter(|(severity, _)| **severity >= Severity::Moderate)
+            .map(|(_, count)| *count)
+            .sum::<u64>();
+        // moderate(1) + high(1) = 2 at or above moderate.
+        assert_eq!(failing_at_moderate, 2);
+        // total across all severities = 3.
+        assert_eq!(counts.values().copied().sum::<u64>(), 3);
+    }
+
+    #[test]
+    fn empty_bulk_response_counts_zero() {
+        let value = json!({});
+        let counts = severity_counts(&value);
+        assert_eq!(counts.values().copied().sum::<u64>(), 0);
     }
 }
