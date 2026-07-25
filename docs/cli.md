@@ -173,6 +173,43 @@ Runs a command from the nearest project's `node_modules/.bin` with that
 folder prepended to `PATH`, preserving native arguments and the child's exit
 status.
 
+## `bpm outdated [target] [flags]`
+
+Shows packages whose locked version is older than the latest version published
+to the registry. The output format matches npm's convention:
+
+```
+Package              Current  Wanted   Latest
+lodash               4.17.21  4.17.21  5.0.0
+express              4.18.2   4.19.0   5.1.0
+```
+
+- **Current** — the version resolved in the project lockfile.
+- **Wanted** — the highest published version that satisfies the declared semver
+  range in `package.json`.
+- **Latest** — the `latest` dist-tag on the registry.
+
+When no packages are outdated, `bpm outdated` prints "All packages are up to
+date." and exits zero.
+
+An optional package name argument limits the check to that one package.
+Registry failures for individual packages produce warnings on stderr but do not
+stop the command — other packages are still reported.
+
+| Flag | Meaning |
+|------|---------|
+| `--registry <url>` | Registry base URL. Defaults to `$BPM_REGISTRY`, then the configured npm registry. |
+| `--store <dir>` | Store root. Defaults to `$BPM_STORE`, then `$HOME/.bpm`. |
+| `--offline` | Never contact the registry; resolve only against cached metadata. |
+| `--json` | Emit machine-readable JSON keyed by package name. |
+
+```bash
+bpm outdated                       # show all outdated packages
+bpm outdated lodash                # check only lodash
+bpm outdated --json                # machine-readable output
+bpm outdated --offline             # cached metadata only
+```
+
 ## `bpm gc [flags]`
 
 Removes unreferenced store objects older than 30 days. Use `--older-than 30d` to

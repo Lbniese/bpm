@@ -10,6 +10,7 @@ mod gc;
 mod import;
 mod install;
 mod mutate;
+mod outdated;
 mod publish;
 mod run;
 
@@ -191,6 +192,13 @@ pub(crate) fn run() -> ExitCode {
             Ok(())
         })(),
         Commands::Run { script } => run::run(&script),
+        Commands::Outdated {
+            target,
+            registry,
+            store,
+            offline,
+            json,
+        } => outdated::run(target, registry, store, offline, json),
         Commands::Uninstall {
             names,
             registry,

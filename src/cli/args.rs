@@ -320,6 +320,23 @@ pub(crate) enum Commands {
         /// Script name to run (for example `build`, `test`, or `preinstall`).
         script: String,
     },
+    /// Show outdated packages (resolved vs latest registry version).
+    Outdated {
+        /// Package name filter (omit for all packages).
+        target: Option<String>,
+        /// Registry base URL.
+        #[arg(long)]
+        registry: Option<String>,
+        /// Store root (defaults to `$BPM_STORE` or `$HOME/.bpm`).
+        #[arg(long)]
+        store: Option<PathBuf>,
+        /// Never contact the registry; resolve only against cached metadata.
+        #[arg(long)]
+        offline: bool,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[cfg(test)]
