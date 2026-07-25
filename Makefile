@@ -1,6 +1,6 @@
 SHELL := /bin/bash
 
-.PHONY: build test run lint fmt fmt-check clippy bench audit
+.PHONY: build test run lint fmt fmt-check clippy bench audit deny
 
 build:
 	cargo build
@@ -27,3 +27,10 @@ bench:
 
 audit:
 	cargo deny check advisories
+
+# Full local cargo-deny gate: advisories (the CI hard gate) plus the
+# licenses/bans/sources stretch tables. Catches new RUSTSEC advisories at the
+# desk before they can turn CI red — `make audit` runs the CI-matching
+# advisories-only subset.
+deny:
+	cargo deny check
