@@ -395,3 +395,138 @@ fn table_output_format() {
         "expected up-to-date message, got: {stdout}"
     );
 }
+
+// ── Concurrent-fan-out regression tests (Plan 024) ───────────────────────────
+//
+// `bpm outdated` now fans packument queries out across OS threads. Output
+// ordering must remain deterministic (independent of fetch completion order)
+// and a single per-package fetch failure must remain a warning, not a fatal
+// error. These tests run the mock registry in *online* mode (no `--offline`)
+// so the concurrent fetch path is actually exercised.
+
+#[test]
+fn concurrent_fetch_produces_deterministic_order() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_bpm_lock(
+        tmp.path(),
+        &[
+            (
+                "alpha",
+                "1.0.0",
+                "https://registry.npmjs.org/alpha/-/alpha-1.0.0.tgz",
+            ),
+            (
+                "beta",
+                "1.0.0",
+                "https://registry.npmjs.org/beta/-/beta-1.0.0.tgz",
+            ),
+            (
+                "gamma",
+                "1.0.0",
+                "https://registry.npmjs.org/gamma/-/gamma-1.0.0.tgz",
+            ),
+        ],
+    );
+    write_package_json(tmp.path(), &["alpha", "beta", "gamma"]);
+
+    let mut responses = std::collections::BTreeMap::new();
+    responses.insert(
+        "alpha".to_string(),
+        make_packument("alpha", &["1.0.0", "2.0.0"], "2.0.0"),
+    );
+    responses.insert(
+        "beta".to_string(),
+        make_packument("beta", &["1.0.0", "2.0.0"], "2.0.0"),
+    );
+    responses.insert(
+        "gamma".to_string(),
+        make_packument("gamma", &["1.0.0", "2.0.0"], "2.0.0"),
+    );
+
+    let (registry_url, shutdown, server) = mock_registry(responses);
+    let (stdout, stderr, code) = run_outdated(
+        tmp.path(),
+        &[
+            "--registry",
+            &registry_url,
+            "--store",
+            tmp.path().join("store").to_str().unwrap(),
+        ],
+    );
+    shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+    server.join().unwrap();
+
+    assert_eq!(
+        code,
+        Some(0),
+        "expected zero exit; stdout: {stdout}, stderr: {stderr}"
+    );
+
+    // All three should be reported as outdated. Output rows must appear in
+    // sorted/declared order (alpha, beta, gamma), not fetch-completion order.
+    let alpha = stdout.find("alpha").unwrap();
+    let beta = stdout.find("beta").unwrap();
+    let gamma = stdout.find("gamma").unwrap();
+    assert!(
+        alpha < beta && beta < gamma,
+        "expected alpha < beta < gamma in output; got: {stdout}"
+    );
+}
+
+#[test]
+fn concurrent_partial_fetch_failure_is_non_fatal() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_bpm_lock(
+        tmp.path(),
+        &[
+            (
+                "alpha",
+                "1.0.0",
+                "https://registry.npmjs.org/alpha/-/alpha-1.0.0.tgz",
+            ),
+            (
+                "missing-pkg",
+                "1.0.0",
+                "https://registry.npmjs.org/missing-pkg/-/missing-pkg-1.0.0.tgz",
+            ),
+        ],
+    );
+    write_package_json(tmp.path(), &["alpha", "missing-pkg"]);
+
+    // Only `alpha` is in the mock registry; `missing-pkg` returns 404.
+    let mut responses = std::collections::BTreeMap::new();
+    responses.insert(
+        "alpha".to_string(),
+        make_packument("alpha", &["1.0.0", "2.0.0"], "2.0.0"),
+    );
+
+    let (registry_url, shutdown, server) = mock_registry(responses);
+    let (stdout, stderr, code) = run_outdated(
+        tmp.path(),
+        &[
+            "--registry",
+            &registry_url,
+            "--store",
+            tmp.path().join("store").to_str().unwrap(),
+        ],
+    );
+    shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+    server.join().unwrap();
+
+    // The command must still succeed (partial results are OK).
+    assert_eq!(
+        code,
+        Some(0),
+        "partial fetch failure must not be fatal; stdout: {stdout}, stderr: {stderr}"
+    );
+    // The successful package is still reported.
+    assert!(
+        stdout.contains("alpha"),
+        "expected alpha row in output; got: {stdout}"
+    );
+    // The failed package produced a warning on stderr, not a fatal error.
+    assert!(
+        stderr.contains("failed to fetch metadata for missing-pkg"),
+        "expected a warning for missing-pkg; got: {stderr}"
+    );
+}
