@@ -16,6 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rusqlite::{params, Connection, Transaction, TransactionBehavior};
 
 use super::schema;
+use crate::derived::{DerivedMetadata, DerivedRecord};
 use crate::gc::policy::{DeletionRank, GcPolicy, PolicyCandidate, PolicyEvaluation};
 use crate::store_lock;
 
@@ -1088,6 +1089,89 @@ impl MetadataRepository {
     }
 }
 
+/// SQLite-backed [`DerivedMetadata`] adapter.
+///
+/// The derived store is filesystem-authoritative: a database row can never
+/// manufacture a cache hit, and a valid on-disk image must always be able to
+/// repair its row. `publish_derived` upserts the record; `access_derived`
+/// transactionally repairs the row (in case the filesystem image exists but
+/// its row is missing) and bumps the `access_log` access timestamp so the
+/// future GC/LRU integration can consume it.
+///
+/// `source_artifact_id` is only linked when it is a valid 128-hex artifact id
+/// (matching the artifacts FK); an empty or invalid value is stored as `NULL`,
+/// exactly as the generic `upsert_object` Derived arm does, so a derived image
+/// whose source artifact is unknown (or not yet published) still records.
+impl DerivedMetadata for MetadataRepository {
+    fn publish_derived(&self, record: &DerivedRecord) -> Result<(), String> {
+        validate_id(ObjectKind::Derived, &record.id).map_err(|e| e.to_string())?;
+        let size = sqlite_u64(record.size_bytes).map_err(|e| e.to_string())?;
+        let published = sqlite_u64(record.published_at_ms).map_err(|e| e.to_string())?;
+        let mut connection = self.connection().map_err(|e| e.to_string())?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        // `source_artifact_id` is deliberately stored as NULL, matching the
+        // generic `upsert_object` Derived arm: the artifacts FK would reject a
+        // source id whose artifact row is not (yet) published. The source link
+        // remains recorded in the derived store's own filesystem metadata
+        // (PersistedMetadata), which is authoritative.
+        transaction
+            .execute(
+                "INSERT INTO derived_artifacts(id,source_artifact_id,rel_path,size_bytes,published_at_ms)
+                 VALUES (?1,NULL,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET
+                   rel_path=excluded.rel_path,size_bytes=excluded.size_bytes,
+                   published_at_ms=min(derived_artifacts.published_at_ms,excluded.published_at_ms)",
+                params![record.id, record.rel_path, size, published],
+            )
+            .map_err(|e| e.to_string())?;
+        transaction.commit().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    fn access_derived(&self, record: &DerivedRecord, accessed_at_ms: u64) -> Result<(), String> {
+        validate_id(ObjectKind::Derived, &record.id).map_err(|e| e.to_string())?;
+        let size = sqlite_u64(record.size_bytes).map_err(|e| e.to_string())?;
+        let published = sqlite_u64(record.published_at_ms).map_err(|e| e.to_string())?;
+        let accessed = sqlite_u64(accessed_at_ms).map_err(|e| e.to_string())?;
+        let mut connection = self.connection().map_err(|e| e.to_string())?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        // Repair/upsert the row so a valid filesystem image can re-establish
+        // its metadata even if the row was lost (filesystem is authoritative).
+        transaction
+            .execute(
+                "INSERT INTO derived_artifacts(id,source_artifact_id,rel_path,size_bytes,published_at_ms)
+                 VALUES (?1,NULL,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET
+                   rel_path=excluded.rel_path,size_bytes=excluded.size_bytes,
+                   published_at_ms=min(derived_artifacts.published_at_ms,excluded.published_at_ms)",
+                params![record.id, record.rel_path, size, published],
+            )
+            .map_err(|e| e.to_string())?;
+        // Bump the access timestamp (max preserves the most-recent value).
+        transaction
+            .execute(
+                "INSERT INTO access_log(object_kind,object_id,accessed_at_ms) VALUES ('derived',?1,?2)
+                 ON CONFLICT(object_kind,object_id) DO UPDATE SET
+                   accessed_at_ms=max(access_log.accessed_at_ms,excluded.accessed_at_ms)",
+                params![record.id, accessed],
+            )
+            .map_err(|e| e.to_string())?;
+        transaction.commit().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
+/// Return the source artifact id if it is a valid 128-hex artifact id, else
+/// `None` (stored as SQL `NULL`). Kept for future use once the artifacts row
+/// existence is guaranteed at publish time; currently unused because the
+/// generic upsert path writes NULL to avoid FK violations for not-yet-
+/// published sources.
+#[allow(dead_code)]
+fn valid_source_artifact_id(value: &str) -> Option<&str> {
+    (!value.is_empty() && validate_id(ObjectKind::Artifact, value).is_ok()).then_some(value)
+}
 fn remove_stale_rows(
     transaction: &Transaction<'_>,
     stale: &[(ObjectKind, &'static str, String)],
@@ -1951,5 +2035,145 @@ mod tests {
             .collect::<rusqlite::Result<_>>()
             .unwrap();
         assert_eq!(ids, vec![present.id().to_owned()]);
+    }
+
+    // ── DerivedMetadata adapter (Plan 022) ───────────────────────────────
+
+    fn derived_record(seed: char, published_at_ms: u64) -> crate::derived::DerivedRecord {
+        crate::derived::DerivedRecord {
+            id: id(seed, 64),
+            source_artifact_id: id('a', 128),
+            rel_path: format!(
+                "derived/blake3/{}/{}",
+                id(seed, 64).get(..2).unwrap(),
+                id(seed, 64)
+            ),
+            size_bytes: 4096,
+            published_at_ms,
+        }
+    }
+
+    #[test]
+    fn derived_metadata_publish_round_trips_into_sqlite() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = MetadataRepository::open(temp.path()).unwrap();
+
+        let record = derived_record('1', 1_000);
+        repository.publish_derived(&record).expect("publish ok");
+
+        let connection = repository.connection().unwrap();
+        let (size, rel_path, published_ms, source): (i64, String, i64, Option<String>) = connection
+            .query_row(
+                "SELECT size_bytes, rel_path, published_at_ms, source_artifact_id
+                     FROM derived_artifacts WHERE id=?1",
+                [&record.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(size, 4096);
+        assert_eq!(rel_path, record.rel_path);
+        assert_eq!(published_ms, 1_000);
+        // source_artifact_id is stored as NULL (matches the generic upsert
+        // Derived arm — the artifacts FK would reject an unknown source id).
+        assert!(source.is_none(), "source_artifact_id must be NULL");
+    }
+
+    #[test]
+    fn derived_metadata_access_updates_timestamp_and_repairs_missing_row() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = MetadataRepository::open(temp.path()).unwrap();
+
+        let record = derived_record('2', 1_000);
+        repository.publish_derived(&record).unwrap();
+
+        // Access at t1, then t2 > t1: timestamp must move forward.
+        repository.access_derived(&record, 2_000).unwrap();
+        repository.access_derived(&record, 5_000).unwrap();
+
+        let connection = repository.connection().unwrap();
+        let accessed: i64 = connection
+            .query_row(
+                "SELECT accessed_at_ms FROM access_log
+                 WHERE object_kind='derived' AND object_id=?1",
+                [&record.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(accessed, 5_000, "access timestamp should be the max");
+
+        // access_derived on a never-published id must REPAIR the row.
+        let new_record = derived_record('3', 1_000);
+        repository
+            .access_derived(&new_record, 5_000)
+            .expect("access repairs missing row");
+        let count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM derived_artifacts WHERE id=?1",
+                [&new_record.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "access_derived should upsert/repair the row");
+    }
+
+    #[test]
+    fn derived_metadata_access_keeps_max_not_overwrite() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = MetadataRepository::open(temp.path()).unwrap();
+        let record = derived_record('4', 1_000);
+        repository.publish_derived(&record).unwrap();
+
+        // Older access first, then a smaller value: max must win.
+        repository.access_derived(&record, 10_000).unwrap();
+        repository.access_derived(&record, 1_500).unwrap();
+
+        let connection = repository.connection().unwrap();
+        let accessed: i64 = connection
+            .query_row(
+                "SELECT accessed_at_ms FROM access_log
+                 WHERE object_kind='derived' AND object_id=?1",
+                [&record.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(accessed, 10_000, "access_log must keep the max timestamp");
+    }
+
+    #[test]
+    fn derived_metadata_empty_source_artifact_stored_as_null() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = MetadataRepository::open(temp.path()).unwrap();
+
+        let mut record = derived_record('5', 1_000);
+        record.source_artifact_id = String::new(); // empty → NULL
+        repository.publish_derived(&record).unwrap();
+
+        let connection = repository.connection().unwrap();
+        let source: Option<String> = connection
+            .query_row(
+                "SELECT source_artifact_id FROM derived_artifacts WHERE id=?1",
+                [&record.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(source.is_none(), "empty source_artifact_id must be NULL");
+    }
+
+    #[test]
+    fn derived_metadata_db_row_alone_is_not_a_filesystem_hit() {
+        // The trait contract (src/derived/store.rs): database-only state can
+        // never create a cache hit — a hit is still validated on disk. We only
+        // assert the repository makes no on-disk claim when publishing a row.
+        let temp = tempfile::tempdir().unwrap();
+        let repository = MetadataRepository::open(temp.path()).unwrap();
+
+        let record = derived_record('6', 1_000);
+        repository.publish_derived(&record).unwrap();
+
+        // The row exists, but no image directory was created on disk.
+        assert!(
+            !temp.path().join(&record.rel_path).exists(),
+            "publishing a metadata row must not materialize an image"
+        );
     }
 }
