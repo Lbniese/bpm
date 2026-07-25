@@ -21,13 +21,56 @@ use serde::Serialize;
 use thiserror::Error;
 
 use crate::derived::{
-    self, DerivedInputs, EnsureDerived, EnsureOptions, NullDerivedMetadata, RuntimeIdentity,
-    SandboxFailure, TargetDescriptor,
+    self, DerivedInputs, DerivedMetadata, EnsureDerived, EnsureOptions, NullDerivedMetadata,
+    RuntimeIdentity, SandboxFailure, TargetDescriptor,
 };
 use crate::graph::package_closure_digest;
 use crate::integrity::{ArtifactId, Integrity};
 use crate::lockfile::{LockSource, Lockfile, PackageEntry};
 use crate::manifest::PackageManifest;
+
+/// Adapter that selects the SQLite-backed [`DerivedMetadata`] when a metadata
+/// repository can be opened for `store_root`, and falls back to the no-op
+/// [`NullDerivedMetadata`] on any error (graceful degradation: the derived
+/// store remains filesystem-authoritative even if the database is unavailable).
+///
+/// Plan 022: replaces the unconditional `NullDerivedMetadata` so derived
+/// image publication and access timestamps are persisted for future GC/LRU.
+enum DerivedMetadataAdapter {
+    Repository(crate::metadata::MetadataRepository),
+    Null(NullDerivedMetadata),
+}
+
+impl DerivedMetadata for DerivedMetadataAdapter {
+    fn publish_derived(&self, record: &crate::derived::DerivedRecord) -> Result<(), String> {
+        match self {
+            DerivedMetadataAdapter::Repository(repo) => repo.publish_derived(record),
+            DerivedMetadataAdapter::Null(adapter) => adapter.publish_derived(record),
+        }
+    }
+
+    fn access_derived(
+        &self,
+        record: &crate::derived::DerivedRecord,
+        accessed_at_ms: u64,
+    ) -> Result<(), String> {
+        match self {
+            DerivedMetadataAdapter::Repository(repo) => repo.access_derived(record, accessed_at_ms),
+            DerivedMetadataAdapter::Null(adapter) => adapter.access_derived(record, accessed_at_ms),
+        }
+    }
+}
+
+/// Open the SQLite-backed derived metadata adapter for `store_root`, falling
+/// back to the no-op adapter on any error. The filesystem stays authoritative,
+/// so a database failure never blocks derived-store operation.
+fn open_derived_metadata(store_root: &Path) -> DerivedMetadataAdapter {
+    match crate::metadata::MetadataRepository::open(store_root) {
+        Ok(repo) => DerivedMetadataAdapter::Repository(repo),
+        Err(_) => DerivedMetadataAdapter::Null(NullDerivedMetadata),
+    }
+}
+
 use crate::metrics::Metrics;
 use crate::registry::RegistryClient;
 use crate::store::ArtifactStore;
@@ -245,9 +288,9 @@ pub fn run_lifecycle(
     } else {
         None
     };
-    let null_metadata = NullDerivedMetadata;
+    let metadata = open_derived_metadata(store.root());
     let derived_store = if owned_runtime.is_some() {
-        derived::DerivedStore::open(store.root(), &null_metadata).ok()
+        derived::DerivedStore::open(store.root(), &metadata).ok()
     } else {
         None
     };
@@ -509,7 +552,7 @@ pub fn prepare_git_packages(
     let runtime = probe_runtime()
         .ok_or_else(|| LifecycleError::Prepare("could not probe the node runtime".into()))?;
     let environment = bounded_environment();
-    let metadata = NullDerivedMetadata;
+    let metadata = open_derived_metadata(store.root());
     let derived_store = derived::DerivedStore::open(store.root(), &metadata)
         .map_err(|error| LifecycleError::Prepare(error.to_string()))?;
     let mut prepared = BTreeMap::new();
