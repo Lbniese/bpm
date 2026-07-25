@@ -1399,7 +1399,7 @@ fn fetch_with_cache(
 }
 
 /// Pick the target version string from a packument for a version request.
-pub(crate) fn select_version(
+pub fn select_version(
     name: &str,
     req: &VersionRequest,
     packument: &Packument,

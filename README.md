@@ -68,6 +68,7 @@ Turbopack can keep dependency realpaths inside the project.
 | `bpm exec <command>` | Execute a local dependency binary with the project bin path |
 | `bpm run <script>` | Execute a root package script with npm-compatible environment variables |
 | `bpm bench` | Run performance benchmark scenarios and emit timing results |
+| `bpm outdated [<pkg>]` | Show packages with newer versions available on the registry |
 | `bpm gc` | Garbage-collect unused global store data |
 
 ## Documentation
