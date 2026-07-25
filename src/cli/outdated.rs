@@ -79,36 +79,85 @@ pub(super) fn run(
         lockfile.packages.iter().collect()
     };
 
-    // 4. For each package, query the registry and compare versions.
+    // 4. For each package, query the registry concurrently and compare versions.
+    //
+    // The per-package queries are independent, so they are fanned out across
+    // OS threads via `std::thread::scope` (no new dependency). The blocking
+    // `RegistryClient` is `Send + Sync` (all fields are `Arc`-wrapped and it
+    // is already shared across the resolver's prefetch pool), so `&client` can
+    // be borrowed by every worker. Results are collected into a map keyed by
+    // package name and re-iterated in the original deterministic `packages`
+    // order so output is independent of fetch completion order.
     let mut rows: Vec<OutdatedRow> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
 
+    /// Outcome of one package query: either the fetched packument, or a
+    /// warning string explaining why the query was skipped/failed.
+    enum FetchOutcome {
+        Packument(bpm::registry::Packument),
+        Warning(String),
+    }
+
+    // Build the list of packages that actually need a registry query (skip
+    // link/workspace packages, and validate the current version up front so
+    // we don't spend a round-trip on an unparseable version).
+    let mut fetch_targets: Vec<&PackageEntry> = Vec::new();
     for package in &packages {
-        // Skip link/workspace packages — they don't have registry versions.
         if package.link || package.resolved.is_empty() {
             continue;
         }
+        if Version::parse(&package.version).is_err() {
+            warnings.push(format!(
+                "warning: could not parse version '{}' for {}",
+                package.version, package.name
+            ));
+            continue;
+        }
+        fetch_targets.push(package);
+    }
 
-        let current = match Version::parse(&package.version) {
-            Ok(v) => v,
-            Err(_) => {
-                warnings.push(format!(
-                    "warning: could not parse version '{}' for {}",
-                    package.version, package.name
-                ));
+    // Fan out the packument fetches concurrently.
+    let fetched: BTreeMap<String, FetchOutcome> = std::thread::scope(|scope| {
+        let client_ref = &client;
+        let handles: Vec<_> = fetch_targets
+            .iter()
+            .map(|package| {
+                let name = package.name.as_str();
+                scope.spawn(move || {
+                    let outcome = match client_ref.packument(name) {
+                        Ok(p) => FetchOutcome::Packument(p),
+                        Err(e) => FetchOutcome::Warning(format!(
+                            "warning: failed to fetch metadata for {}: {e}",
+                            name
+                        )),
+                    };
+                    (name.to_string(), outcome)
+                })
+            })
+            .collect();
+
+        let mut results: BTreeMap<String, FetchOutcome> = BTreeMap::new();
+        for handle in handles {
+            let (name, outcome) = handle
+                .join()
+                .expect("registry query worker thread panicked");
+            results.insert(name, outcome);
+        }
+        results
+    });
+
+    // Iterate in the original deterministic `packages` order so output is
+    // independent of fetch completion order.
+    for package in &fetch_targets {
+        let current = Version::parse(&package.version).expect("validated before fetch; qed");
+
+        let packument = match fetched.get(&package.name) {
+            Some(FetchOutcome::Packument(p)) => p,
+            Some(FetchOutcome::Warning(w)) => {
+                warnings.push(w.clone());
                 continue;
             }
-        };
-
-        let packument = match client.packument(&package.name) {
-            Ok(p) => p,
-            Err(e) => {
-                warnings.push(format!(
-                    "warning: failed to fetch metadata for {}: {e}",
-                    package.name
-                ));
-                continue;
-            }
+            None => continue,
         };
 
         let latest_str = match packument.dist_tags.get("latest") {
@@ -137,7 +186,7 @@ pub(super) fn run(
         // the declared semver range from the root manifest.
         let wanted = if let Some(range_str) = lockfile.root.dependencies.get(package.name.as_str())
         {
-            compute_wanted(&package.name, range_str, &packument)
+            compute_wanted(&package.name, range_str, packument)
                 .unwrap_or_else(|| package.version.clone())
         } else {
             // Transitive dependencies fall back to the resolved version.
