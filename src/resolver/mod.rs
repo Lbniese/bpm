@@ -241,7 +241,7 @@ pub fn resolve_manifest_with_options_and_target_sink(
     let normalized_overrides = overrides.as_map().clone();
 
     let mut resolver = placement::GraphResolver::new(
-        fetch::RegistrySource { client: registry },
+        fetch::CachedPackumentSource::new(fetch::RegistrySource { client: registry }),
         overrides,
         workspace,
         manifest.source_dir.clone(),

@@ -39,6 +39,9 @@ blake3 = "1.5"
 # Registry resolution: package-spec -> version range matching
 semver = "1.0"
 
+# In-memory LRU cache for parsed packument bodies in the resolver
+lru = "0.16"
+
 # Persistent metadata index (filesystem objects remain the source of truth).
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 
