@@ -182,7 +182,7 @@ pub(crate) enum Commands {
         /// (experimental; default off).
         #[arg(long)]
         derived_store: bool,
-        /// Run npm's Git build-context `prepare` lifecycle (experimental; default off).
+        /// Run npm's Git build-context `prepare` lifecycle (experimental; default on; disable with --no-git-prepare).
         #[arg(long)]
         git_prepare: bool,
         /// Ignore peer dependency conflicts.
@@ -226,7 +226,7 @@ pub(crate) enum Commands {
         /// (experimental; default off).
         #[arg(long)]
         derived_store: bool,
-        /// Run npm's Git build-context `prepare` lifecycle (experimental; default off).
+        /// Run npm's Git build-context `prepare` lifecycle (experimental; default on; disable with --no-git-prepare).
         #[arg(long)]
         git_prepare: bool,
         /// Ignore peer dependency conflicts.
@@ -271,7 +271,7 @@ pub(crate) enum Commands {
         /// (experimental; default off).
         #[arg(long)]
         derived_store: bool,
-        /// Run npm's Git build-context `prepare` lifecycle (experimental; default off).
+        /// Run npm's Git build-context `prepare` lifecycle (experimental; default on; disable with --no-git-prepare).
         #[arg(long)]
         git_prepare: bool,
         /// Ignore peer dependency conflicts.
@@ -336,6 +336,11 @@ pub(crate) enum Commands {
         /// Emit machine-readable JSON.
         #[arg(long)]
         json: bool,
+    },
+    /// Show why a package is in the dependency tree.
+    Why {
+        /// Package name to trace.
+        target: String,
     },
 }
 
