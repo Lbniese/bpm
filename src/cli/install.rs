@@ -62,7 +62,8 @@ pub(super) fn run(mut options: Options) -> anyhow::Result<()> {
             matches!(env::var("BPM_DERIVED_STORE").as_deref(), Ok("1" | "true"));
     }
     if !options.git_prepare {
-        options.git_prepare = matches!(env::var("BPM_GIT_PREPARE").as_deref(), Ok("1" | "true"));
+        // Default-on: BPM_GIT_PREPARE=0 to disable, any other value or absent = enabled.
+        options.git_prepare = !matches!(env::var("BPM_GIT_PREPARE").as_deref(), Ok("0"));
     }
     // Global bin linking retains the pre-mutation single-target behavior. Do
     // not silently discard additional targets: users must invoke global
