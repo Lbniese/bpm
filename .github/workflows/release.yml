@@ -49,9 +49,9 @@ jobs:
       - name: Verify cross version
         if: matrix.use_cross
         run: |
-          version=$(cross --version | awk '{print $2}')
+          version=$(cross --version 2>/dev/null | awk '/^cross /{print $2}' | tr -d '\r\n ')
           if [ "$version" != "0.2.5" ]; then
-            echo "cross version mismatch: expected 0.2.5, got $version"
+            echo "cross version mismatch: expected 0.2.5, got '$version'"
             exit 1
           fi
           echo "cross 0.2.5 verified"
