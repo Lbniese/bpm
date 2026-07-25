@@ -8,7 +8,9 @@ title: Architecture
 BPM is a Rust package manager organized around an immutable artifact store,
 deterministic dependency graphs, and reusable project views. The detailed
 product direction remains in [`IMPLEMENTATION.md`](../IMPLEMENTATION.md); this
-page records the architecture that is currently shipped.
+page records the architecture that is currently shipped. For the measured
+cold-vs-warm performance story with cited benchmark numbers, see
+[Performance](performance.md).
 
 ## Subsystems
 

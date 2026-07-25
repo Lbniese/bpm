@@ -134,7 +134,7 @@ pub struct Stats {
 impl Stats {
     pub fn compute(values: Vec<f64>) -> Self {
         let mut sorted = values.clone();
-        sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+        sorted.sort_unstable_by(|a, b| a.total_cmp(&b));
 
         let len = sorted.len();
         if len == 0 {
@@ -1459,7 +1459,7 @@ impl BenchSuite {
                         metrics.requests_sent.median, metrics.requests_sent.p95,
                     );
                     let mut phases: Vec<(&String, &Stats)> = metrics.phase_ms.iter().collect();
-                    phases.sort_by(|a, b| b.1.median.partial_cmp(&a.1.median).unwrap());
+                    phases.sort_by(|a, b| b.1.median.total_cmp(&a.1.median));
                     for (name, stats) in phases.iter().take(6) {
                         println!(
                             "     phase {:<24}: median={:.1}ms  p95={:.1}ms",
@@ -1512,6 +1512,20 @@ mod tests {
         assert_eq!(s.median, 0.0);
         assert_eq!(s.p95, 0.0);
         assert_eq!(s.stddev, 0.0);
+    }
+
+    /// `Stats::compute` must be total/panic-free even if a timing sample is
+    /// malformed (`NaN` or `±inf`). The bench harness previously sorted with
+    /// `partial_cmp(b).unwrap()`, which would panic on any such sample instead
+    /// of reporting results. `total_cmp` (Plan 026) makes the sort total.
+    #[test]
+    fn stats_compute_is_total_for_nan_and_inf_samples() {
+        // Must not panic.
+        let _ = Stats::compute(vec![1.0, f64::NAN, 2.0]);
+        let _ = Stats::compute(vec![f64::NAN, f64::NAN]);
+        let _ = Stats::compute(vec![1.0, f64::INFINITY, 2.0]);
+        let _ = Stats::compute(vec![1.0, f64::NEG_INFINITY, 2.0]);
+        let _ = Stats::compute(vec![f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 1.0]);
     }
 
     #[test]
