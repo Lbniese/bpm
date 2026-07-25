@@ -383,17 +383,28 @@ enum ProjectView {
     Reflink,
 }
 
-fn resolve_project_view(lockfile: &Lockfile) -> ProjectView {
+fn resolve_project_view(lockfile: &Lockfile, project_root: &Path) -> ProjectView {
     let override_view = env::var("BPM_PROJECT_VIEW")
         .ok()
         .filter(|value| !value.is_empty());
-    resolve_project_view_with(lockfile, override_view.as_deref())
+    resolve_project_view_with(lockfile, project_root, override_view.as_deref())
 }
 
-fn resolve_project_view_with(lockfile: &Lockfile, view: Option<&str>) -> ProjectView {
+fn resolve_project_view_with(
+    lockfile: &Lockfile,
+    project_root: &Path,
+    view: Option<&str>,
+) -> ProjectView {
     let auto = || {
         if auto_local_project_view(lockfile) {
-            ProjectView::Local
+            // Probe filesystem capabilities and select the best backend.
+            // On APFS/btrfs/xfs this selects Reflink (copy-on-write);
+            // unsupported filesystems fall back to Local (hardlink).
+            let caps = bpm::materializer::probe_fs_capabilities(project_root);
+            match caps.preferred_backend() {
+                bpm::materializer::MaterializeBackend::Reflink => ProjectView::Reflink,
+                _ => ProjectView::Local,
+            }
         } else {
             ProjectView::Relay
         }
@@ -1616,7 +1627,7 @@ fn finalize_install(
     // inside the project. Keep the O(top-level) relay fast path for ordinary
     // projects, but use a local hardlink view automatically for Next projects;
     // callers can override this with BPM_PROJECT_VIEW=relay|local.
-    let project_view = resolve_project_view(lockfile);
+    let project_view = resolve_project_view(lockfile, project_root);
     let local_project_view = !matches!(project_view, ProjectView::Relay);
     // `final_ownership` is the sorted `ManagedEntry` set BPM actually created
     // this install, used both as the reconciliation desired set and persisted
@@ -2033,27 +2044,29 @@ mod tests {
 
     #[test]
     fn resolve_project_view_maps_env_values() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let project_root = tmp.path();
         let lockfile = Lockfile::new("test");
         assert_eq!(
-            resolve_project_view_with(&lockfile, Some("reflink")),
+            resolve_project_view_with(&lockfile, project_root, Some("reflink")),
             ProjectView::Reflink
         );
         assert_eq!(
-            resolve_project_view_with(&lockfile, Some("local")),
+            resolve_project_view_with(&lockfile, project_root, Some("local")),
             ProjectView::Local
         );
         assert_eq!(
-            resolve_project_view_with(&lockfile, Some("relay")),
+            resolve_project_view_with(&lockfile, project_root, Some("relay")),
             ProjectView::Relay
         );
         // No override on a graph with no fragile package stays relay.
         assert_eq!(
-            resolve_project_view_with(&lockfile, None),
+            resolve_project_view_with(&lockfile, project_root, None),
             ProjectView::Relay
         );
         // An unrecognized value warns and falls back to auto (relay here).
         assert_eq!(
-            resolve_project_view_with(&lockfile, Some("bogus")),
+            resolve_project_view_with(&lockfile, project_root, Some("bogus")),
             ProjectView::Relay
         );
     }
