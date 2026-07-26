@@ -1,10 +1,9 @@
-//! Compatibility oracle for npm's Git `prepare` lifecycle (Plan 004).
+//! Compatibility oracle for npm's Git `prepare` lifecycle.
 //!
 //! This suite drives the real `git` and `node` binaries against a fully local
 //! fixture to pin the Git-`prepare` contract. The BPM contract test is active
 //! when those tools are available; the npm characterization oracle remains
-//! ignored because it additionally depends on the host npm toolchain. The
-//! observed behavior is the input to `docs/[retired]`.
+//! ignored because it additionally depends on the host npm toolchain.
 //!
 //! Run the ignored npm oracle with:
 //!

@@ -10,7 +10,6 @@
 //! Every traversal collection is `BTreeMap`/`BTreeSet`, the peer backtracking
 //! loop calls `versions.sort()`, and `sort_packages()` canonicalises final
 //! ordering.  A placement step must never depend on which fetch completed first.
-//! See `docs/[retired]`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
