@@ -249,6 +249,91 @@ pub(crate) enum Commands {
         #[arg(short = 'g', long)]
         global: bool,
     },
+    /// Re-resolve within declared ranges and bump locked versions to the
+    /// newest satisfying ones (npm `upgrade` compatibility). Does not edit
+    /// `package.json` ranges.
+    Upgrade {
+        /// Package name(s) to upgrade (omit to upgrade all within their ranges).
+        names: Vec<String>,
+        /// Registry base URL for package-spec resolution.
+        #[arg(long)]
+        registry: Option<String>,
+        /// Store root (defaults to `$BPM_STORE` or `$HOME/.bpm`).
+        #[arg(long)]
+        store: Option<PathBuf>,
+        /// Max concurrent fetch + extract workers (0 selects an adaptive limit).
+        #[arg(long, default_value_t = 0)]
+        concurrency: usize,
+        /// Write phase metrics as canonical JSON to `PATH`.
+        #[arg(long = "json-metrics")]
+        json_metrics: Option<PathBuf>,
+        /// Do not run lifecycle scripts.
+        #[arg(long)]
+        ignore_scripts: bool,
+        /// Cache lifecycle-derived package images per dependency closure
+        /// (experimental; default off).
+        #[arg(long)]
+        derived_store: bool,
+        /// Run npm's Git build-context `prepare` lifecycle (experimental; default on; disable with --no-git-prepare).
+        #[arg(long)]
+        git_prepare: bool,
+        /// Ignore peer dependency conflicts.
+        #[arg(long = "legacy-peer-deps")]
+        legacy_peer_deps: bool,
+        /// Never contact the registry; resolve only against cached metadata.
+        #[arg(long)]
+        offline: bool,
+        /// Prefer cached metadata without revalidation; fetch only on a miss.
+        #[arg(long)]
+        prefer_offline: bool,
+        /// Always revalidate cached metadata against the registry.
+        #[arg(long)]
+        prefer_online: bool,
+        /// Optional verified read-through cache for raw artifacts.
+        #[arg(long)]
+        remote_cache: Option<String>,
+    },
+    /// Re-resolve to minimize duplicate versions and rewrite the lock
+    /// (npm `dedupe` compatibility).
+    Dedupe {
+        /// Registry base URL for package-spec resolution.
+        #[arg(long)]
+        registry: Option<String>,
+        /// Store root (defaults to `$BPM_STORE` or `$HOME/.bpm`).
+        #[arg(long)]
+        store: Option<PathBuf>,
+        /// Max concurrent fetch + extract workers (0 selects an adaptive limit).
+        #[arg(long, default_value_t = 0)]
+        concurrency: usize,
+        /// Write phase metrics as canonical JSON to `PATH`.
+        #[arg(long = "json-metrics")]
+        json_metrics: Option<PathBuf>,
+        /// Do not run lifecycle scripts.
+        #[arg(long)]
+        ignore_scripts: bool,
+        /// Cache lifecycle-derived package images per dependency closure
+        /// (experimental; default off).
+        #[arg(long)]
+        derived_store: bool,
+        /// Run npm's Git build-context `prepare` lifecycle (experimental; default on; disable with --no-git-prepare).
+        #[arg(long)]
+        git_prepare: bool,
+        /// Ignore peer dependency conflicts.
+        #[arg(long = "legacy-peer-deps")]
+        legacy_peer_deps: bool,
+        /// Never contact the registry; resolve only against cached metadata.
+        #[arg(long)]
+        offline: bool,
+        /// Prefer cached metadata without revalidation; fetch only on a miss.
+        #[arg(long)]
+        prefer_offline: bool,
+        /// Always revalidate cached metadata against the registry.
+        #[arg(long)]
+        prefer_online: bool,
+        /// Optional verified read-through cache for raw artifacts.
+        #[arg(long)]
+        remote_cache: Option<String>,
+    },
     /// Clean install from `bpm.lock` (npm `ci` compatibility).
     Ci {
         /// Registry base URL for package-spec resolution.

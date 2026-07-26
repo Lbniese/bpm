@@ -923,3 +923,109 @@ fn npm_ci_accepts_exported_package_lock() {
         "npm ci did not install demo-cli"
     );
 }
+
+// ── `bpm upgrade` / `bpm dedupe` (Plan 025) ─────────────────────────────────
+
+#[test]
+fn upgrade_does_not_edit_package_json_ranges() {
+    // npm contract: `upgrade` re-resolves within declared ranges and rewrites
+    // the lock, but NEVER edits the ranges in package.json.
+    let registry = MockRegistry::new(vec![one_package("lodash", "4.17.21", &BTreeMap::new())]);
+    let project = tempfile::tempdir().unwrap();
+    let store = tempfile::tempdir().unwrap();
+    write_manifest(
+        project.path(),
+        r#"{"name":"app","version":"1.0.0","dependencies":{"lodash":"^4.0.0"}}"#,
+    );
+    // First, add the lock via a normal add-less resolve (run install to write
+    // the initial lock).
+    let (ok, _stdout, stderr) = run_bpm(
+        &["install", "--registry", registry.url()],
+        project.path(),
+        store.path(),
+    );
+    assert!(ok, "initial install stderr: {stderr}");
+
+    let manifest_before = read_manifest(project.path());
+    let (ok, _stdout, stderr) = run_bpm(
+        &["upgrade", "--registry", registry.url()],
+        project.path(),
+        store.path(),
+    );
+    assert!(ok, "upgrade stderr: {stderr}");
+
+    let manifest_after = read_manifest(project.path());
+    assert_eq!(
+        manifest_after["dependencies"]["lodash"], manifest_before["dependencies"]["lodash"],
+        "upgrade must not change the declared range"
+    );
+    // The lock is still present and valid.
+    assert!(project.path().join("bpm.lock").is_file());
+}
+
+#[test]
+fn upgrade_warns_on_unknown_package_and_skips() {
+    let registry = MockRegistry::new(vec![one_package("lodash", "4.17.21", &BTreeMap::new())]);
+    let project = tempfile::tempdir().unwrap();
+    let store = tempfile::tempdir().unwrap();
+    write_manifest(
+        project.path(),
+        r#"{"name":"app","version":"1.0.0","dependencies":{"lodash":"^4.0.0"}}"#,
+    );
+    let (ok, _stdout, stderr) = run_bpm(
+        &["install", "--registry", registry.url()],
+        project.path(),
+        store.path(),
+    );
+    assert!(ok, "install stderr: {stderr}");
+
+    // `upgrade not-a-real-dep` must warn and still succeed (non-fatal skip).
+    let (ok, _stdout, stderr) = run_bpm(
+        &["upgrade", "not-a-real-dep", "--registry", registry.url()],
+        project.path(),
+        store.path(),
+    );
+    assert!(ok, "upgrade should still succeed; stderr: {stderr}");
+    assert!(
+        stderr.contains("not declared in package.json"),
+        "expected a warning about the unknown package; got: {stderr}"
+    );
+}
+
+#[test]
+fn dedupe_on_minimal_graph_is_byte_stable() {
+    // BPM's resolver already minimizes duplicates, so `dedupe` on a clean
+    // resolve must leave the lock byte-stable (or rewrite identically).
+    let registry = MockRegistry::new(vec![one_package("lodash", "4.17.21", &BTreeMap::new())]);
+    let project = tempfile::tempdir().unwrap();
+    let store = tempfile::tempdir().unwrap();
+    write_manifest(
+        project.path(),
+        r#"{"name":"app","version":"1.0.0","dependencies":{"lodash":"^4.0.0"}}"#,
+    );
+    let (ok, _stdout, stderr) = run_bpm(
+        &["install", "--registry", registry.url()],
+        project.path(),
+        store.path(),
+    );
+    assert!(ok, "install stderr: {stderr}");
+
+    let lock_before = fs::read_to_string(project.path().join("bpm.lock")).unwrap();
+    let (ok, _stdout, stderr) = run_bpm(
+        &["dedupe", "--registry", registry.url()],
+        project.path(),
+        store.path(),
+    );
+    assert!(ok, "dedupe stderr: {stderr}");
+    let lock_after = fs::read_to_string(project.path().join("bpm.lock")).unwrap();
+
+    // On an already-minimal graph, dedupe reports minimal and is byte-stable.
+    assert!(
+        stderr.contains("already minimal"),
+        "expected 'already minimal' report; got: {stderr}"
+    );
+    assert_eq!(
+        lock_before, lock_after,
+        "dedupe on a minimal graph must be byte-stable"
+    );
+}
