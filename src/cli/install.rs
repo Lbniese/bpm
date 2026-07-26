@@ -1,5 +1,13 @@
 //! Lockfile and global-bin install orchestration.
 
+/// Number of tokio worker threads for the async resolver runtime. The resolver
+/// launches best-effort background packument prefetches via `tokio::spawn`
+/// (Plan 021 fan-out); a multi-threaded runtime lets those fetches overlap on
+/// real worker threads instead of cooperatively sharing one current-thread
+/// task. Placement stays serial and deterministic — only HTTP I/O moves to
+/// worker threads. Bounded to avoid overwhelming the registry connection pool.
+const ASYNC_RESOLVER_WORKERS: usize = 8;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::fs;
@@ -1103,12 +1111,13 @@ fn async_resolve_enabled() -> bool {
     )
 }
 
-/// Diagnostic counters threaded back from the async resolve runtime:
-/// (resolve_calls, packument_hits, packument_misses, download_bytes, ...).
-type ResolveDiags = (u64, u64, u64, u64, u64);
+/// Diagnostic counters threaded back from the async resolve runtime.
+/// Mirrors the blocking resolver's `ResolverDiagnosticsSnapshot`.
+type ResolveDiags = bpm::async_resolver::AsyncResolverDiagnostics;
 
 /// Resolve a fresh manifest with the async resolver (non-streaming) on a
-/// current-thread tokio runtime. Honors the CLI-selected `peer_mode`; the
+/// multi-threaded tokio runtime (so background prefetches overlap on worker
+/// threads). Honors the CLI-selected `peer_mode`; the
 /// resulting lockfile is byte-identical to the blocking resolver's output for
 /// the same manifest/peer-mode (see the `tests/network_pipeline.rs` parity
 /// corpus). Records packument-cache diagnostics.
@@ -1125,8 +1134,10 @@ fn resolve_fresh_manifest_async(
         .measure(
             "dependency_resolution",
             || -> anyhow::Result<(Lockfile, ResolveDiags)> {
-                let diag_cell = std::cell::Cell::new((0u64, 0u64, 0u64, 0u64, 0u64));
-                let result = tokio::runtime::Builder::new_current_thread()
+                let diag_cell =
+                    std::cell::Cell::new(bpm::async_resolver::AsyncResolverDiagnostics::default());
+                let result = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(ASYNC_RESOLVER_WORKERS)
                     .enable_all()
                     .build()
                     .expect("failed to build tokio runtime")
@@ -1154,19 +1165,21 @@ fn resolve_fresh_manifest_async(
                 Ok((result, diag))
             },
         )
-        .map(
-            |(lockfile, (hits, fetches, prefetch, batch, fetch_bytes))| {
-                metrics.record_resolver_diagnostics(
-                    hits,
-                    0,
-                    fetches,
-                    prefetch + batch,
-                    fetch_bytes,
-                    0,
-                );
-                lockfile
-            },
-        )
+        .map(|(lockfile, diag)| {
+            metrics.record_resolver_diagnostics(
+                diag.cache_hits,
+                diag.cache_waits,
+                diag.inline_fetches,
+                diag.prefetch_fetches + diag.batch_prefetch_fetches,
+                diag.fetch_bytes,
+                diag.network_wait_ns,
+            );
+            metrics.record(
+                "resolver_network_wait",
+                std::time::Duration::from_nanos(diag.network_wait_ns),
+            );
+            lockfile
+        })
         .map_err(|error| anyhow::anyhow!("dependency resolution failed: {error}"))
 }
 
@@ -1308,10 +1321,12 @@ fn run_streaming_async_install(
             // to the non-blocking TryChannelSink. Units that overflow the live
             // channel are retained in `overflow` rather than dropped.
             let config_clone = config.clone();
-            let diag_cell = std::cell::Cell::new((0u64, 0u64, 0u64, 0u64, 0u64));
+            let diag_cell =
+                std::cell::Cell::new(bpm::async_resolver::AsyncResolverDiagnostics::default());
             let lockfile = metrics
                 .measure("dependency_resolution", || {
-                    tokio::runtime::Builder::new_current_thread()
+                    tokio::runtime::Builder::new_multi_thread()
+                        .worker_threads(ASYNC_RESOLVER_WORKERS)
                         .enable_all()
                         .build()
                         .expect("failed to build tokio runtime")
@@ -1344,8 +1359,19 @@ fn run_streaming_async_install(
                 })
                 .map_err(|error| anyhow::anyhow!("dependency resolution failed: {error}"))?;
             // Record async resolver diagnostics.
-            let (hits, fetches, prefetch, batch, fetch_bytes) = diag_cell.into_inner();
-            metrics.record_resolver_diagnostics(hits, 0, fetches, prefetch + batch, fetch_bytes, 0);
+            let diag = diag_cell.into_inner();
+            metrics.record_resolver_diagnostics(
+                diag.cache_hits,
+                diag.cache_waits,
+                diag.inline_fetches,
+                diag.prefetch_fetches + diag.batch_prefetch_fetches,
+                diag.fetch_bytes,
+                diag.network_wait_ns,
+            );
+            metrics.record(
+                "resolver_network_wait",
+                std::time::Duration::from_nanos(diag.network_wait_ns),
+            );
             // Async resolution is complete and we are off the tokio runtime, so
             // it is safe to block while draining every overflowed unit through
             // the original concurrent pipeline (workers drain concurrently).

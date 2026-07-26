@@ -20,6 +20,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::time::Instant;
 
 use semver::Version;
 use thiserror::Error;
@@ -100,10 +101,73 @@ fn build_async_client(config: &NpmConfig) -> reqwest::Client {
 use crate::config::NpmConfig;
 use crate::http::redact_url;
 use crate::metadata_cache::{CacheMode, MetadataCache};
-use crate::registry::{version_metadata, WireVersionMetadata, ABBREV_ACCEPT};
+use crate::registry::{select_version, version_metadata, WireVersionMetadata, ABBREV_ACCEPT};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{watch, Mutex as AsyncMutex};
+
+/// Cap on extra (grandchild) packument prefetches launched from one node's
+/// `prefetch_registry_children` call (Plan 036 deeper fan-out). Bounds the
+/// prefetch storm risk on pathological graphs. The singleflight dedups any
+/// repeats and best-effort failures are dropped, so a low cap is safe.
+const GRANDCHILD_PREFETCH_CAP: u32 = 64;
+
+/// Cache/singleflight key for a *full* packument (all versions): the
+/// registry URL plus the package name, NUL-separated. Shared by the inline
+/// `packument()` path and the prefetch fan-out so a prefetch fills the cache
+/// the inline path reads.
+pub fn packument_cache_key(registry_url: &str, name: &str) -> String {
+    format!("{}\0{name}", registry_url.trim_end_matches('/'))
+}
+
+/// Cache/singleflight key for a *single-version* packument (exact-version
+/// requests hit the abbreviated `/{name}/{version}` endpoint, distinct from
+/// the full packument). Namespaced with a `v:` prefix so it never collides
+/// with a full-packument key for the same name (Plan 036).
+pub fn version_cache_key(registry_url: &str, name: &str, version: &Version) -> String {
+    format!(
+        "{}\0{name}\0v:{version}",
+        registry_url.trim_end_matches('/')
+    )
+}
+
+/// Pick a representative version metadata entry from `packument` for the
+/// purposes of prefetching that version's dependencies one level deeper
+/// (Plan 036). Best-effort: returns `None` on any ambiguity so the caller
+/// simply skips the grandchild peek and lets DFS fetch them on descent.
+///
+/// Tries the spec's version request first (handles `npm:` aliases via
+/// `parse_spec`); on failure falls back to the `latest` dist-tag, then the
+/// highest semver version present.
+fn representative_version<'p>(
+    child: &str,
+    child_spec: &str,
+    packument: &'p Packument,
+) -> Option<&'p VersionMetadata> {
+    // Resolve the request the same way the resolver will, then ask
+    // `select_version` for the matching version.
+    let req = parse_spec(&format!("{child}@{child_spec}"))
+        .ok()
+        .map(|spec| spec.req)
+        .unwrap_or(VersionRequest::Latest);
+    let chosen = select_version(child, &req, packument)
+        .ok()
+        .or_else(|| {
+            packument
+                .dist_tags
+                .get("latest")
+                .and_then(|tag| Version::parse(tag).ok())
+        })
+        .or_else(|| {
+            packument
+                .versions
+                .keys()
+                .filter_map(|k| Version::parse(k).ok())
+                .max()
+        })?;
+    let key = chosen.to_string();
+    packument.versions.get(key.as_str())
+}
 
 /// Singleflight state for one in-flight packument fetch, shared between the
 /// launcher and any concurrent waiters (Plan 021 fan-out). The producer
@@ -498,6 +562,15 @@ pub struct AsyncRegistryClient {
     prefetch_fetches: Arc<AtomicU64>,
     batch_prefetch_fetches: Arc<AtomicU64>,
     cache_hits: Arc<AtomicU64>,
+    /// Waiters that joined an in-flight singleflight fetch instead of fetching
+    /// inline (Plan 036). Non-zero means the prefetch/inline overlap is real.
+    cache_waits: Arc<AtomicU64>,
+    /// Accumulated wall time spent on packument network I/O plus waiting on an
+    /// in-flight singleflight fetch, in nanoseconds (Plan 036). Charged from
+    /// both the producer's `async_fetch_packument` and the waiter's `watch`
+    /// await so the cold-path profile is honest about how much of
+    /// `dependency_resolution` is network wait.
+    network_wait_ns: Arc<AtomicU64>,
     metadata_cache: Option<Arc<MetadataCache>>,
     cache_mode: CacheMode,
     max_in_flight: u32,
@@ -517,6 +590,8 @@ impl AsyncRegistryClient {
             prefetch_fetches: Arc::new(AtomicU64::new(0)),
             batch_prefetch_fetches: Arc::new(AtomicU64::new(0)),
             cache_hits: Arc::new(AtomicU64::new(0)),
+            cache_waits: Arc::new(AtomicU64::new(0)),
+            network_wait_ns: Arc::new(AtomicU64::new(0)),
             metadata_cache: None,
             cache_mode: CacheMode::Default,
             max_in_flight: 4,
@@ -562,17 +637,14 @@ impl AsyncRegistryClient {
         match &spec.req {
             VersionRequest::Exact(version) => {
                 let registry_url = self.config.registry_for_package(&spec.name);
-                async_fetch_version_packument(
-                    &self.http,
-                    &spec.name,
-                    version,
-                    &self.config,
-                    registry_url,
-                    self.metadata_cache.as_ref(),
-                    self.cache_mode,
-                    &self.fetch_bytes,
-                )
-                .await
+                // Exact-version requests hit a single-version abbreviated
+                // endpoint distinct from the full-packument endpoint, so they
+                // are cached and singleflighted under a version-scoped key
+                // (Plan 036). Without this, every pinned dependency paid a
+                // serialized round-trip with no prefetch overlap — the
+                // dominant cost on cold installs of pinned graphs.
+                self.fetch_version_packument_singleflighted(&spec.name, version, registry_url)
+                    .await
             }
             VersionRequest::Latest | VersionRequest::Range(_) => self.packument(&spec.name).await,
         }
@@ -580,7 +652,7 @@ impl AsyncRegistryClient {
 
     pub async fn packument(&self, name: &str) -> Result<Packument, AsyncResolveError> {
         let registry_url = self.config.registry_for_package(name);
-        let key = format!("{}\0{name}", registry_url.trim_end_matches('/'));
+        let key = packument_cache_key(registry_url, name);
 
         // Fast path: a completed packument is already cached.
         {
@@ -593,7 +665,19 @@ impl AsyncRegistryClient {
 
         // Miss: count an inline fetch and go through the singleflight so any
         // concurrent prefetch of the same name is deduped rather than
-        // double-fetched.
+        // double-fetched. First, though, re-check the cache: a concurrent
+        // prefetch may have completed and filled the cache between the fast
+        // path's lock release above and now (Plan 036 double-check). This is
+        // what turns a race that would otherwise cost a serialized
+        // round-trip into a cheap cache hit.
+        {
+            let cache = self.packument_cache.lock().await;
+            if let Some(packument) = cache.get(&key) {
+                self.cache_hits.fetch_add(1, Ordering::Relaxed);
+                return Ok(packument.clone());
+            }
+        }
+
         self.inline_fetches.fetch_add(1, Ordering::Relaxed);
         self.fetch_packument_singleflighted(&key, name, registry_url)
             .await
@@ -610,12 +694,25 @@ impl AsyncRegistryClient {
     ///
     /// Must be called from within a tokio runtime context (it spawns a task).
     pub fn prefetch_packument(&self, name: &str, version_spec: Option<&str>) {
-        // Only registry packuments (range/latest requests) benefit from
-        // prefetch. An exact-version request resolves a single version, not
-        // the full packument, so it is skipped here.
-        let _ = version_spec;
+        // Route exact-version specs to the single-version endpoint so the
+        // prefetch fills the same version-scoped cache key that `packument_for`
+        // reads (Plan 036). Range/latest/unknown specs fetch the full packument.
+        // Failures are silently dropped: `packument_for` remains the single
+        // source of truth for error reporting (it will re-fetch and surface
+        // the real error on a miss).
         let registry_url = self.config.registry_for_package(name).to_owned();
-        let key = format!("{}\0{name}", registry_url.trim_end_matches('/'));
+        // Parse outside the spawned task: the borrowed `version_spec` cannot
+        // escape the method body, and we want an owned `Version` to move in.
+        let exact_version = version_spec
+            .and_then(|spec| parse_spec(&format!("{name}@{spec}")).ok())
+            .and_then(|parsed| match parsed.req {
+                VersionRequest::Exact(version) => Some(version),
+                _ => None,
+            });
+        let key = match &exact_version {
+            Some(version) => version_cache_key(&registry_url, name, version),
+            None => packument_cache_key(&registry_url, name),
+        };
         let this = self.clone();
         let name_owned = name.to_owned();
         // `spawn` detaches the task; if the runtime is dropped first the task
@@ -632,9 +729,20 @@ impl AsyncRegistryClient {
             this.prefetch_fetches.fetch_add(1, Ordering::Relaxed);
             // Drive the fetch to completion; the result fills the cache via
             // the singleflight. Errors are intentionally ignored here.
-            let _ = this
-                .fetch_packument_singleflighted(&key, &name_owned, &registry_url)
-                .await;
+            let _ = match exact_version {
+                Some(version) => {
+                    this.fetch_version_packument_singleflighted(
+                        &name_owned,
+                        &version,
+                        &registry_url,
+                    )
+                    .await
+                }
+                None => {
+                    this.fetch_packument_singleflighted(&key, &name_owned, &registry_url)
+                        .await
+                }
+            };
         });
     }
 
@@ -655,6 +763,109 @@ impl AsyncRegistryClient {
         name: &str,
         registry_url: &str,
     ) -> Result<Packument, AsyncResolveError> {
+        // Build a producer factory (full packument) and delegate to the
+        // generic singleflight core (Plan 036 unified the producer body so
+        // the exact-version path can share it). The factory is `Fn` so the
+        // fallback path can re-fetch inline.
+        let http = self.http.clone();
+        let config = self.config.clone();
+        let cache = self.metadata_cache.clone();
+        let cache_mode = self.cache_mode;
+        let fetch_bytes = Arc::clone(&self.fetch_bytes);
+        let name_owned = name.to_owned();
+        let registry_owned = registry_url.to_owned();
+        self.singleflight_fetch(key, move || {
+            let http = http.clone();
+            let config = config.clone();
+            let cache = cache.clone();
+            let fetch_bytes = Arc::clone(&fetch_bytes);
+            let name = name_owned.clone();
+            let registry = registry_owned.clone();
+            async move {
+                async_fetch_packument(
+                    &http,
+                    &name,
+                    &config,
+                    &registry,
+                    cache.as_ref(),
+                    cache_mode,
+                    &fetch_bytes,
+                )
+                .await
+            }
+        })
+        .await
+    }
+
+    /// Exact-version variant of [`fetch_packument_singleflighted`]: fetches the
+    /// single-version abbreviated endpoint under a version-scoped key (Plan
+    /// 036). Shares the same `in_flight` map and `packument_cache` (keys are
+    /// namespaced so full and version packuments never collide).
+    async fn fetch_version_packument_singleflighted(
+        &self,
+        name: &str,
+        version: &Version,
+        registry_url: &str,
+    ) -> Result<Packument, AsyncResolveError> {
+        let key = version_cache_key(registry_url, name, version);
+        // Fast path: a completed version packument is already cached.
+        {
+            let cache = self.packument_cache.lock().await;
+            if let Some(packument) = cache.get(&key) {
+                self.cache_hits.fetch_add(1, Ordering::Relaxed);
+                return Ok(packument.clone());
+            }
+        }
+        self.inline_fetches.fetch_add(1, Ordering::Relaxed);
+        let http = self.http.clone();
+        let config = self.config.clone();
+        let cache = self.metadata_cache.clone();
+        let cache_mode = self.cache_mode;
+        let fetch_bytes = Arc::clone(&self.fetch_bytes);
+        let name_owned = name.to_owned();
+        let registry_owned = registry_url.to_owned();
+        let version_owned = version.clone();
+        self.singleflight_fetch(&key, move || {
+            let http = http.clone();
+            let config = config.clone();
+            let cache = cache.clone();
+            let fetch_bytes = Arc::clone(&fetch_bytes);
+            let name = name_owned.clone();
+            let registry = registry_owned.clone();
+            let version = version_owned.clone();
+            async move {
+                async_fetch_version_packument(
+                    &http,
+                    &name,
+                    &version,
+                    &config,
+                    &registry,
+                    cache.as_ref(),
+                    cache_mode,
+                    &fetch_bytes,
+                )
+                .await
+            }
+        })
+        .await
+    }
+
+    /// Generic singleflight core shared by the full-packument and
+    /// exact-version fetch paths (Plan 036). `producer` performs the actual
+    /// network fetch; the singleflight dedups concurrent callers for the same
+    /// `key`, caches success, and times network wait into `network_wait_ns`.
+    /// On the waiter path a closed sender (producer cancelled) falls back to
+    /// re-fetching inline via `producer` rather than re-entering the
+    /// singleflight, so this path never recurses.
+    async fn singleflight_fetch<F, Fut>(
+        &self,
+        key: &str,
+        producer: F,
+    ) -> Result<Packument, AsyncResolveError>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<Packument, AsyncResolveError>>,
+    {
         // Briefly hold the in_flight map lock to insert or look up the entry.
         // `is_new == true` means we won the race to produce; any concurrent
         // caller finds the same `Arc<InFlightEntry>` and becomes a waiter.
@@ -672,16 +883,13 @@ impl AsyncRegistryClient {
 
         if is_new {
             // ── Producer path: do the network fetch, then publish. ──
-            let result = async_fetch_packument(
-                &self.http,
-                name,
-                &self.config,
-                registry_url,
-                self.metadata_cache.as_ref(),
-                self.cache_mode,
-                &self.fetch_bytes,
-            )
-            .await;
+            // Time the network I/O into `network_wait_ns` (Plan 036) so the
+            // cold-path profile can attribute `dependency_resolution` time to
+            // network vs CPU.
+            let fetch_start = Instant::now();
+            let result = producer().await;
+            self.network_wait_ns
+                .fetch_add(fetch_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
             // Cache success only (errors must be retryable). Use
             // `or_insert_with` so a concurrent cache fill never overwrites.
@@ -711,31 +919,36 @@ impl AsyncRegistryClient {
             if let FetchState::Done(result) = &*entry.tx.borrow() {
                 return clone_shared_result(result);
             }
+            // We are joining an in-flight fetch rather than fetching inline:
+            // count a cache wait and time the wait (Plan 036).
+            self.cache_waits.fetch_add(1, Ordering::Relaxed);
+            let wait_start = Instant::now();
             // Wait until the producer publishes. A closed sender (producer
             // task was cancelled before publishing) is treated as a transient
-            // miss and re-fetched inline below.
+            // miss and re-fetched inline below. Resolve and drop the borrow
+            // *before* the lock `.await` below so the future stays `Send`.
             let mut rx = entry.rx.clone();
-            if let Ok(guard) = rx.wait_for(|state| state.is_done()).await {
-                if let FetchState::Done(result) = &*guard {
-                    // Owned result: clones the packument / reconstructs the
-                    // error, so no borrow escapes the guard's lifetime.
-                    return clone_shared_result(result);
-                }
+            let joined_result: Option<Result<Packument, String>> =
+                match rx.wait_for(|state| state.is_done()).await {
+                    Ok(guard) => match &*guard {
+                        FetchState::Done(result) => Some(result.clone()),
+                        _ => None,
+                    },
+                    Err(_) => None,
+                };
+            self.network_wait_ns
+                .fetch_add(wait_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            if let Some(result) = joined_result {
+                return clone_shared_result(&result);
             }
             // The producer dropped without publishing (e.g. its task was
-            // cancelled). Re-fetch inline rather than re-entering the
-            // singleflight, so this path never recurses.
+            // cancelled). Re-fetch inline via the same producer rather than
+            // re-entering the singleflight, so this path never recurses.
             self.in_flight.lock().await.remove(key);
-            let packument = async_fetch_packument(
-                &self.http,
-                name,
-                &self.config,
-                registry_url,
-                self.metadata_cache.as_ref(),
-                self.cache_mode,
-                &self.fetch_bytes,
-            )
-            .await?;
+            let fetch_start = Instant::now();
+            let packument = producer().await?;
+            self.network_wait_ns
+                .fetch_add(fetch_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
             let mut cache = self.packument_cache.lock().await;
             cache
                 .entry(key.to_owned())
@@ -744,19 +957,46 @@ impl AsyncRegistryClient {
         }
     }
 
-    /// Drain the resolver fetch diagnostics counters. Returns
-    /// `(cache_hits, inline_fetches, prefetch_fetches, batch_prefetch_fetches,
-    /// fetch_bytes)`. `prefetch_fetches` counts background fan-out launches
-    /// (Plan 021); `batch_prefetch_fetches` counts root-warmup launches.
-    pub fn take_diagnostics(&self) -> (u64, u64, u64, u64, u64) {
-        (
-            self.cache_hits.swap(0, Ordering::Relaxed),
-            self.inline_fetches.swap(0, Ordering::Relaxed),
-            self.prefetch_fetches.swap(0, Ordering::Relaxed),
-            self.batch_prefetch_fetches.swap(0, Ordering::Relaxed),
-            self.fetch_bytes.swap(0, Ordering::Relaxed),
-        )
+    /// Drain the resolver fetch diagnostics counters as an
+    /// [`AsyncResolverDiagnostics`] snapshot (values are reset to zero).
+    ///
+    /// `prefetch_fetches` counts background fan-out launches (Plan 021);
+    /// `batch_prefetch_fetches` counts root-warmup launches; `cache_waits`
+    /// counts singleflight joins (Plan 036); `network_wait_ns` accumulates
+    /// packument network I/O plus singleflight wait time (Plan 036).
+    pub fn take_diagnostics(&self) -> AsyncResolverDiagnostics {
+        AsyncResolverDiagnostics {
+            cache_hits: self.cache_hits.swap(0, Ordering::Relaxed),
+            cache_waits: self.cache_waits.swap(0, Ordering::Relaxed),
+            inline_fetches: self.inline_fetches.swap(0, Ordering::Relaxed),
+            prefetch_fetches: self.prefetch_fetches.swap(0, Ordering::Relaxed),
+            batch_prefetch_fetches: self.batch_prefetch_fetches.swap(0, Ordering::Relaxed),
+            fetch_bytes: self.fetch_bytes.swap(0, Ordering::Relaxed),
+            network_wait_ns: self.network_wait_ns.swap(0, Ordering::Relaxed),
+        }
     }
+}
+
+/// Snapshot of the async resolver's fetch diagnostics, drained via
+/// [`AsyncRegistryClient::take_diagnostics`]. Mirrors the blocking resolver's
+/// `ResolverDiagnosticsSnapshot` vocabulary so the two paths report comparable
+/// metrics. `network_wait_ns` and `cache_waits` are populated by Plan 036.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AsyncResolverDiagnostics {
+    /// Packument cache hits (no fetch needed).
+    pub cache_hits: u64,
+    /// Singleflight joins (waiter observed an in-flight fetch).
+    pub cache_waits: u64,
+    /// Inline packument fetches (resolver fetched itself).
+    pub inline_fetches: u64,
+    /// Background prefetch fetches (Plan 021 fan-out).
+    pub prefetch_fetches: u64,
+    /// Batch-prefetch closure fetches (root warmup).
+    pub batch_prefetch_fetches: u64,
+    /// Total bytes of packument bodies fetched.
+    pub fetch_bytes: u64,
+    /// Network I/O + singleflight wait time, in nanoseconds.
+    pub network_wait_ns: u64,
 }
 
 /// Lift a singleflight result out of `FetchState::Done` for a waiter.
@@ -1052,7 +1292,17 @@ impl<'a> AsyncGraphResolver<'a> {
     /// and workspace members are skipped; the singleflight dedups repeats and
     /// best-effort failures are dropped (the inline `resolve_children` path
     /// re-fetches and surfaces real errors).
+    ///
+    /// Plan 036 widens the fan-out one level deeper: for each registry child
+    /// whose packument is *already* cached (its own prefetch completed), the
+    /// dependency names of a representative version are read and those
+    /// grandchildren are prefetched too, bounded by `GRANDCHILD_PREFETCH_CAP`.
+    /// This lets grandchild and sibling-subtree fetches overlap with the first
+    /// child's subtree instead of serializing behind DFS descent. The cap
+    /// prevents a prefetch storm on pathological graphs (e.g. a package with
+    /// thousands of transitive deps at one level).
     fn prefetch_registry_children(&self, dependencies: &BTreeMap<String, String>) {
+        let mut grandchild_budget = GRANDCHILD_PREFETCH_CAP;
         for (child, child_spec) in dependencies {
             if DependencySource::parse(child_spec).is_some() {
                 continue;
@@ -1061,7 +1311,61 @@ impl<'a> AsyncGraphResolver<'a> {
                 continue;
             }
             self.registry.prefetch_packument(child, Some(child_spec));
+            // ── Plan 036: prefetch grandchildren one level deeper. ──
+            // Only when the child's packument is already cached (its prefetch
+            // completed) can we read a version's dependency list; otherwise we
+            // defer to the child's own `prefetch_registry_children` call when
+            // DFS reaches it. Best-effort: a wrong version guess just wastes a
+            // prefetch the singleflight dedups anyway.
+            if grandchild_budget == 0 {
+                continue;
+            }
+            grandchild_budget =
+                self.prefetch_cached_grandchildren(child, child_spec, grandchild_budget);
         }
+    }
+
+    /// Read a representative version's dependency names from the cached
+    /// packument for `child` (if present) and prefetch the registry-typed
+    /// ones, consuming up to `budget` prefetches. Returns the remaining
+    /// budget. Fully best-effort: missing cache, unparseable specs, and
+    /// fetch failures are all silently skipped.
+    fn prefetch_cached_grandchildren(&self, child: &str, child_spec: &str, budget: u32) -> u32 {
+        let mut remaining = budget;
+        let registry_url = self.registry.config.registry_for_package(child);
+        let key = format!("{}\0{child}", registry_url.trim_end_matches('/'));
+        let packument = {
+            // Try-lock: if the cache is contended (a fetch is publishing),
+            // skip the grandchild peek this round — the inline DFS path will
+            // fetch these on descent. Never `blocking_lock`: we are on the
+            // tokio runtime thread.
+            match self.registry.packument_cache.try_lock() {
+                Ok(cache) => match cache.get(&key) {
+                    Some(packument) => packument.clone(),
+                    None => return remaining,
+                },
+                Err(_) => return remaining,
+            }
+        };
+        let Some(metadata) = representative_version(child, child_spec, &packument) else {
+            return remaining;
+        };
+        let merged = resolver::merged_dependencies(metadata);
+        for (grandchild, grandchild_spec) in &merged {
+            if remaining == 0 {
+                break;
+            }
+            if DependencySource::parse(grandchild_spec).is_some() {
+                continue;
+            }
+            if self.workspace.and_then(|w| w.get(grandchild)).is_some() {
+                continue;
+            }
+            self.registry
+                .prefetch_packument(grandchild, Some(grandchild_spec));
+            remaining -= 1;
+        }
+        remaining
     }
 
     async fn resolve_children(
@@ -1454,17 +1758,14 @@ pub async fn resolve_manifest_with_options_and_target_async_sink(
             Ok(parsed) => parsed,
             Err(_) => continue,
         };
-        // The singleflight only fetches full packuments (range/latest).
-        if matches!(parsed.req, registry::VersionRequest::Exact(_)) {
-            continue;
-        }
         let registry_clone = registry.clone();
         registry
             .batch_prefetch_fetches
             .fetch_add(1, Ordering::Relaxed);
-        let name_owned = name.to_owned();
+        // `packument_for` routes exact-version requests to the version-scoped
+        // singleflight/cache (Plan 036) and range/latest to the full packument.
         warmup.spawn(async move {
-            let _ = registry_clone.packument(&name_owned).await;
+            let _ = registry_clone.packument_for(&parsed).await;
         });
     }
     while warmup.join_next().await.is_some() {}
