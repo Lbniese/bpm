@@ -294,6 +294,34 @@ reinstalls. A name that is not declared is a no-op: neither `package.json` nor
 the lock is rewritten. `bpm remove --global` is rejected because global-bin
 ownership metadata does not exist yet.
 
+## `bpm upgrade [pkg...]`
+
+Re-resolves the manifest within its declared ranges and bumps locked versions
+to the newest satisfying ones, rewriting `bpm.lock` (and `package-lock.json`
+for npm-authority projects). **Never edits the ranges in `package.json`**
+(npm default). Named packages are reported specifically; the whole graph is
+re-resolved because it must stay globally consistent. A named package that is
+not declared in `package.json` produces a warning and is skipped (non-fatal).
+Omit the package list to upgrade everything within its declared ranges.
+
+```bash
+bpm upgrade lodash
+bpm upgrade            # upgrade all within their ranges
+```
+
+## `bpm dedupe`
+
+Re-resolves the manifest to minimize duplicate package versions and rewrites
+`bpm.lock`. BPM's resolver already minimizes duplicates during initial
+resolution (it unifies versions wherever the declared ranges permit), so
+`dedupe` on an already-minimal graph reports `already minimal` and is
+byte-stable. If the lockfile had drifted from a clean resolve, `dedupe`
+reports the reduction it applied.
+
+```bash
+bpm dedupe
+```
+
 `bpm install -g <pkg>` retains the pre-mutation user-bin linking behavior; `-g`
 with no target is an error.
 

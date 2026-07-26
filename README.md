@@ -63,6 +63,8 @@ Turbopack can keep dependency realpaths inside the project.
 | `bpm doctor` | Inspect the nearest `package.json` and report diagnostics |
 | `bpm fetch <spec\|url>` | Resolve a package by spec (`lodash`, `lodash@4.17.21`) or fetch a tarball by exact URL, then verify, store, and extract. Supports `--offline`, `--prefer-offline`, `--prefer-online` |
 | `bpm install [<spec\|url>]` | Install the project lockfile, or add registry targets to the local manifest; use `bpm install -g <spec>` for global bin linking. Supports `--offline`, `--prefer-offline`, `--prefer-online` |
+| `bpm upgrade [<pkg>...]` | Re-resolve within declared ranges and bump locked versions to the newest satisfying ones; rewrites `bpm.lock` without editing `package.json` ranges |
+| `bpm dedupe` | Re-resolve to minimize duplicate versions and rewrite `bpm.lock` |
 | `bpm ci` | Reproducible frozen install from `bpm.lock` (npm `ci` compatibility) |
 | `bpm import` | Convert npm `package-lock.json` v3 to `bpm.lock` and preserve root manifest metadata |
 | `bpm exec <command>` | Execute a local dependency binary with the project bin path |
