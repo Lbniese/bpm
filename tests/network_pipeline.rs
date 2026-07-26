@@ -2270,8 +2270,7 @@ fn multi_registry_mock_with_deps(
         let base = base_thread.lock().unwrap().clone();
         for pkg in entries.iter() {
             if path == pkg.metadata_path {
-                let tarball_url =
-                    format!("{}{}", base.trim_end_matches('/'), pkg.tarball_path);
+                let tarball_url = format!("{}{}", base.trim_end_matches('/'), pkg.tarball_path);
                 return Some(RouteBody(
                     serde_json::to_vec(&packument_with_deps(
                         &pkg.version,
