@@ -384,4 +384,58 @@ mod tests {
         let files = package_file_list(root.path(), &manifest).unwrap();
         assert_eq!(files, ["README.md", "dist/index.js", "package.json"]);
     }
+
+    #[test]
+    fn ignore_match_supports_glob_patterns() {
+        // glob in final segment, bare basename (no slash) → any depth
+        assert!(ignore_match("debug.log", "*.log"));
+        assert!(ignore_match("logs/x.log", "*.log"));
+        assert!(ignore_match("dist/bundle.js.map", "*.map"));
+        assert!(ignore_match("a.js", "*.js"));
+        // must NOT over-match: a non-matching extension is kept
+        assert!(!ignore_match("debug.txt", "*.log"));
+        assert!(!ignore_match("logger.js", "*.log"));
+        // directory-scoped glob
+        assert!(ignore_match("dist/a.js", "dist/*.js"));
+        assert!(ignore_match("dist/b.js", "dist/*.js"));
+        // existing exact / prefix behaviors preserved
+        assert!(ignore_match("secret.txt", "secret.txt"));
+        assert!(ignore_match("build/x", "build"));
+        assert!(ignore_match("build/x", "build/"));
+        // single-char wildcard
+        assert!(ignore_match("a.txt", "?.txt"));
+        assert!(!ignore_match("ab.txt", "?.txt"));
+        // empty pattern never matches
+        assert!(!ignore_match("anything", ""));
+        assert!(!ignore_match("anything", "/"));
+    }
+
+    #[test]
+    fn package_file_list_honors_globbed_npmignore() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("package.json"),
+            r#"{"name":"p","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        fs::write(root.path().join("README.md"), "readme").unwrap();
+        fs::write(root.path().join("index.js"), "ok").unwrap();
+        // A glob pattern that MUST exclude both top-level and nested .log files.
+        fs::write(root.path().join(".npmignore"), "*.log\n").unwrap();
+        fs::write(root.path().join("debug.log"), "no").unwrap();
+        fs::create_dir_all(root.path().join("logs")).unwrap();
+        fs::write(root.path().join("logs/run.log"), "no").unwrap();
+
+        let manifest: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(root.path().join("package.json")).unwrap())
+                .unwrap();
+        let files = package_file_list(root.path(), &manifest).unwrap();
+        assert!(
+            !files.iter().any(|f| f.ends_with(".log")),
+            "globbed .npmignore must exclude all .log files, got: {files:?}"
+        );
+        assert!(files.contains(&"index.js".to_string()));
+        assert!(files.contains(&"README.md".to_string()));
+        assert!(files.contains(&"package.json".to_string()));
+    }
 }
