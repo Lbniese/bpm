@@ -102,3 +102,49 @@ fn audit_level_controls_exit_policy() {
         "moderate threshold should fail for a high finding"
     );
 }
+
+#[test]
+fn audit_counts_shared_advisory_once_across_packages() {
+    // Two packages, one advisory id reported under each. The summary must say
+    // "1 vulnerability finding(s)" and the high threshold must fail (1 >= 1),
+    // proving the duplicate id was not double-counted.
+    let project = tempfile::tempdir().unwrap();
+    fs::write(
+        project.path().join("package.json"),
+        r#"{"name":"app","version":"1.0.0","dependencies":{"left-pad":"1.3.0","right-pad":"1.0.0"}}"#,
+    )
+    .unwrap();
+    let response = br#"{"left-pad":[{"id":7,"severity":"high","title":"shared","url":"https://example.test/x"}],"right-pad":[{"id":7,"severity":"high","title":"shared","url":"https://example.test/x"}]}"#;
+    let server =
+        MiniServer::start_routed(move |_| Some(RouteBody(response.to_vec(), "application/json")));
+
+    // With dedup, there is exactly 1 high finding, so --audit-level high fails.
+    let output = Command::new(bpm_bin())
+        .current_dir(project.path())
+        .args([
+            "audit",
+            "--registry",
+            &server.url(""),
+            "--audit-level",
+            "high",
+        ])
+        .output()
+        .expect("run bpm audit");
+    assert!(
+        !output.status.success(),
+        "high threshold should fail for one shared high advisory\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    // The human-readable summary must report 1 finding, not 2.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("1 vulnerability finding(s)"),
+        "expected deduped count of 1 in stdout, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("2 vulnerability finding(s)"),
+        "advisory was double-counted; got: {stdout}"
+    );
+}
