@@ -134,7 +134,7 @@ pub struct Stats {
 impl Stats {
     pub fn compute(values: Vec<f64>) -> Self {
         let mut sorted = values.clone();
-        sorted.sort_unstable_by(|a, b| a.total_cmp(&b));
+        sorted.sort_unstable_by(|a, b| a.total_cmp(b));
 
         let len = sorted.len();
         if len == 0 {
