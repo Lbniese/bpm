@@ -1,0 +1,15 @@
+# Pinned Rust toolchain.
+#
+# CI installs exactly this channel (`.github/workflows/ci.yml` uses
+# `dtolnay/rust-toolchain@<version>` with the same version below). Pinning
+# keeps the `cargo clippy -- -D warnings` gate reproducible: new stable
+# releases can introduce lints mid-stream and turn every open PR red, which
+# is exactly what forced the reactive Plan 031 fix. Bump this pin deliberately
+# (and re-run the full gate) when you want to move forward.
+#
+# `dtolnay/rust-toolchain@stable` is intentionally NOT used: that tag floats
+# to the latest stable and ignores this file's channel, which would defeat
+# the pin.
+[toolchain]
+channel = "1.96.1"
+components = ["rustfmt", "clippy"]

@@ -40,8 +40,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+      # Pinned toolchain — see rust-toolchain.toml. Keep the version here
+      # identical to the channel in that file.
+      - name: Install Rust (pinned)
+        uses: dtolnay/rust-toolchain@1.96.1
         with:
           components: rustfmt, clippy
 
@@ -67,8 +69,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust (pinned)
+        uses: dtolnay/rust-toolchain@1.96.1
         with:
           components: rustfmt, clippy
 
@@ -98,7 +100,7 @@ jobs:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.96.1
       - run: cargo run -- bench --list
       - run: cargo test --test bench
 
@@ -108,7 +110,7 @@ jobs:
     if: github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.96.1
       - uses: actions/setup-node@v5
         with:
           node-version: '26.0.0'
@@ -144,7 +146,7 @@ jobs:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'push'
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.96.1
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
@@ -165,8 +167,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust (pinned)
+        uses: dtolnay/rust-toolchain@1.96.1
       - name: Run cargo-deny (advisories)
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
