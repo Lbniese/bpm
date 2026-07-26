@@ -1103,6 +1103,10 @@ fn async_resolve_enabled() -> bool {
     )
 }
 
+/// Diagnostic counters threaded back from the async resolve runtime:
+/// (resolve_calls, packument_hits, packument_misses, download_bytes, ...).
+type ResolveDiags = (u64, u64, u64, u64, u64);
+
 /// Resolve a fresh manifest with the async resolver (non-streaming) on a
 /// current-thread tokio runtime. Honors the CLI-selected `peer_mode`; the
 /// resulting lockfile is byte-identical to the blocking resolver's output for
@@ -1120,7 +1124,7 @@ fn resolve_fresh_manifest_async(
     metrics
         .measure(
             "dependency_resolution",
-            || -> anyhow::Result<(Lockfile, (u64, u64, u64, u64, u64))> {
+            || -> anyhow::Result<(Lockfile, ResolveDiags)> {
                 let diag_cell = std::cell::Cell::new((0u64, 0u64, 0u64, 0u64, 0u64));
                 let result = tokio::runtime::Builder::new_current_thread()
                     .enable_all()

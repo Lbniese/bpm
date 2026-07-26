@@ -14,6 +14,9 @@ use std::time::Duration;
 use bpm::lockfile::{Lockfile, PackageEntry, RootEntry};
 use common::{build_tgz, integrity_of, CapturedRequest, MiniServer, RouteBody};
 
+/// (name, version, tarball url, tarball body, extra response headers)
+type PkgFixture<'a> = (&'a str, &'a str, &'a str, Vec<u8>, BTreeMap<String, String>);
+
 fn bin() -> String {
     std::env::var("CARGO_BIN_EXE_bpm").expect("CARGO_BIN_EXE_bpm")
 }
@@ -2302,7 +2305,7 @@ fn multi_registry_mock_with_deps(
 #[test]
 fn async_resolve_wide_fanout_byte_identical() {
     // Build 10 sibling deps + 10 transitive deps on one registry mock.
-    let mut pkgs: Vec<(&str, &str, &str, Vec<u8>, BTreeMap<String, String>)> = Vec::new();
+    let mut pkgs: Vec<PkgFixture<'_>> = Vec::new();
     let mut names: Vec<String> = Vec::new();
     for i in 0..10 {
         let sibling = format!("sib-{i}");
@@ -2395,7 +2398,7 @@ fn async_resolve_wide_fanout_byte_identical() {
 /// against any accidental completion-order leak in the lockfile.
 #[test]
 fn async_resolve_wide_fanout_is_deterministic_across_runs() {
-    let mut pkgs: Vec<(&str, &str, &str, Vec<u8>, BTreeMap<String, String>)> = Vec::new();
+    let mut pkgs: Vec<PkgFixture<'_>> = Vec::new();
     let mut names: Vec<String> = Vec::new();
     for i in 0..10 {
         let sibling = format!("sib2-{i}");
