@@ -2203,3 +2203,262 @@ fn serve_slow_origin(stream: &mut TcpStream, pkgs: &[(String, Vec<u8>, String)],
     let _ = stream
         .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
 }
+
+// ── Plan 021: concurrency-stress parity (wide sibling fan-out) ─────────────
+
+/// A packument whose version entry declares `dependencies`, so the resolver
+/// expands a real transitive edge from the mock. The minimal [`packument`]
+/// helper omits it; this one lets a mock package declare children the resolver
+/// recurses into.
+fn packument_with_deps(
+    version: &str,
+    tarball_url: String,
+    integrity: String,
+    deps: &BTreeMap<String, String>,
+) -> serde_json::Value {
+    let mut versions = serde_json::Map::new();
+    let mut dist = serde_json::Map::new();
+    dist.insert("tarball".into(), serde_json::json!(tarball_url));
+    dist.insert("integrity".into(), serde_json::json!(integrity));
+    let mut entry = serde_json::Map::new();
+    entry.insert("dist".into(), serde_json::Value::Object(dist));
+    if !deps.is_empty() {
+        entry.insert("dependencies".into(), serde_json::json!(deps));
+    }
+    versions.insert(version.to_string(), serde_json::Value::Object(entry));
+
+    let mut root = serde_json::Map::new();
+    let mut tags = serde_json::Map::new();
+    tags.insert("latest".into(), serde_json::json!(version));
+    root.insert("dist-tags".into(), serde_json::Value::Object(tags));
+    root.insert("versions".into(), serde_json::Value::Object(versions));
+    serde_json::Value::Object(root)
+}
+
+/// Multi-package registry mock where each package may declare `dependencies`
+/// in its packument (so the resolver expands real transitive edges). Each
+/// entry is `(name, version, tarball_path, tgz, deps)`.
+#[allow(clippy::type_complexity)]
+fn multi_registry_mock_with_deps(
+    packages: Vec<(&str, &str, &str, Vec<u8>, BTreeMap<String, String>)>,
+) -> MiniServer {
+    struct Pkg {
+        metadata_path: String,
+        tarball_path: String,
+        version: String,
+        integrity: String,
+        tarball: Vec<u8>,
+        deps: BTreeMap<String, String>,
+    }
+    let mut entries: Vec<Pkg> = Vec::new();
+    for (name, version, tarball_path, tgz, deps) in packages {
+        let integrity = integrity_of(&tgz);
+        entries.push(Pkg {
+            metadata_path: format!("/{}", name.replace('/', "%2F")),
+            tarball_path: format!("/{}", tarball_path.trim_start_matches('/')),
+            version: version.to_string(),
+            integrity,
+            tarball: tgz,
+            deps,
+        });
+    }
+    let entries = Arc::new(entries);
+    let base = Arc::new(Mutex::new(String::new()));
+    let base_thread = base.clone();
+
+    let server = MiniServer::start_keep_alive_routed(move |path| {
+        let base = base_thread.lock().unwrap().clone();
+        for pkg in entries.iter() {
+            if path == pkg.metadata_path {
+                let tarball_url =
+                    format!("{}{}", base.trim_end_matches('/'), pkg.tarball_path);
+                return Some(RouteBody(
+                    serde_json::to_vec(&packument_with_deps(
+                        &pkg.version,
+                        tarball_url,
+                        pkg.integrity.clone(),
+                        &pkg.deps,
+                    ))
+                    .unwrap(),
+                    "application/json",
+                ));
+            }
+            if path == pkg.tarball_path {
+                return Some(RouteBody(pkg.tarball.clone(), "application/gzip"));
+            }
+        }
+        None
+    });
+    *base.lock().unwrap() = server.url("");
+    server
+}
+
+/// Concurrency-stress parity test (Plan 021 Step 0): a root with a wide
+/// sibling fan-out (10 direct deps, each with its own unique transitive dep)
+/// so the async resolver's concurrent packument fan-out is actually
+/// exercised. Asserts the async path (`BPM_ASYNC_RESOLVE=1`) produces a
+/// byte-identical `bpm.lock` to the blocking kill-switch path
+/// (`BPM_ASYNC_RESOLVE=0`), proving fan-out does not leak completion order
+/// into the output.
+#[test]
+fn async_resolve_wide_fanout_byte_identical() {
+    // Build 10 sibling deps + 10 transitive deps on one registry mock.
+    let mut pkgs: Vec<(&str, &str, &str, Vec<u8>, BTreeMap<String, String>)> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
+    for i in 0..10 {
+        let sibling = format!("sib-{i}");
+        let transitive = format!("trn-{i}");
+        names.push(sibling.clone());
+
+        // Sibling depends on its unique transitive dep.
+        let sib_tgz = package_tgz(&sibling, "1.0.0", None);
+        let sib_tgz_path = format!("tarballs/{sibling}-1.0.0.tgz");
+        let mut sib_deps = BTreeMap::new();
+        sib_deps.insert(transitive.clone(), "^1.0.0".to_string());
+        pkgs.push((
+            Box::leak(sibling.into_boxed_str()),
+            "1.0.0",
+            Box::leak(sib_tgz_path.into_boxed_str()),
+            sib_tgz,
+            sib_deps,
+        ));
+
+        // Transitive dep is a leaf.
+        let trn_tgz = package_tgz(&transitive, "1.0.0", None);
+        let trn_tgz_path = format!("tarballs/{transitive}-1.0.0.tgz");
+        pkgs.push((
+            Box::leak(transitive.into_boxed_str()),
+            "1.0.0",
+            Box::leak(trn_tgz_path.into_boxed_str()),
+            trn_tgz,
+            BTreeMap::new(),
+        ));
+    }
+
+    let server = multi_registry_mock_with_deps(pkgs);
+
+    // Root depends on all 10 siblings -> wide fan-out at depth 1.
+    let deps_json = names
+        .iter()
+        .map(|n| format!("\"{n}\":\"^1.0.0\""))
+        .collect::<Vec<_>>()
+        .join(",");
+    let manifest = format!(
+        "{{\"name\":\"fanout-app\",\"version\":\"1.0.0\",\"dependencies\":{{{deps_json}}}}}"
+    );
+
+    let project = tempfile::tempdir().unwrap();
+    fs::write(project.path().join("package.json"), manifest).unwrap();
+    write_npmrc(project.path(), &[format!("registry={}", server.url(""))]);
+
+    // ---- Blocking resolve (BPM_ASYNC_RESOLVE=0, no streaming) ----
+    let store_block = tempfile::tempdir().unwrap();
+    let (ok_block, stdout_block, stderr_block) = run_bpm_with_env(
+        &["install"],
+        project.path(),
+        store_block.path(),
+        None,
+        RESOLVE_BLOCKING,
+    );
+    assert!(
+        ok_block,
+        "blocking install failed\nstdout: {stdout_block}\nstderr: {stderr_block}"
+    );
+    let blocking_lock = fs::read_to_string(project.path().join("bpm.lock"))
+        .expect("bpm.lock should exist after blocking install");
+
+    // ---- Async resolve (BPM_ASYNC_RESOLVE=1) — exercises fan-out ----
+    let store_async = tempfile::tempdir().unwrap();
+    let _ = fs::remove_file(project.path().join("bpm.lock"));
+    let mut cmd = std::process::Command::new(bin());
+    cmd.args(["install"])
+        .current_dir(project.path())
+        .env("BPM_STORE", store_async.path())
+        .env("BPM_ASYNC_RESOLVE", "1");
+    let out = cmd.output().expect("run bpm with async resolver");
+    assert!(
+        out.status.success(),
+        "async install failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let async_lock = fs::read_to_string(project.path().join("bpm.lock"))
+        .expect("bpm.lock should exist after async install");
+
+    assert_eq!(
+        blocking_lock, async_lock,
+        "blocking and async resolve must produce byte-identical bpm.lock under wide fan-out"
+    );
+}
+
+/// Determinism-under-reordering test (Plan 021): run the async resolve twice
+/// on the same wide-fanout graph and assert byte-identical output, guarding
+/// against any accidental completion-order leak in the lockfile.
+#[test]
+fn async_resolve_wide_fanout_is_deterministic_across_runs() {
+    let mut pkgs: Vec<(&str, &str, &str, Vec<u8>, BTreeMap<String, String>)> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
+    for i in 0..10 {
+        let sibling = format!("sib2-{i}");
+        let transitive = format!("trn2-{i}");
+        names.push(sibling.clone());
+        let sib_tgz = package_tgz(&sibling, "1.0.0", None);
+        let sib_tgz_path = format!("tarballs/{sibling}-1.0.0.tgz");
+        let mut sib_deps = BTreeMap::new();
+        sib_deps.insert(transitive.clone(), "^1.0.0".to_string());
+        pkgs.push((
+            Box::leak(sibling.into_boxed_str()),
+            "1.0.0",
+            Box::leak(sib_tgz_path.into_boxed_str()),
+            sib_tgz,
+            sib_deps,
+        ));
+        let trn_tgz = package_tgz(&transitive, "1.0.0", None);
+        let trn_tgz_path = format!("tarballs/{transitive}-1.0.0.tgz");
+        pkgs.push((
+            Box::leak(transitive.into_boxed_str()),
+            "1.0.0",
+            Box::leak(trn_tgz_path.into_boxed_str()),
+            trn_tgz,
+            BTreeMap::new(),
+        ));
+    }
+    let server = multi_registry_mock_with_deps(pkgs);
+    let deps_json = names
+        .iter()
+        .map(|n| format!("\"{n}\":\"^1.0.0\""))
+        .collect::<Vec<_>>()
+        .join(",");
+    let manifest = format!(
+        "{{\"name\":\"fanout-app2\",\"version\":\"1.0.0\",\"dependencies\":{{{deps_json}}}}}"
+    );
+
+    let resolve_once = |store: &Path| -> String {
+        let project = tempfile::tempdir().unwrap();
+        fs::write(project.path().join("package.json"), &manifest).unwrap();
+        write_npmrc(project.path(), &[format!("registry={}", server.url(""))]);
+        let mut cmd = std::process::Command::new(bin());
+        cmd.args(["install"])
+            .current_dir(project.path())
+            .env("BPM_STORE", store)
+            .env("BPM_ASYNC_RESOLVE", "1");
+        let out = cmd.output().expect("run bpm with async resolver");
+        assert!(
+            out.status.success(),
+            "async install failed\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        fs::read_to_string(project.path().join("bpm.lock"))
+            .expect("bpm.lock should exist after async install")
+    };
+
+    let store_a = tempfile::tempdir().unwrap();
+    let store_b = tempfile::tempdir().unwrap();
+    let lock_a = resolve_once(store_a.path());
+    let lock_b = resolve_once(store_b.path());
+    assert_eq!(
+        lock_a, lock_b,
+        "async resolve must be byte-identical across runs regardless of fetch completion order"
+    );
+}
