@@ -177,7 +177,7 @@ fn put_artifact_stores_bytes_at_verified_digest_path() {
     let client = RemoteCacheClient::with_push(config, true).unwrap();
 
     client
-        .put_artifact(&digest, &body)
+        .put_artifact(&digest, reqwest::blocking::Body::from(body.clone()))
         .expect("put should succeed");
 
     let captured = handle.join().unwrap();
@@ -207,7 +207,7 @@ fn put_artifact_409_is_idempotent_success() {
 
     // 409 = already exists → success, not an error.
     client
-        .put_artifact(&digest, &body)
+        .put_artifact(&digest, reqwest::blocking::Body::from(body.clone()))
         .expect("409 should be idempotent success");
 }
 
@@ -221,7 +221,7 @@ fn put_artifact_failure_is_non_fatal_and_redacts_token() {
     let client = RemoteCacheClient::with_push(config, true).unwrap();
 
     let error = client
-        .put_artifact(&digest, &body)
+        .put_artifact(&digest, reqwest::blocking::Body::from(body.clone()))
         .expect_err("500 should be an error");
     let message = format!("{error}");
     assert!(
@@ -260,7 +260,7 @@ fn ensure_artifact_with_remote_pushes_after_origin_fetch() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let cache_base = format!("http://{address}");
-    let expected_digest = digest.clone();
+    let expected_digest = digest;
     let cache_handle = thread::spawn(move || {
         let mut captured_put: Option<Vec<u8>> = None;
         for _ in 0..2 {
@@ -372,4 +372,46 @@ fn ensure_artifact_with_remote_pushes_after_origin_fetch() {
         !metrics_json.contains("remote_cache_push_error"),
         "push should not have errored: {metrics_json}"
     );
+}
+
+#[test]
+fn put_artifact_streams_from_file() {
+    use std::io::Write;
+
+    // Write a small artifact to a temp file.
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("artifact.bin");
+    let content = b"streamed tarball content";
+    {
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(content).unwrap();
+    }
+
+    let digest = Sha512Digest::hash_bytes(content);
+    let (base, handle) = put_server("201 Created");
+    let config =
+        RemoteCacheConfig::new_loopback_for_tests(&base, Some("stream-secret".into())).unwrap();
+    let client = RemoteCacheClient::with_push(config, true).unwrap();
+
+    // Open the file and stream it as the request body.
+    let file = std::fs::File::open(&path).unwrap();
+    let body = reqwest::blocking::Body::from(file);
+    client
+        .put_artifact(&digest, body)
+        .expect("put from file should succeed");
+
+    let captured = handle.join().unwrap();
+    assert_eq!(captured.method, "PUT");
+    assert!(
+        captured
+            .path
+            .contains(&format!("/v1/artifacts/sha512/{}", digest.to_hex())),
+        "expected verified digest in path, got: {}",
+        captured.path
+    );
+    assert_eq!(
+        captured.body, content,
+        "uploaded body must match the file content"
+    );
+    assert_eq!(captured.auth, Some("Bearer stream-secret".into()));
 }

@@ -31,7 +31,7 @@ use crate::download::{self, DownloadError};
 use crate::http::{redact_url, HttpClient};
 use crate::integrity::{ArtifactId, Integrity, IntegrityError, Sha512Digest};
 use crate::metrics::Metrics;
-use crate::remote_cache::{RemoteCacheClient, RemoteFetch};
+use crate::remote_cache::{RemoteCacheClient, RemoteCacheError, RemoteFetch};
 
 // `std::fs::File` provides inherent `lock()` (exclusive advisory lock) and
 // `unlock()` on stable Rust, used here for per-artifact mutual exclusion.
@@ -342,12 +342,21 @@ impl ArtifactStore {
         // push is explicitly enabled (`BPM_REMOTE_CACHE_PUSH=1`). The just-
         // published artifact's verified SHA-512 is the push digest; a push
         // failure is a warning + metric, never an install failure.
+        // The body is streamed from the published file (Plan 029), avoiding a
+        // double heap buffer of the (potentially large) artifact.
         if remote.push_enabled() {
-            match fs::read(&destination) {
-                Ok(bytes) => match remote.put_artifact(&id, &bytes) {
-                    Ok(()) => metrics.record("remote_cache_push", std::time::Duration::ZERO),
-                    Err(_) => metrics.record("remote_cache_push_error", std::time::Duration::ZERO),
-                },
+            let result = match std::fs::File::open(&destination) {
+                Ok(file) => {
+                    let body = reqwest::blocking::Body::from(file);
+                    remote.put_artifact(&id, body)
+                }
+                Err(_) => Err(RemoteCacheError::Request {
+                    endpoint: String::new(),
+                    message: "cannot open published artifact for push".into(),
+                }),
+            };
+            match result {
+                Ok(()) => metrics.record("remote_cache_push", std::time::Duration::ZERO),
                 Err(_) => metrics.record("remote_cache_push_error", std::time::Duration::ZERO),
             }
         }

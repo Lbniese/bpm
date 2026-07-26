@@ -10,7 +10,7 @@ use std::io::{self, Read, Write};
 use std::path::Path;
 use std::time::Duration;
 
-use reqwest::blocking::{Client, ClientBuilder};
+use reqwest::blocking::{Body, Client, ClientBuilder};
 use reqwest::redirect::Policy;
 use thiserror::Error;
 
@@ -282,7 +282,13 @@ impl RemoteCacheClient {
     /// publication) — the client does not rehash or trust a path-derived
     /// value. `200`/`201`/`409` are success (stored / already stored); any
     /// other status or transport failure is returned as `RemoteCacheError`.
-    pub fn put_artifact(&self, id: &ArtifactId, body: &[u8]) -> Result<(), RemoteCacheError> {
+    ///
+    /// The body is accepted as a `reqwest::blocking::Body` so the caller can
+    /// stream from a `File` (or any `Read`) instead of double-buffering the
+    /// artifact in heap. The 60s client timeout applies to the whole request,
+    /// including streaming; a slow upload under that timeout may fail
+    /// identically to an in-memory send of the same bytes.
+    pub fn put_artifact(&self, id: &ArtifactId, body: Body) -> Result<(), RemoteCacheError> {
         let endpoint = format!(
             "{}/v1/artifacts/sha512/{}",
             self.config.base_url().trim_end_matches('/'),
@@ -292,7 +298,7 @@ impl RemoteCacheClient {
             .client
             .put(&endpoint)
             .header("Content-Type", "application/octet-stream")
-            .body(body.to_vec());
+            .body(body);
         if let Some(token) = &self.config.token {
             request = request.bearer_auth(&token.0);
         }
