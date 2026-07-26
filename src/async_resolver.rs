@@ -103,7 +103,27 @@ use crate::metadata_cache::{CacheMode, MetadataCache};
 use crate::registry::{version_metadata, WireVersionMetadata, ABBREV_ACCEPT};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{watch, Mutex as AsyncMutex};
+
+/// Singleflight state for one in-flight packument fetch, shared between the
+/// launcher and any concurrent waiters (Plan 021 fan-out). The producer
+/// transitions `Pending` -> `Done` exactly once; waiters block on the watch
+/// until `Done`. The shared payload is `Result<Packument, String>`: the
+/// packument is cheaply cloneable, and the error is pre-stringified by the
+/// producer (the original `AsyncResolveError` is not `Clone`). The producer
+/// returns its own verbatim error; waiters reconstruct an equivalent one via
+/// `AsyncResolveError::Http`.
+#[derive(Clone)]
+enum FetchState {
+    Pending,
+    Done(Result<Packument, String>),
+}
+
+impl FetchState {
+    fn is_done(&self) -> bool {
+        matches!(self, FetchState::Done(_))
+    }
+}
 
 /// One complete async metadata fetch that honors the persistent cache
 /// contract, mirroring blocking [`crate::registry::fetch_with_cache`].
@@ -449,20 +469,39 @@ async fn async_fetch_version_packument(
 
 // ── AsyncRegistryClient ─────────────────────────────────────────────────
 
+/// Singleflight entry: a `watch` sender the launcher drives to `Done`, plus a
+/// receiver waiters clone to await the result.
+struct InFlightEntry {
+    tx: watch::Sender<FetchState>,
+    rx: watch::Receiver<FetchState>,
+}
+
+impl InFlightEntry {
+    fn new() -> Self {
+        let (tx, rx) = watch::channel(FetchState::Pending);
+        Self { tx, rx }
+    }
+}
+
 #[derive(Clone)]
 pub struct AsyncRegistryClient {
     config: NpmConfig,
     http: reqwest::Client,
     packument_cache: Arc<AsyncMutex<BTreeMap<String, Packument>>>,
+    /// Singleflight map of in-flight packument fetches keyed by
+    /// `{registry}\0{name}`. The map lock is held only briefly (to insert /
+    /// look up an `Arc<InFlightEntry>`); the network fetch runs *outside* both
+    /// this lock and the `packument_cache` lock, so sibling fetches overlap.
+    in_flight: Arc<AsyncMutex<BTreeMap<String, Arc<InFlightEntry>>>>,
     fetch_bytes: Arc<AtomicU64>,
     inline_fetches: Arc<AtomicU64>,
+    prefetch_fetches: Arc<AtomicU64>,
+    batch_prefetch_fetches: Arc<AtomicU64>,
     cache_hits: Arc<AtomicU64>,
     metadata_cache: Option<Arc<MetadataCache>>,
     cache_mode: CacheMode,
     max_in_flight: u32,
     peak_in_flight: Arc<AtomicU64>,
-    #[allow(dead_code)]
-    in_flight: Arc<AtomicU64>,
 }
 
 impl AsyncRegistryClient {
@@ -472,14 +511,16 @@ impl AsyncRegistryClient {
             config,
             http,
             packument_cache: Arc::new(AsyncMutex::new(BTreeMap::new())),
+            in_flight: Arc::new(AsyncMutex::new(BTreeMap::new())),
             fetch_bytes: Arc::new(AtomicU64::new(0)),
             inline_fetches: Arc::new(AtomicU64::new(0)),
+            prefetch_fetches: Arc::new(AtomicU64::new(0)),
+            batch_prefetch_fetches: Arc::new(AtomicU64::new(0)),
             cache_hits: Arc::new(AtomicU64::new(0)),
             metadata_cache: None,
             cache_mode: CacheMode::Default,
             max_in_flight: 4,
             peak_in_flight: Arc::new(AtomicU64::new(0)),
-            in_flight: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -541,6 +582,7 @@ impl AsyncRegistryClient {
         let registry_url = self.config.registry_for_package(name);
         let key = format!("{}\0{name}", registry_url.trim_end_matches('/'));
 
+        // Fast path: a completed packument is already cached.
         {
             let cache = self.packument_cache.lock().await;
             if let Some(packument) = cache.get(&key) {
@@ -549,29 +591,188 @@ impl AsyncRegistryClient {
             }
         }
 
+        // Miss: count an inline fetch and go through the singleflight so any
+        // concurrent prefetch of the same name is deduped rather than
+        // double-fetched.
         self.inline_fetches.fetch_add(1, Ordering::Relaxed);
-        let packument = async_fetch_packument(
-            &self.http,
-            name,
-            &self.config,
-            registry_url,
-            self.metadata_cache.as_ref(),
-            self.cache_mode,
-            &self.fetch_bytes,
-        )
-        .await?;
-
-        let mut cache = self.packument_cache.lock().await;
-        cache.entry(key).or_insert_with(|| packument.clone());
-        Ok(packument)
+        self.fetch_packument_singleflighted(&key, name, registry_url)
+            .await
     }
 
-    pub fn take_diagnostics(&self) -> (u64, u64, u64) {
+    /// Best-effort, non-blocking hint that a packument will be needed soon
+    /// (Plan 021 fan-out). If the packument is already cached or in flight,
+    /// this is a no-op. Otherwise it launches the fetch as a detached
+    /// background task that drives the singleflight to completion and fills
+    /// the cache; the result is later observed by `packument`/`packument_for`
+    /// via the cache or the in-flight entry. Failures are silently dropped:
+    /// `packument_for` remains the single source of truth for error reporting
+    /// (it will re-fetch and surface the real error on a miss).
+    ///
+    /// Must be called from within a tokio runtime context (it spawns a task).
+    pub fn prefetch_packument(&self, name: &str, version_spec: Option<&str>) {
+        // Only registry packuments (range/latest requests) benefit from
+        // prefetch. An exact-version request resolves a single version, not
+        // the full packument, so it is skipped here.
+        let _ = version_spec;
+        let registry_url = self.config.registry_for_package(name).to_owned();
+        let key = format!("{}\0{name}", registry_url.trim_end_matches('/'));
+        let this = self.clone();
+        let name_owned = name.to_owned();
+        // `spawn` detaches the task; if the runtime is dropped first the task
+        // is cancelled, which is safe (the cache stays authoritative).
+        tokio::spawn(async move {
+            // Cheap re-check under the cache lock to avoid a redundant
+            // singleflight entry for an already-cached packument.
+            {
+                let cache = this.packument_cache.lock().await;
+                if cache.contains_key(&key) {
+                    return;
+                }
+            }
+            this.prefetch_fetches.fetch_add(1, Ordering::Relaxed);
+            // Drive the fetch to completion; the result fills the cache via
+            // the singleflight. Errors are intentionally ignored here.
+            let _ = this
+                .fetch_packument_singleflighted(&key, &name_owned, &registry_url)
+                .await;
+        });
+    }
+
+    /// Singleflighted packument fetch keyed by `{registry}\0{name}`. If a fetch
+    /// for `key` is already in flight, this joins it (awaiting the shared
+    /// `watch`); otherwise this call launches the fetch and becomes the
+    /// producer. The network I/O runs *outside* both the `in_flight` map lock
+    /// and the `packument_cache` lock, so sibling fetches overlap.
+    ///
+    /// On success the packument is inserted into `packument_cache` (so later
+    /// requests hit the fast path) and the in-flight entry is completed then
+    /// removed from the map. On error the entry is still completed (so
+    /// waiters get the same error) but nothing is cached, so a later retry
+    /// re-fetches.
+    async fn fetch_packument_singleflighted(
+        &self,
+        key: &str,
+        name: &str,
+        registry_url: &str,
+    ) -> Result<Packument, AsyncResolveError> {
+        // Briefly hold the in_flight map lock to insert or look up the entry.
+        // `is_new == true` means we won the race to produce; any concurrent
+        // caller finds the same `Arc<InFlightEntry>` and becomes a waiter.
+        let (entry, is_new) = {
+            let mut in_flight = self.in_flight.lock().await;
+            match in_flight.get(key) {
+                Some(existing) => (Arc::clone(existing), false),
+                None => {
+                    let entry = Arc::new(InFlightEntry::new());
+                    in_flight.insert(key.to_owned(), Arc::clone(&entry));
+                    (entry, true)
+                }
+            }
+        };
+
+        if is_new {
+            // ── Producer path: do the network fetch, then publish. ──
+            let result = async_fetch_packument(
+                &self.http,
+                name,
+                &self.config,
+                registry_url,
+                self.metadata_cache.as_ref(),
+                self.cache_mode,
+                &self.fetch_bytes,
+            )
+            .await;
+
+            // Cache success only (errors must be retryable). Use
+            // `or_insert_with` so a concurrent cache fill never overwrites.
+            if let Ok(packument) = &result {
+                let mut cache = self.packument_cache.lock().await;
+                cache
+                    .entry(key.to_owned())
+                    .or_insert_with(|| packument.clone());
+            }
+
+            // Publish the result to every waiter, then remove the in-flight
+            // marker so a future miss re-fetches. The producer returns its
+            // own verbatim `result`; waiters get a clone (`Packument` is
+            // `Clone`; errors are shared as a stringified render).
+            let shared = match &result {
+                Ok(packument) => Ok(packument.clone()),
+                Err(error) => Err(error.to_string()),
+            };
+            let _ = entry.tx.send(FetchState::Done(shared));
+            self.in_flight.lock().await.remove(key);
+
+            result
+        } else {
+            // ── Waiter path: observe the shared result. ──
+            // Fast done-check: the producer may have finished between our
+            // map-lock release and now.
+            if let FetchState::Done(result) = &*entry.tx.borrow() {
+                return clone_shared_result(result);
+            }
+            // Wait until the producer publishes. A closed sender (producer
+            // task was cancelled before publishing) is treated as a transient
+            // miss and re-fetched inline below.
+            let mut rx = entry.rx.clone();
+            if let Ok(guard) = rx.wait_for(|state| state.is_done()).await {
+                if let FetchState::Done(result) = &*guard {
+                    // Owned result: clones the packument / reconstructs the
+                    // error, so no borrow escapes the guard's lifetime.
+                    return clone_shared_result(result);
+                }
+            }
+            // The producer dropped without publishing (e.g. its task was
+            // cancelled). Re-fetch inline rather than re-entering the
+            // singleflight, so this path never recurses.
+            self.in_flight.lock().await.remove(key);
+            let packument = async_fetch_packument(
+                &self.http,
+                name,
+                &self.config,
+                registry_url,
+                self.metadata_cache.as_ref(),
+                self.cache_mode,
+                &self.fetch_bytes,
+            )
+            .await?;
+            let mut cache = self.packument_cache.lock().await;
+            cache
+                .entry(key.to_owned())
+                .or_insert_with(|| packument.clone());
+            Ok(packument)
+        }
+    }
+
+    /// Drain the resolver fetch diagnostics counters. Returns
+    /// `(cache_hits, inline_fetches, prefetch_fetches, batch_prefetch_fetches,
+    /// fetch_bytes)`. `prefetch_fetches` counts background fan-out launches
+    /// (Plan 021); `batch_prefetch_fetches` counts root-warmup launches.
+    pub fn take_diagnostics(&self) -> (u64, u64, u64, u64, u64) {
         (
             self.cache_hits.swap(0, Ordering::Relaxed),
             self.inline_fetches.swap(0, Ordering::Relaxed),
+            self.prefetch_fetches.swap(0, Ordering::Relaxed),
+            self.batch_prefetch_fetches.swap(0, Ordering::Relaxed),
             self.fetch_bytes.swap(0, Ordering::Relaxed),
         )
+    }
+}
+
+/// Lift a singleflight result out of `FetchState::Done` for a waiter.
+///
+/// The shared payload is `Result<Packument, String>`: we clone the packument
+/// on success, or reconstruct an `AsyncResolveError::Http` from the
+/// stringified error on failure. Errors are never cached, so this
+/// reconstruction is only observed by concurrent waiters that joined an
+/// in-flight fetch; the producing caller gets the original error verbatim.
+fn clone_shared_result(result: &Result<Packument, String>) -> Result<Packument, AsyncResolveError> {
+    match result {
+        Ok(packument) => Ok(packument.clone()),
+        Err(message) => Err(AsyncResolveError::Http {
+            url: String::new(),
+            message: message.clone(),
+        }),
     }
 }
 
@@ -832,11 +1033,35 @@ impl<'a> AsyncGraphResolver<'a> {
             // ── Announce to sink ────────────────────────────────────────────
             self.announce(&path);
 
+            // ── Prefetch registry-typed children (Plan 021 fan-out) ───
+            // Launch best-effort background fetches for each registry child
+            // so sibling packument fetches overlap while DFS proceeds into
+            // the first child. The singleflight dedups repeats; failures are
+            // dropped and re-fetched inline by `resolve_children`.
+            self.prefetch_registry_children(&dependencies);
+
             // ── Recurse into children ───────────────────────────────────────
             self.resolve_children(&path, &dependencies, optional, dev)
                 .await?;
             Ok(Some(path))
         })
+    }
+
+    /// Launch best-effort background packument fetches for every registry-typed
+    /// child (Plan 021 fan-out). Non-registry specs (`file:`/`git:`/tarball)
+    /// and workspace members are skipped; the singleflight dedups repeats and
+    /// best-effort failures are dropped (the inline `resolve_children` path
+    /// re-fetches and surfaces real errors).
+    fn prefetch_registry_children(&self, dependencies: &BTreeMap<String, String>) {
+        for (child, child_spec) in dependencies {
+            if DependencySource::parse(child_spec).is_some() {
+                continue;
+            }
+            if self.workspace.and_then(|w| w.get(child)).is_some() {
+                continue;
+            }
+            self.registry.prefetch_packument(child, Some(child_spec));
+        }
     }
 
     async fn resolve_children(
@@ -1211,11 +1436,38 @@ pub async fn resolve_manifest_with_options_and_target_async_sink(
     );
 
     // ── Prefetch root-level packuments (concurrent warmup) ──────────
+    // Fan out all root-level packument fetches concurrently (Plan 021). Each
+    // launch goes through the singleflight so duplicates dedup; the JoinSet
+    // awaits them as a batch. Exact-version requests are skipped (they fetch
+    // a single version, not the full packument). Failures are ignored here —
+    // the real resolve below surfaces any genuine error via `packument_for`.
+    let mut warmup = tokio::task::JoinSet::new();
     for (name, spec) in &root_deps {
-        if let Ok(parsed) = parse_spec(&format!("{name}@{spec}")) {
-            let _ = registry.packument_for(&parsed).await;
+        // Only registry specs benefit from packument prefetch.
+        if DependencySource::parse(spec).is_some() {
+            continue;
         }
+        if workspace.and_then(|w| w.get(name)).is_some() {
+            continue;
+        }
+        let parsed = match parse_spec(&format!("{name}@{spec}")) {
+            Ok(parsed) => parsed,
+            Err(_) => continue,
+        };
+        // The singleflight only fetches full packuments (range/latest).
+        if matches!(parsed.req, registry::VersionRequest::Exact(_)) {
+            continue;
+        }
+        let registry_clone = registry.clone();
+        registry
+            .batch_prefetch_fetches
+            .fetch_add(1, Ordering::Relaxed);
+        let name_owned = name.to_owned();
+        warmup.spawn(async move {
+            let _ = registry_clone.packument(&name_owned).await;
+        });
     }
+    while warmup.join_next().await.is_some() {}
 
     // ── Resolve root dependencies ───────────────────────────────────────
     let mut root_targets: BTreeMap<String, (String, String)> = BTreeMap::new();

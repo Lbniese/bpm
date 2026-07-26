@@ -1120,8 +1120,8 @@ fn resolve_fresh_manifest_async(
     metrics
         .measure(
             "dependency_resolution",
-            || -> anyhow::Result<(Lockfile, (u64, u64, u64))> {
-                let diag_cell = std::cell::Cell::new((0u64, 0u64, 0u64));
+            || -> anyhow::Result<(Lockfile, (u64, u64, u64, u64, u64))> {
+                let diag_cell = std::cell::Cell::new((0u64, 0u64, 0u64, 0u64, 0u64));
                 let result = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
@@ -1150,10 +1150,19 @@ fn resolve_fresh_manifest_async(
                 Ok((result, diag))
             },
         )
-        .map(|(lockfile, (hits, fetches, fetch_bytes))| {
-            metrics.record_resolver_diagnostics(hits, 0, fetches, 0, fetch_bytes, 0);
-            lockfile
-        })
+        .map(
+            |(lockfile, (hits, fetches, prefetch, batch, fetch_bytes))| {
+                metrics.record_resolver_diagnostics(
+                    hits,
+                    0,
+                    fetches,
+                    prefetch + batch,
+                    fetch_bytes,
+                    0,
+                );
+                lockfile
+            },
+        )
         .map_err(|error| anyhow::anyhow!("dependency resolution failed: {error}"))
 }
 
@@ -1295,7 +1304,7 @@ fn run_streaming_async_install(
             // to the non-blocking TryChannelSink. Units that overflow the live
             // channel are retained in `overflow` rather than dropped.
             let config_clone = config.clone();
-            let diag_cell = std::cell::Cell::new((0u64, 0u64, 0u64));
+            let diag_cell = std::cell::Cell::new((0u64, 0u64, 0u64, 0u64, 0u64));
             let lockfile = metrics
                 .measure("dependency_resolution", || {
                     tokio::runtime::Builder::new_current_thread()
@@ -1331,8 +1340,8 @@ fn run_streaming_async_install(
                 })
                 .map_err(|error| anyhow::anyhow!("dependency resolution failed: {error}"))?;
             // Record async resolver diagnostics.
-            let (hits, fetches, fetch_bytes) = diag_cell.into_inner();
-            metrics.record_resolver_diagnostics(hits, 0, fetches, 0, fetch_bytes, 0);
+            let (hits, fetches, prefetch, batch, fetch_bytes) = diag_cell.into_inner();
+            metrics.record_resolver_diagnostics(hits, 0, fetches, prefetch + batch, fetch_bytes, 0);
             // Async resolution is complete and we are off the tokio runtime, so
             // it is safe to block while draining every overflowed unit through
             // the original concurrent pipeline (workers drain concurrently).
