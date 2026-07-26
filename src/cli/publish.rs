@@ -281,9 +281,72 @@ fn ignore_match(path: &str, pattern: &str) -> bool {
     if pattern.is_empty() {
         return false;
     }
-    path == pattern
-        || path.starts_with(&format!("{pattern}/"))
-        || path.rsplit('/').next().is_some_and(|name| name == pattern)
+    if path == pattern || path.starts_with(&format!("{pattern}/")) {
+        return true;
+    }
+    // Final-segment glob: split the pattern on the last `/` so the wildcard
+    // applies to the basename only. A pattern with no `/` matches any basename
+    // at any depth (gitignore "pattern with no slash matches at any depth");
+    // a pattern with a `/` matches only the same directory prefix.
+    let (pat_dir, pat_name) = match pattern.rsplit_once('/') {
+        Some((d, n)) => (Some(d), n),
+        None => (None, pattern),
+    };
+    let (path_dir, path_name) = match path.rsplit_once('/') {
+        Some((d, n)) => (Some(d), n),
+        None => (None, path),
+    };
+    match (pat_dir, path_dir) {
+        (Some(pd), Some(pthd)) if !glob_segment(pthd, pd) => return false,
+        (Some(_), None) => return false,
+        _ => {}
+    }
+    glob_segment(path_name, pat_name)
+}
+
+/// Return true if a single path segment `seg` matches a glob `pat` where `pat`
+/// may contain `*` (zero or more bytes within this segment) and `?` (exactly
+/// one byte). Literal bytes match themselves. Case-sensitive (gitignore is
+/// case-sensitive by default and npm follows gitignore). No `**` semantics
+/// here — cross-segment handling is in `ignore_match`, which splits on `/`.
+fn glob_segment(seg: &str, pat: &str) -> bool {
+    let seg = seg.as_bytes();
+    let pat = pat.as_bytes();
+    let (mut si, mut pi) = (0usize, 0usize);
+    let (mut star_si, mut star_pi): (Option<usize>, usize) = (None, 0);
+    while si < seg.len() {
+        match pi < pat.len() {
+            true if pat[pi] == b'*' => {
+                star_si = Some(si);
+                star_pi = pi;
+                pi += 1;
+            }
+            true if pat[pi] == b'?' || pat[pi] == seg[si] => {
+                si += 1;
+                pi += 1;
+            }
+            true => match star_si {
+                Some(ss) => {
+                    si = ss + 1;
+                    star_si = Some(si);
+                    pi = star_pi + 1;
+                }
+                None => return false,
+            },
+            false => match star_si {
+                Some(ss) => {
+                    si = ss + 1;
+                    star_si = Some(si);
+                    pi = star_pi + 1;
+                }
+                None => return false,
+            },
+        }
+    }
+    while pi < pat.len() && pat[pi] == b'*' {
+        pi += 1;
+    }
+    pi == pat.len()
 }
 
 fn normalize_manifest_path(value: &str) -> String {
