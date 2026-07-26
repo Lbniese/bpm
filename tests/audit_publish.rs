@@ -55,7 +55,7 @@ fn audit_level_controls_exit_policy() {
         r#"{"name":"app","version":"1.0.0","dependencies":{"left-pad":"1.3.0"}}"#,
     )
     .unwrap();
-    let response = br#"{"metadata":{"vulnerabilities":{"info":0,"low":0,"moderate":0,"high":1,"critical":0,"total":1}}}"#;
+    let response = br#"{"left-pad":[{"id":1,"severity":"high","title":"demo","url":"https://example.test/x"}]}"#;
     let server =
         MiniServer::start_routed(move |_| Some(RouteBody(response.to_vec(), "application/json")));
 
@@ -84,4 +84,21 @@ fn audit_level_controls_exit_policy() {
         .output()
         .expect("run bpm audit");
     assert!(!output.status.success(), "high threshold should fail");
+
+    // A `high` finding is at-or-above `moderate`, so this must also fail.
+    let output = Command::new(bpm_bin())
+        .current_dir(project.path())
+        .args([
+            "audit",
+            "--registry",
+            &server.url(""),
+            "--audit-level",
+            "moderate",
+        ])
+        .output()
+        .expect("run bpm audit");
+    assert!(
+        !output.status.success(),
+        "moderate threshold should fail for a high finding"
+    );
 }
