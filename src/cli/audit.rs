@@ -207,6 +207,13 @@ fn severity_zeroes() -> BTreeMap<&'static str, u64> {
 /// Count advisory severities from a `/-/npm/v1/security/advisories/bulk`
 /// response, which maps each package name to an array of advisory objects,
 /// each carrying a `severity` field.
+///
+/// A single advisory (identified by its numeric `id`) can affect several
+/// packages in the tree and is therefore repeated under each affected package
+/// name. Count each distinct `id` once, matching `npm audit`. An advisory
+/// object without a parseable `id` is counted once per occurrence (preserving
+/// the previous behavior for malformed entries so they are not silently
+/// hidden).
 fn severity_counts(value: &serde_json::Value) -> BTreeMap<Severity, u64> {
     let mut counts = BTreeMap::from([
         (Severity::Info, 0),
@@ -215,15 +222,28 @@ fn severity_counts(value: &serde_json::Value) -> BTreeMap<Severity, u64> {
         (Severity::High, 0),
         (Severity::Critical, 0),
     ]);
+    // Distinct advisory `id`s already counted. Advisories without a numeric
+    // `id` are counted per-occurrence (see doc comment) and are not added
+    // here, so two id-less entries do not collapse into one.
+    let mut seen_ids: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
     if let Some(map) = value.as_object() {
         for advisories in map.values() {
             if let Some(arr) = advisories.as_array() {
                 for advisory in arr {
-                    if let Some(severity) = advisory.get("severity").and_then(|v| v.as_str()) {
-                        if let Ok(severity) = Severity::parse(severity) {
-                            *counts.entry(severity).or_default() += 1;
+                    let Some(severity) = advisory.get("severity").and_then(|v| v.as_str()) else {
+                        continue;
+                    };
+                    let Ok(severity) = Severity::parse(severity) else {
+                        continue;
+                    };
+                    // If the advisory carries a numeric id we have already
+                    // counted, skip the duplicate occurrence.
+                    if let Some(id) = advisory.get("id").and_then(|v| v.as_u64()) {
+                        if !seen_ids.insert(id) {
+                            continue;
                         }
                     }
+                    *counts.entry(severity).or_default() += 1;
                 }
             }
         }
@@ -361,5 +381,35 @@ mod tests {
         let value = json!({});
         let counts = severity_counts(&value);
         assert_eq!(counts.values().copied().sum::<u64>(), 0);
+    }
+
+    #[test]
+    fn severity_counts_dedupes_shared_advisory_id_across_packages() {
+        // The same advisory id (42) appears under two package names. It must be
+        // counted once, as `high`.
+        let value = json!({
+            "left-pad": [{"id": 42, "severity": "high", "title": "x", "url": "https://e.test/x"}],
+            "right-pad": [{"id": 42, "severity": "high", "title": "x", "url": "https://e.test/x"}]
+        });
+        let counts = severity_counts(&value);
+        assert_eq!(counts[&Severity::High], 1);
+        let total: u64 = counts.values().copied().sum();
+        assert_eq!(total, 1, "shared advisory id counted once overall");
+    }
+
+    #[test]
+    fn severity_counts_distinct_ids_count_independently() {
+        // Two different advisory ids under the same and different packages.
+        let value = json!({
+            "left-pad": [
+                {"id": 1, "severity": "high", "title": "a", "url": "https://e.test/a"},
+                {"id": 2, "severity": "low",  "title": "b", "url": "https://e.test/b"}
+            ],
+            "right-pad": [{"id": 2, "severity": "low", "title": "b", "url": "https://e.test/b"}]
+        });
+        let counts = severity_counts(&value);
+        // id 2 appears under two packages but counts once.
+        assert_eq!(counts[&Severity::Low], 1);
+        assert_eq!(counts[&Severity::High], 1);
     }
 }
