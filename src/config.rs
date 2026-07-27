@@ -163,6 +163,27 @@ impl NpmConfig {
             .map(|(_, token)| token.as_str())
     }
 
+    /// Return a deterministic, one-way partition identity for configured
+    /// registry credentials without exposing token text to callers.
+    pub(crate) fn credential_partition_digest(&self) -> [u8; 32] {
+        fn hash_field(hasher: &mut blake3::Hasher, tag: &[u8], value: &[u8]) {
+            hasher.update(&(tag.len() as u64).to_le_bytes());
+            hasher.update(tag);
+            hasher.update(&(value.len() as u64).to_le_bytes());
+            hasher.update(value);
+        }
+
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"bpm-npm-credential-partition-v1\0");
+        hasher.update(&(self.auth_tokens.len() as u64).to_le_bytes());
+        for (scope, token) in &self.auth_tokens {
+            hash_field(&mut hasher, b"authority", scope.authority.as_bytes());
+            hash_field(&mut hasher, b"path-prefix", scope.path_prefix.as_bytes());
+            hash_field(&mut hasher, b"token", token.as_bytes());
+        }
+        *hasher.finalize().as_bytes()
+    }
+
     fn apply_source(
         &mut self,
         path: &Path,
@@ -546,6 +567,54 @@ mod tests {
         let debug = format!("{config:?}");
         assert!(!debug.contains("highly-sensitive"));
         assert!(debug.contains("auth_token_count"));
+    }
+
+    fn load_test_config(source: &str) -> NpmConfig {
+        let root = temp_dir();
+        let npmrc = root.join(".npmrc");
+        fs::write(&npmrc, source).unwrap();
+        let config = NpmConfig::load_paths(None, Some(&npmrc)).unwrap();
+        fs::remove_dir_all(root).unwrap();
+        config
+    }
+
+    #[test]
+    fn credential_partition_is_stable_and_order_independent() {
+        let first = load_test_config(
+            "//registry.example/private/:_authToken=private-token\n//registry.example/:_authToken=root-token\n",
+        );
+        let reordered = load_test_config(
+            "//registry.example/:_authToken=root-token\n//registry.example/private/:_authToken=private-token\n",
+        );
+        assert_eq!(
+            first.credential_partition_digest(),
+            reordered.credential_partition_digest()
+        );
+        assert_eq!(
+            NpmConfig::default().credential_partition_digest(),
+            NpmConfig::default().credential_partition_digest()
+        );
+    }
+
+    #[test]
+    fn credential_partition_separates_values_authorities_and_paths() {
+        let base = load_test_config("//registry.example/:_authToken=first-token\n");
+        let different_value = load_test_config("//registry.example/:_authToken=second-token\n");
+        let different_authority = load_test_config("//other.example/:_authToken=first-token\n");
+        let different_path =
+            load_test_config("//registry.example/private/:_authToken=first-token\n");
+        let base_digest = base.credential_partition_digest();
+
+        assert_ne!(
+            base_digest,
+            different_value.credential_partition_digest(),
+            "same-count credentials with different values must be partitioned"
+        );
+        assert_ne!(
+            base_digest,
+            different_authority.credential_partition_digest()
+        );
+        assert_ne!(base_digest, different_path.credential_partition_digest());
     }
 
     #[test]
