@@ -118,14 +118,15 @@ full benchmark methodology.
 
 ## Known gap: cold resolution
 
-The cold path is the primary outstanding performance bottleneck. The structural
-prerequisite — unifying the blocking and async resolvers behind a single
-I/O-agnostic placement core — is done (`src/resolver/placement.rs`), and async
-resolution is now default-on (`BPM_ASYNC_RESOLVE=0` is the kill-switch). Closing
-the actual network fan-out gap (fetching sibling dependency packuments
-concurrently during graph expansion) is tracked as follow-up work; see
-[`plans/`](https://github.com/lbniese/bpm/tree/main/plans) for the current
-cold-resolver plan.
+The cold path remains the primary outstanding performance bottleneck. The
+resolver now uses the async path by default, with concurrent exact-version
+packument prefetches and in-flight request sharing during graph expansion;
+`BPM_ASYNC_RESOLVE=0` remains the blocking kill-switch. Plan 036's shipped
+measurements reduced the `large-frontend` `true_cold` dependency-resolution
+phase from roughly 18.9 seconds to roughly 3.2–4.7 seconds. The checked-in
+benchmark table above remains the historical baseline and has not been
+regenerated, so these newer measurements are post-baseline observations rather
+than replacements for its numbers.
 
 ## Refreshing this page
 

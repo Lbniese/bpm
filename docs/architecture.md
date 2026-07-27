@@ -28,12 +28,11 @@ cold-vs-warm performance story with cited benchmark numbers, see
    peer modes, npm platform filtering, optional reachability, cycles, and local
    workspaces. Non-frozen `bpm install` resolves `package.json` and writes
    `bpm.lock`; frozen installs are resolution-free.
-3. **Async resolver (experimental)** — `src/async_resolver.rs` is a drop-in
-   async counterpart of the native resolver. It uses tokio and reqwest's async
-   HTTP client to issue concurrent packument fetches without stalling the
-   resolution thread. The output `bpm.lock` is byte-identical to the blocking
-   path; only the I/O model differs. Enabled with `BPM_ASYNC_RESOLVE=1`. Still
-   experimental; the blocking resolver remains the default.
+3. **Async resolver** — `src/async_resolver.rs` is the default resolver path.
+   It uses tokio and reqwest's async HTTP client to issue concurrent packument
+   fetches without stalling the resolution thread. The shared placement core
+   keeps output `bpm.lock` byte-identical to the blocking path; only the I/O
+   model differs. Set `BPM_ASYNC_RESOLVE=0` to use the blocking kill-switch.
 4. **Artifact and metadata stores** — `src/store.rs`, `src/download.rs`,
    `src/archive.rs`, and `src/integrity.rs` provide immutable, verified
    tarballs and extracted package images. `src/metadata/` records artifacts,
