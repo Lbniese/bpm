@@ -92,20 +92,17 @@ const PREPARE_PHASES: &[&str] = &[
 const DERIVED_RUNNER_VERSION: u32 = 1;
 /// Derived-key policy version. Bumped when the set of inputs folded into the
 /// key changes meaningfully (e.g. environment bounding lands in a later phase).
-const DERIVED_POLICY_VERSION: u32 = 1;
+const DERIVED_POLICY_VERSION: u32 = 2;
 
 /// Environment variables that can plausibly change a native lifecycle build's
 /// output, and so must distinguish two derived keys even when the source and
 /// dependency graph are identical.
 ///
-/// This is a conservative allowlist, not the complete process environment:
-/// folding the whole env in would make the cache almost never hit (PATH, HOME,
-/// USER, hostname, and other host-specific noise differ across machines and
-/// invocations) and would defeat cross-machine reuse. Anything not listed is
-/// assumed not to affect build output. The full `env_clear` + complete
-/// bounded-environment execution contract is a later refinement; until then
-/// the script still inherits the parent env at run time, and this snapshot is
-/// the subset that influences the derived key.
+/// This is a conservative allowlist rather than the complete process
+/// environment. Host-noise variables such as HOME, USER, hostname, and PWD are
+/// deliberately absent and are also absent from the executed environment.
+/// PATH is retained because it selects toolchain executables and is therefore
+/// a build input, not merely host noise.
 const ENV_INPUT_VARS: &[&str] = &[
     // C/C++ toolchain selection and flags.
     "CC",
@@ -135,6 +132,8 @@ const ENV_INPUT_VARS: &[&str] = &[
     "HOST",
     "PKG_CONFIG_PATH",
     "PKG_CONFIG_SYSROOT_DIR",
+    // Tool lookup affects native builds and script commands.
+    "PATH",
 ];
 
 #[derive(Debug, Error)]
@@ -385,6 +384,7 @@ pub fn run_lifecycle(
                                 &project_root_owned,
                                 store,
                                 &pkg_clone,
+                                &bounded_env,
                             );
                             let code = status
                                 .map(|status| status.code().unwrap_or(-1))
@@ -494,7 +494,7 @@ pub fn run_lifecycle(
                 continue;
             };
             let status = metrics.measure("lifecycle", || {
-                run_script(&cwd, phase, cmd, project_root, store, pkg)
+                run_script(&cwd, phase, cmd, project_root, store, pkg, &bounded_env)
             });
             let code = status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
             let outcome = LifecycleOutcome {
@@ -648,6 +648,7 @@ pub fn prepare_git_packages(
                             &build_root,
                             store,
                             &package_for_script,
+                            &environment,
                         )
                         .map_err(|error| {
                             SandboxFailure::new(
@@ -764,9 +765,14 @@ fn run_script(
     project_root: &Path,
     _store: &ArtifactStore,
     pkg: &PackageEntry,
+    environment: &BTreeMap<OsString, OsString>,
 ) -> std::io::Result<std::process::ExitStatus> {
     let mut cmd = crate::platform::script_command(command);
     cmd.current_dir(cwd);
+    cmd.env_clear();
+    for (name, value) in environment {
+        cmd.env(name, value);
+    }
     // npm-compatible environment (IMPLEMENTATION §14).
     cmd.env("npm_lifecycle_event", phase);
     cmd.env("npm_lifecycle_script", command);
@@ -780,15 +786,17 @@ fn run_script(
     cmd.env("INIT_CWD", project_root);
     let node = crate::platform::find_executable(
         std::ffi::OsStr::new("node"),
-        std::env::var_os("PATH").as_deref(),
+        environment
+            .get(std::ffi::OsStr::new("PATH"))
+            .map(OsString::as_os_str),
     )
     .unwrap_or_else(|| PathBuf::from("node"));
     cmd.env("NODE", node);
     // Project node_modules/.bin should be reachable for scripts; prepend it.
-    if let Some(path) = std::env::var_os("PATH") {
+    if let Some(path) = environment.get(std::ffi::OsStr::new("PATH")) {
         let bin = project_root.join("node_modules").join(".bin");
         let mut paths = vec![bin];
-        paths.extend(std::env::split_paths(&path));
+        paths.extend(std::env::split_paths(path));
         let new_path = std::env::join_paths(paths).map_err(|error| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -1026,12 +1034,11 @@ fn node_executable_digest(exec_path: &str) -> Option<Vec<u8>> {
     Some(hasher.finalize().as_bytes().to_vec())
 }
 
-/// Snapshot the bounded lifecycle environment for the derived key: the values
-/// of [`ENV_INPUT_VARS`] that are actually set in the current process
-/// environment. Only these are folded into the key (everything else is assumed
-/// build-invariant), keeping the cache stable in the face of ambient noise like
-/// PATH/HOME/USER/hostname that must not defeat reuse. Deterministic and
-/// independent of the process environment's iteration order.
+/// Snapshot the bounded lifecycle environment for the derived key and script
+/// execution: the values of [`ENV_INPUT_VARS`] that are actually set in the
+/// current process environment. Everything else is absent from the script
+/// process, so it cannot change the derived output without changing the key.
+/// Deterministic and independent of the process environment's iteration order.
 fn bounded_environment() -> BTreeMap<OsString, OsString> {
     ENV_INPUT_VARS
         .iter()
@@ -1389,9 +1396,9 @@ mod tests {
                 "ENV_INPUT_VARS missing {must}"
             );
         }
-        // Host-specific ambient noise must never be folded into a derived key,
-        // or the cache would never hit and would not transfer across machines.
-        for noise in ["PATH", "HOME", "USER", "PWD", "HOSTNAME", "SHELL", "TMPDIR"] {
+        // Host-specific ambient noise must never be folded into a derived key
+        // or exposed to lifecycle scripts.
+        for noise in ["HOME", "USER", "PWD", "HOSTNAME", "SHELL", "TMPDIR"] {
             assert!(
                 !ENV_INPUT_VARS.contains(&noise),
                 "{noise} must stay out of the derived-key environment (host-specific noise)",
