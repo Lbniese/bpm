@@ -32,6 +32,13 @@ fn run_bpm(args: &[&str], cwd: &Path, store: &Path) -> std::process::Output {
 /// Copy of `build_tgz` for use on Windows without needing the common module's
 /// generic `build`-callback signature.
 fn build_tgz(files: &[(&str, &[u8], u32)]) -> Vec<u8> {
+    build_tgz_with_links(files, &[])
+}
+
+/// Build a package tarball with regular files and archive symlink headers.
+/// Windows extraction copies these links after all regular entries exist, so
+/// the fixture never needs to create a host filesystem symlink.
+fn build_tgz_with_links(files: &[(&str, &[u8], u32)], links: &[(&str, &str)]) -> Vec<u8> {
     let mut buf = Vec::new();
     let enc = flate2::write::GzEncoder::new(&mut buf, flate2::Compression::none());
     let mut builder = tar::Builder::new(enc);
@@ -42,6 +49,16 @@ fn build_tgz(files: &[(&str, &[u8], u32)]) -> Vec<u8> {
         header.set_mode(*mode);
         header.set_cksum();
         builder.append(&header, &data[..]).unwrap();
+    }
+    for (path, target) in links {
+        let mut header = tar::Header::new_gnu();
+        header.set_path(path).unwrap();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_link_name(target).unwrap();
+        header.set_size(0);
+        header.set_mode(0o777);
+        header.set_cksum();
+        builder.append(&header, &[][..]).unwrap();
     }
     let enc = builder.into_inner().unwrap();
     enc.finish().unwrap();
@@ -55,18 +72,27 @@ fn integrity_of(bytes: &[u8]) -> String {
 
 #[test]
 fn windows_frozen_install_materializes_packages_and_bins() {
-    let tgz = build_tgz(&[
-        (
-            "package/package.json",
-            br#"{"name":"demo","version":"1.0.0","bin":{"demo":"./cli.js"}}"# as &[u8],
-            0o644,
-        ),
-        (
-            "package/cli.js",
-            b"#!/usr/bin/env node\nconsole.log('demo');\n",
-            0o755,
-        ),
-    ]);
+    let tgz = build_tgz_with_links(
+        &[
+            (
+                "package/package.json",
+                br#"{"name":"demo","version":"1.0.0","bin":{"demo":"./cli.js"}}"# as &[u8],
+                0o644,
+            ),
+            (
+                "package/cli.js",
+                b"#!/usr/bin/env node\nconsole.log('demo');\n",
+                0o755,
+            ),
+            ("package/target.txt", b"target bytes\n", 0o644),
+            ("package/docs/index.txt", b"nested docs\n", 0o644),
+        ],
+        &[
+            ("package/forward.txt", "target.txt"),
+            ("package/docs-link", "docs"),
+            ("package/chain.txt", "forward.txt"),
+        ],
+    );
     let store = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     let tarball_path = store.path().join("demo-1.0.0.tgz");
@@ -113,6 +139,28 @@ fn windows_frozen_install_materializes_packages_and_bins() {
     assert!(
         demo_dir.join("cli.js").exists(),
         "cli.js should be extracted"
+    );
+    assert_eq!(
+        fs::read_to_string(demo_dir.join("forward.txt")).unwrap(),
+        "target bytes\n",
+        "forward archive links should be copied as regular files"
+    );
+    assert_eq!(
+        fs::read_to_string(demo_dir.join("chain.txt")).unwrap(),
+        "target bytes\n",
+        "deferred archive links should resolve through a link chain"
+    );
+    assert_eq!(
+        fs::read_to_string(demo_dir.join("docs-link/index.txt")).unwrap(),
+        "nested docs\n",
+        "directory archive links should copy their complete tree"
+    );
+    assert!(
+        !fs::symlink_metadata(demo_dir.join("forward.txt"))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "Windows archive links must not require symlink privileges"
     );
     // Verify .cmd and .ps1 bin shims are generated.
     let cmd_shim = project.path().join("node_modules/.bin/demo.cmd");
