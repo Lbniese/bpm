@@ -10,6 +10,7 @@ mod gc;
 mod import;
 mod init;
 mod install;
+mod link;
 mod ls;
 mod mutate;
 mod outdated;
@@ -252,6 +253,26 @@ pub(crate) fn run() -> ExitCode {
             all,
             depth,
             json,
+        }),
+        Commands::Link {
+            target,
+            store,
+            registry,
+        } => link::run(link::Options {
+            target,
+            store,
+            registry,
+        }),
+        Commands::Unlink {
+            name,
+            global,
+            store,
+            registry,
+        } => link::run_unlink(link::UnlinkOptions {
+            name,
+            global,
+            store,
+            registry,
         }),
         Commands::Uninstall {
             names,

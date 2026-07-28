@@ -234,6 +234,37 @@ pub(crate) enum Commands {
         #[arg(long)]
         remote_cache: Option<String>,
     },
+    /// Symlink the cwd package into the global registry (`bpm link`), or
+    /// consume a globally-registered package into the current project
+    /// (`bpm link <name>`). npm `link` compatibility.
+    Link {
+        /// Name of a globally-registered package to link into the current
+        /// project. Omit to register the cwd package globally instead.
+        target: Option<String>,
+        /// Store root (defaults to `$BPM_STORE` or `$HOME/.bpm`).
+        #[arg(long)]
+        store: Option<PathBuf>,
+        /// Registry base URL (passed through to the consume install step).
+        #[arg(long)]
+        registry: Option<String>,
+    },
+    /// Remove a consumed link from the current project (`bpm unlink <name>`),
+    /// or unregister a package from the global registry
+    /// (`bpm unlink --global [<name>]`). npm `unlink` compatibility.
+    Unlink {
+        /// Name of the package to unlink. With `--global`, defaults to the cwd
+        /// package's name.
+        name: Option<String>,
+        /// Remove the package from the global registry instead of the project.
+        #[arg(short = 'g', long)]
+        global: bool,
+        /// Store root (defaults to `$BPM_STORE` or `$HOME/.bpm`).
+        #[arg(long)]
+        store: Option<PathBuf>,
+        /// Registry base URL (passed through to the unconsume reinstall step).
+        #[arg(long)]
+        registry: Option<String>,
+    },
     /// Remove one or more packages from the project manifest and lock.
     #[command(alias = "remove", alias = "rm", alias = "un")]
     Uninstall {
@@ -771,5 +802,59 @@ mod tests {
         assert!(store.is_none());
         assert!(!offline);
         assert!(json);
+    }
+
+    #[test]
+    fn link_register_and_consume_parse() {
+        let cli = Cli::try_parse_from(["bpm", "link"]).unwrap();
+        let Commands::Link {
+            target,
+            store,
+            registry,
+        } = cli.command
+        else {
+            panic!("expected link command");
+        };
+        assert!(target.is_none());
+        assert!(store.is_none());
+        assert!(registry.is_none());
+
+        let cli = Cli::try_parse_from(["bpm", "link", "mylib", "--store", "/tmp/s"]).unwrap();
+        let Commands::Link {
+            target,
+            store,
+            registry,
+        } = cli.command
+        else {
+            panic!("expected link command");
+        };
+        assert_eq!(target.as_deref(), Some("mylib"));
+        assert_eq!(store.as_deref(), Some(std::path::Path::new("/tmp/s")));
+        assert!(registry.is_none());
+    }
+
+    #[test]
+    fn unlink_global_and_unconsume_parse() {
+        let cli = Cli::try_parse_from(["bpm", "unlink", "--global", "mylib"]).unwrap();
+        let Commands::Unlink {
+            name,
+            global,
+            store,
+            registry,
+        } = cli.command
+        else {
+            panic!("expected unlink command");
+        };
+        assert_eq!(name.as_deref(), Some("mylib"));
+        assert!(global);
+        assert!(store.is_none());
+        assert!(registry.is_none());
+
+        let cli = Cli::try_parse_from(["bpm", "unlink", "mylib"]).unwrap();
+        let Commands::Unlink { name, global, .. } = cli.command else {
+            panic!("expected unlink command");
+        };
+        assert_eq!(name.as_deref(), Some("mylib"));
+        assert!(!global);
     }
 }

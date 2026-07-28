@@ -151,6 +151,62 @@ install or CI. Package-lock versions 1 and 2 are rejected clearly. Workspace or
 `link` package-lock entries and non-link entries without `resolved` are currently
 unsupported for direct install and fail before fetching or materializing.
 
+## `bpm link [name] [flags]`
+
+npm `link` compatibility: developer package linking via a global registry under
+`$BPM_STORE/links/`.
+
+**`bpm link`** (run inside a package directory) registers the cwd package
+globally as a symlink `$BPM_STORE/links/<name>` -> the package directory. The
+package name is read from `package.json`.
+
+**`bpm link <name>`** (run inside a consumer project) consumes a registration:
+it adds `<name>: "file:$BPM_STORE/links/<name>"` to `package.json` and runs the
+normal install, which materializes `node_modules/<name>` -> the registered
+target. The dependency is recorded with `"link": true` in `bpm.lock`.
+
+Re-registering a name repoints the global symlink; consumers follow the repoint
+on their next `bpm install` (their `package.json` points at the symlink, not the
+resolved target, so each resolution re-canonicalizes through the current
+registration).
+
+```bash
+cd ~/dev/mylib && bpm link          # register mylib globally
+cd ~/dev/myapp && bpm link mylib    # consume: node_modules/mylib -> mylib
+```
+
+| Flag | Meaning |
+|------|---------|
+| `<name>` | Omit to register the cwd package; give a name to consume a registration. |
+| `--store <dir>` | Store root. Defaults to `$BPM_STORE`, then `$HOME/.bpm`. |
+| `--registry <url>` | Registry base URL (passed through to the consume install step). |
+
+> Symlink-based. On Windows, creating directory symlinks requires Developer
+> Mode or administrator privileges; enable them before using `bpm link`.
+
+## `bpm unlink [name] [--global] [flags]`
+
+Reverses `bpm link`.
+
+**`bpm unlink <name>`** (in a consumer) removes the consumed dependency from
+`package.json` and reinstalls, deleting the `node_modules/<name>` link.
+
+**`bpm unlink --global [<name>]`** unregisters a package from the global
+registry (`$BPM_STORE/links/<name>`). With `--global` and no name, unregisters
+the cwd package.
+
+```bash
+cd ~/dev/myapp && bpm unlink mylib         # stop consuming mylib
+cd ~/dev/mylib  && bpm unlink --global     # unregister mylib globally
+```
+
+| Flag | Meaning |
+|------|---------|
+| `<name>` | Package to unlink (required without `--global`). |
+| `--global`, `-g` | Unregister from the global registry instead of the project. |
+| `--store <dir>` | Store root. Defaults to `$BPM_STORE`, then `$HOME/.bpm`. |
+| `--registry <url>` | Registry base URL (passed through to the unconsume reinstall step). |
+
 ## `bpm import [path] [flags]`
 
 Imports an npm `package-lock.json` (`lockfileVersion` 3 only) into a
