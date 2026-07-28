@@ -162,6 +162,15 @@ responses, and `--offline` preserve normal origin behavior. See
 [remote-cache-protocol.md](remote-cache-protocol.md). The prototype does not
 share lockfiles, images, graph volumes, or lifecycle-derived output.
 
+### Resolution snapshot cache
+
+After a successful fresh resolve, BPM stores the validated lockfile in the
+selected store keyed by the complete resolver input identity. `--prefer-offline`
+and `--offline` reuse that snapshot when the project manifest, workspace state,
+registry configuration, peer mode, and target are unchanged. A malformed or
+missing snapshot falls back to normal resolution; ordinary installs still
+revalidate registry metadata, and `--prefer-online` never uses the snapshot.
+
 ```bash
 bpm import                        # ./package-lock.json -> ./bpm.lock
 bpm import path/to/lock.json --out path/to/bpm.lock --json
@@ -362,6 +371,14 @@ When `BPM_ASYNC_RESOLVE=1` and `BPM_STREAM_INSTALL` is set to its default of
 a non-blocking sink, combining concurrent packument fetches with overlapped
 downloads. Missing pipeline units (from channel backpressure) are fetched in a
 sequential pass after resolution completes.
+
+`BPM_RESOLVER_MAX_IN_FLIGHT` bounds async registry request bodies (default
+`32`, clamped to `1..64`). Lower it for a constrained registry or raise it for
+high-latency HTTP/1.1 environments; lockfile placement remains deterministic.
+
+Artifact downloads use HTTP/2 via ALPN by default so concurrent response bodies
+can share a connection. Set `BPM_HTTP2=0` to force HTTP/1.1 when diagnosing a
+registry or transport compatibility issue.
 
 Set `BPM_STREAM_INSTALL=0` alongside `BPM_ASYNC_RESOLVE=1` to use the async
 resolver without the download overlap.

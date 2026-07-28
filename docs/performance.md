@@ -43,7 +43,7 @@ three cache states:
 | Scenario | Meaning |
 |---|---|
 | `true_cold` | Every cache (download, extraction, graph) is empty. Full network resolution, download, and extraction. This is the worst case and the current bottleneck. |
-| `resolved_cold` | The immutable artifact store is warm (artifacts already downloaded/extracted), but the resolved graph for *this project* is not yet materialized. Resolution still runs; download/extraction are served from the store. |
+| `resolved_cold` | A BPM lockfile is present, the store is empty, and the project view is absent. The install is frozen and resolution-free; it isolates artifact download, extraction, and graph construction. |
 | `repeat_install` | The complete graph already exists in the store. `node_modules` re-attaches from cached images. This is BPM's headline win. |
 
 Fixtures: `large-frontend` (a sizable real-world frontend dependency graph),
@@ -113,20 +113,28 @@ PATH="$PWD/target/release:$PATH" \
 Each tool runs from an isolated cache root, and bpm's timed runs also record
 outbound registry **request counts** and named **phase timings** (resolve,
 download, extract, …) under each tool's `bpm_metrics`, so cold-path profiling is
-reproducible from the JSON alone. See  → M7 for the
-full benchmark methodology.
+reproducible from the JSON alone. On pnpm 11+, the harness writes a temporary
+`allowBuilds` policy for the fixture's known native build dependencies, keeping
+lifecycle scripts enabled while avoiding pnpm's strict unreviewed-build exit.
 
 ## Known gap: cold resolution
 
 The cold path remains the primary outstanding performance bottleneck. The
-resolver now uses the async path by default, with concurrent exact-version
-packument prefetches and in-flight request sharing during graph expansion;
+`resolved_cold` scenario isolates the artifact pipeline; `true_cold` adds
+fresh dependency resolution. The resolver now uses the async path by default,
+with bounded concurrent exact-version packument prefetches and in-flight
+request sharing during one-level graph expansion; metadata-cache writes are
+best-effort and asynchronous;
 `BPM_ASYNC_RESOLVE=0` remains the blocking kill-switch. Plan 036's shipped
 measurements reduced the `large-frontend` `true_cold` dependency-resolution
 phase from roughly 18.9 seconds to roughly 3.2–4.7 seconds. The checked-in
 benchmark table above remains the historical baseline and has not been
 regenerated, so these newer measurements are post-baseline observations rather
 than replacements for its numbers.
+
+Repeated fresh resolves can reuse a validated resolution snapshot with
+`--prefer-offline` or `--offline`; normal installs continue registry validation
+and therefore do not change npm-compatible freshness semantics.
 
 ## Refreshing this page
 
