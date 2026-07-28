@@ -30,6 +30,25 @@ bpm doctor
 bpm doctor --json
 ```
 
+## `bpm init [flags]`
+
+Scaffolds a new `package.json` in the current directory (npm `init`
+compatibility). Each field is resolved from an explicit flag, a default
+(`--yes`), or an interactive prompt where empty input keeps the default.
+
+- The package name defaults to the current directory name, lowercased with
+  non-npm characters replaced by `-`.
+- `--yes`/`-y` skips all prompts and uses defaults.
+- `--force` overwrites an existing `package.json`.
+- The name is validated with the same rules as `bpm doctor`; an invalid name
+  aborts without writing a file.
+
+```bash
+bpm init -y
+bpm init --name @scope/lib --license Apache-2.0
+bpm init
+```
+
 ## `bpm fetch <target> [flags]`
 
 Fetches a package by **npm-style spec** or **exact URL**. For a spec, BPM

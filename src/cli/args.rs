@@ -118,6 +118,39 @@ pub(crate) enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Create a new `package.json` in the current directory (npm `init` compatibility).
+    Init {
+        /// Use defaults for every field; do not prompt.
+        #[arg(short = 'y', long = "yes")]
+        yes: bool,
+        /// Overwrite an existing `package.json`.
+        #[arg(long)]
+        force: bool,
+        /// Package name (defaults to the current directory name).
+        #[arg(long)]
+        name: Option<String>,
+        /// Initial version (default: 1.0.0).
+        #[arg(long)]
+        version: Option<String>,
+        /// Description written to `package.json`.
+        #[arg(long)]
+        description: Option<String>,
+        /// Entry point / `main` field (default: index.js).
+        #[arg(long)]
+        entry: Option<String>,
+        /// License SPDX id (default: MIT).
+        #[arg(long)]
+        license: Option<String>,
+        /// Author string.
+        #[arg(long)]
+        author: Option<String>,
+        /// Git repository shorthand or URL.
+        #[arg(long)]
+        repository: Option<String>,
+        /// Test command for the `scripts.test` field.
+        #[arg(long = "test-script")]
+        test_script: Option<String>,
+    },
     /// Publish the current package to an npm-compatible registry.
     Publish {
         #[arg(long)]
@@ -609,5 +642,44 @@ mod tests {
     fn uninstall_requires_at_least_one_name() {
         let error = Cli::try_parse_from(["bpm", "remove"]).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn init_yes_flag_parses() {
+        let cli = Cli::try_parse_from(["bpm", "init", "-y"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Init {
+                yes: true,
+                force: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn init_accepts_field_overrides() {
+        let cli = Cli::try_parse_from([
+            "bpm",
+            "init",
+            "--name",
+            "demo",
+            "--license",
+            "Apache-2.0",
+            "--force",
+        ])
+        .unwrap();
+        let Commands::Init {
+            name,
+            license,
+            force,
+            ..
+        } = cli.command
+        else {
+            panic!("expected init command");
+        };
+        assert_eq!(name.as_deref(), Some("demo"));
+        assert_eq!(license.as_deref(), Some("Apache-2.0"));
+        assert!(force);
     }
 }
