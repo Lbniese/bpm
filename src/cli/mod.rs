@@ -18,6 +18,7 @@ mod outdated;
 mod publish;
 mod run;
 mod view;
+mod whoami;
 mod why;
 
 use std::process::ExitCode;
@@ -244,6 +245,7 @@ pub(crate) fn run() -> ExitCode {
             offline,
             json,
         }),
+        Commands::Whoami { registry } => whoami::run(whoami::Options { registry }),
         Commands::Why { target } => why::execute(&target),
         Commands::Ls {
             name,

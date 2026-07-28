@@ -26,7 +26,7 @@ use serde::{Deserialize, Deserializer};
 use thiserror::Error;
 
 use crate::config::NpmConfig;
-use crate::http::HttpClient;
+use crate::http::{HttpClient, HttpError};
 use crate::integrity::Integrity;
 use crate::metadata_cache::{CacheMode, MetadataCache};
 
@@ -537,6 +537,46 @@ impl RegistryClient {
         let registry = self.config.registry_for_package(&spec.name);
         let packument = self.packument_for(spec)?;
         resolve_packument(spec, &packument, registry)
+    }
+
+    /// Look up the username authenticated to the configured registry via the
+    /// npm `/-/whoami` endpoint. The bearer token (if any) is attached by the
+    /// shared HTTP layer. Returns [`RegistryError::BadStatus`] for 401/403 and
+    /// [`RegistryError::BadJson`] if the response omits `username`.
+    pub fn whoami(&self) -> Result<String, RegistryError> {
+        let base = self.config.registry().trim_end_matches('/');
+        let url = format!("{base}/-/whoami");
+        let response = self.http.get_with_headers(&url, &[]).map_err(|source| {
+            // 4xx/5xx (including 401/403 auth failures) are reported by the HTTP
+            // layer as `HttpError::Status`; surface the code so callers can
+            // distinguish an auth rejection from a transport error.
+            match source {
+                HttpError::Status { code, .. } => RegistryError::BadStatus {
+                    package: "-/whoami".to_string(),
+                    code,
+                },
+                other => RegistryError::Network {
+                    package: "-/whoami".to_string(),
+                    source: Box::new(other),
+                },
+            }
+        })?;
+        let body = response
+            .into_string()
+            .map_err(|source| RegistryError::Network {
+                package: "-/whoami".to_string(),
+                source: Box::new(source),
+            })?;
+        #[derive(serde::Deserialize)]
+        struct WhoamiResponse {
+            username: String,
+        }
+        let parsed: WhoamiResponse =
+            serde_json::from_str(&body).map_err(|source| RegistryError::BadJson {
+                package: "-/whoami".to_string(),
+                source,
+            })?;
+        Ok(parsed.username)
     }
 
     /// Fetch the smallest metadata document that can resolve `spec`.
@@ -2385,5 +2425,73 @@ mod tests {
         shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
         let _ = server_a.join();
         let _ = server_b.join();
+    }
+
+    /// Spawn a local server that replies to every request with `status` and
+    /// `body`. Returns the registry base URL, a shutdown flag, and the server
+    /// thread handle.
+    fn whoami_server(
+        status: u16,
+        body: &'static str,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let registry = format!("http://{address}");
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_shutdown = std::sync::Arc::clone(&shutdown);
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            while !server_shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(c) => c,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let reason = if status == 200 { "OK" } else { "Unauthorized" };
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        (registry, shutdown, server)
+    }
+
+    #[test]
+    fn whoami_returns_username() {
+        let (registry, shutdown, server) = whoami_server(200, r#"{"username":"alice"}"#);
+        let config = NpmConfig::default()
+            .with_registry_override(&registry)
+            .unwrap();
+        let client = RegistryClient::new(config);
+        assert_eq!(client.whoami().unwrap(), "alice");
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = server.join();
+    }
+
+    #[test]
+    fn whoami_unauthenticated_returns_bad_status() {
+        let (registry, shutdown, server) = whoami_server(401, "{}");
+        let config = NpmConfig::default()
+            .with_registry_override(&registry)
+            .unwrap();
+        let client = RegistryClient::new(config);
+        match client.whoami() {
+            Err(RegistryError::BadStatus { code, .. }) => assert_eq!(code, 401),
+            other => panic!("expected BadStatus 401, got {other:?}"),
+        }
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = server.join();
     }
 }
