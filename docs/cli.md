@@ -348,6 +348,26 @@ bpm view lodash dist-tags            # the dist-tags map
 | `--offline` | Never contact the registry; resolve only against cached metadata. |
 | `--json` | Emit machine-readable JSON. |
 
+## `bpm whoami [flags]`
+
+npm `whoami` compatibility: print the username authenticated to the configured
+registry.
+
+Reads npm config (`$HOME/.npmrc` then the project `.npmrc`) and calls the
+registry's `/-/whoami` endpoint, sending the configured bearer token. Prints
+the username and exits `0` on success. Exits nonzero with a clear message when
+no token is configured for the registry or the registry rejects the
+credentials.
+
+```bash
+bpm whoami                       # who am I on the default registry?
+bpm whoami --registry https://npm.example  # …on a private registry
+```
+
+| Flag | Meaning |
+|------|---------|
+| `--registry <url>` | Registry base URL. Defaults to the config's registry, then `https://registry.npmjs.org`. |
+
 ## `bpm why <package>`
 
 Shows why a package is present in the dependency tree by walking the lockfile

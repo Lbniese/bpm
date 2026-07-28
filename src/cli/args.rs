@@ -517,6 +517,12 @@ pub(crate) enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Show the registry-authenticated username (npm `whoami`).
+    Whoami {
+        /// Registry base URL.
+        #[arg(long)]
+        registry: Option<String>,
+    },
     /// Show why a package is in the dependency tree.
     Why {
         /// Package name to trace.
@@ -867,6 +873,22 @@ mod tests {
         };
         assert_eq!(name.as_deref(), Some("mylib"));
         assert!(!global);
+    }
+
+    #[test]
+    fn whoami_parses_registry_override() {
+        let cli = Cli::try_parse_from(["bpm", "whoami"]).unwrap();
+        let Commands::Whoami { registry } = cli.command else {
+            panic!("expected whoami command");
+        };
+        assert!(registry.is_none());
+
+        let cli =
+            Cli::try_parse_from(["bpm", "whoami", "--registry", "https://reg.example"]).unwrap();
+        let Commands::Whoami { registry } = cli.command else {
+            panic!("expected whoami command");
+        };
+        assert_eq!(registry.as_deref(), Some("https://reg.example"));
     }
 
     #[test]
