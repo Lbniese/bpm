@@ -429,6 +429,39 @@ change the grace period or `--max-size 50GB` to reclaim eligible objects until
 the store is within a size cap. Active leases and graphs attached to projects
 are always retained.
 
+## `bpm cache [action] [flags]`
+
+npm `cache` compatibility: inspect and reclaim the global artifact + metadata
+cache (the store root shared by [`bpm gc`](#bpm-gc-flags)).
+
+**`bpm cache`** / **`bpm cache ls`** prints a read-only size + object-count
+breakdown by area (`artifacts/sha512`, `images/sha512`, `graphs/blake3`, the
+`store.db` metadata database, and the `tmp`/`locks` scratch dirs).
+
+**`bpm cache verify`** runs a repair + garbage-collection pass with the default
+policy (objects older than 30 days eligible) and reports reclaimed space and any
+repaired index/lock anomalies.
+
+**`bpm cache clean`** reclaims **every** unreferenced object (no grace period,
+zero-byte cap). Protected installs are preserved by their durable leases and
+project registrations, so a clean never breaks a running or registered install —
+but everything else is removed and will be re-fetched on next use.
+
+```bash
+bpm cache                       # show cache sizes and counts
+bpm cache ls --store /opt/cache # inspect a non-default store
+bpm cache verify                # gc + repair, then report
+bpm cache clean                 # reclaim all unreferenced objects
+```
+
+| Flag | Meaning |
+|------|---------|
+| `[action]` | `ls`/`list` (default), `verify`, or `clean`. |
+| `--store <dir>` | Store root. Defaults to `$BPM_STORE`, then `$HOME/.bpm`. |
+
+> `bpm cache clean` is a stricter form of `bpm gc --older-than 0 --max-size 0`;
+> `bpm cache verify` is `bpm gc` with the default policy plus a repair report.
+
 ## Exit codes
 
 `0` on success. Nonzero on any hard error (missing/invalid input, integrity

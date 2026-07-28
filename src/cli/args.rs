@@ -36,6 +36,17 @@ pub(crate) enum Commands {
         #[arg(long)]
         store: Option<PathBuf>,
     },
+    /// Inspect or reclaim the global artifact and metadata cache. npm `cache`
+    /// compatibility.
+    Cache {
+        /// Operation: `ls`/`list` (default) prints a size + count breakdown;
+        /// `verify` runs a repair + garbage-collection pass; `clean` reclaims
+        /// every unreferenced object (protected installs are preserved).
+        action: Option<String>,
+        /// Store root (defaults to `$BPM_STORE` or `$HOME/.bpm`).
+        #[arg(long)]
+        store: Option<PathBuf>,
+    },
     /// Download, verify, store, and extract a package by spec or exact URL.
     Fetch {
         /// Package spec or an exact tarball URL / `file://` path.
@@ -856,5 +867,31 @@ mod tests {
         };
         assert_eq!(name.as_deref(), Some("mylib"));
         assert!(!global);
+    }
+
+    #[test]
+    fn cache_defaults_to_ls_and_accepts_subcommands() {
+        // Bare `bpm cache` defaults to ls (action = None).
+        let cli = Cli::try_parse_from(["bpm", "cache"]).unwrap();
+        let Commands::Cache { action, store } = cli.command else {
+            panic!("expected cache command");
+        };
+        assert!(action.is_none());
+        assert!(store.is_none());
+
+        // `bpm cache verify --store X`.
+        let cli = Cli::try_parse_from(["bpm", "cache", "verify", "--store", "/tmp/s"]).unwrap();
+        let Commands::Cache { action, store } = cli.command else {
+            panic!("expected cache command");
+        };
+        assert_eq!(action.as_deref(), Some("verify"));
+        assert_eq!(store.as_deref(), Some(std::path::Path::new("/tmp/s")));
+
+        // `bpm cache clean`.
+        let cli = Cli::try_parse_from(["bpm", "cache", "clean"]).unwrap();
+        let Commands::Cache { action, .. } = cli.command else {
+            panic!("expected cache command");
+        };
+        assert_eq!(action.as_deref(), Some("clean"));
     }
 }

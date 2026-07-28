@@ -3,6 +3,7 @@
 mod args;
 mod audit;
 mod bench;
+mod cache;
 mod doctor;
 mod exec;
 mod fetch;
@@ -43,6 +44,7 @@ pub(crate) fn run() -> ExitCode {
             max_size,
             store,
         } => gc::run(older_than, max_size, store),
+        Commands::Cache { action, store } => cache::run(cache::Options { action, store }),
         Commands::Fetch {
             target,
             integrity,
