@@ -460,6 +460,21 @@ pub(crate) enum Commands {
         /// Package name to trace.
         target: String,
     },
+    /// List installed packages as a dependency tree (npm `ls` compat).
+    #[command(alias = "list")]
+    Ls {
+        /// Only show paths leading to packages matching this name.
+        name: Option<String>,
+        /// Show every occurrence instead of deduplicating shared packages.
+        #[arg(short = 'a', long)]
+        all: bool,
+        /// Maximum levels to expand below the root (default: unlimited).
+        #[arg(long)]
+        depth: Option<usize>,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[cfg(test)]
@@ -681,5 +696,38 @@ mod tests {
         assert_eq!(name.as_deref(), Some("demo"));
         assert_eq!(license.as_deref(), Some("Apache-2.0"));
         assert!(force);
+    }
+
+    #[test]
+    fn ls_parses_flags_and_alias() {
+        let cli = Cli::try_parse_from(["bpm", "ls", "--all", "--depth", "1", "--json"]).unwrap();
+        let Commands::Ls {
+            name,
+            all,
+            depth,
+            json,
+        } = cli.command
+        else {
+            panic!("expected ls command");
+        };
+        assert!(name.is_none());
+        assert!(all);
+        assert_eq!(depth, Some(1));
+        assert!(json);
+
+        let cli = Cli::try_parse_from(["bpm", "list", "lodash"]).unwrap();
+        let Commands::Ls {
+            name,
+            all,
+            depth,
+            json,
+        } = cli.command
+        else {
+            panic!("expected ls command");
+        };
+        assert_eq!(name.as_deref(), Some("lodash"));
+        assert!(!all);
+        assert!(depth.is_none());
+        assert!(!json);
     }
 }
