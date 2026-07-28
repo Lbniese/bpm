@@ -8,6 +8,7 @@ mod exec;
 mod fetch;
 mod gc;
 mod import;
+mod init;
 mod install;
 mod mutate;
 mod outdated;
@@ -88,6 +89,29 @@ pub(crate) fn run() -> ExitCode {
             list,
         }),
         Commands::Import { path, out, json } => import::run(path, out, json),
+        Commands::Init {
+            yes,
+            force,
+            name,
+            version,
+            description,
+            entry,
+            license,
+            author,
+            repository,
+            test_script,
+        } => init::run(init::Options {
+            yes,
+            force,
+            name,
+            version,
+            description,
+            entry,
+            license,
+            author,
+            repository,
+            test_script,
+        }),
         Commands::Publish {
             registry,
             access,
