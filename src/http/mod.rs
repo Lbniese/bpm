@@ -141,7 +141,7 @@ impl HttpClient {
         url: &str,
         headers: &[(&str, &str)],
     ) -> Result<HttpResponse, HttpError> {
-        let response = self.execute_get(url, headers)?;
+        let (response, _in_flight) = self.execute_get(url, headers)?;
         let status = response.status().as_u16();
         let collected = collect_headers(response.headers());
         let body = response.bytes().map_err(|error| HttpError::Transport {
@@ -158,8 +158,11 @@ impl HttpClient {
 
     /// Execute a GET request and expose its body as a streaming reader.
     pub fn stream(&self, url: &str) -> Result<Box<dyn Read + Send + Sync + 'static>, HttpError> {
-        let response = self.execute_get(url, &[])?;
-        Ok(Box::new(response))
+        let (response, in_flight) = self.execute_get(url, &[])?;
+        Ok(Box::new(TrackedResponse {
+            response,
+            _in_flight: in_flight,
+        }))
     }
 
     /// POST a JSON request body and return the response body as bytes.
@@ -197,9 +200,13 @@ impl HttpClient {
     /// The returned [`Response`] is for any terminal status below 400
     /// (including `304 Not Modified`). Statuses at or above 400 are retried
     /// when transient and otherwise become [`HttpError::Status`].
-    fn execute_get(&self, url: &str, headers: &[(&str, &str)]) -> Result<Response, HttpError> {
+    fn execute_get(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+    ) -> Result<(Response, InFlightGuard), HttpError> {
         self.requests.fetch_add(1, Ordering::Relaxed);
-        let _in_flight = self.track_in_flight();
+        let in_flight = self.track_in_flight();
         let display_url = redact_url(url);
         let network = &self.config.network;
         let attempts = network.retries.saturating_add(1);
@@ -213,7 +220,7 @@ impl HttpClient {
                     }
                     let status = response.status().as_u16();
                     if status < 400 {
-                        return Ok(response);
+                        return Ok((response, in_flight));
                     }
                     let completed = attempt + 1;
                     if is_retryable_status(status) && completed < attempts {
@@ -420,6 +427,20 @@ impl Drop for InFlightGuard {
     }
 }
 
+/// Keeps HTTP in-flight tracking alive until a streaming response body has
+/// been consumed or dropped. The artifact pipeline streams tarballs after the
+/// response headers arrive, so tracking only `send()` undercounts concurrency.
+struct TrackedResponse {
+    response: Response,
+    _in_flight: InFlightGuard,
+}
+
+impl Read for TrackedResponse {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.response.read(buffer)
+    }
+}
+
 /// Build a pooled HTTP client.
 ///
 /// HTTP/1.1 with a large idle connection pool is the default. The npm registry
@@ -429,8 +450,9 @@ impl Drop for InFlightGuard {
 /// `pool_max_idle_per_host(64)` lets each worker own its own connection,
 /// achieving N-way concurrency for N workers.
 ///
-/// Set `BPM_HTTP2=1` to negotiate HTTP/2 via ALPN for benchmarking against
-/// registries that do not per-connection throttle.
+/// HTTP/2 is enabled by default and negotiates via ALPN, allowing concurrent
+/// artifact bodies to multiplex over one connection. Set `BPM_HTTP2=0` to
+/// force the legacy HTTP/1.1 transport for compatibility diagnostics.
 ///
 /// A static user agent and a valid timeout never produce an invalid builder in
 /// practice, so a build failure falls back to the default client rather than
@@ -439,7 +461,7 @@ fn build_client(timeout: Duration) -> Client {
     let use_http2 = std::env::var("BPM_HTTP2")
         .ok()
         .and_then(|v| v.parse::<u8>().ok())
-        .unwrap_or(0)
+        .unwrap_or(1)
         != 0;
 
     let mut builder = ClientBuilder::new().user_agent(USER_AGENT).timeout(timeout);

@@ -24,6 +24,39 @@ struct CountedRegistry {
     hits: Arc<AtomicUsize>,
 }
 
+struct ConcurrencyRegistry {
+    _server: MiniServer,
+    peak: Arc<AtomicUsize>,
+}
+
+impl ConcurrencyRegistry {
+    fn new() -> Self {
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let active_for_server = active.clone();
+        let peak_for_server = peak.clone();
+        let server = MiniServer::start_keep_alive_routed(move |path| {
+            let is_version = matches!(path, "/a/1.0.0" | "/b/1.0.0");
+            if !is_version {
+                return None;
+            }
+            let current = active_for_server.fetch_add(1, Ordering::SeqCst) + 1;
+            peak_for_server.fetch_max(current, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            active_for_server.fetch_sub(1, Ordering::SeqCst);
+            let name = if path.starts_with("/a/") { "a" } else { "b" };
+            Some(RouteBody(
+                abbreviated_version_body(name, "1.0.0"),
+                "application/json",
+            ))
+        });
+        Self {
+            _server: server,
+            peak,
+        }
+    }
+}
+
 impl CountedRegistry {
     fn new(name: &str, version: &str) -> Self {
         let hits = Arc::new(AtomicUsize::new(0));
@@ -153,6 +186,30 @@ async fn inline_fetch_charges_network_wait_metric() {
         diag.network_wait_ns
     );
     assert!(diag.inline_fetches >= 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn max_in_flight_bounds_full_async_request_lifetime() {
+    let registry = ConcurrencyRegistry::new();
+    let config = NpmConfig::default()
+        .with_registry_override(&registry._server.url(""))
+        .expect("valid registry override");
+    let client = AsyncRegistryClient::new(config).with_max_in_flight(1);
+    let a = PackageSpec {
+        name: "a".to_string(),
+        req: VersionRequest::Exact(semver::Version::new(1, 0, 0)),
+    };
+    let b = PackageSpec {
+        name: "b".to_string(),
+        req: VersionRequest::Exact(semver::Version::new(1, 0, 0)),
+    };
+
+    let (a_result, b_result) = tokio::join!(client.packument_for(&a), client.packument_for(&b));
+    a_result.expect("a metadata fetch");
+    b_result.expect("b metadata fetch");
+
+    assert_eq!(registry.peak.load(Ordering::SeqCst), 1);
+    assert_eq!(client.take_diagnostics().peak_http_concurrency, 1);
 }
 
 /// Plan 036 Step 4: a background prefetch against a missing package (404) must

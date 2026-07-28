@@ -308,6 +308,10 @@ fn capture_tool_version(tool: Tool) -> Option<String> {
 pub struct BpmMetricsSummary {
     pub requests_sent: Stats,
     pub phase_ms: BTreeMap<String, Stats>,
+    /// Numeric scalar diagnostics (for example peak HTTP concurrency) kept
+    /// separate from duration phases so the report preserves their units.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub counters: BTreeMap<String, Stats>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -534,7 +538,11 @@ pub fn install_command_spec(
             configure_tool_cache_env(Tool::Pnpm, bpm_store),
         ),
         Tool::Bpm => {
-            let mut args = vec!["install".to_string()];
+            // npm and pnpm benchmark installs both use prefer-offline; keep
+            // BPM on the same cache policy so warm comparisons measure the
+            // package managers rather than different metadata freshness
+            // defaults. True-cold runs still have an empty per-run store.
+            let mut args = vec!["install".to_string(), "--prefer-offline".to_string()];
             if scenario_uses_lockfile(scenario) {
                 args.push("--frozen".to_string());
             }
@@ -579,6 +587,62 @@ fn create_fixture_workspace(fixture: &Fixture, work_dir: &Path) -> anyhow::Resul
     } else {
         generate_fixture_files(fixture, work_dir)?;
     }
+    Ok(())
+}
+
+fn create_tool_fixture_workspace(
+    fixture: &Fixture,
+    tool: Tool,
+    work_dir: &Path,
+) -> anyhow::Result<()> {
+    create_fixture_workspace(fixture, work_dir)?;
+    if tool == Tool::Pnpm {
+        configure_pnpm_build_policy(fixture, work_dir)?;
+    }
+    Ok(())
+}
+
+fn configure_pnpm_build_policy(fixture: &Fixture, work_dir: &Path) -> anyhow::Result<()> {
+    let pnpm_major = Command::new("pnpm")
+        .arg("--version")
+        .current_dir(work_dir)
+        .output()
+        .ok()
+        .and_then(|output| {
+            if output.status.success() {
+                String::from_utf8_lossy(&output.stdout)
+                    .trim()
+                    .split('.')
+                    .next()
+                    .and_then(|major| major.parse::<u32>().ok())
+            } else {
+                None
+            }
+        });
+
+    // pnpm 11 made dependency build approval strict and moved the setting to
+    // pnpm-workspace.yaml. Keep benchmark lifecycle behavior enabled for the
+    // checked-in native-build fixtures while leaving pnpm 10 baselines alone.
+    if pnpm_major < Some(11) {
+        return Ok(());
+    }
+
+    let allow_builds: &[&str] = match fixture.name {
+        "large-frontend" => &["esbuild"],
+        "native-addon" => &["node-gyp"],
+        _ => &[],
+    };
+    if allow_builds.is_empty() {
+        return Ok(());
+    }
+
+    let mut settings = String::from("allowBuilds:\n");
+    for package in allow_builds {
+        settings.push_str("  ");
+        settings.push_str(package);
+        settings.push_str(": true\n");
+    }
+    fs::write(work_dir.join("pnpm-workspace.yaml"), settings)?;
     Ok(())
 }
 
@@ -643,13 +707,7 @@ struct BpmMetricsFile {
     #[serde(default)]
     phases: BTreeMap<String, f64>,
     #[serde(default)]
-    counters: BpmMetricsCounters,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct BpmMetricsCounters {
-    #[serde(default)]
-    requests_sent: u64,
+    counters: BTreeMap<String, serde_json::Value>,
 }
 
 /// Best-effort read+parse of a bpm metrics file. Returns `None` on any I/O or
@@ -666,13 +724,27 @@ pub fn aggregate_bpm_metrics(
     request_counts: Vec<f64>,
     phase_samples: BTreeMap<String, Vec<f64>>,
 ) -> BpmMetricsSummary {
+    aggregate_bpm_metrics_with_counters(request_counts, phase_samples, BTreeMap::new())
+}
+
+/// Aggregate benchmark metrics while retaining numeric scalar diagnostics.
+pub fn aggregate_bpm_metrics_with_counters(
+    request_counts: Vec<f64>,
+    phase_samples: BTreeMap<String, Vec<f64>>,
+    counter_samples: BTreeMap<String, Vec<f64>>,
+) -> BpmMetricsSummary {
     let phase_ms = phase_samples
+        .into_iter()
+        .map(|(name, samples)| (name, Stats::compute(samples)))
+        .collect();
+    let counters = counter_samples
         .into_iter()
         .map(|(name, samples)| (name, Stats::compute(samples)))
         .collect();
     BpmMetricsSummary {
         requests_sent: Stats::compute(request_counts),
         phase_ms,
+        counters,
     }
 }
 
@@ -697,6 +769,7 @@ pub fn run_scenario_with_runner(
     // captured from each timed run's `--json-metrics` file.
     let mut request_counts: Vec<f64> = Vec::with_capacity(num_runs);
     let mut phase_samples: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    let mut counter_samples: BTreeMap<String, Vec<f64>> = BTreeMap::new();
 
     for run_index in 0..num_runs {
         let work_dir = temp_base.path().join(format!("run-{run_index}"));
@@ -754,7 +827,19 @@ pub fn run_scenario_with_runner(
 
         if let Some(path) = &metrics_path {
             if let Some(file) = read_bpm_metrics(path) {
-                request_counts.push(file.counters.requests_sent as f64);
+                request_counts.push(
+                    file.counters
+                        .get("requests_sent")
+                        .and_then(serde_json::Value::as_f64)
+                        .unwrap_or_default(),
+                );
+                for (name, value) in file.counters {
+                    if name != "requests_sent" {
+                        if let Some(value) = value.as_f64() {
+                            counter_samples.entry(name).or_default().push(value);
+                        }
+                    }
+                }
                 for (name, ms) in file.phases {
                     phase_samples.entry(name).or_default().push(ms);
                 }
@@ -763,7 +848,11 @@ pub fn run_scenario_with_runner(
     }
 
     let bpm_metrics = if tool == Tool::Bpm && !request_counts.is_empty() {
-        Some(aggregate_bpm_metrics(request_counts, phase_samples))
+        Some(aggregate_bpm_metrics_with_counters(
+            request_counts,
+            phase_samples,
+            counter_samples,
+        ))
     } else {
         None
     };
@@ -787,18 +876,18 @@ fn prepare_scenario_with_runner(
 ) -> anyhow::Result<()> {
     match scenario {
         ScenarioKind::TrueCold => {
-            create_fixture_workspace(fixture, work_dir)?;
+            create_tool_fixture_workspace(fixture, tool, work_dir)?;
             ensure_node_modules_empty(work_dir);
         }
         ScenarioKind::ResolvedCold => {
-            create_fixture_workspace(fixture, work_dir)?;
+            create_tool_fixture_workspace(fixture, tool, work_dir)?;
             ensure_node_modules_empty(work_dir);
             run_setup_commands(
                 fixture, scenario, tool, work_dir, bpm_store, run_number, runner,
             )?;
         }
         ScenarioKind::WarmStore => {
-            create_fixture_workspace(fixture, work_dir)?;
+            create_tool_fixture_workspace(fixture, tool, work_dir)?;
             ensure_node_modules_empty(work_dir);
             run_setup_commands(
                 fixture, scenario, tool, work_dir, bpm_store, run_number, runner,
@@ -809,7 +898,7 @@ fn prepare_scenario_with_runner(
             clear_node_modules(work_dir);
         }
         ScenarioKind::RepeatInstall => {
-            create_fixture_workspace(fixture, work_dir)?;
+            create_tool_fixture_workspace(fixture, tool, work_dir)?;
             run_setup_commands(
                 fixture, scenario, tool, work_dir, bpm_store, run_number, runner,
             )?;
@@ -818,13 +907,13 @@ fn prepare_scenario_with_runner(
             )?;
         }
         ScenarioKind::SecondProjectSameGraph => {
-            create_fixture_workspace(fixture, work_dir)?;
+            create_tool_fixture_workspace(fixture, tool, work_dir)?;
             run_setup_commands(
                 fixture, scenario, tool, work_dir, bpm_store, run_number, runner,
             )?;
 
             let seed = work_dir.with_file_name("seed-project");
-            create_fixture_workspace(fixture, &seed)?;
+            create_tool_fixture_workspace(fixture, tool, &seed)?;
             run_setup_commands(
                 fixture, scenario, tool, &seed, bpm_store, run_number, runner,
             )?;
@@ -834,7 +923,7 @@ fn prepare_scenario_with_runner(
             ensure_node_modules_empty(work_dir);
         }
         ScenarioKind::PartialDependencyChange => {
-            create_fixture_workspace(fixture, work_dir)?;
+            create_tool_fixture_workspace(fixture, tool, work_dir)?;
             run_setup_commands(
                 fixture, scenario, tool, work_dir, bpm_store, run_number, runner,
             )?;
@@ -844,7 +933,7 @@ fn prepare_scenario_with_runner(
             clear_node_modules(work_dir);
         }
         ScenarioKind::MonorepoCold | ScenarioKind::MonorepoIncremental => {
-            create_fixture_workspace(fixture, work_dir)?;
+            create_tool_fixture_workspace(fixture, tool, work_dir)?;
             run_setup_commands(
                 fixture, scenario, tool, work_dir, bpm_store, run_number, runner,
             )?;
@@ -1578,6 +1667,25 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_bpm_metrics_keeps_scalar_counters_separate_from_phases() {
+        let counters = BTreeMap::from([(
+            "resolver_peak_http_concurrency".to_string(),
+            vec![4.0, 8.0, 8.0],
+        )]);
+        let summary =
+            aggregate_bpm_metrics_with_counters(vec![3.0, 3.0, 3.0], BTreeMap::new(), counters);
+        assert_eq!(
+            summary
+                .counters
+                .get("resolver_peak_http_concurrency")
+                .unwrap()
+                .median,
+            8.0
+        );
+        assert!(summary.phase_ms.is_empty());
+    }
+
+    #[test]
     fn tool_results_round_trips_with_and_without_bpm_metrics() {
         // Without bpm_metrics: existing reference baselines still deserialize.
         let without = serde_json::json!({
@@ -1599,6 +1707,7 @@ mod tests {
                     "dependency_resolution".to_string(),
                     Stats::compute(vec![10.0]),
                 )]),
+                counters: BTreeMap::new(),
             }),
         };
         let json = serde_json::to_string(&with).unwrap();

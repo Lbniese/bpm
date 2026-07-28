@@ -94,6 +94,14 @@ fn build_async_client(config: &NpmConfig) -> reqwest::Client {
     reqwest::Client::builder()
         .user_agent(concat!("bpm/", env!("CARGO_PKG_VERSION"), " (async)"))
         .timeout(timeout)
+        // npm registry traffic commonly remains HTTP/1.1. Keep enough idle
+        // connections for the bounded prefetch fan-out so sibling requests
+        // can reuse established TLS connections instead of paying setup cost
+        // repeatedly. HTTP/2 negotiation remains enabled when the registry
+        // supports it; this pool setting is harmless in that mode.
+        .pool_max_idle_per_host(64)
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .tcp_keepalive(std::time::Duration::from_secs(30))
         .build()
         .expect("valid reqwest async client with defaults")
 }
@@ -101,16 +109,16 @@ fn build_async_client(config: &NpmConfig) -> reqwest::Client {
 use crate::config::NpmConfig;
 use crate::http::redact_url;
 use crate::metadata_cache::{CacheMode, MetadataCache};
-use crate::registry::{select_version, version_metadata, WireVersionMetadata, ABBREV_ACCEPT};
-use std::sync::atomic::{AtomicU64, Ordering};
+use crate::registry::{version_metadata, WireVersionMetadata, ABBREV_ACCEPT};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::{watch, Mutex as AsyncMutex};
+use tokio::sync::{watch, Mutex as AsyncMutex, Semaphore};
 
-/// Cap on extra (grandchild) packument prefetches launched from one node's
-/// `prefetch_registry_children` call (Plan 036 deeper fan-out). Bounds the
-/// prefetch storm risk on pathological graphs. The singleflight dedups any
-/// repeats and best-effort failures are dropped, so a low cap is safe.
-const GRANDCHILD_PREFETCH_CAP: u32 = 64;
+/// Default maximum number of async registry request bodies in flight. This is
+/// deliberately above the old prefetch fan-out size: the semaphore bounds the
+/// actual HTTP lifecycle while still allowing enough sibling requests to hide
+/// registry latency on HTTP/1.1.
+const DEFAULT_MAX_IN_FLIGHT: usize = 32;
 
 /// Cache/singleflight key for a *full* packument (all versions): the
 /// registry URL plus the package name, NUL-separated. Shared by the inline
@@ -129,44 +137,6 @@ pub fn version_cache_key(registry_url: &str, name: &str, version: &Version) -> S
         "{}\0{name}\0v:{version}",
         registry_url.trim_end_matches('/')
     )
-}
-
-/// Pick a representative version metadata entry from `packument` for the
-/// purposes of prefetching that version's dependencies one level deeper
-/// (Plan 036). Best-effort: returns `None` on any ambiguity so the caller
-/// simply skips the grandchild peek and lets DFS fetch them on descent.
-///
-/// Tries the spec's version request first (handles `npm:` aliases via
-/// `parse_spec`); on failure falls back to the `latest` dist-tag, then the
-/// highest semver version present.
-fn representative_version<'p>(
-    child: &str,
-    child_spec: &str,
-    packument: &'p Packument,
-) -> Option<&'p VersionMetadata> {
-    // Resolve the request the same way the resolver will, then ask
-    // `select_version` for the matching version.
-    let req = parse_spec(&format!("{child}@{child_spec}"))
-        .ok()
-        .map(|spec| spec.req)
-        .unwrap_or(VersionRequest::Latest);
-    let chosen = select_version(child, &req, packument)
-        .ok()
-        .or_else(|| {
-            packument
-                .dist_tags
-                .get("latest")
-                .and_then(|tag| Version::parse(tag).ok())
-        })
-        .or_else(|| {
-            packument
-                .versions
-                .keys()
-                .filter_map(|k| Version::parse(k).ok())
-                .max()
-        })?;
-    let key = chosen.to_string();
-    packument.versions.get(key.as_str())
 }
 
 /// Singleflight state for one in-flight packument fetch, shared between the
@@ -211,6 +181,10 @@ async fn async_fetch_with_cache(
     mode: CacheMode,
     send_abbreviated_accept: bool,
     fetch_bytes: &Arc<AtomicU64>,
+    in_flight: &Arc<AtomicU64>,
+    peak_in_flight: &Arc<AtomicU64>,
+    observed_http2: &Arc<AtomicBool>,
+    request_limit: &Arc<Semaphore>,
 ) -> Result<String, AsyncResolveError> {
     // 1. Read the persistent cache off the Tokio runtime. An SQLite or
     //    spawn-task failure counts as no usable cached body.
@@ -254,6 +228,18 @@ async fn async_fetch_with_cache(
         }
     }
 
+    // Hold one permit for the complete request lifecycle, including retries,
+    // response-body consumption, and the best-effort cache write. This keeps
+    // the configured concurrency bound meaningful for HTTP/1.1 as well as
+    // HTTP/2, where request headers may complete before the body is drained.
+    let _request_permit = Arc::clone(request_limit)
+        .acquire_owned()
+        .await
+        .map_err(|_| AsyncResolveError::Http {
+            url: redact_url(url),
+            message: "async registry request limiter closed".to_string(),
+        })?;
+
     // 4. Send validators from the cached entry (scoped to this exact URL),
     //    retrying transient statuses/transports per `NetworkConfig`. A fresh
     //    request is built on each attempt so auth/Accept/validators are
@@ -267,6 +253,9 @@ async fn async_fetch_with_cache(
         cached.as_ref(),
         send_abbreviated_accept,
         attempts,
+        in_flight,
+        peak_in_flight,
+        observed_http2,
     )
     .await?;
 
@@ -306,7 +295,10 @@ async fn async_fetch_with_cache(
     fetch_bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
 
     // 7. Best-effort refresh: a cache write failure must never fail an install.
-    async_cache_put(cache, url, &body, etag, last_modified).await;
+    // The in-memory singleflight/cache is authoritative for this process, so
+    // do not hold a resolver permit or await SQLite here. The persistent cache
+    // is rebuildable and may safely lose this write if the runtime exits.
+    spawn_async_cache_put(cache, url, &body, etag, last_modified);
 
     Ok(body)
 }
@@ -318,6 +310,7 @@ async fn async_fetch_with_cache(
 /// for cache/body handling; retryable bodies are drained only up to the shared
 /// retry-body bound. Waits via `tokio::time::sleep`; never caches or parses a
 /// retryable error body.
+#[allow(clippy::too_many_arguments)]
 async fn async_send_with_retry(
     client: &reqwest::Client,
     url: &str,
@@ -325,6 +318,9 @@ async fn async_send_with_retry(
     cached: Option<&crate::metadata_cache::CachedPackument>,
     send_abbreviated_accept: bool,
     attempts: usize,
+    in_flight: &Arc<AtomicU64>,
+    peak_in_flight: &Arc<AtomicU64>,
+    observed_http2: &Arc<AtomicBool>,
 ) -> Result<reqwest::Response, AsyncResolveError> {
     use crate::http::retry::{
         is_retryable_status, is_retryable_transport, parse_retry_after_at, retry_delay,
@@ -333,6 +329,17 @@ async fn async_send_with_retry(
     use std::time::SystemTime;
 
     let mut completed = 0usize;
+    let current = in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+    let mut peak = peak_in_flight.load(Ordering::Relaxed);
+    while current > peak {
+        match peak_in_flight.compare_exchange(peak, current, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(actual) => peak = actual,
+        }
+    }
+    let _guard = AsyncInFlightGuard {
+        counter: Arc::clone(in_flight),
+    };
     loop {
         let mut request = client.get(url);
         if send_abbreviated_accept {
@@ -352,6 +359,9 @@ async fn async_send_with_retry(
         completed += 1;
         match request.send().await {
             Ok(response) => {
+                if response.version() == reqwest::Version::HTTP_2 {
+                    observed_http2.store(true, Ordering::Relaxed);
+                }
                 let status = response.status().as_u16();
                 // `304` (conditional cache success) and other `< 400` responses
                 // are terminal success; hand them to the cache/body logic.
@@ -393,6 +403,16 @@ async fn async_send_with_retry(
     }
 }
 
+struct AsyncInFlightGuard {
+    counter: Arc<AtomicU64>,
+}
+
+impl Drop for AsyncInFlightGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// Drain a retryable async response body only up to the shared retry-body
 /// bound, then drop it. Reading past the bound distinguishes a complete small
 /// body from an oversized one; dropping an oversized reader leaves bytes
@@ -416,7 +436,7 @@ async fn drain_bounded_async(response: reqwest::Response) {
     }
 }
 
-async fn async_cache_put(
+fn spawn_async_cache_put(
     cache: Option<&Arc<MetadataCache>>,
     url: &str,
     body: &str,
@@ -427,21 +447,21 @@ async fn async_cache_put(
     let url = url.to_owned();
     let body = body.to_owned();
     let cache = Arc::clone(cache);
-    let _ = tokio::task::spawn_blocking(move || {
+    std::mem::drop(tokio::task::spawn_blocking(move || {
         cache.put(
             &url,
             body.as_bytes(),
             etag.as_deref(),
             last_modified.as_deref(),
         )
-    })
-    .await;
+    }));
 }
 
 fn encode_package_name(name: &str) -> String {
     name.replace('/', "%2F")
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn async_fetch_packument(
     client: &reqwest::Client,
     name: &str,
@@ -450,6 +470,10 @@ async fn async_fetch_packument(
     cache: Option<&Arc<MetadataCache>>,
     mode: CacheMode,
     fetch_bytes: &Arc<AtomicU64>,
+    in_flight: &Arc<AtomicU64>,
+    peak_in_flight: &Arc<AtomicU64>,
+    observed_http2: &Arc<AtomicBool>,
+    request_limit: &Arc<Semaphore>,
 ) -> Result<Packument, AsyncResolveError> {
     let base = registry.trim_end_matches('/');
     let encoded = encode_package_name(name);
@@ -465,6 +489,10 @@ async fn async_fetch_packument(
         mode,
         true,
         fetch_bytes,
+        in_flight,
+        peak_in_flight,
+        observed_http2,
+        request_limit,
     )
     .await?;
 
@@ -488,6 +516,10 @@ async fn async_fetch_version_packument(
     cache: Option<&Arc<MetadataCache>>,
     mode: CacheMode,
     fetch_bytes: &Arc<AtomicU64>,
+    in_flight: &Arc<AtomicU64>,
+    peak_in_flight: &Arc<AtomicU64>,
+    observed_http2: &Arc<AtomicBool>,
+    request_limit: &Arc<Semaphore>,
 ) -> Result<Packument, AsyncResolveError> {
     let base = registry.trim_end_matches('/');
     let encoded = encode_package_name(name);
@@ -503,6 +535,10 @@ async fn async_fetch_version_packument(
         mode,
         false,
         fetch_bytes,
+        in_flight,
+        peak_in_flight,
+        observed_http2,
+        request_limit,
     )
     .await?;
 
@@ -573,8 +609,10 @@ pub struct AsyncRegistryClient {
     network_wait_ns: Arc<AtomicU64>,
     metadata_cache: Option<Arc<MetadataCache>>,
     cache_mode: CacheMode,
-    max_in_flight: u32,
+    request_limit: Arc<Semaphore>,
     peak_in_flight: Arc<AtomicU64>,
+    http_in_flight: Arc<AtomicU64>,
+    observed_http2: Arc<AtomicBool>,
 }
 
 impl AsyncRegistryClient {
@@ -594,13 +632,15 @@ impl AsyncRegistryClient {
             network_wait_ns: Arc::new(AtomicU64::new(0)),
             metadata_cache: None,
             cache_mode: CacheMode::Default,
-            max_in_flight: 4,
+            request_limit: Arc::new(Semaphore::new(DEFAULT_MAX_IN_FLIGHT)),
             peak_in_flight: Arc::new(AtomicU64::new(0)),
+            http_in_flight: Arc::new(AtomicU64::new(0)),
+            observed_http2: Arc::new(AtomicBool::new(false)),
         }
     }
 
     pub fn with_max_in_flight(mut self, max: u32) -> Self {
-        self.max_in_flight = max.max(1);
+        self.request_limit = Arc::new(Semaphore::new(max.max(1) as usize));
         self
     }
 
@@ -772,6 +812,10 @@ impl AsyncRegistryClient {
         let cache = self.metadata_cache.clone();
         let cache_mode = self.cache_mode;
         let fetch_bytes = Arc::clone(&self.fetch_bytes);
+        let in_flight = Arc::clone(&self.http_in_flight);
+        let peak_in_flight = Arc::clone(&self.peak_in_flight);
+        let observed_http2 = Arc::clone(&self.observed_http2);
+        let request_limit = Arc::clone(&self.request_limit);
         let name_owned = name.to_owned();
         let registry_owned = registry_url.to_owned();
         self.singleflight_fetch(key, move || {
@@ -779,6 +823,10 @@ impl AsyncRegistryClient {
             let config = config.clone();
             let cache = cache.clone();
             let fetch_bytes = Arc::clone(&fetch_bytes);
+            let in_flight = Arc::clone(&in_flight);
+            let peak_in_flight = Arc::clone(&peak_in_flight);
+            let observed_http2 = Arc::clone(&observed_http2);
+            let request_limit = Arc::clone(&request_limit);
             let name = name_owned.clone();
             let registry = registry_owned.clone();
             async move {
@@ -790,6 +838,10 @@ impl AsyncRegistryClient {
                     cache.as_ref(),
                     cache_mode,
                     &fetch_bytes,
+                    &in_flight,
+                    &peak_in_flight,
+                    &observed_http2,
+                    &request_limit,
                 )
                 .await
             }
@@ -822,6 +874,10 @@ impl AsyncRegistryClient {
         let cache = self.metadata_cache.clone();
         let cache_mode = self.cache_mode;
         let fetch_bytes = Arc::clone(&self.fetch_bytes);
+        let in_flight = Arc::clone(&self.http_in_flight);
+        let peak_in_flight = Arc::clone(&self.peak_in_flight);
+        let observed_http2 = Arc::clone(&self.observed_http2);
+        let request_limit = Arc::clone(&self.request_limit);
         let name_owned = name.to_owned();
         let registry_owned = registry_url.to_owned();
         let version_owned = version.clone();
@@ -830,6 +886,10 @@ impl AsyncRegistryClient {
             let config = config.clone();
             let cache = cache.clone();
             let fetch_bytes = Arc::clone(&fetch_bytes);
+            let in_flight = Arc::clone(&in_flight);
+            let peak_in_flight = Arc::clone(&peak_in_flight);
+            let observed_http2 = Arc::clone(&observed_http2);
+            let request_limit = Arc::clone(&request_limit);
             let name = name_owned.clone();
             let registry = registry_owned.clone();
             let version = version_owned.clone();
@@ -843,6 +903,10 @@ impl AsyncRegistryClient {
                     cache.as_ref(),
                     cache_mode,
                     &fetch_bytes,
+                    &in_flight,
+                    &peak_in_flight,
+                    &observed_http2,
+                    &request_limit,
                 )
                 .await
             }
@@ -973,6 +1037,8 @@ impl AsyncRegistryClient {
             batch_prefetch_fetches: self.batch_prefetch_fetches.swap(0, Ordering::Relaxed),
             fetch_bytes: self.fetch_bytes.swap(0, Ordering::Relaxed),
             network_wait_ns: self.network_wait_ns.swap(0, Ordering::Relaxed),
+            peak_http_concurrency: self.peak_in_flight.swap(0, Ordering::Relaxed),
+            observed_http2: self.observed_http2.swap(false, Ordering::Relaxed),
         }
     }
 }
@@ -997,6 +1063,10 @@ pub struct AsyncResolverDiagnostics {
     pub fetch_bytes: u64,
     /// Network I/O + singleflight wait time, in nanoseconds.
     pub network_wait_ns: u64,
+    /// Peak concurrent registry requests in the async resolver.
+    pub peak_http_concurrency: u64,
+    /// Whether any async registry response negotiated HTTP/2.
+    pub observed_http2: bool,
 }
 
 /// Lift a singleflight result out of `FetchState::Done` for a waiter.
@@ -1291,18 +1361,10 @@ impl<'a> AsyncGraphResolver<'a> {
     /// child (Plan 021 fan-out). Non-registry specs (`file:`/`git:`/tarball)
     /// and workspace members are skipped; the singleflight dedups repeats and
     /// best-effort failures are dropped (the inline `resolve_children` path
-    /// re-fetches and surfaces real errors).
-    ///
-    /// Plan 036 widens the fan-out one level deeper: for each registry child
-    /// whose packument is *already* cached (its own prefetch completed), the
-    /// dependency names of a representative version are read and those
-    /// grandchildren are prefetched too, bounded by `GRANDCHILD_PREFETCH_CAP`.
-    /// This lets grandchild and sibling-subtree fetches overlap with the first
-    /// child's subtree instead of serializing behind DFS descent. The cap
-    /// prevents a prefetch storm on pathological graphs (e.g. a package with
-    /// thousands of transitive deps at one level).
+    /// re-fetches and surfaces real errors). Keep this to one graph level:
+    /// deeper speculative fan-out creates registry contention without enough
+    /// additional overlap to repay its extra work.
     fn prefetch_registry_children(&self, dependencies: &BTreeMap<String, String>) {
-        let mut grandchild_budget = GRANDCHILD_PREFETCH_CAP;
         for (child, child_spec) in dependencies {
             if DependencySource::parse(child_spec).is_some() {
                 continue;
@@ -1311,61 +1373,7 @@ impl<'a> AsyncGraphResolver<'a> {
                 continue;
             }
             self.registry.prefetch_packument(child, Some(child_spec));
-            // ── Plan 036: prefetch grandchildren one level deeper. ──
-            // Only when the child's packument is already cached (its prefetch
-            // completed) can we read a version's dependency list; otherwise we
-            // defer to the child's own `prefetch_registry_children` call when
-            // DFS reaches it. Best-effort: a wrong version guess just wastes a
-            // prefetch the singleflight dedups anyway.
-            if grandchild_budget == 0 {
-                continue;
-            }
-            grandchild_budget =
-                self.prefetch_cached_grandchildren(child, child_spec, grandchild_budget);
         }
-    }
-
-    /// Read a representative version's dependency names from the cached
-    /// packument for `child` (if present) and prefetch the registry-typed
-    /// ones, consuming up to `budget` prefetches. Returns the remaining
-    /// budget. Fully best-effort: missing cache, unparseable specs, and
-    /// fetch failures are all silently skipped.
-    fn prefetch_cached_grandchildren(&self, child: &str, child_spec: &str, budget: u32) -> u32 {
-        let mut remaining = budget;
-        let registry_url = self.registry.config.registry_for_package(child);
-        let key = format!("{}\0{child}", registry_url.trim_end_matches('/'));
-        let packument = {
-            // Try-lock: if the cache is contended (a fetch is publishing),
-            // skip the grandchild peek this round — the inline DFS path will
-            // fetch these on descent. Never `blocking_lock`: we are on the
-            // tokio runtime thread.
-            match self.registry.packument_cache.try_lock() {
-                Ok(cache) => match cache.get(&key) {
-                    Some(packument) => packument.clone(),
-                    None => return remaining,
-                },
-                Err(_) => return remaining,
-            }
-        };
-        let Some(metadata) = representative_version(child, child_spec, &packument) else {
-            return remaining;
-        };
-        let merged = resolver::merged_dependencies(metadata);
-        for (grandchild, grandchild_spec) in &merged {
-            if remaining == 0 {
-                break;
-            }
-            if DependencySource::parse(grandchild_spec).is_some() {
-                continue;
-            }
-            if self.workspace.and_then(|w| w.get(grandchild)).is_some() {
-                continue;
-            }
-            self.registry
-                .prefetch_packument(grandchild, Some(grandchild_spec));
-            remaining -= 1;
-        }
-        remaining
     }
 
     async fn resolve_children(

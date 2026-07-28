@@ -12,6 +12,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Instant;
 
 use bpm::config::NpmConfig;
 use bpm::graph;
@@ -22,6 +24,7 @@ use bpm::manifest::PackageManifest;
 use bpm::metrics::Metrics;
 use bpm::path_safety::{validate_bin_name, validate_bin_target};
 use bpm::project_lock::{find_project_lock, validate_npm_direct_install, ProjectLockKind};
+use bpm::resolution_cache::{key_for as resolution_snapshot_key, ResolutionSnapshotCache};
 use bpm::resolver;
 use bpm::resolver::model::PlatformConstraints;
 use bpm::resolver::platform::{check_package_platform, PackageReachability, PlatformDisposition};
@@ -143,6 +146,34 @@ pub(super) fn run(mut options: Options) -> anyhow::Result<()> {
             } else {
                 bpm::resolver::peer::PeerMode::Strict
             };
+            let target = bpm::resolver::current_target_platform();
+            let snapshot_cache = ResolutionSnapshotCache::new(&store_root_path);
+            let snapshot_key = resolution_snapshot_key(
+                &manifest,
+                &workspace_index,
+                &config,
+                peer_mode,
+                &target,
+            );
+            if options.cache_mode.serves_stale() {
+                if let Some(lockfile) = snapshot_cache.load(&snapshot_key) {
+                    let path = root.join(bpm::lockfile::BPM_LOCK_FILE);
+                    lockfile.write_to(&path)?;
+                    eprintln!(
+                        "reused cached resolution for {} package(s) and wrote {}",
+                        lockfile.packages.len(),
+                        path.display()
+                    );
+                    return install_resolved_lockfile(
+                        &root,
+                        &path,
+                        lockfile,
+                        ProjectLockKind::Bpm,
+                        &options,
+                        &store_root_path,
+                    );
+                }
+            }
             let store = ArtifactStore::open(&store_root_path)?;
             let mut metrics = Metrics::new();
             // Async resolve (default since Phase 4); the blocking resolver is the BPM_ASYNC_RESOLVE=0 kill-switch path.
@@ -167,6 +198,8 @@ pub(super) fn run(mut options: Options) -> anyhow::Result<()> {
                     &http,
                     &mut metrics,
                     &options,
+                    &snapshot_cache,
+                    &snapshot_key,
                 );
             }
             if streaming_install_enabled() {
@@ -181,6 +214,8 @@ pub(super) fn run(mut options: Options) -> anyhow::Result<()> {
                     &http,
                     &mut metrics,
                     &options,
+                    &snapshot_cache,
+                    &snapshot_key,
                 );
             }
             // Non-streaming: resolve the whole graph before downloading. Route
@@ -197,6 +232,8 @@ pub(super) fn run(mut options: Options) -> anyhow::Result<()> {
                     config,
                     options.cache_mode,
                     &mut metrics,
+                    &snapshot_cache,
+                    &snapshot_key,
                 )?
             } else {
                 resolve_fresh_manifest_blocking(
@@ -206,6 +243,8 @@ pub(super) fn run(mut options: Options) -> anyhow::Result<()> {
                     peer_mode,
                     &http,
                     &mut metrics,
+                    &snapshot_cache,
+                    &snapshot_key,
                 )?
             };
             let path = root.join(bpm::lockfile::BPM_LOCK_FILE);
@@ -346,7 +385,7 @@ pub(super) fn install_resolved_lockfile(
     let outcomes = std::thread::scope(|scope| -> anyhow::Result<Vec<FetchOutcome>> {
         let (unit_tx, unit_rx) = std::sync::mpsc::sync_channel::<InstallWork>(workers.max(1) * 2);
         let unit_rx = std::sync::Arc::new(std::sync::Mutex::new(unit_rx));
-        let (downloaders, extractors) =
+        let (downloaders, extractors, clock) =
             spawn_fetch_pipeline(scope, &store, &http, remote.as_ref(), unit_rx, workers);
         for item in work {
             if unit_tx.send(item).is_err() {
@@ -354,7 +393,7 @@ pub(super) fn install_resolved_lockfile(
             }
         }
         drop(unit_tx);
-        join_pipeline(downloaders, extractors, &mut metrics)
+        join_pipeline(downloaders, extractors, &mut metrics, &clock)
     })?;
 
     let cached = outcomes
@@ -916,6 +955,41 @@ type DownloaderHandle<'scope> = std::thread::ScopedJoinHandle<'scope, Result<Met
 type ExtractorHandle<'scope> =
     std::thread::ScopedJoinHandle<'scope, Result<(Vec<FetchOutcome>, Metrics), FetchFail>>;
 
+/// Wall-clock lifetime of the concurrent fetch/extract pipeline. Per-worker
+/// metrics sum durations, which cannot show how much work overlapped. This
+/// clock measures the actual critical-path lifetime from the first worker to
+/// the last worker.
+struct PipelineClock {
+    start: std::sync::Mutex<Option<Instant>>,
+    end: std::sync::Mutex<Option<Instant>>,
+}
+
+impl PipelineClock {
+    fn new() -> Self {
+        Self {
+            start: std::sync::Mutex::new(None),
+            end: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn mark_start(&self) {
+        let mut start = self.start.lock().expect("pipeline clock start lock");
+        if start.is_none() {
+            *start = Some(Instant::now());
+        }
+    }
+
+    fn mark_end(&self) {
+        *self.end.lock().expect("pipeline clock end lock") = Some(Instant::now());
+    }
+
+    fn elapsed(&self) -> Option<std::time::Duration> {
+        let start = *self.start.lock().expect("pipeline clock start lock");
+        let end = *self.end.lock().expect("pipeline clock end lock");
+        start.zip(end).map(|(start, end)| end.duration_since(start))
+    }
+}
+
 /// Spawn the download→extract worker pipeline consuming resolved install units
 /// from `unit_rx`. Returns the downloader and extractor join handles; the
 /// caller joins them via [`join_pipeline`] after the unit producer finishes.
@@ -931,9 +1005,14 @@ fn spawn_fetch_pipeline<'scope, 'env>(
     remote: Option<&'env bpm::remote_cache::RemoteCacheClient>,
     unit_rx: std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<InstallWork>>>,
     workers: usize,
-) -> (Vec<DownloaderHandle<'scope>>, Vec<ExtractorHandle<'scope>>) {
+) -> (
+    Vec<DownloaderHandle<'scope>>,
+    Vec<ExtractorHandle<'scope>>,
+    Arc<PipelineClock>,
+) {
     use std::sync::mpsc::sync_channel;
     let workers = workers.max(1);
+    let clock = Arc::new(PipelineClock::new());
     let (send, receive) = sync_channel::<Result<PendingArtifact, FetchFail>>(workers * 2);
     let receive = std::sync::Arc::new(std::sync::Mutex::new(receive));
     let mut downloaders = Vec::with_capacity(workers);
@@ -942,10 +1021,20 @@ fn spawn_fetch_pipeline<'scope, 'env>(
         let send = send.clone();
         let http = http.clone();
         let remote = remote.cloned();
+        let clock = Arc::clone(&clock);
         downloaders.push(scope.spawn(move || -> Result<Metrics, FetchFail> {
+            clock.mark_start();
             let mut local = Metrics::new();
             let mut extraction_gone = false;
-            while let Ok(item) = unit_rx.lock().expect("unit receiver lock").recv() {
+            loop {
+                // Keep the receiver mutex held only for the blocking recv.
+                // Binding the result separately is important: the temporary
+                // mutex guard must be dropped before this worker performs
+                // network I/O, otherwise all downloaders serialize on recv.
+                let received = unit_rx.lock().expect("unit receiver lock").recv();
+                let Ok(item) = received else {
+                    break;
+                };
                 if extraction_gone {
                     continue;
                 }
@@ -985,6 +1074,7 @@ fn spawn_fetch_pipeline<'scope, 'env>(
                     extraction_gone = true;
                 }
             }
+            clock.mark_end();
             Ok(local)
         }));
     }
@@ -992,8 +1082,10 @@ fn spawn_fetch_pipeline<'scope, 'env>(
     let mut extractors = Vec::with_capacity(workers);
     for _ in 0..workers {
         let receive = receive.clone();
+        let clock = Arc::clone(&clock);
         extractors.push(
             scope.spawn(move || -> Result<(Vec<FetchOutcome>, Metrics), FetchFail> {
+                clock.mark_start();
                 let mut local = Metrics::new();
                 let mut outcomes = Vec::new();
                 let mut first_error: Option<FetchFail> = None;
@@ -1031,14 +1123,16 @@ fn spawn_fetch_pipeline<'scope, 'env>(
                     }
                 }
                 if let Some(error) = first_error {
+                    clock.mark_end();
                     Err(error)
                 } else {
+                    clock.mark_end();
                     Ok((outcomes, local))
                 }
             }),
         );
     }
-    (downloaders, extractors)
+    (downloaders, extractors, clock)
 }
 
 /// Join the pipeline handles, merging per-worker metrics and surfacing the
@@ -1047,6 +1141,7 @@ fn join_pipeline(
     downloaders: Vec<DownloaderHandle<'_>>,
     extractors: Vec<ExtractorHandle<'_>>,
     metrics: &mut Metrics,
+    clock: &PipelineClock,
 ) -> anyhow::Result<Vec<FetchOutcome>> {
     for handle in downloaders {
         metrics.extend(
@@ -1062,6 +1157,9 @@ fn join_pipeline(
             .map_err(|_| anyhow::anyhow!("extract worker panicked"))??;
         metrics.extend(&local);
         outcomes.append(&mut values);
+    }
+    if let Some(elapsed) = clock.elapsed() {
+        metrics.record("artifact_pipeline_wall", elapsed);
     }
     Ok(outcomes)
 }
@@ -1111,6 +1209,18 @@ fn async_resolve_enabled() -> bool {
     )
 }
 
+/// Maximum number of async registry request bodies allowed concurrently.
+/// Benchmarking and unusual registries can tune this without changing the
+/// deterministic placement algorithm; the bound prevents accidental request
+/// storms while keeping the default wide enough to hide HTTP/1.1 latency.
+fn async_resolver_max_in_flight() -> u32 {
+    env::var("BPM_RESOLVER_MAX_IN_FLIGHT")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .map(|value| value.clamp(1, 64))
+        .unwrap_or(32)
+}
+
 /// Diagnostic counters threaded back from the async resolve runtime.
 /// Mirrors the blocking resolver's `ResolverDiagnosticsSnapshot`.
 type ResolveDiags = bpm::async_resolver::AsyncResolverDiagnostics;
@@ -1121,6 +1231,7 @@ type ResolveDiags = bpm::async_resolver::AsyncResolverDiagnostics;
 /// resulting lockfile is byte-identical to the blocking resolver's output for
 /// the same manifest/peer-mode (see the `tests/network_pipeline.rs` parity
 /// corpus). Records packument-cache diagnostics.
+#[allow(clippy::too_many_arguments)]
 fn resolve_fresh_manifest_async(
     manifest: &PackageManifest,
     workspace_index: &bpm::resolver::workspaces::WorkspaceIndex,
@@ -1129,6 +1240,8 @@ fn resolve_fresh_manifest_async(
     config: NpmConfig,
     cache_mode: bpm::metadata_cache::CacheMode,
     metrics: &mut Metrics,
+    snapshot_cache: &ResolutionSnapshotCache,
+    snapshot_key: &str,
 ) -> anyhow::Result<Lockfile> {
     metrics
         .measure(
@@ -1144,7 +1257,8 @@ fn resolve_fresh_manifest_async(
                     .block_on(async {
                         let async_cache = open_metadata_cache(store.root(), cache_mode)?;
                         let mut async_registry =
-                            bpm::async_resolver::AsyncRegistryClient::new(config);
+                            bpm::async_resolver::AsyncRegistryClient::new(config)
+                                .with_max_in_flight(async_resolver_max_in_flight());
                         if let Some(cache) = async_cache {
                             async_registry = async_registry.with_metadata_cache(cache, cache_mode);
                         }
@@ -1178,6 +1292,11 @@ fn resolve_fresh_manifest_async(
                 "resolver_network_wait",
                 std::time::Duration::from_nanos(diag.network_wait_ns),
             );
+            metrics
+                .record_resolver_http_diagnostics(diag.peak_http_concurrency, diag.observed_http2);
+            if let Err(error) = snapshot_cache.store(snapshot_key, &lockfile) {
+                eprintln!("warning: could not persist resolution snapshot: {error}");
+            }
             lockfile
         })
         .map_err(|error| anyhow::anyhow!("dependency resolution failed: {error}"))
@@ -1187,6 +1306,7 @@ fn resolve_fresh_manifest_async(
 /// `BPM_ASYNC_RESOLVE=0` kill-switch path. Honors the CLI-selected `peer_mode`.
 /// Records the same resolver-diagnostic vocabulary as the blocking streaming
 /// path so metrics stay comparable across all four matrix rows.
+#[allow(clippy::too_many_arguments)]
 fn resolve_fresh_manifest_blocking(
     manifest: &PackageManifest,
     client: &bpm::registry::RegistryClient,
@@ -1194,6 +1314,8 @@ fn resolve_fresh_manifest_blocking(
     peer_mode: bpm::resolver::peer::PeerMode,
     http: &HttpClient,
     metrics: &mut Metrics,
+    snapshot_cache: &ResolutionSnapshotCache,
+    snapshot_key: &str,
 ) -> anyhow::Result<Lockfile> {
     let lockfile = metrics
         .measure("dependency_resolution", || {
@@ -1220,18 +1342,10 @@ fn resolve_fresh_manifest_blocking(
         diag.resolver_fetch_nanos,
     );
     metrics.record_batch_prefetch(diag.batch_prefetch_fetches);
-    metrics.record(
-        "http_observed_http2",
-        if http.observed_http2() {
-            std::time::Duration::from_nanos(1)
-        } else {
-            std::time::Duration::ZERO
-        },
-    );
-    metrics.record(
-        "http_peak_concurrency",
-        std::time::Duration::from_nanos(http.max_concurrent_requests()),
-    );
+    metrics.record_http_diagnostics(http.max_concurrent_requests(), http.observed_http2());
+    if let Err(error) = snapshot_cache.store(snapshot_key, &lockfile) {
+        eprintln!("warning: could not persist resolution snapshot: {error}");
+    }
     Ok(lockfile)
 }
 
@@ -1288,6 +1402,8 @@ fn run_streaming_async_install(
     http: &HttpClient,
     metrics: &mut Metrics,
     options: &Options,
+    snapshot_cache: &ResolutionSnapshotCache,
+    snapshot_key: &str,
 ) -> anyhow::Result<()> {
     let config = effective_npm_config(root, options.registry.as_deref())?;
     let remote = if options.cache_mode.allows_network() {
@@ -1315,7 +1431,7 @@ fn run_streaming_async_install(
             let (unit_tx, unit_rx) =
                 std::sync::mpsc::sync_channel::<InstallWork>(workers.max(1) * 2);
             let unit_rx = std::sync::Arc::new(std::sync::Mutex::new(unit_rx));
-            let (downloaders, extractors) =
+            let (downloaders, extractors, clock) =
                 spawn_fetch_pipeline(scope, store, http, remote.as_ref(), unit_rx, workers);
             // Run async resolution on a tokio runtime, emitting placed nodes
             // to the non-blocking TryChannelSink. Units that overflow the live
@@ -1336,8 +1452,10 @@ fn run_streaming_async_install(
                                 overflow: std::sync::Arc::clone(&overflow),
                             };
                             let async_cache = open_metadata_cache(store.root(), options.cache_mode)?;
-                            let mut registry =
-                                bpm::async_resolver::AsyncRegistryClient::new(config_clone);
+                            let mut registry = bpm::async_resolver::AsyncRegistryClient::new(
+                                config_clone,
+                            )
+                            .with_max_in_flight(async_resolver_max_in_flight());
                             if let Some(cache) = async_cache {
                                 registry = registry.with_metadata_cache(cache, options.cache_mode);
                             }
@@ -1372,6 +1490,8 @@ fn run_streaming_async_install(
                 "resolver_network_wait",
                 std::time::Duration::from_nanos(diag.network_wait_ns),
             );
+            metrics
+                .record_resolver_http_diagnostics(diag.peak_http_concurrency, diag.observed_http2);
             // Async resolution is complete and we are off the tokio runtime, so
             // it is safe to block while draining every overflowed unit through
             // the original concurrent pipeline (workers drain concurrently).
@@ -1386,7 +1506,8 @@ fn run_streaming_async_install(
                 let _ = unit_tx.send(work);
             }
             drop(unit_tx);
-            let outcomes = join_pipeline(downloaders, extractors, metrics)?;
+            let outcomes = join_pipeline(downloaders, extractors, metrics, &clock)?;
+            metrics.record_http_diagnostics(http.max_concurrent_requests(), http.observed_http2());
             if overflow_count > 0 {
                 metrics.record(
                     "post_resolution_fetches",
@@ -1397,6 +1518,9 @@ fn run_streaming_async_install(
             // have an outcome. A gap is an internal pipeline error, not a
             // reason to start a behaviorally different sequential pass.
             assert_outcomes_complete(&lockfile, &outcomes)?;
+            if let Err(error) = snapshot_cache.store(snapshot_key, &lockfile) {
+                eprintln!("warning: could not persist resolution snapshot: {error}");
+            }
             Ok((lockfile, outcomes))
         },
     )?;
@@ -1472,6 +1596,8 @@ fn run_streaming_install(
     http: &HttpClient,
     metrics: &mut Metrics,
     options: &Options,
+    snapshot_cache: &ResolutionSnapshotCache,
+    snapshot_key: &str,
 ) -> anyhow::Result<()> {
     let remote = if options.cache_mode.allows_network() {
         options
@@ -1499,7 +1625,7 @@ fn run_streaming_install(
             let (unit_tx, unit_rx) =
                 std::sync::mpsc::sync_channel::<InstallWork>(workers.max(1) * 2);
             let unit_rx = std::sync::Arc::new(std::sync::Mutex::new(unit_rx));
-            let (downloaders, extractors) =
+            let (downloaders, extractors, clock) =
                 spawn_fetch_pipeline(scope, store, http, remote.as_ref(), unit_rx, workers);
             // Run resolution on this thread, emitting each placed node to the
             // sink; dropping `sink` closes the unit channel so downloaders (and
@@ -1539,21 +1665,13 @@ fn run_streaming_install(
             // Record batch-prefetch closure count (packuments fetched before
             // DFS started, separate from inline and pool prefetches).
             metrics.record_batch_prefetch(diag.batch_prefetch_fetches);
-            // Also record the HTTP transport diagnostics: whether HTTP/2 was
-            // observed and the peak in-flight request concurrency.
-            metrics.record(
-                "http_observed_http2",
-                if http.observed_http2() {
-                    std::time::Duration::from_nanos(1)
-                } else {
-                    std::time::Duration::ZERO
-                },
-            );
-            metrics.record(
-                "http_peak_concurrency",
-                std::time::Duration::from_nanos(http.max_concurrent_requests()),
-            );
-            let outcomes = join_pipeline(downloaders, extractors, metrics)?;
+            let outcomes = join_pipeline(downloaders, extractors, metrics, &clock)?;
+            // Record transport diagnostics after the streaming bodies have
+            // drained; the HTTP guard spans each full artifact response.
+            metrics.record_http_diagnostics(http.max_concurrent_requests(), http.observed_http2());
+            if let Err(error) = snapshot_cache.store(snapshot_key, &lockfile) {
+                eprintln!("warning: could not persist resolution snapshot: {error}");
+            }
             Ok((lockfile, outcomes))
         })?;
     let path = root.join(bpm::lockfile::BPM_LOCK_FILE);
@@ -1609,6 +1727,7 @@ fn finalize_install(
     // infer ownership from the live prior graph volume so a single generation
     // of stale entries still clears, claiming only entries whose live state
     // exactly matches the prior volume.
+    let ownership_start = Instant::now();
     let prior_owned_vec: Vec<bpm::graph::ManagedEntry> = match prior_plan {
         Some(plan) if plan.owned_entries.is_empty() => bpm::volume::infer_prior_ownership(
             project_root,
@@ -1617,6 +1736,7 @@ fn finalize_install(
         Some(plan) => plan.owned_entries.clone(),
         None => Vec::new(),
     };
+    metrics.record("ownership_reconciliation", ownership_start.elapsed());
     let prior_owned = prior_owned_vec.as_slice();
     let git_prepare_enabled = options.git_prepare
         && lockfile
@@ -1652,17 +1772,21 @@ fn finalize_install(
     // records the graph's inventory edges, and publishes the durable project
     // registration after attachment. Failures propagate with `?` so an install
     // never reports success with an unprotected graph.
+    let metadata_open_start = Instant::now();
     let mut session = bpm::metadata::InstallSession::open(store.root())
         .map_err(|error| anyhow::anyhow!("open metadata index failed: {error}"))?;
+    metrics.record("metadata_open", metadata_open_start.elapsed());
     let lease_artifacts: Vec<ArtifactId> = artifact_ids
         .iter()
         .zip(lockfile.packages.iter())
         .filter_map(|(maybe_id, pkg)| if pkg.link { None } else { *maybe_id })
         .collect();
     let prepared_derived: Vec<String> = prepared.values().map(|image| image.key.to_hex()).collect();
+    let metadata_lease_start = Instant::now();
     session
         .lease_objects(&lease_artifacts, &prepared_derived)
         .map_err(|error| anyhow::anyhow!("lease store objects failed: {error}"))?;
+    metrics.record("metadata_lease", metadata_lease_start.elapsed());
     // Turbopack and similar bundlers enforce that dependency realpaths remain
     // inside the project. Keep the O(top-level) relay fast path for ordinary
     // projects, but use a local hardlink view automatically for Next projects;
@@ -1677,6 +1801,7 @@ fn finalize_install(
     // graph-volume ownership (see plan 011 Scope).
     let mut final_ownership: Vec<bpm::graph::ManagedEntry> = Vec::new();
     let mut graph_hex: Option<String> = None;
+    let materialization_start = Instant::now();
     let (volume, mut view_entry_count) = if direct_materialization {
         bpm::materializer::materialize_lockfile_with_backend(
             project_root,
@@ -1715,6 +1840,7 @@ fn finalize_install(
             attach.stats.relays_created + attach.stats.relays_unchanged,
         )
     };
+    metrics.record("materialization", materialization_start.elapsed());
     let lifecycle = run_lifecycle_if_enabled(
         project_root,
         store,
@@ -1730,6 +1856,7 @@ fn finalize_install(
         options.derived_store,
         metrics,
     )?;
+    let local_view_start = Instant::now();
     if local_project_view {
         if let Some(volume) = volume.as_ref() {
             let backend = match project_view {
@@ -1745,6 +1872,7 @@ fn finalize_install(
             final_ownership = attached.owned;
         }
     }
+    metrics.record("project_local_view", local_view_start.elapsed());
 
     // Reconcile stale project-view entries from the prior install AFTER the
     // final view is attached, using the final ownership set as the desired set.
@@ -1753,6 +1881,7 @@ fn finalize_install(
     // For direct materialization (`volume == None`) there is no new graph-
     // volume ownership to reconcile against; a prior graph-volume owner that we
     // cannot safely attribute is preserved rather than deleted.
+    let reconciliation_start = Instant::now();
     if !prior_owned.is_empty() && volume.is_some() {
         let new_desired: std::collections::BTreeSet<String> =
             final_ownership.iter().map(|e| e.path.clone()).collect();
@@ -1765,7 +1894,9 @@ fn finalize_install(
             );
         }
     }
+    metrics.record("project_reconciliation", reconciliation_start.elapsed());
 
+    let graph_record_start = Instant::now();
     if let Some(hex) = &graph_hex {
         session
             .record_graph(
@@ -1774,7 +1905,9 @@ fn finalize_install(
             )
             .map_err(|error| anyhow::anyhow!("record graph ownership failed: {error}"))?;
     }
+    metrics.record("metadata_graph_record", graph_record_start.elapsed());
 
+    let plan_start = Instant::now();
     let plan_path = graph::plan_path_for(lockfile_path);
     let mut plan = graph::build_plan(
         lockfile,
@@ -1794,11 +1927,13 @@ fn finalize_install(
             plan_path.display()
         );
     }
+    metrics.record("plan_write", plan_start.elapsed());
     // Persist durable project ownership now that the graph is attached and
     // `.bpm-state`/plan are written. The lease is checked before and after;
     // a lost lease fails the install rather than leaving an unprotected graph.
     // Direct workspace materialization (no graph volume) does not register a
     // nonexistent graph; any prior registration is preserved conservatively.
+    let metadata_finalize_start = Instant::now();
     if let Some(hex) = &graph_hex {
         session
             .finalize_project(project_root, hex)
@@ -1808,6 +1943,7 @@ fn finalize_install(
             .check()
             .map_err(|error| anyhow::anyhow!("metadata lease lost before completion: {error}"))?;
     }
+    metrics.record("metadata_finalize", metadata_finalize_start.elapsed());
     let package_count = lockfile
         .packages
         .iter()
