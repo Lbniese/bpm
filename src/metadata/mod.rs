@@ -10,6 +10,6 @@ mod schema;
 
 pub use install::InstallSession;
 pub use repository::{
-    GraphRecord, LeaseGuard, LeaseOptions, MetadataError, MetadataRepository, ObjectKey,
+    GcReport, GraphRecord, LeaseGuard, LeaseOptions, MetadataError, MetadataRepository, ObjectKey,
     ObjectKind, ObjectRecord, ProjectRegistration, RepairReport, Timestamp,
 };
