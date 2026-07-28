@@ -235,6 +235,15 @@ pub fn import(json: &str) -> Result<ImportReport, NpmLockError> {
         let version = pkg.version.clone().unwrap_or_default();
         let link = pkg.link.unwrap_or(false);
 
+        // npm v3 records workspace manifests under their project-relative
+        // paths as metadata entries in addition to the installable
+        // node_modules/<name> link entries. The metadata is consumed through
+        // the link entry and must not be treated as a materialized package
+        // path (or rejected by node_modules path validation).
+        if !link && !path.split('/').any(|segment| segment == "node_modules") {
+            continue;
+        }
+
         if link {
             diagnostics.push(warn(
                 "LINK_PACKAGE_UNSUPPORTED",
