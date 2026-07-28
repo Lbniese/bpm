@@ -29,12 +29,6 @@ fn run_bpm(args: &[&str], cwd: &Path, store: &Path) -> std::process::Output {
         .expect("run bpm")
 }
 
-/// Copy of `build_tgz` for use on Windows without needing the common module's
-/// generic `build`-callback signature.
-fn build_tgz(files: &[(&str, &[u8], u32)]) -> Vec<u8> {
-    build_tgz_with_links(files, &[])
-}
-
 /// Build a package tarball with regular files and archive symlink headers.
 /// Windows extraction copies these links after all regular entries exist, so
 /// the fixture never needs to create a host filesystem symlink.
