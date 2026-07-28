@@ -16,7 +16,7 @@
 //! Scoped names (`@scope/pkg`) are URL-encoded the way the npm registry
 //! expects (`/` -> `%2F`) so the whole name is one path segment.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
@@ -237,7 +237,11 @@ struct WirePackument {
     #[serde(default, rename = "dist-tags")]
     dist_tags: BTreeMap<String, String>,
     #[serde(default)]
-    versions: BTreeMap<String, WireVersionMetadata>,
+    // Wire order is not part of npm semantics. Parse into a hash map, then
+    // normalize once into Packument's deterministic BTreeMap below; parsing
+    // directly into a tree and copying into another tree doubles insertion
+    // work on large abbreviated packuments.
+    versions: HashMap<String, WireVersionMetadata>,
 }
 
 #[derive(Default, Deserialize)]

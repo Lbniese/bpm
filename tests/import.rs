@@ -163,6 +163,44 @@ fn reports_link_and_platform_constructs_with_codes() {
     assert!(codes.contains(&"LINK_PACKAGE_UNSUPPORTED"));
 }
 
+#[test]
+fn skips_npm_workspace_metadata_entries_outside_node_modules() {
+    let report = import(
+        r#"{
+          "lockfileVersion": 3,
+          "packages": {
+            "": { "name": "app", "workspaces": ["packages/*"] },
+            "node_modules/@scope/shared": {
+              "resolved": "packages/shared",
+              "link": true
+            },
+            "packages/shared": {
+              "name": "@scope/shared",
+              "version": "1.0.0",
+              "dependencies": { "left-pad": "^1.3.0" }
+            },
+            "node_modules/left-pad": {
+              "version": "1.3.0",
+              "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+              "integrity": "sha512-AAAA"
+            }
+          }
+        }"#,
+    )
+    .unwrap();
+
+    let paths: Vec<&str> = report
+        .lockfile
+        .packages
+        .iter()
+        .map(|package| package.path.as_str())
+        .collect();
+    assert_eq!(
+        paths,
+        vec!["node_modules/@scope/shared", "node_modules/left-pad"]
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn cli_import_metadata_roundtrips_through_ci() {

@@ -49,6 +49,14 @@ pub struct Counters {
     pub resolver_network_wait_ns: u64,
     /// Packuments fetched during the batch-prefetch closure phase (before DFS).
     pub batch_prefetch_fetches: u64,
+    /// Peak concurrent HTTP requests observed by the async resolver.
+    pub resolver_peak_http_concurrency: u64,
+    /// Whether the async resolver observed at least one HTTP/2 response.
+    pub resolver_observed_http2: bool,
+    /// Peak concurrent requests observed by the shared artifact HTTP client.
+    pub http_peak_concurrency: u64,
+    /// Whether the shared artifact HTTP client observed at least one HTTP/2 response.
+    pub http_observed_http2: bool,
 }
 
 impl Counters {
@@ -71,6 +79,12 @@ impl Counters {
         self.packument_bytes += other.packument_bytes;
         self.resolver_network_wait_ns += other.resolver_network_wait_ns;
         self.batch_prefetch_fetches += other.batch_prefetch_fetches;
+        self.resolver_peak_http_concurrency = self
+            .resolver_peak_http_concurrency
+            .max(other.resolver_peak_http_concurrency);
+        self.resolver_observed_http2 |= other.resolver_observed_http2;
+        self.http_peak_concurrency = self.http_peak_concurrency.max(other.http_peak_concurrency);
+        self.http_observed_http2 |= other.http_observed_http2;
     }
 }
 
@@ -145,6 +159,20 @@ impl Metrics {
     /// prefetches because the batch phase runs before DFS traversal begins).
     pub fn record_batch_prefetch(&mut self, batch_fetches: u64) {
         self.counters.batch_prefetch_fetches += batch_fetches;
+    }
+
+    /// Record async resolver HTTP diagnostics as typed scalar counters rather
+    /// than encoding them as fake durations.
+    pub fn record_resolver_http_diagnostics(&mut self, peak: u64, observed_http2: bool) {
+        self.counters.resolver_peak_http_concurrency =
+            self.counters.resolver_peak_http_concurrency.max(peak);
+        self.counters.resolver_observed_http2 |= observed_http2;
+    }
+
+    /// Record diagnostics from the shared artifact HTTP client.
+    pub fn record_http_diagnostics(&mut self, peak: u64, observed_http2: bool) {
+        self.counters.http_peak_concurrency = self.counters.http_peak_concurrency.max(peak);
+        self.counters.http_observed_http2 |= observed_http2;
     }
 
     /// Add `n` to the outbound-request counter. Used to fold a shared HTTP
@@ -251,6 +279,22 @@ impl Metrics {
         counters.insert(
             "batch_prefetch_fetches".into(),
             serde_json::Value::from(self.counters.batch_prefetch_fetches),
+        );
+        counters.insert(
+            "resolver_peak_http_concurrency".into(),
+            serde_json::Value::from(self.counters.resolver_peak_http_concurrency),
+        );
+        counters.insert(
+            "resolver_observed_http2".into(),
+            serde_json::Value::from(self.counters.resolver_observed_http2),
+        );
+        counters.insert(
+            "http_peak_concurrency".into(),
+            serde_json::Value::from(self.counters.http_peak_concurrency),
+        );
+        counters.insert(
+            "http_observed_http2".into(),
+            serde_json::Value::from(self.counters.http_observed_http2),
         );
         let mut root = serde_json::Map::new();
         root.insert(
