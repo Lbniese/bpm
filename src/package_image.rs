@@ -10,6 +10,10 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 const MAGIC: &[u8; 8] = b"BPMIMG01";
+/// Metadata-only sidecar format used for new extracted images. Unlike the
+/// original image encoding, it stores paths and symlink targets without
+/// duplicating every file payload that already exists in the extracted image.
+const INDEX_MAGIC: &[u8; 8] = b"BPMIDX01";
 
 /// Maximum number of entries accepted by [`decode_index`]. Generous relative
 /// to any real package (npm packages have at most tens of thousands of files)
@@ -55,6 +59,13 @@ pub enum ImageError {
 pub fn encode(entries: &[Entry]) -> Result<Vec<u8>, ImageError> {
     let mut sorted = entries.to_vec();
     sorted.sort_by(|a, b| path(a).cmp(path(b)));
+    encode_sorted(&sorted)
+}
+
+/// Encode entries that are already sorted by path. The directory-backed image
+/// builder owns its entry vector and can sort it in place, avoiding a second
+/// full clone of every file payload during cold image publication.
+fn encode_sorted(sorted: &[Entry]) -> Result<Vec<u8>, ImageError> {
     let mut out = Vec::new();
     out.extend_from_slice(MAGIC);
     write_u32(&mut out, sorted.len() as u32);
@@ -62,13 +73,13 @@ pub fn encode(entries: &[Entry]) -> Result<Vec<u8>, ImageError> {
         match entry {
             Entry::File { path, bytes } => {
                 out.push(0);
-                write_str(&mut out, &path);
-                write_bytes(&mut out, &bytes);
+                write_str(&mut out, path);
+                write_bytes(&mut out, bytes);
             }
             Entry::Symlink { path, target } => {
                 out.push(1);
-                write_str(&mut out, &path);
-                write_str(&mut out, &target);
+                write_str(&mut out, path);
+                write_str(&mut out, target);
             }
         }
     }
@@ -122,6 +133,9 @@ pub fn decode_index<R: Read + Seek>(reader: &mut R) -> Result<Vec<IndexEntry>, I
 
     let mut magic = [0u8; MAGIC.len()];
     reader.read_exact(&mut magic)?;
+    if &magic == INDEX_MAGIC {
+        return decode_metadata_index(reader, end);
+    }
     if &magic != MAGIC {
         return Err(ImageError::Invalid("bad magic".into()));
     }
@@ -184,6 +198,47 @@ pub fn decode_index<R: Read + Seek>(reader: &mut R) -> Result<Vec<IndexEntry>, I
     Ok(entries)
 }
 
+fn decode_metadata_index<R: Read + Seek>(
+    reader: &mut R,
+    end: u64,
+) -> Result<Vec<IndexEntry>, ImageError> {
+    let count = read_u32_reader(reader)? as usize;
+    if count > MAX_INDEX_ENTRIES {
+        return Err(ImageError::Invalid(format!(
+            "entry count {count} exceeds maximum {MAX_INDEX_ENTRIES}"
+        )));
+    }
+    let header_end = reader.stream_position()?;
+    let remaining = end
+        .checked_sub(header_end)
+        .ok_or_else(|| ImageError::Invalid("stream end precedes header end".into()))?;
+    let min_body = (count as u64).saturating_mul(5);
+    if min_body > remaining {
+        return Err(ImageError::Invalid(format!(
+            "entry count {count} implies {min_body} bytes but only {remaining} remain"
+        )));
+    }
+
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        let kind = read_u8_reader(reader)?;
+        let path = read_bounded_string(reader)?;
+        let entry = match kind {
+            0 => IndexEntry::File { path },
+            1 => IndexEntry::Symlink {
+                path,
+                target: read_bounded_string(reader)?,
+            },
+            _ => return Err(ImageError::Invalid("unknown kind".into())),
+        };
+        entries.push(entry);
+    }
+    if reader.stream_position()? != end {
+        return Err(ImageError::Invalid("trailing bytes".into()));
+    }
+    Ok(entries)
+}
+
 fn read_u32_reader<R: Read>(reader: &mut R) -> Result<u32, ImageError> {
     let mut buf = [0u8; 4];
     reader.read_exact(&mut buf)?;
@@ -211,7 +266,59 @@ fn read_bounded_string<R: Read>(reader: &mut R) -> Result<String, ImageError> {
 pub fn from_directory(root: &Path) -> Result<Vec<u8>, ImageError> {
     let mut entries = Vec::new();
     collect(root, root, &mut entries)?;
-    encode(&entries)
+    entries.sort_by(|a, b| path(a).cmp(path(b)));
+    encode_sorted(&entries)
+}
+
+/// Build the metadata-only sidecar used beside a newly extracted image.
+/// Materialization reads file bytes from the extracted directory itself, so
+/// copying them into the sidecar is unnecessary cold-path I/O.
+pub fn from_directory_index(root: &Path) -> Result<Vec<u8>, ImageError> {
+    let mut entries = Vec::new();
+    collect_index(root, root, &mut entries)?;
+    entries.sort_by(|a, b| a.path().cmp(b.path()));
+
+    let mut out = Vec::new();
+    out.extend_from_slice(INDEX_MAGIC);
+    write_u32(&mut out, entries.len() as u32);
+    for entry in entries {
+        match entry {
+            IndexEntry::File { path } => {
+                out.push(0);
+                write_str(&mut out, &path);
+            }
+            IndexEntry::Symlink { path, target } => {
+                out.push(1);
+                write_str(&mut out, &path);
+                write_str(&mut out, &target);
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn collect_index(root: &Path, dir: &Path, out: &mut Vec<IndexEntry>) -> Result<(), ImageError> {
+    for item in fs::read_dir(dir)? {
+        let item = item?;
+        let p = item.path();
+        let rel = p
+            .strip_prefix(root)
+            .map_err(|_| ImageError::Invalid("entry outside image".into()))?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let ty = item.file_type()?;
+        if ty.is_dir() {
+            collect_index(root, &p, out)?;
+        } else if ty.is_file() {
+            out.push(IndexEntry::File { path: rel });
+        } else if ty.is_symlink() {
+            out.push(IndexEntry::Symlink {
+                path: rel,
+                target: fs::read_link(p)?.to_string_lossy().into_owned(),
+            });
+        }
+    }
+    Ok(())
 }
 
 pub fn to_directory(bytes: &[u8], root: &Path) -> Result<(), ImageError> {
@@ -375,6 +482,30 @@ mod tests {
             other => panic!("expected symlink, got {other:?}"),
         }
         assert!(matches!(index[0], IndexEntry::File { .. }));
+    }
+
+    #[test]
+    fn metadata_index_does_not_duplicate_file_payloads() {
+        let root = tempfile::tempdir().unwrap();
+        let payload = vec![7u8; 100_000];
+        fs::write(root.path().join("large.bin"), &payload).unwrap();
+
+        let bytes = from_directory_index(root.path()).unwrap();
+        assert_eq!(&bytes[..INDEX_MAGIC.len()], INDEX_MAGIC);
+        assert!(
+            bytes.len() < payload.len() / 10,
+            "metadata sidecar should not copy the {}-byte file payload",
+            payload.len()
+        );
+
+        let mut cursor = io::Cursor::new(bytes);
+        let index = decode_index(&mut cursor).unwrap();
+        assert_eq!(
+            index,
+            vec![IndexEntry::File {
+                path: "large.bin".into()
+            }]
+        );
     }
 
     /// A `Read + Seek` wrapper that counts bytes returned by `read` (not seeks),

@@ -299,6 +299,14 @@ fn detect_archive_root_prefix(archive_path: &Path) -> Result<Option<PathBuf>, Ex
             continue;
         };
         let first = PathBuf::from(first);
+        // `strip_package_prefix` strips the conventional npm `package/`
+        // root unconditionally, even when an archive contains mixed roots.
+        // Once the first entry proves this is an npm-shaped archive, there is
+        // no need to decompress and enumerate the entire archive a second
+        // time before extraction.
+        if first == Path::new(PACKAGE_PREFIX) {
+            return Ok(Some(first));
+        }
         if common.as_ref().is_some_and(|value| value != &first) {
             return Ok(None);
         }
