@@ -157,7 +157,7 @@ jobs:
           }
 
           openssl dgst -sha256 -sign "$key_file" -out SHA256SUMS.sig SHA256SUMS
-          openssl dgst -sha256 -verify .github/release-signing-public.pem -signature SHA256SUMS.sig SHA256SUMS
+          openssl dgst -sha256 -verify "$GITHUB_WORKSPACE/.github/release-signing-public.pem" -signature SHA256SUMS.sig SHA256SUMS
 
           echo "Prepared 4 tarballs and verified SHA256SUMS signature."
 
