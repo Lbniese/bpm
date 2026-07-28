@@ -18,6 +18,7 @@ use rusqlite::{params, Connection, Transaction, TransactionBehavior};
 use super::schema;
 use crate::derived::{DerivedMetadata, DerivedRecord};
 use crate::gc::policy::{DeletionRank, GcPolicy, PolicyCandidate, PolicyEvaluation};
+use crate::resolution_cache::ResolutionSnapshotCache;
 use crate::store_lock;
 
 const DATABASE_NAME: &str = "store.db";
@@ -889,6 +890,19 @@ impl MetadataRepository {
             tx.commit()?;
             report.deleted += 1;
             report.deleted_bytes += *size;
+        }
+
+        // Resolution snapshots are an acceleration cache (never source of
+        // truth), are not metadata-DB-tracked, and are disposable. Age-sweep
+        // them with the same grace window, folding reclaimed bytes into the
+        // report. Best-effort: a read-only or missing snapshot directory must
+        // never abort GC.
+        let snapshot_cutoff =
+            UNIX_EPOCH + Duration::from_millis(now.as_millis()).saturating_sub(policy.grace);
+        let reclaimed_bytes =
+            ResolutionSnapshotCache::new(&self.store_root).prune_older_than(snapshot_cutoff);
+        if reclaimed_bytes > 0 {
+            report.deleted_bytes = report.deleted_bytes.saturating_add(reclaimed_bytes);
         }
         Ok(report)
     }
