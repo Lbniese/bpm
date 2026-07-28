@@ -476,7 +476,7 @@ impl ArtifactStore {
         {
             let index = self.image_index_path(id);
             if !index.exists() {
-                let bytes = crate::package_image::from_directory(&img)
+                let bytes = crate::package_image::from_directory_index(&img)
                     .map_err(|error| io_err(&index, std::io::Error::other(error.to_string())))?;
                 fs::write(&index, bytes).map_err(|source| io_err(&index, source))?;
             }
@@ -514,7 +514,7 @@ impl ArtifactStore {
         match fs::rename(&tmp, &img) {
             Ok(()) => {
                 let index = self.image_index_path(id);
-                let bytes = crate::package_image::from_directory(&img)
+                let bytes = crate::package_image::from_directory_index(&img)
                     .map_err(|error| io_err(&index, std::io::Error::other(error.to_string())))?;
                 fs::write(&index, bytes).map_err(|source| io_err(&index, source))?;
                 fs::write(&version, IMAGE_LAYOUT_VERSION)

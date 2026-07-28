@@ -256,6 +256,7 @@ pub fn ensure_graph_volume_with_prepared(
     prepared: &BTreeMap<String, crate::lifecycle::PreparedImage>,
     metrics: &mut Metrics,
 ) -> Result<VolumeRef, VolumeError> {
+    let build_start = std::time::Instant::now();
     let prepared_keys = prepared
         .iter()
         .map(|(path, image)| (path.clone(), *image.key.as_bytes()))
@@ -332,6 +333,10 @@ pub fn ensure_graph_volume_with_prepared(
         .zip(lockfile.packages.iter())
         .filter_map(|(maybe_id, pkg)| maybe_id.map(|id| (pkg, id)))
         .collect();
+    // Graph volumes must keep package realpaths inside the volume, so a
+    // symlinked package image is not safe here. Hardlinks also let the plan
+    // validator prove that pristine package files still match their immutable
+    // store images using device/inode identity.
     let stats = materialize_with_backend(
         staging.as_path(),
         store,
@@ -361,7 +366,7 @@ pub fn ensure_graph_volume_with_prepared(
     };
     let vref = pending.publish()?;
 
-    metrics.record("graph_volume_build", std::time::Duration::ZERO);
+    metrics.record("graph_volume_build", build_start.elapsed());
     Ok(vref)
 }
 

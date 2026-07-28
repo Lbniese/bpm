@@ -472,17 +472,28 @@ fn link_entries_from_index(
     link_file: fn(&Path, &Path) -> Result<(), MaterializeError>,
 ) -> Result<(), MaterializeError> {
     fs::create_dir_all(target).map_err(|source| io_err(target, source))?;
+    // The index contains files/symlinks but no directory entries. Create each
+    // parent once, in index order, so a package with many files does not issue
+    // one redundant `create_dir_all` syscall per file.
+    let mut created_parents = BTreeSet::new();
     for entry in entries {
         match entry {
             crate::package_image::IndexEntry::File { path } => {
                 let from = safe_relative_join(source, path)?;
                 let to = safe_relative_join(target, path)?;
+                if let Some(parent) = to.parent() {
+                    if created_parents.insert(parent.to_path_buf()) {
+                        fs::create_dir_all(parent).map_err(|source| io_err(parent, source))?;
+                    }
+                }
                 link_file(&from, &to)?;
             }
             crate::package_image::IndexEntry::Symlink { path, target: link } => {
                 let to = safe_relative_join(target, path)?;
                 if let Some(parent) = to.parent() {
-                    fs::create_dir_all(parent).map_err(|source| io_err(parent, source))?;
+                    if created_parents.insert(parent.to_path_buf()) {
+                        fs::create_dir_all(parent).map_err(|source| io_err(parent, source))?;
+                    }
                 }
                 make_symlink(Path::new(link), &to)?;
             }
@@ -492,9 +503,6 @@ fn link_entries_from_index(
 }
 
 fn hardlink_or_copy_file(from: &Path, to: &Path) -> Result<(), MaterializeError> {
-    if let Some(parent) = to.parent() {
-        fs::create_dir_all(parent).map_err(|source| io_err(parent, source))?;
-    }
     fs::hard_link(from, to)
         .or_else(|_| fs::copy(from, to).map(|_| ()))
         .map_err(|source| io_err(to, source))
@@ -510,9 +518,6 @@ fn hardlink_or_copy_file(from: &Path, to: &Path) -> Result<(), MaterializeError>
 /// clones mode) and `FICLONE` (Linux, which does not).
 #[cfg(unix)]
 fn reflink_or_fallback_file(from: &Path, to: &Path) -> Result<(), MaterializeError> {
-    if let Some(parent) = to.parent() {
-        fs::create_dir_all(parent).map_err(|source| io_err(parent, source))?;
-    }
     match try_reflink_file(from, to) {
         Ok(()) => {
             copy_mode(from, to)?;
