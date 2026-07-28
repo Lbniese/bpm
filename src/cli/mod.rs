@@ -17,6 +17,7 @@ mod mutate;
 mod outdated;
 mod publish;
 mod run;
+mod token;
 mod view;
 mod whoami;
 mod why;
@@ -246,6 +247,25 @@ pub(crate) fn run() -> ExitCode {
             json,
         }),
         Commands::Whoami { registry } => whoami::run(whoami::Options { registry }),
+        Commands::Token {
+            action,
+            id,
+            registry,
+            read_only,
+            cidr,
+            password,
+            otp,
+            json,
+        } => token::run(token::Options {
+            action,
+            id,
+            registry,
+            read_only,
+            cidr,
+            password,
+            otp,
+            json,
+        }),
         Commands::Why { target } => why::execute(&target),
         Commands::Ls {
             name,

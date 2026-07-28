@@ -195,6 +195,21 @@ impl HttpClient {
         self.request_json("PUT", url, body, headers)
     }
 
+    /// Send a parameter-less DELETE request and return the response body.
+    pub fn delete(&self, url: &str) -> Result<Vec<u8>, HttpError> {
+        self.request_json("DELETE", url, &[], &[])
+    }
+
+    /// Send a parameter-less DELETE request with extra headers (e.g. `npm-otp`)
+    /// and return the response body.
+    pub fn delete_with_headers(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+    ) -> Result<Vec<u8>, HttpError> {
+        self.request_json("DELETE", url, &[], headers)
+    }
+
     /// Send a GET (following redirects) honoring the retry policy.
     ///
     /// The returned [`Response`] is for any terminal status below 400
@@ -281,6 +296,7 @@ impl HttpClient {
             let request = match method {
                 "POST" => self.client.post(url),
                 "PUT" => self.client.put(url),
+                "DELETE" => self.client.delete(url),
                 _ => unreachable!(),
             }
             .header("Content-Type", "application/json")
