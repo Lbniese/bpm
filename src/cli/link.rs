@@ -184,12 +184,12 @@ fn run_unconsume(
     let cwd = std::env::current_dir()?;
     let project_root = find_project_root(&cwd).unwrap_or(cwd);
     let node_modules_entry = project_root.join("node_modules").join(&name);
-    if node_modules_entry.is_symlink() || node_modules_entry.exists() {
-        if std::fs::remove_file(&node_modules_entry).is_err() {
-            // A directory symlink on Windows needs `remove_dir`.
-            std::fs::remove_dir(&node_modules_entry)
-                .with_context(|| format!("removing {}", node_modules_entry.display()))?;
-        }
+    if (node_modules_entry.is_symlink() || node_modules_entry.exists())
+        && std::fs::remove_file(&node_modules_entry).is_err()
+    {
+        // A directory symlink on Windows needs `remove_dir`.
+        std::fs::remove_dir(&node_modules_entry)
+            .with_context(|| format!("removing {}", node_modules_entry.display()))?;
     }
     Ok(())
 }
