@@ -455,6 +455,26 @@ pub(crate) enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Show registry metadata for a package (npm `view` compat).
+    View {
+        /// Package spec: `<name>`, `<name>@<version>`, or `<name>@<range>`.
+        package: String,
+        /// Optional field selector (e.g. `dependencies`, `dist.tarball`,
+        /// `versions`, or `dist-tags`).
+        field: Option<String>,
+        /// Registry base URL.
+        #[arg(long)]
+        registry: Option<String>,
+        /// Store root (defaults to `$BPM_STORE` or `$HOME/.bpm`).
+        #[arg(long)]
+        store: Option<PathBuf>,
+        /// Never contact the registry; resolve only against cached metadata.
+        #[arg(long)]
+        offline: bool,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Show why a package is in the dependency tree.
     Why {
         /// Package name to trace.
@@ -729,5 +749,27 @@ mod tests {
         assert!(!all);
         assert!(depth.is_none());
         assert!(!json);
+    }
+
+    #[test]
+    fn view_parses_package_spec_and_field() {
+        let cli = Cli::try_parse_from(["bpm", "view", "lodash", "dependencies", "--json"]).unwrap();
+        let Commands::View {
+            package,
+            field,
+            registry,
+            store,
+            offline,
+            json,
+        } = cli.command
+        else {
+            panic!("expected view command");
+        };
+        assert_eq!(package, "lodash");
+        assert_eq!(field.as_deref(), Some("dependencies"));
+        assert!(registry.is_none());
+        assert!(store.is_none());
+        assert!(!offline);
+        assert!(json);
     }
 }

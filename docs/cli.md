@@ -238,6 +238,60 @@ bpm outdated --json                # machine-readable output
 bpm outdated --offline             # cached metadata only
 ```
 
+## `bpm view <package> [field] [flags]`
+
+Shows package metadata fetched from the registry (npm `view` compatibility).
+Given a package spec (`<name>`, `<name>@<version>`, or `<name>@<range>`), it
+fetches the packument, resolves the version (defaulting to `dist-tags.latest`),
+and prints the resolved version's metadata:
+
+```
+demo-pkg@2.0.0
+DEPRECATED: use demo-pkg2 instead
+
+dist-tags:
+  latest: 2.0.0
+
+dependencies:
+  lodash: ^4.17.21
+  ms: ^2.1.3
+
+bin:
+  demo: ./index.js
+
+dist:
+  tarball: https://registry.npmjs.org/demo-pkg/-/demo-pkg-2.0.0.tgz
+  integrity: sha512-...
+  shasum: ...
+
+versions: 3 published
+```
+
+Only the resolution-relevant fields bpm extracts are shown (dependencies,
+optional/peer dependencies, `bin`, `dist`, `engines`, `os`/`cpu`/`libc`, and
+`deprecated`); richer manifest fields such as `description`, `license`, or
+`homepage` are not retained by the resolver today.
+
+An optional field selector prints just one value, supporting dotted paths:
+
+```bash
+bpm view lodash                      # full metadata for the latest version
+bpm view lodash@4.17.21              # a specific version
+bpm view lodash@^4.0.0               # the highest version in a range
+bpm view lodash dependencies         # just the dependencies map
+bpm view lodash dist.tarball         # a single nested field
+bpm view lodash versions             # all published versions (one per line)
+bpm view lodash dist-tags            # the dist-tags map
+```
+
+| Flag | Meaning |
+|------|---------|
+| `<field>` | Optional dotted field selector (see examples above). |
+| `--registry <url>` | Registry base URL. Defaults to `$BPM_REGISTRY`, then the configured npm registry. |
+| `--store <dir>` | Store root. Defaults to `$BPM_STORE`, then `$HOME/.bpm`. |
+| `--offline` | Never contact the registry; resolve only against cached metadata. |
+| `--json` | Emit machine-readable JSON. |
+
 ## `bpm why <package>`
 
 Shows why a package is present in the dependency tree by walking the lockfile
