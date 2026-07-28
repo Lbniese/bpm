@@ -368,6 +368,46 @@ bpm whoami --registry https://npm.example  # …on a private registry
 |------|---------|
 | `--registry <url>` | Registry base URL. Defaults to the config's registry, then `https://registry.npmjs.org`. |
 
+## `bpm token <action> [flags]`
+
+npm `token` compatibility: list, create, and revoke registry authentication
+tokens against npm's `/-/npm/v1/tokens` endpoint. All subcommands require an
+authenticated session (a bearer token in `.npmrc`).
+
+```bash
+bpm token                       # list tokens (alias: list)
+bpm token create --password p1  # mint a token (re-auth required)
+bpm token create --read-only --cidr 10.0.0.0/8 --password p1
+bpm token revoke abc123         # revoke by the `key` shown by `token list`
+```
+
+### `bpm token list`
+
+Prints each token's id (`key`), whether it is read-only, its CIDR whitelist,
+and creation time. Add `--json` for machine-readable output.
+
+### `bpm token create`
+
+Mints a new token. npm requires re-authentication with the account password to
+mint a token: pass `--password` (or set `$BPM_PASSWORD`). Pass `--otp <code>`
+when the account enforces two-factor authentication. Prints the new token (the
+full secret is shown once); add `--json` for machine-readable output.
+
+### `bpm token revoke <id>`
+
+Revokes the token whose `key` (shown by `bpm token list`) equals `<id>`.
+
+### Flags
+
+| Flag | Meaning |
+|------|---------|
+| `--registry <url>` | Registry base URL. Defaults to the config's registry, then `https://registry.npmjs.org`. |
+| `--read-only` | (`create`) Mint a read-only token that cannot publish. |
+| `--cidr <CIDR>` | (`create`) CIDR whitelist entry; repeatable. |
+| `--password <pw>` | (`create`) Account password; also read from `$BPM_PASSWORD`. |
+| `--otp <code>` | (`create`/`revoke`) Two-factor OTP code. |
+| `--json` | (`list`/`create`) Emit machine-readable JSON. |
+
 ## `bpm why <package>`
 
 Shows why a package is present in the dependency tree by walking the lockfile

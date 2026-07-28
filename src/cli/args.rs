@@ -523,6 +523,31 @@ pub(crate) enum Commands {
         #[arg(long)]
         registry: Option<String>,
     },
+    /// Manage registry authentication tokens (npm `token` compat).
+    Token {
+        /// Action: `list` (default), `create`, or `revoke`.
+        action: Option<String>,
+        /// Token id/`key` to revoke (for `revoke`; shown by `bpm token list`).
+        id: Option<String>,
+        /// Registry base URL.
+        #[arg(long)]
+        registry: Option<String>,
+        /// Mint a read-only token (for `create`).
+        #[arg(long = "read-only")]
+        read_only: bool,
+        /// CIDR whitelist entry for the new token (for `create`; repeatable).
+        #[arg(long = "cidr")]
+        cidr: Vec<String>,
+        /// Account password (for `create`); also read from `$BPM_PASSWORD`.
+        #[arg(long)]
+        password: Option<String>,
+        /// Two-factor OTP code, if the account requires it.
+        #[arg(long)]
+        otp: Option<String>,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Show why a package is in the dependency tree.
     Why {
         /// Package name to trace.
@@ -889,6 +914,51 @@ mod tests {
             panic!("expected whoami command");
         };
         assert_eq!(registry.as_deref(), Some("https://reg.example"));
+    }
+
+    #[test]
+    fn token_defaults_to_list_and_parses_actions() {
+        let cli = Cli::try_parse_from(["bpm", "token"]).unwrap();
+        let Commands::Token { action, id, .. } = cli.command else {
+            panic!("expected token command");
+        };
+        assert_eq!(action.as_deref(), None);
+        assert!(id.is_none());
+
+        let cli = Cli::try_parse_from([
+            "bpm",
+            "token",
+            "create",
+            "--read-only",
+            "--cidr",
+            "10.0.0.0/8",
+            "--password",
+            "pw",
+        ])
+        .unwrap();
+        let Commands::Token {
+            action,
+            read_only,
+            cidr,
+            password,
+            id,
+            ..
+        } = cli.command
+        else {
+            panic!("expected token command");
+        };
+        assert_eq!(action.as_deref(), Some("create"));
+        assert!(read_only);
+        assert_eq!(cidr, vec!["10.0.0.0/8".to_string()]);
+        assert_eq!(password.as_deref(), Some("pw"));
+        assert!(id.is_none());
+
+        let cli = Cli::try_parse_from(["bpm", "token", "revoke", "abc"]).unwrap();
+        let Commands::Token { action, id, .. } = cli.command else {
+            panic!("expected token command");
+        };
+        assert_eq!(action.as_deref(), Some("revoke"));
+        assert_eq!(id.as_deref(), Some("abc"));
     }
 
     #[test]

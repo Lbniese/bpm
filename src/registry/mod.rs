@@ -579,6 +579,78 @@ impl RegistryClient {
         Ok(parsed.username)
     }
 
+    /// List the caller's authentication tokens (`GET /-/npm/v1/tokens`).
+    pub fn list_tokens(&self) -> Result<Vec<RegistryToken>, RegistryError> {
+        let base = self.config.registry().trim_end_matches('/');
+        let url = format!("{base}/-/npm/v1/tokens");
+        let response = self
+            .http
+            .get_with_headers(&url, &[])
+            .map_err(token_http_error)?;
+        let body = response
+            .into_string()
+            .map_err(|source| RegistryError::Network {
+                package: "-/npm/v1/tokens".to_string(),
+                source: Box::new(source),
+            })?;
+        let tokens: Vec<RegistryToken> =
+            serde_json::from_str(&body).map_err(|source| RegistryError::BadJson {
+                package: "-/npm/v1/tokens".to_string(),
+                source,
+            })?;
+        Ok(tokens)
+    }
+
+    /// Mint a new authentication token (`POST /-/npm/v1/tokens`). npm requires
+    /// re-authentication with the account `password`; pass an `otp` code when
+    /// the account enforces two-factor authentication.
+    pub fn create_token(
+        &self,
+        req: &CreateTokenRequest,
+        otp: Option<&str>,
+    ) -> Result<RegistryToken, RegistryError> {
+        let base = self.config.registry().trim_end_matches('/');
+        let url = format!("{base}/-/npm/v1/tokens");
+        let body = serde_json::to_vec(req).map_err(|source| RegistryError::BadJson {
+            package: "-/npm/v1/tokens".to_string(),
+            source,
+        })?;
+        let otp_header;
+        let mut headers: Vec<(&str, &str)> = Vec::new();
+        if let Some(code) = otp {
+            otp_header = code.to_string();
+            headers.push(("npm-otp", otp_header.as_str()));
+        }
+        let bytes = self
+            .http
+            .post_json_with_headers(&url, &body, &headers)
+            .map_err(token_http_error)?;
+        let token: RegistryToken =
+            serde_json::from_slice(&bytes).map_err(|source| RegistryError::BadJson {
+                package: "-/npm/v1/tokens".to_string(),
+                source,
+            })?;
+        Ok(token)
+    }
+
+    /// Revoke an authentication token by its `key` id
+    /// (`DELETE /-/npm/v1/tokens/token/<key>`). Pass an `otp` code when the
+    /// account enforces two-factor authentication.
+    pub fn revoke_token(&self, key: &str, otp: Option<&str>) -> Result<(), RegistryError> {
+        let base = self.config.registry().trim_end_matches('/');
+        let url = format!("{base}/-/npm/v1/tokens/token/{key}");
+        let otp_header;
+        let mut headers: Vec<(&str, &str)> = Vec::new();
+        if let Some(code) = otp {
+            otp_header = code.to_string();
+            headers.push(("npm-otp", otp_header.as_str()));
+        }
+        self.http
+            .delete_with_headers(&url, &headers)
+            .map_err(token_http_error)?;
+        Ok(())
+    }
+
     /// Fetch the smallest metadata document that can resolve `spec`.
     ///
     /// Exact versions have a dedicated registry endpoint and do not need the
@@ -1055,6 +1127,52 @@ impl Drop for PrefetchPool {
         for handle in self.handles.drain(..) {
             let _ = handle.join();
         }
+    }
+}
+
+/// A registry authentication token, matching npm's `/-/npm/v1/tokens` shape.
+///
+/// `token` is only populated by the *create* response; the list endpoint
+/// returns each token with a `key` (the id used for revocation) and metadata.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RegistryToken {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    #[serde(default)]
+    pub readonly: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cidr_whitelist: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated: Option<String>,
+}
+
+/// Request body for `POST /-/npm/v1/tokens` (mint a new token). npm requires
+/// re-authenticating with the account password to create a token.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CreateTokenRequest {
+    pub password: String,
+    pub readonly: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub cidrs: Vec<String>,
+}
+
+/// Map an HTTP-layer error from a `/-/npm/v1/tokens` request into a registry
+/// error, surfacing 4xx/5xx status codes distinctly (so 401/403 are
+/// distinguishable from transport errors).
+fn token_http_error(source: HttpError) -> RegistryError {
+    match source {
+        HttpError::Status { code, .. } => RegistryError::BadStatus {
+            package: "-/npm/v1/tokens".into(),
+            code,
+        },
+        other => RegistryError::Network {
+            package: "-/npm/v1/tokens".into(),
+            source: Box::new(other),
+        },
     }
 }
 
@@ -2488,6 +2606,135 @@ mod tests {
             .unwrap();
         let client = RegistryClient::new(config);
         match client.whoami() {
+            Err(RegistryError::BadStatus { code, .. }) => assert_eq!(code, 401),
+            other => panic!("expected BadStatus 401, got {other:?}"),
+        }
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = server.join();
+    }
+
+    /// Spawn a local server that dispatches each request to `handler(method, path)`
+    /// and replies with the returned `(status, body)`. Returns the registry base
+    /// URL, a shutdown flag, and the server thread handle.
+    fn token_server<F>(
+        handler: F,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        std::thread::JoinHandle<()>,
+    )
+    where
+        F: Fn(&str, &str) -> (u16, String) + Send + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let registry = format!("http://{address}");
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_shutdown = std::sync::Arc::clone(&shutdown);
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            while !server_shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(c) => c,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let request = std::str::from_utf8(&buf[..n]).unwrap_or("");
+                let request_line = request.lines().next().unwrap_or("");
+                let mut parts = request_line.split_whitespace();
+                let method = parts.next().unwrap_or("GET");
+                let path = parts.next().unwrap_or("/");
+                let (status, body) = handler(method, path);
+                let reason = if status < 400 { "OK" } else { "Error" };
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        (registry, shutdown, server)
+    }
+
+    #[test]
+    fn list_tokens_returns_array() {
+        let body = r#"[{"key":"abc123","readonly":false,"cidr_whitelist":["10.0.0.0/8"],"created":"2021-01-01T00:00:00.000Z"}]"#;
+        let body = body.to_string();
+        let (registry, shutdown, server) = token_server(move |_method, _path| (200, body.clone()));
+        let config = NpmConfig::default()
+            .with_registry_override(&registry)
+            .unwrap();
+        let client = RegistryClient::new(config);
+        let tokens = client.list_tokens().unwrap();
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].key.as_deref(), Some("abc123"));
+        assert!(!tokens[0].readonly);
+        let cidrs = tokens[0].cidr_whitelist.as_ref().expect("cidr whitelist");
+        assert_eq!(cidrs, &vec!["10.0.0.0/8".to_string()]);
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = server.join();
+    }
+
+    #[test]
+    fn create_token_returns_new_token() {
+        let body = r#"{"token":"xyz_secret","key":"abc123","readonly":true,"created":"2021-01-01T00:00:00.000Z"}"#;
+        let body = body.to_string();
+        let (registry, shutdown, server) = token_server(move |method, _path| {
+            // `create` must POST.
+            assert_eq!(method, "POST");
+            (200, body.clone())
+        });
+        let config = NpmConfig::default()
+            .with_registry_override(&registry)
+            .unwrap();
+        let client = RegistryClient::new(config);
+        let req = CreateTokenRequest {
+            password: "hunter2".to_string(),
+            readonly: true,
+            cidrs: vec!["10.0.0.0/8".to_string()],
+        };
+        let token = client.create_token(&req, None).unwrap();
+        assert_eq!(token.token.as_deref(), Some("xyz_secret"));
+        assert_eq!(token.key.as_deref(), Some("abc123"));
+        assert!(token.readonly);
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = server.join();
+    }
+
+    #[test]
+    fn revoke_token_succeeds() {
+        let (registry, shutdown, server) = token_server(|method, path| {
+            // `revoke` must DELETE /-/npm/v1/tokens/token/<key>.
+            assert_eq!(method, "DELETE");
+            assert!(
+                path.ends_with("/-/npm/v1/tokens/token/abc123"),
+                "unexpected path: {path}"
+            );
+            (200, String::new())
+        });
+        let config = NpmConfig::default()
+            .with_registry_override(&registry)
+            .unwrap();
+        let client = RegistryClient::new(config);
+        client.revoke_token("abc123", None).unwrap();
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = server.join();
+    }
+
+    #[test]
+    fn list_tokens_unauthenticated_returns_bad_status() {
+        let (registry, shutdown, server) = token_server(|_method, _path| (401, "{}".to_string()));
+        let config = NpmConfig::default()
+            .with_registry_override(&registry)
+            .unwrap();
+        let client = RegistryClient::new(config);
+        match client.list_tokens() {
             Err(RegistryError::BadStatus { code, .. }) => assert_eq!(code, 401),
             other => panic!("expected BadStatus 401, got {other:?}"),
         }
