@@ -8,6 +8,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use blake3::Hasher;
 
@@ -54,9 +55,43 @@ impl ResolutionSnapshotCache {
             .map_err(|error| std::io::Error::other(error.to_string()))?;
         fs::create_dir_all(&self.root)?;
         let path = self.path_for(key);
-        let temp = path.with_extension("tmp");
+        // A PID-suffixed temp name means concurrent installs that resolve the
+        // same inputs each write their own temp; identical inputs yield
+        // byte-identical lockfiles, so both rename to the same final
+        // `{key}.json` atomically and never collide.
+        let temp = self.root.join(format!("{key}.{}.tmp", std::process::id()));
         fs::write(&temp, json.as_bytes())?;
         fs::rename(temp, path)
+    }
+
+    /// Best-effort age sweep. Removes snapshot files and stale publish temps
+    /// whose modification time is at or before `cutoff`. Unreadable or busy
+    /// entries are skipped; a missing directory returns `0`. Returns the byte
+    /// total of files actually removed.
+    pub fn prune_older_than(&self, cutoff: SystemTime) -> u64 {
+        let mut reclaimed = 0;
+        let Ok(entries) = fs::read_dir(&self.root) else {
+            return 0;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_snapshot = path.extension().and_then(|ext| ext.to_str()) == Some("json");
+            let is_temp = path.extension().and_then(|ext| ext.to_str()) == Some("tmp");
+            if !is_snapshot && !is_temp {
+                continue;
+            }
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            let Ok(modified) = metadata.modified() else {
+                continue;
+            };
+            if modified <= cutoff {
+                reclaimed += metadata.len();
+                let _ = fs::remove_file(&path);
+            }
+        }
+        reclaimed
     }
 
     fn path_for(&self, key: &str) -> PathBuf {
@@ -264,5 +299,62 @@ mod tests {
             assert!(!value.contains(TOKEN_A));
             assert!(!value.contains(TOKEN_B));
         }
+    }
+
+    #[test]
+    fn store_uses_process_unique_temp() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = ResolutionSnapshotCache::new(temp.path());
+        let lockfile = Lockfile::new("bpm");
+        cache.store("k", &lockfile).unwrap();
+        // The PID-suffixed temp is renamed away to `k.json`; no shared
+        // `k.tmp` lingers in the snapshot directory.
+        let key_path = cache.path_for("k");
+        let dir = key_path.parent().unwrap();
+        assert!(!dir.join("k.tmp").exists());
+        assert_eq!(cache.load("k"), Some(lockfile));
+        // Re-publishing the same key is idempotent.
+        cache.store("k", &Lockfile::new("bpm")).unwrap();
+        assert!(cache.load("k").is_some());
+    }
+
+    #[test]
+    fn prune_removes_old_snapshots_and_temps() {
+        use std::path::Path;
+        use std::time::Duration;
+        let temp = tempfile::tempdir().unwrap();
+        let cache = ResolutionSnapshotCache::new(temp.path());
+        let dir = cache.path_for("k").parent().unwrap().to_path_buf();
+        fs::create_dir_all(&dir).unwrap();
+        let now = SystemTime::now();
+        let old = now - Duration::from_secs(31 * 86400);
+        let write_with_mtime = |path: &Path, mtime: SystemTime, body: &str| {
+            fs::write(path, body).unwrap();
+            let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+            let _ = f.set_modified(mtime);
+        };
+        write_with_mtime(&dir.join("old.json"), old, "{\"old\":1}");
+        write_with_mtime(&dir.join("recent.json"), now, "{\"recent\":1}");
+        write_with_mtime(&dir.join("stale.tmp"), old, "temp-bytes");
+        write_with_mtime(&dir.join("keep.bin"), old, "binary");
+
+        let old_bytes = fs::metadata(dir.join("old.json")).unwrap().len();
+        let temp_bytes = fs::metadata(dir.join("stale.tmp")).unwrap().len();
+        let reclaimed = cache.prune_older_than(now - Duration::from_secs(30 * 86400));
+
+        assert!(!dir.join("old.json").exists());
+        assert!(!dir.join("stale.tmp").exists());
+        assert!(dir.join("recent.json").exists());
+        // Non-snapshot files are left alone.
+        assert!(dir.join("keep.bin").exists());
+        assert_eq!(reclaimed, old_bytes + temp_bytes);
+    }
+
+    #[test]
+    fn prune_missing_directory_is_zero() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = ResolutionSnapshotCache::new(temp.path());
+        // The `resolution-snapshots/` directory was never created.
+        assert_eq!(cache.prune_older_than(SystemTime::now()), 0);
     }
 }

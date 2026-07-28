@@ -46,6 +46,7 @@ pub mod project;
 pub mod project_lock;
 pub mod registry;
 pub mod remote_cache;
+pub mod resolution_cache;
 pub mod resolver;
 pub mod store;
 pub mod store_lock;

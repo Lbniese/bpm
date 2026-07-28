@@ -263,3 +263,44 @@ fn lease_protects_object_from_collection_until_released() {
     );
     assert!(!art_dir.join(format!("{artifact}.tgz")).exists());
 }
+
+#[test]
+fn gc_collects_aged_resolution_snapshots_but_keeps_recent() {
+    use std::path::Path;
+    let temp = tempfile::tempdir().unwrap();
+    let repository = MetadataRepository::open(temp.path()).unwrap();
+    let snapshot_dir = temp.path().join("resolution-snapshots");
+    fs::create_dir_all(&snapshot_dir).unwrap();
+
+    let now = SystemTime::now();
+    let old = now - Duration::from_secs(31 * 86400);
+    let set_mtime = |path: &Path, mtime: SystemTime| {
+        let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        let _ = f.set_modified(mtime);
+    };
+
+    // An aged snapshot (older than the grace window).
+    let aged = snapshot_dir.join("aged.json");
+    fs::write(&aged, b"aged-snapshot-bytes").unwrap();
+    set_mtime(&aged, old);
+    let aged_bytes = fs::metadata(&aged).unwrap().len();
+
+    // A recent snapshot (within the grace window).
+    let recent = snapshot_dir.join("recent.json");
+    fs::write(&recent, b"recent-snapshot-bytes").unwrap();
+    set_mtime(&recent, now);
+
+    let report = repository
+        .collect(GcPolicy {
+            grace: Duration::from_secs(30 * 86400),
+            max_size_bytes: None,
+        })
+        .unwrap();
+
+    assert!(!aged.exists(), "aged snapshot should be pruned");
+    assert!(recent.exists(), "recent snapshot should be retained");
+    assert!(
+        report.deleted_bytes >= aged_bytes,
+        "reclaimed bytes should include the aged snapshot"
+    );
+}
