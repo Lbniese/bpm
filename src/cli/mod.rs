@@ -10,6 +10,7 @@ mod gc;
 mod import;
 mod init;
 mod install;
+mod ls;
 mod mutate;
 mod outdated;
 mod publish;
@@ -225,6 +226,17 @@ pub(crate) fn run() -> ExitCode {
             json,
         } => outdated::run(target, registry, store, offline, json),
         Commands::Why { target } => why::execute(&target),
+        Commands::Ls {
+            name,
+            all,
+            depth,
+            json,
+        } => ls::run(ls::Options {
+            filter: name,
+            all,
+            depth,
+            json,
+        }),
         Commands::Uninstall {
             names,
             registry,

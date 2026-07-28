@@ -271,6 +271,47 @@ bpm why lodash               # show why lodash is installed
 bpm why accepts              # show who depends on accepts
 ```
 
+## `bpm ls [flags]`
+
+Lists installed packages as a dependency tree (npm `ls` compatibility). The
+tree is built from the project lockfile (`bpm.lock` or `package-lock.json`)
+and rendered with `name@version` nodes:
+
+```
+test-project@1.0.0
+├── express@4.18.2
+│   └── accepts@1.3.8
+└── lodash@4.17.21
+```
+
+By default, packages that appear more than once in the graph (diamonds and
+shared transitives) are expanded once and shown collapsed elsewhere, matching
+`npm ls`. Pass `--all` to expand every occurrence.
+
+Edges come from the resolver metadata (`resolution.packages[path].dependencies[].target`)
+when present and otherwise from npm's `node_modules` lookup order over the
+compatibility `dependencies` map, so the tree reflects the physical install.
+The command is lockfile-local and read-only — it never contacts the registry
+or modifies any files.
+
+An optional positional package name filters the output to only the paths that
+lead to that package (like `npm ls <pkg>`).
+
+| Flag | Meaning |
+|------|---------|
+| `[name]` | Only show paths leading to packages matching this name. |
+| `--all` / `-a` | Expand every occurrence instead of deduplicating. |
+| `--depth <n>` | Limit the tree to `n` levels below the root (default: unlimited). |
+| `--json` | Emit machine-readable JSON (npm `ls --json` shape). |
+
+```bash
+bpm ls                        # full dependency tree
+bpm ls accepts                # only the path(s) to accepts
+bpm ls --all                  # expand every occurrence
+bpm ls --depth 0              # direct dependencies only
+bpm ls --json                 # machine-readable output
+```
+
 ## `bpm gc [flags]`
 
 Removes unreferenced store objects older than 30 days. Use `--older-than 30d` to
