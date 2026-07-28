@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-28
+
+Cold-path performance, mutation and diagnostic commands, and remote-cache
+push on top of 0.1.0.
+
+### Added
+
+- **Mutation and diagnostic commands**. `bpm upgrade` and `bpm dedupe`
+  update manifest dependencies in place; `bpm why` traces why a package is
+  in the graph, and `bpm outdated` reports available updates (registry
+  dist-tags are queried concurrently).
+- **Remote-cache push**. A best-effort `PUT` uploads package images to a
+  remote cache so other machines can install without re-downloading.
+- **Persistent resolution snapshot cache**. Successful fresh resolves store
+  a snapshot keyed by manifest, workspace, registry configuration, peer
+  mode, and target platform; `--prefer-offline`/`--offline` installs reuse
+  it after validating the cached lockfile. The store path is process-safe
+  (PID-namespaced temp), and aged snapshots are pruned during GC.
+- **Derived metadata store**. The derived package store is wired into the
+  SQLite repository so computed metadata persists across runs.
+- **git-prepare on by default**, and reflink auto-selection for local
+  project views.
+
+### Changed
+
+- **HTTP/2 by default and overlapping downloads**. The transport
+  multiplexes artifact bodies over HTTP/2 (`BPM_HTTP2=0` opts out), the
+  fetch/extract receiver mutex is held only across `recv` so downloaders
+  overlap, and async registry concurrency is bounded by a semaphore
+  (`BPM_RESOLVER_MAX_IN_FLIGHT`, default 32).
+- **Faster cold resolution**. Prefetches now overlap on a multi-threaded
+  runtime, exact-version packument fetches are singleflighted and cached
+  under a version-scoped key, and packument bodies are held in an
+  in-memory LRU; packument fan-out and dist-tag queries run concurrently.
+- **Leaner cold publication**. Image publication writes a metadata-only
+  index (`BPMIDX01`) instead of duplicating file payloads, the
+  materializer batches directory creation, and npm-shaped archives skip a
+  redundant pre-extraction scan.
+- **Streaming remote-cache push** bodies instead of double-buffering.
+
+### Fixed
+
+- **npm v3 lockfile import** skips workspace metadata entries recorded
+  under project-relative paths.
+- **`.npmignore`/`.gitignore`** glob patterns are honored during publish.
+- **Security audits** use the bulk advisory endpoint and deduplicate
+  counts by advisory id.
+- **Derived script environments** are bounded.
+
 ## [0.1.0] - 2026-07-25
 
 Reliability, correctness, and performance improvements on top of the initial public release.
