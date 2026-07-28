@@ -30,6 +30,7 @@ pub mod graph;
 pub mod http;
 pub mod integrity;
 pub mod lifecycle;
+pub mod link_store;
 pub mod lockfile;
 pub mod manifest;
 pub mod manifest_edit;
