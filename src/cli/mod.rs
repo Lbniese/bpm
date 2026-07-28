@@ -15,6 +15,7 @@ mod mutate;
 mod outdated;
 mod publish;
 mod run;
+mod view;
 mod why;
 
 use std::process::ExitCode;
@@ -225,6 +226,21 @@ pub(crate) fn run() -> ExitCode {
             offline,
             json,
         } => outdated::run(target, registry, store, offline, json),
+        Commands::View {
+            package,
+            field,
+            registry,
+            store,
+            offline,
+            json,
+        } => view::run(view::Options {
+            package,
+            field,
+            registry,
+            store,
+            offline,
+            json,
+        }),
         Commands::Why { target } => why::execute(&target),
         Commands::Ls {
             name,
