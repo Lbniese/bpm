@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-07-28
+
+Supersedes 0.2.0: the release signing keypair was rotated after the 0.2.0
+private key could not be recovered. No functional or code changes; the
+shipped binaries are identical to 0.2.0.
+
+### Changed
+
+- Rotated `.github/release-signing-public.pem`; published `SHA256SUMS` is now
+  signed with the replacement key.
+
 ## [0.2.0] - 2026-07-28
 
 Cold-path performance, mutation and diagnostic commands, and remote-cache
