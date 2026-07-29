@@ -264,7 +264,7 @@ pub(crate) struct WireVersionMetadata {
     bin: WireBin,
     #[serde(default)]
     dist: Dist,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_engines")]
     engines: BTreeMap<String, String>,
     #[serde(default, deserialize_with = "deserialize_string_list")]
     os: Vec<String>,
@@ -322,6 +322,30 @@ where
     Ok(match StringList::deserialize(deserializer)? {
         StringList::One(value) => vec![value],
         StringList::Many(values) => values,
+    })
+}
+
+/// Deserialize npm `engines`, which is normally `{ "node": ">=4" }` but was an
+/// array of engine names (`["node", "rhino"]`) in very old packages. A legacy
+/// array becomes a map of engine name → `"*"` (any version), preserving the
+/// legacy "runs on these engines" semantic for downstream `engines.node` lookups.
+fn deserialize_engines<'de, D>(deserializer: D) -> Result<BTreeMap<String, String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum WireEngines {
+        Map(BTreeMap<String, String>),
+        List(Vec<String>),
+    }
+
+    Ok(match WireEngines::deserialize(deserializer)? {
+        WireEngines::Map(map) => map,
+        WireEngines::List(names) => names
+            .into_iter()
+            .map(|name| (name, "*".to_string()))
+            .collect(),
     })
 }
 
@@ -1720,6 +1744,37 @@ mod tests {
 
     fn packument(value: serde_json::Value) -> Packument {
         serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn packument_accepts_legacy_array_engines() {
+        // Very old packages published `engines` as an array of engine names
+        // (e.g. lodash 0.1.0 had `["node","rhino"]`) instead of the modern
+        // `{ "node": ">=4" }` map. The map form must still work; the legacy
+        // array form must deserialize without aborting the whole packument,
+        // normalizing each name to a wildcard constraint.
+        let map_engines = packument(serde_json::json!({
+            "name": "p",
+            "versions": { "1.0.0": { "version": "1.0.0", "engines": { "node": ">=18" } } }
+        }));
+        assert_eq!(
+            map_engines
+                .versions
+                .get("1.0.0")
+                .unwrap()
+                .engines
+                .get("node")
+                .map(String::as_str),
+            Some(">=18")
+        );
+
+        let array_engines = packument(serde_json::json!({
+            "name": "p",
+            "versions": { "0.1.0": { "version": "0.1.0", "engines": ["node", "rhino"] } }
+        }));
+        let v = array_engines.versions.get("0.1.0").unwrap();
+        assert_eq!(v.engines.get("node").map(String::as_str), Some("*"));
+        assert_eq!(v.engines.get("rhino").map(String::as_str), Some("*"));
     }
 
     #[test]
