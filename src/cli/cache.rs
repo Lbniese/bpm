@@ -38,6 +38,11 @@ pub(crate) fn run(options: Options) -> Result<()> {
 }
 
 /// Read-only breakdown of cache size and object counts by area.
+///
+/// Every regular file under the store root is classified into exactly one
+/// category, so the printed category bytes always sum to the printed total.
+/// Derived objects, plans, and resolution snapshots (previously invisible)
+/// and any unrecognized files (reported under `other`) are now included.
 fn run_ls(root: &Path) -> Result<()> {
     println!("bpm cache: {}", root.display());
 
@@ -46,35 +51,25 @@ fn run_ls(root: &Path) -> Result<()> {
         return Ok(());
     }
 
-    let artifacts = area(root, "artifacts/sha512");
-    let images = area(root, "images/sha512");
-    let graphs = area(root, "graphs/blake3");
-    let db = root.join("store.db");
-    let db_bytes = std::fs::metadata(&db).map(|m| m.len()).unwrap_or(0);
-    let scratch = scratch_area(root);
-    let total = total_size(root);
+    let stats = collect_categories(root);
+    let total: u64 = stats.iter().map(|s| s.bytes).sum();
 
-    println!(
-        "  artifacts   {:>6} tarball(s)   {}",
-        artifacts.count,
-        format_bytes(artifacts.bytes)
-    );
-    println!(
-        "  images      {:>6} image(s)     {}",
-        images.dirs,
-        format_bytes(images.bytes)
-    );
-    println!(
-        "  graphs      {:>6} volume(s)    {}",
-        graphs.dirs,
-        format_bytes(graphs.bytes)
-    );
-    println!("  metadata    store.db          {}", format_bytes(db_bytes));
-    println!("  scratch     tmp + locks       {}", format_bytes(scratch));
-    println!(
-        "  total                         {}",
-        format_bytes(total.bytes)
-    );
+    // Stable order for CLI consumers. Sharded content areas (images, derived,
+    // graphs) report object (leaf-dir) counts; file-based areas report file
+    // counts. Bytes are reported for every category so the total reconciles.
+    for (key, label, unit) in CATEGORY_DISPLAY {
+        let s = stats[category_index(key)];
+        let count = if matches!(*key, "images" | "derived" | "graphs") {
+            s.objects
+        } else {
+            s.files
+        };
+        println!(
+            "  {label:<12}{count:>6} {unit:<13}{}",
+            format_bytes(s.bytes)
+        );
+    }
+    println!("  total                         {}", format_bytes(total));
     Ok(())
 }
 
@@ -132,64 +127,135 @@ fn print_report(report: &GcReport) {
     }
 }
 
-#[derive(Default)]
-struct AreaStats {
+/// One cache category: bytes plus a regular-file count, and (for sharded
+/// content areas) a leaf-directory object count.
+#[derive(Default, Clone, Copy)]
+struct CategoryStats {
     bytes: u64,
-    /// Count of regular files (used for `artifacts`, where each is a tarball).
-    count: usize,
-    /// Count of sharded leaf directories (used for `images`/`graphs`).
-    dirs: usize,
+    files: usize,
+    objects: usize,
 }
 
-/// Stats for one sharded content area (`artifacts/sha512`, `images/sha512`, or
-/// `graphs/blake3`). `count` counts files; `dirs` counts the two-level sharded
-/// leaf directories.
-fn area(root: &Path, sub: &str) -> AreaStats {
-    let base = root.join(sub);
-    let mut stats = AreaStats::default();
-    if !base.is_dir() {
-        return stats;
+/// Stable display order: `(category key, label, count unit)`. CLI consumers
+/// may rely on this ordering and these labels.
+const CATEGORY_DISPLAY: &[(&str, &str, &str)] = &[
+    ("artifacts", "artifacts", "tarball(s)"),
+    ("images", "images", "image(s)"),
+    ("derived", "derived", "object(s)"),
+    ("graphs", "graphs", "volume(s)"),
+    ("plans", "plans", "plan(s)"),
+    ("snapshots", "snapshots", "snapshot(s)"),
+    ("metadata", "metadata", "db file(s)"),
+    ("scratch", "scratch", "file(s)"),
+    ("leases", "leases", "lease(s)"),
+    ("links", "links", "file(s)"),
+    ("other", "other", "file(s)"),
+];
+
+/// Index of a category key within the `CategoryStats` vector returned by
+/// [`collect_categories`]. `"other"` is the catch-all tail.
+fn category_index(key: &str) -> usize {
+    match key {
+        "artifacts" => 0,
+        "images" => 1,
+        "derived" => 2,
+        "graphs" => 3,
+        "plans" => 4,
+        "snapshots" => 5,
+        "metadata" => 6,
+        "scratch" => 7,
+        "leases" => 8,
+        "links" => 9,
+        _ => 10,
     }
-    // Sum bytes over the whole subtree and count regular files.
-    walk(&base, &mut |bytes| {
-        stats.bytes += bytes;
-        stats.count += 1;
-    });
-    // Count leaf directories: base/<prefix>/<hash>.
-    if let Ok(prefixes) = std::fs::read_dir(&base) {
-        for prefix in prefixes.flatten() {
-            if prefix.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                if let Ok(leaves) = std::fs::read_dir(prefix.path()) {
-                    for leaf in leaves.flatten() {
-                        if leaf.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                            stats.dirs += 1;
-                        }
-                    }
-                }
+}
+
+/// Classify a top-level store subdirectory by name into a category.
+fn dir_category(name: &str) -> &'static str {
+    match name {
+        "artifacts" => "artifacts",
+        "images" => "images",
+        "derived" => "derived",
+        "graphs" => "graphs",
+        "plans" => "plans",
+        "resolution-snapshots" => "snapshots",
+        "locks" | "tmp" => "scratch",
+        "leases" => "leases",
+        "links" => "links",
+        "metadata" => "metadata",
+        _ => "other",
+    }
+}
+
+/// Classify a file that lives directly in the store root (no subdirectory).
+fn root_file_category(name: &std::ffi::OsStr) -> &'static str {
+    match name.to_str() {
+        Some("store.db") | Some("metadata-cache.db") => "metadata",
+        _ => "other",
+    }
+}
+
+/// Walk the store root once and classify every regular file into exactly one
+/// category. Symlinks and unreadable entries are skipped (via [`walk`]'s
+/// `symlink_metadata` discipline) so a partially-populated or locked store
+/// still reports. The returned vector is indexed by [`category_index`].
+fn collect_categories(root: &Path) -> Vec<CategoryStats> {
+    let mut stats: Vec<CategoryStats> = CATEGORY_DISPLAY
+        .iter()
+        .map(|_| CategoryStats::default())
+        .collect();
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return stats;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // `symlink_metadata` so a dangling/relative symlink is never followed.
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.is_file() {
+            let key = root_file_category(&entry.file_name());
+            let s = &mut stats[category_index(key)];
+            s.bytes += meta.len();
+            s.files += 1;
+        } else if meta.is_dir() {
+            let key = dir_category(&entry.file_name().to_string_lossy());
+            let s = &mut stats[category_index(key)];
+            walk(&path, &mut |bytes| {
+                s.bytes += bytes;
+                s.files += 1;
+            });
+            // Preserve useful object-count semantics for sharded areas, where
+            // each two-level leaf directory is one object/volume/image.
+            if matches!(key, "images" | "derived" | "graphs") {
+                s.objects += count_sharded_leaves(&path);
             }
         }
     }
     stats
 }
 
-/// Combined size of the `tmp` and `locks` scratch directories.
-fn scratch_area(root: &Path) -> u64 {
-    let mut bytes = 0u64;
-    for sub in ["tmp", "locks"] {
-        let dir = root.join(sub);
-        walk(&dir, &mut |b| bytes += b);
+/// Count the two-level sharded leaf directories under `base`
+/// (`base/<prefix>/<hash>`). Used for the object counts of `images`, `derived`,
+/// and `graphs`.
+fn count_sharded_leaves(base: &Path) -> usize {
+    let mut count = 0;
+    let Ok(prefixes) = std::fs::read_dir(base) else {
+        return 0;
+    };
+    for prefix in prefixes.flatten() {
+        if !prefix.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        if let Ok(leaves) = std::fs::read_dir(prefix.path()) {
+            for leaf in leaves.flatten() {
+                if leaf.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    count += 1;
+                }
+            }
+        }
     }
-    bytes
-}
-
-/// Total bytes (and file count) across the entire store root.
-fn total_size(root: &Path) -> AreaStats {
-    let mut stats = AreaStats::default();
-    walk(root, &mut |bytes| {
-        stats.bytes += bytes;
-        stats.count += 1;
-    });
-    stats
+    count
 }
 
 /// Recursively sum the size of every regular file under `dir`, invoking
@@ -266,27 +332,71 @@ mod tests {
     }
 
     #[test]
-    fn area_counts_sharded_leaves() {
+    fn collect_categories_reconciles_to_total() {
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path();
-        // Mimic images/sha512/<prefix>/<hash> with two leaves.
-        std::fs::create_dir_all(root.join("images/sha512/ab/abcd")).unwrap();
-        std::fs::create_dir_all(root.join("images/sha512/ab/abef")).unwrap();
-        std::fs::create_dir_all(root.join("images/sha512/cd/cdef")).unwrap();
-        std::fs::write(root.join("images/sha512/ab/abcd/file"), [0u8; 10]).unwrap();
+        // One representative regular file per category, including previously
+        // invisible areas (derived, plans, resolution-snapshots) and an
+        // unknown directory + stray root file routed to `other`.
+        let mk = |sub: &str, name: &str, bytes: usize| {
+            let dir = root.join(sub);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(name), vec![0u8; bytes]).unwrap();
+        };
+        mk("artifacts/sha512/ab", "c1.tgz", 100);
+        mk("images/sha512/ab/cd", "meta", 10);
+        mk("derived/blake3/ab/cd", "out", 40);
+        mk("graphs/blake3/ab/cd", "vol", 200);
+        mk("plans/blake3/ab", "p.bin", 30);
+        mk("resolution-snapshots", "s.json", 16);
+        mk("tmp", "x", 5);
+        mk("locks", "l", 3);
+        mk("leases", "lease1", 7);
+        mk("links", "lnk", 9);
+        mk("metadata", "migrations.sql", 11);
+        std::fs::write(root.join("store.db"), vec![0u8; 80]).unwrap();
+        std::fs::write(root.join("metadata-cache.db"), vec![0u8; 12]).unwrap();
+        // Unknown dir + unknown root file land in `other`.
+        mk("future-area", "thing", 22);
+        std::fs::write(root.join("stray.bin"), vec![0u8; 4]).unwrap();
+        // A symlink must never be followed into its target's size.
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("store.db"), root.join("store.db.link")).unwrap();
 
-        let stats = area(root, "images/sha512");
-        assert_eq!(stats.dirs, 3, "three leaf image dirs");
-        assert_eq!(stats.count, 1, "one regular file");
-        assert_eq!(stats.bytes, 10);
+        let stats = collect_categories(root);
+        let sum: u64 = stats.iter().map(|s| s.bytes).sum();
+        let expected = 100 + 10 + 40 + 200 + 30 + 16 + 5 + 3 + 7 + 9 + 11 + 80 + 12 + 22 + 4;
+        assert_eq!(sum, expected);
+
+        // The category sum must equal an independent full-tree walk.
+        let mut total = 0u64;
+        walk(root, &mut |b| total += b);
+        assert_eq!(
+            sum, total,
+            "category bytes must reconcile to total regular-file bytes"
+        );
+
+        // Spot-check classifications.
+        assert_eq!(stats[category_index("artifacts")].bytes, 100);
+        assert_eq!(stats[category_index("images")].bytes, 10);
+        assert_eq!(stats[category_index("derived")].bytes, 40);
+        assert_eq!(stats[category_index("snapshots")].bytes, 16);
+        assert_eq!(stats[category_index("metadata")].bytes, 11 + 80 + 12);
+        assert_eq!(stats[category_index("other")].bytes, 22 + 4);
+        // Sharded leaf-object counts are preserved.
+        assert_eq!(stats[category_index("images")].objects, 1);
+        assert_eq!(stats[category_index("derived")].objects, 1);
+        assert_eq!(stats[category_index("graphs")].objects, 1);
+        // File-based areas are not leaf-counted.
+        assert_eq!(stats[category_index("artifacts")].objects, 0);
+        assert_eq!(stats[category_index("artifacts")].files, 1);
     }
 
     #[test]
-    fn area_handles_missing_dir() {
+    fn collect_categories_handles_missing_store() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let stats = area(tmp.path(), "artifacts/sha512");
-        assert_eq!(stats.bytes, 0);
-        assert_eq!(stats.count, 0);
-        assert_eq!(stats.dirs, 0);
+        let stats = collect_categories(tmp.path());
+        let sum: u64 = stats.iter().map(|s| s.bytes).sum();
+        assert_eq!(sum, 0);
     }
 }

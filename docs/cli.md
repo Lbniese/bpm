@@ -575,8 +575,13 @@ npm `cache` compatibility: inspect and reclaim the global artifact + metadata
 cache (the store root shared by [`bpm gc`](#bpm-gc-flags)).
 
 **`bpm cache`** / **`bpm cache ls`** prints a read-only size + object-count
-breakdown by area (`artifacts/sha512`, `images/sha512`, `graphs/blake3`, the
-`store.db` metadata database, and the `tmp`/`locks` scratch dirs).
+breakdown that reconciles exactly to the displayed total: every regular file
+under the store root is classified into one category — `artifacts`, `images`,
+`derived`, `graphs`, `plans`, `snapshots` (resolution snapshots), `metadata`
+(`store.db` + `metadata-cache.db` + migrations), `scratch` (`tmp` + `locks`),
+`leases`, `links`, or an explicit `other` bucket for unrecognized files. Totals
+are regular-file bytes; symlink targets are not followed, so a symlink never
+inflates the count.
 
 **`bpm cache verify`** runs a repair + garbage-collection pass with the default
 policy (objects older than 30 days eligible) and reports reclaimed space and any
