@@ -38,6 +38,10 @@ blake3 = "1.5"
 
 # Registry resolution: package-spec -> version range matching
 semver = "1.0"
+# Percent-encoding of user-controlled registry path segments (dist-tags,
+# collaborator names, token keys) so reserved delimiters cannot change the
+# request target. Direct dep so we do not rely on `url`'s transitive copy.
+percent-encoding = "2.3"
 
 # In-memory LRU cache for parsed packument bodies in the resolver
 lru = "0.16"
