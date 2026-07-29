@@ -564,6 +564,23 @@ pub(crate) enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Manage package owners/collaborators (npm `owner` compat).
+    Owner {
+        /// Action: `ls` (default), `add`, or `rm`.
+        action: Option<String>,
+        /// Package name (for `ls`) or user (for `add`/`rm`). For `ls`,
+        /// defaults to the name in the local `package.json`.
+        target: Option<String>,
+        /// Package name (for `add`/`rm`); defaults to the local `package.json`
+        /// name.
+        value: Option<String>,
+        /// Registry base URL.
+        #[arg(long)]
+        registry: Option<String>,
+        /// Emit machine-readable JSON (`ls`).
+        #[arg(long)]
+        json: bool,
+    },
     /// Show why a package is in the dependency tree.
     Why {
         /// Package name to trace.
@@ -1035,6 +1052,69 @@ mod tests {
         assert_eq!(action.as_deref(), Some("rm"));
         assert_eq!(target.as_deref(), Some("lodash"));
         assert_eq!(value.as_deref(), Some("old"));
+    }
+
+    #[test]
+    fn owner_parses_actions_and_positionals() {
+        // Bare `bpm owner` defaults to ls (action = None).
+        let cli = Cli::try_parse_from(["bpm", "owner"]).unwrap();
+        let Commands::Owner {
+            action,
+            target,
+            value,
+            ..
+        } = cli.command
+        else {
+            panic!("expected owner command");
+        };
+        assert_eq!(action.as_deref(), None);
+        assert!(target.is_none());
+        assert!(value.is_none());
+
+        // `owner ls <pkg>` → action=ls, target=pkg.
+        let cli = Cli::try_parse_from(["bpm", "owner", "ls", "lodash"]).unwrap();
+        let Commands::Owner {
+            action,
+            target,
+            value,
+            ..
+        } = cli.command
+        else {
+            panic!("expected owner command");
+        };
+        assert_eq!(action.as_deref(), Some("ls"));
+        assert_eq!(target.as_deref(), Some("lodash"));
+        assert!(value.is_none());
+
+        // `owner add <user> [pkg]` → action=add, target=user, value=pkg.
+        let cli = Cli::try_parse_from(["bpm", "owner", "add", "alice", "@scope/pkg"]).unwrap();
+        let Commands::Owner {
+            action,
+            target,
+            value,
+            ..
+        } = cli.command
+        else {
+            panic!("expected owner command");
+        };
+        assert_eq!(action.as_deref(), Some("add"));
+        assert_eq!(target.as_deref(), Some("alice"));
+        assert_eq!(value.as_deref(), Some("@scope/pkg"));
+
+        // `owner rm <user> <pkg>`.
+        let cli = Cli::try_parse_from(["bpm", "owner", "rm", "bob", "mypkg"]).unwrap();
+        let Commands::Owner {
+            action,
+            target,
+            value,
+            ..
+        } = cli.command
+        else {
+            panic!("expected owner command");
+        };
+        assert_eq!(action.as_deref(), Some("rm"));
+        assert_eq!(target.as_deref(), Some("bob"));
+        assert_eq!(value.as_deref(), Some("mypkg"));
     }
 
     #[test]

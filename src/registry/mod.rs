@@ -22,7 +22,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
 
 use semver::{Version, VersionReq};
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
 use crate::config::NpmConfig;
@@ -228,6 +228,16 @@ pub struct Dist {
     pub integrity: String,
     #[serde(default)]
     pub shasum: Option<String>,
+}
+
+/// A package maintainer/collaborator, as listed in a packument's top-level
+/// `maintainers` field (npm `owner ls`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct Maintainer {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -717,6 +727,63 @@ impl RegistryClient {
         let base = self.config.registry().trim_end_matches('/');
         let escaped = name.replace('/', "%2f");
         let url = format!("{base}/-/package/{escaped}/dist-tags/{tag}");
+        self.http
+            .delete(&url)
+            .map_err(|source| registry_error_for(name, source))?;
+        Ok(())
+    }
+
+    /// List a package's maintainers (npm `owner ls`). Reads the full packument
+    /// (not the abbreviated install metadata, which omits `maintainers`) so the
+    /// list is available for public packages without authentication.
+    pub fn maintainers(&self, name: &str) -> Result<Vec<Maintainer>, RegistryError> {
+        let base = self.config.registry().trim_end_matches('/');
+        let escaped = name.replace('/', "%2f");
+        let url = format!("{base}/{escaped}");
+        let response = self
+            .http
+            .get_with_headers(&url, &[])
+            .map_err(|source| registry_error_for(name, source))?;
+        let body = response
+            .into_string()
+            .map_err(|source| RegistryError::Network {
+                package: name.to_string(),
+                source: Box::new(source),
+            })?;
+        #[derive(serde::Deserialize)]
+        struct FullPackument {
+            #[serde(default)]
+            maintainers: Vec<Maintainer>,
+        }
+        let parsed: FullPackument =
+            serde_json::from_str(&body).map_err(|source| RegistryError::BadJson {
+                package: name.to_string(),
+                source,
+            })?;
+        Ok(parsed.maintainers)
+    }
+
+    /// Add `user` as a collaborator on `name` with write permission (npm
+    /// `owner add`). Writes via the registry's
+    /// `/-/package/<escaped>/collaborators/<user>` endpoint; requires an
+    /// authenticated session with owner rights.
+    pub fn add_owner(&self, name: &str, user: &str) -> Result<(), RegistryError> {
+        let base = self.config.registry().trim_end_matches('/');
+        let escaped = name.replace('/', "%2f");
+        let url = format!("{base}/-/package/{escaped}/collaborators/{user}");
+        self.http
+            .put_json(&url, br#"{"permissions":"write"}"#)
+            .map_err(|source| registry_error_for(name, source))?;
+        Ok(())
+    }
+
+    /// Remove `user` from `name`'s collaborators (npm `owner rm`). Deletes via
+    /// the registry's `/-/package/<escaped>/collaborators/<user>` endpoint;
+    /// requires an authenticated session with owner rights.
+    pub fn remove_owner(&self, name: &str, user: &str) -> Result<(), RegistryError> {
+        let base = self.config.registry().trim_end_matches('/');
+        let escaped = name.replace('/', "%2f");
+        let url = format!("{base}/-/package/{escaped}/collaborators/{user}");
         self.http
             .delete(&url)
             .map_err(|source| registry_error_for(name, source))?;
@@ -2690,6 +2757,13 @@ mod tests {
                     }
                     Err(_) => break,
                 };
+                // The listener is non-blocking so the shutdown flag can be
+                // polled; force the accepted stream back to blocking with a
+                // deadline so the read below waits for the client's bytes
+                // instead of returning `WouldBlock` immediately (which would
+                // yield an empty request under load).
+                let _ = stream.set_nonblocking(false);
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
                 let mut buf = [0u8; 1024];
                 let _ = stream.read(&mut buf);
                 let reason = if status == 200 { "OK" } else { "Unauthorized" };
@@ -2761,6 +2835,13 @@ mod tests {
                     }
                     Err(_) => break,
                 };
+                // The listener is non-blocking so the shutdown flag can be
+                // polled; force the accepted stream back to blocking with a
+                // deadline so the read below waits for the client's bytes
+                // instead of returning `WouldBlock` immediately (which would
+                // yield an empty request under load).
+                let _ = stream.set_nonblocking(false);
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
                 let mut buf = [0u8; 4096];
                 let n = stream.read(&mut buf).unwrap_or(0);
                 let request = std::str::from_utf8(&buf[..n]).unwrap_or("");
@@ -2943,6 +3024,106 @@ mod tests {
             .unwrap();
         let client = RegistryClient::new(config);
         match client.set_dist_tag("mypkg", "latest", "1.2.3") {
+            Err(RegistryError::BadStatus { code, .. }) => assert_eq!(code, 401),
+            other => panic!("expected BadStatus 401, got {other:?}"),
+        }
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = server.join();
+    }
+
+    #[test]
+    fn maintainers_reads_top_level_field() {
+        let body = r#"{"name":"mypkg","maintainers":[{"name":"alice","email":"alice@example.com"},{"name":"bob"}]}"#
+            .to_string();
+        let (registry, shutdown, server) =
+            token_server(move |_method, _path, _body| (200, body.clone()));
+        let config = NpmConfig::default()
+            .with_registry_override(&registry)
+            .unwrap();
+        let client = RegistryClient::new(config);
+        let maintainers = client.maintainers("mypkg").unwrap();
+        assert_eq!(maintainers.len(), 2);
+        assert_eq!(maintainers[0].name, "alice");
+        assert_eq!(maintainers[0].email.as_deref(), Some("alice@example.com"));
+        assert_eq!(maintainers[1].name, "bob");
+        assert_eq!(maintainers[1].email, None);
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = server.join();
+    }
+
+    #[test]
+    fn maintainers_empty_when_field_absent() {
+        let body = r#"{"name":"mypkg"}"#.to_string();
+        let (registry, shutdown, server) =
+            token_server(move |_method, _path, _body| (200, body.clone()));
+        let config = NpmConfig::default()
+            .with_registry_override(&registry)
+            .unwrap();
+        let client = RegistryClient::new(config);
+        let maintainers = client.maintainers("mypkg").unwrap();
+        assert!(maintainers.is_empty());
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = server.join();
+    }
+
+    #[test]
+    fn add_owner_puts_collaborator_endpoint() {
+        let (registry, shutdown, server) = token_server(|method, path, body| {
+            assert_eq!(method, "PUT");
+            assert_eq!(path, "/-/package/mypkg/collaborators/alice");
+            assert_eq!(body, r#"{"permissions":"write"}"#);
+            (200, String::new())
+        });
+        let config = NpmConfig::default()
+            .with_registry_override(&registry)
+            .unwrap();
+        let client = RegistryClient::new(config);
+        client.add_owner("mypkg", "alice").unwrap();
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = server.join();
+    }
+
+    #[test]
+    fn add_owner_escapes_scoped_name() {
+        let (registry, shutdown, server) = token_server(|method, path, _body| {
+            assert_eq!(method, "PUT");
+            assert_eq!(path, "/-/package/@scope%2fpkg/collaborators/bob");
+            (200, String::new())
+        });
+        let config = NpmConfig::default()
+            .with_registry_override(&registry)
+            .unwrap();
+        let client = RegistryClient::new(config);
+        client.add_owner("@scope/pkg", "bob").unwrap();
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = server.join();
+    }
+
+    #[test]
+    fn remove_owner_deletes_collaborator_endpoint() {
+        let (registry, shutdown, server) = token_server(|method, path, _body| {
+            assert_eq!(method, "DELETE");
+            assert_eq!(path, "/-/package/mypkg/collaborators/alice");
+            (200, String::new())
+        });
+        let config = NpmConfig::default()
+            .with_registry_override(&registry)
+            .unwrap();
+        let client = RegistryClient::new(config);
+        client.remove_owner("mypkg", "alice").unwrap();
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = server.join();
+    }
+
+    #[test]
+    fn add_owner_unauthorized_returns_bad_status() {
+        let (registry, shutdown, server) =
+            token_server(|_method, _path, _body| (401, "{}".to_string()));
+        let config = NpmConfig::default()
+            .with_registry_override(&registry)
+            .unwrap();
+        let client = RegistryClient::new(config);
+        match client.add_owner("mypkg", "alice") {
             Err(RegistryError::BadStatus { code, .. }) => assert_eq!(code, 401),
             other => panic!("expected BadStatus 401, got {other:?}"),
         }
