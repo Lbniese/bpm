@@ -524,3 +524,78 @@ fn missing_openssl_falls_back_to_source() {
     );
     assert!(!install_dir.join("bpm").exists());
 }
+
+/// Extract the first `-----BEGIN PUBLIC KEY----- ... -----END PUBLIC KEY-----`
+/// block from `text` (the installer embeds the release key in a heredoc).
+#[cfg(unix)]
+fn extract_pubkey_block(text: &str) -> Option<String> {
+    let header = "-----BEGIN PUBLIC KEY-----";
+    let footer = "-----END PUBLIC KEY-----";
+    let start = text.find(header)?;
+    let end = text[start..].find(footer)? + start + footer.len();
+    Some(text[start..end].to_string())
+}
+
+/// Normalize a PEM block to its base64 body (header/footer/whitespace
+/// stripped). Equal bodies imply equal DER key material.
+#[cfg(unix)]
+fn normalize_pubkey_body(pem: &str) -> String {
+    pem.lines()
+        .filter(|line| !line.starts_with("-----"))
+        .flat_map(|line| line.chars())
+        .filter(|c| !c.is_whitespace())
+        .collect()
+}
+
+/// Convert a PEM public-key block to raw DER bytes via `openssl`. The
+/// installer already depends on openssl for signature verification, so this
+/// is available wherever the installer runs.
+#[cfg(unix)]
+fn pubkey_to_der(pem: &str) -> Vec<u8> {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("pub.pem");
+    std::fs::write(&path, pem).expect("write pem");
+    let out = Command::new("openssl")
+        .args(["pkey", "-pubin", "-outform", "DER"])
+        .arg("-in")
+        .arg(&path)
+        .output()
+        .expect("run openssl pkey");
+    assert!(
+        out.status.success(),
+        "openssl pkey failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out.stdout
+}
+
+/// Regression guard for Plan 044: the production public key embedded in
+/// `install.sh` must stay byte-aligned with `.github/release-signing-public.pem`
+/// (the key the release workflow signs and verifies with). A future key
+/// rotation fails this test until the installer is updated to match.
+#[test]
+#[cfg(unix)]
+fn embedded_release_pubkey_matches_checked_in_key() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let installer_src =
+        std::fs::read_to_string(manifest.join("install.sh")).expect("read install.sh");
+    let checked_in_src =
+        std::fs::read_to_string(manifest.join(".github/release-signing-public.pem"))
+            .expect("read release-signing-public.pem");
+
+    let embedded =
+        extract_pubkey_block(&installer_src).expect("install.sh embeds a release public key");
+    let checked_in =
+        extract_pubkey_block(&checked_in_src).expect("checked-in key is a PEM public key");
+
+    assert_eq!(
+        normalize_pubkey_body(&embedded),
+        normalize_pubkey_body(&checked_in),
+        "install.sh embedded key body must match .github/release-signing-public.pem"
+    );
+    assert_eq!(
+        pubkey_to_der(&embedded),
+        pubkey_to_der(&checked_in),
+        "embedded and checked-in key DER fingerprints must match"
+    );
+}

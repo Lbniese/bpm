@@ -138,8 +138,8 @@ verify_binary() {
 release_signing_pubkey() {
     cat <<'BPM_RELEASE_PUBKEY'
 -----BEGIN PUBLIC KEY-----
-MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEhNDYaModKhZ5vrJ9U5zWncqiusE4
-Ue2hXf/9nfdY+bb+jjb5sk1dR9626QFTSYS0KIrhKjq0zUXCYsbM8kzO7A==
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEX+ehNNI6kk1SE2FLv6mDNhEuIH7F
+2p0Stjm5LtjXPeOa5iS2kLX0yP+VyCGY6axoL+FVzmK58czIYR3f8+Yqdg==
 -----END PUBLIC KEY-----
 BPM_RELEASE_PUBKEY
 }
