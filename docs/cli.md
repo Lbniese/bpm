@@ -408,6 +408,44 @@ Revokes the token whose `key` (shown by `bpm token list`) equals `<id>`.
 | `--otp <code>` | (`create`/`revoke`) Two-factor OTP code. |
 | `--json` | (`list`/`create`) Emit machine-readable JSON. |
 
+## `bpm dist-tag <action> [args] [flags]`
+
+npm `dist-tag` compatibility: list, set, and remove a package's distribution
+tags (named pointers like `latest`, `beta`, `next`).
+
+```bash
+bpm dist-tag ls lodash                  # list lodash's tags
+bpm dist-tag ls                          # list tags for the local package
+bpm dist-tag add mypkg@1.2.3 next        # point `next` at 1.2.3
+bpm dist-tag add mypkg@1.2.3             # `add` defaults the tag to `latest`
+bpm dist-tag rm mypkg old                # remove the `old` tag
+```
+
+### `bpm dist-tag ls [pkg]`
+
+Prints `tag: version` for each dist-tag (sorted). With no package, reads the
+`name` from the local `package.json`. Listing is a public read — no
+authentication required for public packages. Add `--json` for machine-readable
+output.
+
+### `bpm dist-tag add <pkg>@<version> [tag]`
+
+Points `tag` (default `latest`) at `version` via the registry's
+``/-/package/<name>/dist-tags/<tag>`` endpoint. Requires an authenticated
+session with publish rights. (For scoped packages the name is percent-encoded,
+e.g. `@scope/name` → `@scope%2Fname`.)
+
+### `bpm dist-tag rm <pkg> <tag>`
+
+Removes `tag` from `pkg`. Requires publish rights.
+
+### Flags
+
+| Flag | Meaning |
+|------|---------|
+| `--registry <url>` | Registry base URL. Defaults to the config's registry, then `https://registry.npmjs.org`. |
+| `--json` | (`ls`) Emit machine-readable JSON. |
+
 ## `bpm why <package>`
 
 Shows why a package is present in the dependency tree by walking the lockfile

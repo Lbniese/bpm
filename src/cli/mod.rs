@@ -4,6 +4,7 @@ mod args;
 mod audit;
 mod bench;
 mod cache;
+mod dist_tag;
 mod doctor;
 mod exec;
 mod fetch;
@@ -264,6 +265,19 @@ pub(crate) fn run() -> ExitCode {
             cidr,
             password,
             otp,
+            json,
+        }),
+        Commands::DistTag {
+            action,
+            target,
+            value,
+            registry,
+            json,
+        } => dist_tag::run(dist_tag::Options {
+            action,
+            target,
+            value,
+            registry,
             json,
         }),
         Commands::Why { target } => why::execute(&target),
