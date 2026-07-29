@@ -4,9 +4,10 @@
 //! packument, then spawns the built `bpm view` pointed at it via `--registry`.
 //! No real network is used.
 
+mod common;
+use common::mock_registry;
+
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
-use std::net::TcpListener;
 use std::path::Path;
 use std::process::Command;
 
@@ -60,63 +61,7 @@ fn rich_packument() -> &'static str {
     }"#
 }
 
-/// A mock registry keyed by package name; unknown packages get a 404.
-/// Returns (registry_url, shutdown_flag, server_thread).
-fn mock_registry(
-    responses: BTreeMap<String, String>,
-) -> (
-    String,
-    std::sync::Arc<std::sync::atomic::AtomicBool>,
-    std::thread::JoinHandle<()>,
-) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    let registry_url = format!("http://{address}");
-    let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let server_shutdown = shutdown.clone();
-
-    let server = std::thread::spawn(move || {
-        listener.set_nonblocking(true).unwrap();
-        while !server_shutdown.load(std::sync::atomic::Ordering::SeqCst) {
-            let (mut stream, _) = match listener.accept() {
-                Ok(c) => c,
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                    continue;
-                }
-                Err(_) => break,
-            };
-            stream
-                .set_read_timeout(Some(std::time::Duration::from_millis(500)))
-                .ok();
-            let mut request = [0u8; 4096];
-            let n = stream.read(&mut request).unwrap_or(0);
-            let request_str = String::from_utf8_lossy(&request[..n]);
-
-            let path = request_str
-                .lines()
-                .next()
-                .and_then(|line| line.split(' ').nth(1).map(|p| p.trim_start_matches('/')))
-                .unwrap_or("")
-                .split('?')
-                .next()
-                .unwrap_or("");
-            let package_name = path.replace("%2F", "/");
-
-            let (status, body) = match responses.get(&package_name) {
-                Some(body) => ("200 OK", body.clone()),
-                None => ("404 Not Found", "{\"error\":\"not found\"}".to_string()),
-            };
-            let response = format!(
-                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            let _ = stream.write_all(response.as_bytes());
-        }
-    });
-
-    (registry_url, shutdown, server)
-}
+// `mock_registry` is shared from `tests/common/mod.rs` (hardened read loop).
 
 /// Start the demo mock registry. Returns (url, shutdown, thread).
 fn demo_registry() -> (

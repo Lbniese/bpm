@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -346,6 +346,75 @@ fn serve_keep_alive(
 }
 
 const MAX_REQUEST_HEADERS: usize = 64 * 1024;
+
+/// Start a tiny mock npm registry on `127.0.0.1` that serves canned packument
+/// JSON keyed by package name (decoded from the request path, with `%2F` → `/`).
+/// Unknown packages get a `404`. Returns `(url, shutdown_flag, server_thread)`;
+/// set the flag to stop the accept loop, then `join()` the thread.
+///
+/// Each request is read with a generous 10s deadline and buffered until the
+/// full HTTP head arrives (via [`read_request`]), so this does not flake under
+/// heavy `cargo test` parallel load: the previous single-`read()`/500ms variant
+/// timed out while the client subprocess was starved by the scheduler and then
+/// answered a spurious `404`.
+pub fn mock_registry(
+    responses: BTreeMap<String, String>,
+) -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("local_addr");
+    let registry_url = format!("http://{address}");
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let server_shutdown = shutdown.clone();
+
+    let server = thread::spawn(move || {
+        listener.set_nonblocking(true).expect("nonblocking");
+        while !server_shutdown.load(Ordering::SeqCst) {
+            let (mut stream, _) = match listener.accept() {
+                Ok(c) => c,
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(_) => break,
+            };
+            // The listener is non-blocking so the shutdown flag can be polled;
+            // force each accepted stream back to blocking so the read deadline
+            // below actually takes effect. Otherwise the inherited non-blocking
+            // mode makes `read()` return `WouldBlock` before the client's bytes
+            // arrive, yielding an empty request and a spurious `404`.
+            let _ = stream.set_nonblocking(false);
+            // Generous deadline: under heavy parallel test load the client may
+            // be preempted long past the old 500ms before it sends its request.
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+            let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+
+            // `read_request` loops until the full HTTP head is buffered. The
+            // path is the second token of the request line with the leading
+            // `/` stripped (matching the prior behavior callers rely on).
+            let path = read_request(&mut stream, 0, 0)
+                .map(|request| request.path)
+                .unwrap_or_default();
+            let package_name = path
+                .split('?')
+                .next()
+                .unwrap_or("")
+                .trim_start_matches('/')
+                .replace("%2F", "/");
+
+            let (status, body) = match responses.get(&package_name) {
+                Some(body) => ("200 OK", body.clone()),
+                None => ("404 Not Found", "{\"error\":\"not found\"}".to_string()),
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+
+    (registry_url, shutdown, server)
+}
 
 fn read_request(
     stream: &mut TcpStream,
