@@ -700,7 +700,7 @@ impl RegistryClient {
         }
         let bytes = self
             .http
-            .post_json_with_headers(&url, &body, &headers)
+            .post_json_with_headers_once(&url, &body, &headers)
             .map_err(token_http_error)?;
         let token: RegistryToken =
             serde_json::from_slice(&bytes).map_err(|source| RegistryError::BadJson {
@@ -2945,6 +2945,81 @@ mod tests {
         assert!(token.readonly);
         shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
         let _ = server.join();
+    }
+
+    #[test]
+    fn create_token_does_not_retry_on_server_error() {
+        // A retryable 5xx must still result in exactly one POST: token creation
+        // is non-idempotent, so a transient failure cannot be allowed to mint a
+        // second credential the caller cannot observe.
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let (registry, shutdown, server) = {
+            let requests = std::sync::Arc::clone(&requests);
+            token_server(move |method, _path, _body| {
+                assert_eq!(method, "POST", "token creation must POST");
+                requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                (500, String::new())
+            })
+        };
+        let mut config = NpmConfig::default()
+            .with_registry_override(&registry)
+            .unwrap();
+        // Generously retryable policy to prove token creation opts out anyway.
+        config.network.retries = 5;
+        let client = RegistryClient::new(config);
+        let req = CreateTokenRequest {
+            password: "hunter2".to_string(),
+            readonly: true,
+            cidrs: vec![],
+        };
+        match client.create_token(&req, None) {
+            Err(RegistryError::BadStatus { code, .. }) => assert_eq!(code, 500),
+            other => panic!("expected BadStatus 500, got {other:?}"),
+        }
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = server.join();
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "create_token must perform exactly one request despite a retryable status"
+        );
+    }
+
+    #[test]
+    fn approved_mutation_still_retries_retryable_failure() {
+        // `set_dist_tag` is an approved retryable mutation: a first 5xx is
+        // retried and the second attempt succeeds, proving the no-retry path
+        // is scoped to token creation only.
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let (registry, shutdown, server) = {
+            let requests = std::sync::Arc::clone(&requests);
+            token_server(move |method, _path, _body| {
+                assert_eq!(method, "PUT");
+                let n = requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n == 0 {
+                    (500, String::new())
+                } else {
+                    (200, String::new())
+                }
+            })
+        };
+        let mut config = NpmConfig::default()
+            .with_registry_override(&registry)
+            .unwrap();
+        // Keep the backoff tiny so the retry is exercised without slowing the
+        // test suite (default min-timeout is 10s).
+        config.network.retries = 2;
+        config.network.retry_min_timeout = std::time::Duration::from_millis(1);
+        config.network.retry_max_timeout = std::time::Duration::from_millis(1);
+        let client = RegistryClient::new(config);
+        client.set_dist_tag("mypkg", "latest", "1.2.3").unwrap();
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = server.join();
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "approved mutations must still retry retryable failures"
+        );
     }
 
     #[test]
