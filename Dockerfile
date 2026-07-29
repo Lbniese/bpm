@@ -1,4 +1,8 @@
-FROM rust:1.97.0-bookworm
+# Keep this Rust version in lockstep with `rust-toolchain.toml` and CI
+# (`.github/workflows/ci.yml`) so the container installs the same compiler the
+# project pins. Drift causes an extra rustup fetch and a build that does not
+# match CI.
+FROM rust:1.96.1-bookworm
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
