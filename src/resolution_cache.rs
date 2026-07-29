@@ -87,8 +87,16 @@ impl ResolutionSnapshotCache {
                 continue;
             };
             if modified <= cutoff {
-                reclaimed += metadata.len();
-                let _ = fs::remove_file(&path);
+                // Charge bytes only on a successful removal. A `NotFound`
+                // race (a concurrent prune or install) contributes zero: this
+                // invocation did not actually reclaim the file. Permission or
+                // busy failures are likewise skipped so the GC report never
+                // overstates reclaimed space.
+                match fs::remove_file(&path) {
+                    Ok(()) => reclaimed += metadata.len(),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => {}
+                }
             }
         }
         reclaimed
@@ -356,5 +364,24 @@ mod tests {
         let cache = ResolutionSnapshotCache::new(temp.path());
         // The `resolution-snapshots/` directory was never created.
         assert_eq!(cache.prune_older_than(SystemTime::now()), 0);
+    }
+
+    #[test]
+    fn prune_charges_zero_when_removal_fails() {
+        // Portable failure injection without privileged permissions: a
+        // directory named like a snapshot qualifies for pruning, but
+        // `fs::remove_file` cannot remove a directory, so it must contribute
+        // zero bytes (a future cutoff makes its mtime eligible).
+        use std::time::Duration;
+        let temp = tempfile::tempdir().unwrap();
+        let cache = ResolutionSnapshotCache::new(temp.path());
+        let dir = cache.path_for("k").parent().unwrap().to_path_buf();
+        fs::create_dir_all(&dir).unwrap();
+        let trap = dir.join("trap.json");
+        fs::create_dir(&trap).unwrap();
+        let cutoff = SystemTime::now() + Duration::from_secs(86400);
+        let reclaimed = cache.prune_older_than(cutoff);
+        assert_eq!(reclaimed, 0, "a failed removal must not be charged");
+        assert!(trap.exists(), "directory survives remove_file failure");
     }
 }
