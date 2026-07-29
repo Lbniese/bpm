@@ -548,6 +548,22 @@ pub(crate) enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Manage package distribution tags (npm `dist-tag` compat).
+    DistTag {
+        /// Action: `ls` (default), `add`, or `rm`.
+        action: Option<String>,
+        /// Package name (for `ls`/`rm`) or `<pkg>@<version>` spec (for `add`).
+        /// For `ls`, defaults to the name in the local `package.json`.
+        target: Option<String>,
+        /// Tag name (for `add`/`rm`); `add` defaults to `latest`.
+        value: Option<String>,
+        /// Registry base URL.
+        #[arg(long)]
+        registry: Option<String>,
+        /// Emit machine-readable JSON (`ls`).
+        #[arg(long)]
+        json: bool,
+    },
     /// Show why a package is in the dependency tree.
     Why {
         /// Package name to trace.
@@ -959,6 +975,66 @@ mod tests {
         };
         assert_eq!(action.as_deref(), Some("revoke"));
         assert_eq!(id.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn dist_tag_parses_actions_and_positionals() {
+        let cli = Cli::try_parse_from(["bpm", "dist-tag"]).unwrap();
+        let Commands::DistTag {
+            action,
+            target,
+            value,
+            ..
+        } = cli.command
+        else {
+            panic!("expected dist-tag command");
+        };
+        assert_eq!(action.as_deref(), None); // defaults to "ls"
+        assert!(target.is_none());
+        assert!(value.is_none());
+
+        let cli = Cli::try_parse_from(["bpm", "dist-tag", "ls", "lodash"]).unwrap();
+        let Commands::DistTag {
+            action,
+            target,
+            value,
+            ..
+        } = cli.command
+        else {
+            panic!("expected dist-tag command");
+        };
+        assert_eq!(action.as_deref(), Some("ls"));
+        assert_eq!(target.as_deref(), Some("lodash"));
+        assert!(value.is_none());
+
+        let cli =
+            Cli::try_parse_from(["bpm", "dist-tag", "add", "@scope/pkg@1.2.3", "next"]).unwrap();
+        let Commands::DistTag {
+            action,
+            target,
+            value,
+            ..
+        } = cli.command
+        else {
+            panic!("expected dist-tag command");
+        };
+        assert_eq!(action.as_deref(), Some("add"));
+        assert_eq!(target.as_deref(), Some("@scope/pkg@1.2.3"));
+        assert_eq!(value.as_deref(), Some("next"));
+
+        let cli = Cli::try_parse_from(["bpm", "dist-tag", "rm", "lodash", "old"]).unwrap();
+        let Commands::DistTag {
+            action,
+            target,
+            value,
+            ..
+        } = cli.command
+        else {
+            panic!("expected dist-tag command");
+        };
+        assert_eq!(action.as_deref(), Some("rm"));
+        assert_eq!(target.as_deref(), Some("lodash"));
+        assert_eq!(value.as_deref(), Some("old"));
     }
 
     #[test]

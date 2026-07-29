@@ -465,6 +465,16 @@ impl RegistryClient {
         &self.http
     }
 
+    /// The npm configuration this client was built from (registry URLs, auth).
+    pub fn config(&self) -> &NpmConfig {
+        &self.config
+    }
+
+    /// The effective registry base URL requests are sent to.
+    pub fn registry(&self) -> &str {
+        self.config.registry()
+    }
+
     /// Construct a registry facade with a newly allocated HTTP pool.
     ///
     /// This compatibility constructor is intended for callers that do not
@@ -648,6 +658,44 @@ impl RegistryClient {
         self.http
             .delete_with_headers(&url, &headers)
             .map_err(token_http_error)?;
+        Ok(())
+    }
+
+    /// Read a package's distribution tags (npm `dist-tag ls`). Reuses the
+    /// packument read so public packages need no authentication.
+    pub fn dist_tags(
+        &self,
+        name: &str,
+    ) -> Result<std::collections::BTreeMap<String, String>, RegistryError> {
+        let packument = self.packument(name)?;
+        Ok(packument.dist_tags)
+    }
+
+    /// Point a distribution `tag` at `version` (npm `dist-tag add`). Writes via
+    /// the registry's `/-/package/<escaped>/dist-tags/<tag>` endpoint; requires
+    /// an authenticated session with publish rights.
+    pub fn set_dist_tag(&self, name: &str, tag: &str, version: &str) -> Result<(), RegistryError> {
+        let base = self.config.registry().trim_end_matches('/');
+        let escaped = name.replace('/', "%2f");
+        let url = format!("{base}/-/package/{escaped}/dist-tags/{tag}");
+        // npm expects the version as a bare JSON string.
+        let body = format!("\"{version}\"");
+        self.http
+            .put_json(&url, body.as_bytes())
+            .map_err(|source| registry_error_for(name, source))?;
+        Ok(())
+    }
+
+    /// Remove a distribution `tag` from `name` (npm `dist-tag rm`). Deletes via
+    /// the registry's `/-/package/<escaped>/dist-tags/<tag>` endpoint; requires
+    /// an authenticated session with publish rights.
+    pub fn delete_dist_tag(&self, name: &str, tag: &str) -> Result<(), RegistryError> {
+        let base = self.config.registry().trim_end_matches('/');
+        let escaped = name.replace('/', "%2f");
+        let url = format!("{base}/-/package/{escaped}/dist-tags/{tag}");
+        self.http
+            .delete(&url)
+            .map_err(|source| registry_error_for(name, source))?;
         Ok(())
     }
 
@@ -1171,6 +1219,21 @@ fn token_http_error(source: HttpError) -> RegistryError {
         },
         other => RegistryError::Network {
             package: "-/npm/v1/tokens".into(),
+            source: Box::new(other),
+        },
+    }
+}
+
+/// Map an HTTP-layer error into a registry error labeled with `package`,
+/// surfacing 4xx/5xx status codes distinctly.
+fn registry_error_for(package: &str, source: HttpError) -> RegistryError {
+    match source {
+        HttpError::Status { code, .. } => RegistryError::BadStatus {
+            package: package.to_string(),
+            code,
+        },
+        other => RegistryError::Network {
+            package: package.to_string(),
             source: Box::new(other),
         },
     }
@@ -2613,9 +2676,10 @@ mod tests {
         let _ = server.join();
     }
 
-    /// Spawn a local server that dispatches each request to `handler(method, path)`
-    /// and replies with the returned `(status, body)`. Returns the registry base
-    /// URL, a shutdown flag, and the server thread handle.
+    /// Spawn a local server that dispatches each request to
+    /// `handler(method, path, body)` and replies with the returned
+    /// `(status, body)`. Returns the registry base URL, a shutdown flag, and the
+    /// server thread handle.
     fn token_server<F>(
         handler: F,
     ) -> (
@@ -2624,7 +2688,7 @@ mod tests {
         std::thread::JoinHandle<()>,
     )
     where
-        F: Fn(&str, &str) -> (u16, String) + Send + 'static,
+        F: Fn(&str, &str, &str) -> (u16, String) + Send + 'static,
     {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -2649,7 +2713,8 @@ mod tests {
                 let mut parts = request_line.split_whitespace();
                 let method = parts.next().unwrap_or("GET");
                 let path = parts.next().unwrap_or("/");
-                let (status, body) = handler(method, path);
+                let body = request.split("\r\n\r\n").nth(1).unwrap_or("").trim();
+                let (status, body) = handler(method, path, body);
                 let reason = if status < 400 { "OK" } else { "Error" };
                 write!(
                     stream,
@@ -2666,7 +2731,8 @@ mod tests {
     fn list_tokens_returns_array() {
         let body = r#"[{"key":"abc123","readonly":false,"cidr_whitelist":["10.0.0.0/8"],"created":"2021-01-01T00:00:00.000Z"}]"#;
         let body = body.to_string();
-        let (registry, shutdown, server) = token_server(move |_method, _path| (200, body.clone()));
+        let (registry, shutdown, server) =
+            token_server(move |_method, _path, _body| (200, body.clone()));
         let config = NpmConfig::default()
             .with_registry_override(&registry)
             .unwrap();
@@ -2685,7 +2751,7 @@ mod tests {
     fn create_token_returns_new_token() {
         let body = r#"{"token":"xyz_secret","key":"abc123","readonly":true,"created":"2021-01-01T00:00:00.000Z"}"#;
         let body = body.to_string();
-        let (registry, shutdown, server) = token_server(move |method, _path| {
+        let (registry, shutdown, server) = token_server(move |method, _path, _body| {
             // `create` must POST.
             assert_eq!(method, "POST");
             (200, body.clone())
@@ -2709,7 +2775,7 @@ mod tests {
 
     #[test]
     fn revoke_token_succeeds() {
-        let (registry, shutdown, server) = token_server(|method, path| {
+        let (registry, shutdown, server) = token_server(|method, path, _body| {
             // `revoke` must DELETE /-/npm/v1/tokens/token/<key>.
             assert_eq!(method, "DELETE");
             assert!(
@@ -2729,12 +2795,99 @@ mod tests {
 
     #[test]
     fn list_tokens_unauthenticated_returns_bad_status() {
-        let (registry, shutdown, server) = token_server(|_method, _path| (401, "{}".to_string()));
+        let (registry, shutdown, server) =
+            token_server(|_method, _path, _body| (401, "{}".to_string()));
         let config = NpmConfig::default()
             .with_registry_override(&registry)
             .unwrap();
         let client = RegistryClient::new(config);
         match client.list_tokens() {
+            Err(RegistryError::BadStatus { code, .. }) => assert_eq!(code, 401),
+            other => panic!("expected BadStatus 401, got {other:?}"),
+        }
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = server.join();
+    }
+
+    #[test]
+    fn dist_tags_returns_tags() {
+        // `dist-tag ls` reuses the packument read; the server returns a
+        // packument whose `dist-tags` become the returned map.
+        let body = r#"{"name":"mypkg","dist-tags":{"latest":"1.0.0","beta":"1.1.0"},"versions":{"1.0.0":{},"1.1.0":{}}}"#;
+        let body = body.to_string();
+        let (registry, shutdown, server) =
+            token_server(move |_method, _path, _body| (200, body.clone()));
+        let config = NpmConfig::default()
+            .with_registry_override(&registry)
+            .unwrap();
+        let client = RegistryClient::new(config);
+        let tags = client.dist_tags("mypkg").unwrap();
+        assert_eq!(tags.get("latest").map(String::as_str), Some("1.0.0"));
+        assert_eq!(tags.get("beta").map(String::as_str), Some("1.1.0"));
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = server.join();
+    }
+
+    #[test]
+    fn set_dist_tag_puts_version_as_json_string() {
+        let (registry, shutdown, server) = token_server(|method, path, body| {
+            assert_eq!(method, "PUT");
+            assert_eq!(path, "/-/package/mypkg/dist-tags/latest");
+            // npm expects the version as a bare JSON string.
+            assert_eq!(body, "\"1.2.3\"");
+            (200, String::new())
+        });
+        let config = NpmConfig::default()
+            .with_registry_override(&registry)
+            .unwrap();
+        let client = RegistryClient::new(config);
+        client.set_dist_tag("mypkg", "latest", "1.2.3").unwrap();
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = server.join();
+    }
+
+    #[test]
+    fn set_dist_tag_escapes_scoped_name() {
+        let (registry, shutdown, server) = token_server(|method, path, _body| {
+            assert_eq!(method, "PUT");
+            // The `/` in a scoped name is percent-encoded (`%2f`).
+            assert_eq!(path, "/-/package/@scope%2fpkg/dist-tags/next");
+            (200, String::new())
+        });
+        let config = NpmConfig::default()
+            .with_registry_override(&registry)
+            .unwrap();
+        let client = RegistryClient::new(config);
+        client.set_dist_tag("@scope/pkg", "next", "2.0.0").unwrap();
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = server.join();
+    }
+
+    #[test]
+    fn delete_dist_tag_deletes_endpoint() {
+        let (registry, shutdown, server) = token_server(|method, path, _body| {
+            assert_eq!(method, "DELETE");
+            assert_eq!(path, "/-/package/mypkg/dist-tags/beta");
+            (200, String::new())
+        });
+        let config = NpmConfig::default()
+            .with_registry_override(&registry)
+            .unwrap();
+        let client = RegistryClient::new(config);
+        client.delete_dist_tag("mypkg", "beta").unwrap();
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = server.join();
+    }
+
+    #[test]
+    fn set_dist_tag_unauthorized_returns_bad_status() {
+        let (registry, shutdown, server) =
+            token_server(|_method, _path, _body| (401, "{}".to_string()));
+        let config = NpmConfig::default()
+            .with_registry_override(&registry)
+            .unwrap();
+        let client = RegistryClient::new(config);
+        match client.set_dist_tag("mypkg", "latest", "1.2.3") {
             Err(RegistryError::BadStatus { code, .. }) => assert_eq!(code, 401),
             other => panic!("expected BadStatus 401, got {other:?}"),
         }
