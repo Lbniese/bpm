@@ -181,6 +181,7 @@ dependencies = [
  "httpdate",
  "libc",
  "lru",
+ "percent-encoding",
  "proptest",
  "reqwest",
  "rusqlite",

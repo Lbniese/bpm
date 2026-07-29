@@ -21,6 +21,8 @@ use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
 
+use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
+
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
@@ -34,6 +36,37 @@ use crate::metadata_cache::{CacheMode, MetadataCache};
 /// resolution. Requesting it avoids downloading each packument's full
 /// publish-time history (multi-megabyte for popular packages).
 pub(crate) const ABBREV_ACCEPT: &str = "application/vnd.npm.install-v1+json";
+
+/// Bytes that must be percent-encoded when interpolating a user-controlled
+/// value into a single registry path segment. The reserved delimiters `/`
+/// (path), `?` (query), `#` (fragment), and `%` (escape) are encoded so they
+/// can never change the request target; spaces, quotes, and angle brackets
+/// are encoded as defense-in-depth. Unreserved identifier characters npm
+/// allows (`A-Za-z0-9`, `-`, `_`, `.`, `~`) are left raw so valid dist-tags,
+/// usernames, and token keys match the wire format exactly.
+const REGISTRY_SEGMENT: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'<')
+    .add(b'>')
+    .add(b'`')
+    .add(b'{')
+    .add(b'}')
+    .add(b'\\')
+    .add(b'^')
+    .add(b'|')
+    .add(b'/')
+    .add(b'?')
+    .add(b'#')
+    .add(b'%');
+
+/// Percent-encode one user-controlled registry path segment (a dist-tag,
+/// collaborator name, or token key) so reserved delimiters cannot change the
+/// request target. Package names have their own scoped handling
+/// (`/` -> `%2F`) and must NOT be passed through here.
+fn encode_registry_segment(segment: &str) -> String {
+    utf8_percent_encode(segment, REGISTRY_SEGMENT).to_string()
+}
 
 /// Per-client diagnostic accumulator shared by a `RegistryClient` and its
 /// prefetch workers. All fields use saturating atomic adds so concurrent
@@ -682,6 +715,7 @@ impl RegistryClient {
     /// account enforces two-factor authentication.
     pub fn revoke_token(&self, key: &str, otp: Option<&str>) -> Result<(), RegistryError> {
         let base = self.config.registry().trim_end_matches('/');
+        let key = encode_registry_segment(key);
         let url = format!("{base}/-/npm/v1/tokens/token/{key}");
         let otp_header;
         let mut headers: Vec<(&str, &str)> = Vec::new();
@@ -711,6 +745,7 @@ impl RegistryClient {
     pub fn set_dist_tag(&self, name: &str, tag: &str, version: &str) -> Result<(), RegistryError> {
         let base = self.config.registry().trim_end_matches('/');
         let escaped = name.replace('/', "%2f");
+        let tag = encode_registry_segment(tag);
         let url = format!("{base}/-/package/{escaped}/dist-tags/{tag}");
         // npm expects the version as a bare JSON string.
         let body = format!("\"{version}\"");
@@ -726,6 +761,7 @@ impl RegistryClient {
     pub fn delete_dist_tag(&self, name: &str, tag: &str) -> Result<(), RegistryError> {
         let base = self.config.registry().trim_end_matches('/');
         let escaped = name.replace('/', "%2f");
+        let tag = encode_registry_segment(tag);
         let url = format!("{base}/-/package/{escaped}/dist-tags/{tag}");
         self.http
             .delete(&url)
@@ -770,6 +806,7 @@ impl RegistryClient {
     pub fn add_owner(&self, name: &str, user: &str) -> Result<(), RegistryError> {
         let base = self.config.registry().trim_end_matches('/');
         let escaped = name.replace('/', "%2f");
+        let user = encode_registry_segment(user);
         let url = format!("{base}/-/package/{escaped}/collaborators/{user}");
         self.http
             .put_json(&url, br#"{"permissions":"write"}"#)
@@ -783,6 +820,7 @@ impl RegistryClient {
     pub fn remove_owner(&self, name: &str, user: &str) -> Result<(), RegistryError> {
         let base = self.config.registry().trim_end_matches('/');
         let escaped = name.replace('/', "%2f");
+        let user = encode_registry_segment(user);
         let url = format!("{base}/-/package/{escaped}/collaborators/{user}");
         self.http
             .delete(&url)
@@ -3127,6 +3165,116 @@ mod tests {
             Err(RegistryError::BadStatus { code, .. }) => assert_eq!(code, 401),
             other => panic!("expected BadStatus 401, got {other:?}"),
         }
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = server.join();
+    }
+
+    #[test]
+    fn encode_registry_segment_leaves_unreserved_raw() {
+        // npm-valid identifier characters are untouched so valid tags, users,
+        // and token keys match the wire format exactly.
+        assert_eq!(encode_registry_segment("latest"), "latest");
+        assert_eq!(
+            encode_registry_segment("alpha-1.0_beta.~rc"),
+            "alpha-1.0_beta.~rc"
+        );
+    }
+
+    #[test]
+    fn encode_registry_segment_percent_encodes_reserved() {
+        // Every structural delimiter and the escape char must be encoded so a
+        // value cannot split into multiple path segments or spawn a query or
+        // fragment.
+        assert_eq!(
+            encode_registry_segment("a/b?c#d%e f"),
+            "a%2Fb%3Fc%23d%25e%20f"
+        );
+        // Control characters (e.g. tab) are encoded.
+        assert_eq!(encode_registry_segment("a\tb"), "a%09b");
+    }
+
+    #[test]
+    fn set_dist_tag_encodes_reserved_delimiters() {
+        let (registry, shutdown, server) = token_server(|method, path, _body| {
+            assert_eq!(method, "PUT");
+            // `?`, `#`, `/`, and `%` must be encoded so the tag stays a single
+            // segment and adds no query or fragment.
+            assert_eq!(path, "/-/package/mypkg/dist-tags/a%3Fb%23c%2Fd%25e");
+            (200, String::new())
+        });
+        let config = NpmConfig::default()
+            .with_registry_override(&registry)
+            .unwrap();
+        let client = RegistryClient::new(config);
+        client.set_dist_tag("mypkg", "a?b#c/d%e", "2.0.0").unwrap();
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = server.join();
+    }
+
+    #[test]
+    fn delete_dist_tag_encodes_reserved_delimiters() {
+        let (registry, shutdown, server) = token_server(|method, path, _body| {
+            assert_eq!(method, "DELETE");
+            assert_eq!(path, "/-/package/mypkg/dist-tags/a%2Fb");
+            (200, String::new())
+        });
+        let config = NpmConfig::default()
+            .with_registry_override(&registry)
+            .unwrap();
+        let client = RegistryClient::new(config);
+        client.delete_dist_tag("mypkg", "a/b").unwrap();
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = server.join();
+    }
+
+    #[test]
+    fn add_owner_encodes_reserved_delimiters() {
+        let (registry, shutdown, server) = token_server(|method, path, _body| {
+            assert_eq!(method, "PUT");
+            assert_eq!(path, "/-/package/mypkg/collaborators/a%3Fb%23c");
+            (200, String::new())
+        });
+        let config = NpmConfig::default()
+            .with_registry_override(&registry)
+            .unwrap();
+        let client = RegistryClient::new(config);
+        client.add_owner("mypkg", "a?b#c").unwrap();
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = server.join();
+    }
+
+    #[test]
+    fn remove_owner_encodes_reserved_delimiters() {
+        let (registry, shutdown, server) = token_server(|method, path, _body| {
+            assert_eq!(method, "DELETE");
+            assert_eq!(path, "/-/package/mypkg/collaborators/a%2Fb");
+            (200, String::new())
+        });
+        let config = NpmConfig::default()
+            .with_registry_override(&registry)
+            .unwrap();
+        let client = RegistryClient::new(config);
+        client.remove_owner("mypkg", "a/b").unwrap();
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = server.join();
+    }
+
+    #[test]
+    fn revoke_token_encodes_key_segment() {
+        let (registry, shutdown, server) = token_server(|method, path, _body| {
+            assert_eq!(method, "DELETE");
+            // A token key containing `/` must be a single segment.
+            assert!(
+                path.ends_with("/-/npm/v1/tokens/token/a%2Fb%3Fc"),
+                "unexpected path: {path}"
+            );
+            (200, String::new())
+        });
+        let config = NpmConfig::default()
+            .with_registry_override(&registry)
+            .unwrap();
+        let client = RegistryClient::new(config);
+        client.revoke_token("a/b?c", None).unwrap();
         shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
         let _ = server.join();
     }
