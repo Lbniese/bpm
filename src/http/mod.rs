@@ -167,7 +167,7 @@ impl HttpClient {
 
     /// POST a JSON request body and return the response body as bytes.
     pub fn post_json(&self, url: &str, body: &[u8]) -> Result<Vec<u8>, HttpError> {
-        self.request_json("POST", url, body, &[])
+        self.request_json("POST", url, body, &[], true)
     }
 
     /// POST a JSON request with additional headers and return the response body as bytes.
@@ -177,12 +177,25 @@ impl HttpClient {
         body: &[u8],
         headers: &[(&str, &str)],
     ) -> Result<Vec<u8>, HttpError> {
-        self.request_json("POST", url, body, headers)
+        self.request_json("POST", url, body, headers, true)
+    }
+
+    /// POST a JSON request with additional headers, performing exactly one
+    /// network attempt. Reserved for non-idempotent mutations (token creation)
+    /// where a retry on a transient failure could duplicate a side effect the
+    /// caller cannot observe. The response body is returned as bytes.
+    pub fn post_json_with_headers_once(
+        &self,
+        url: &str,
+        body: &[u8],
+        headers: &[(&str, &str)],
+    ) -> Result<Vec<u8>, HttpError> {
+        self.request_json("POST", url, body, headers, false)
     }
 
     /// PUT a JSON request body and return the response body as bytes.
     pub fn put_json(&self, url: &str, body: &[u8]) -> Result<Vec<u8>, HttpError> {
-        self.request_json("PUT", url, body, &[])
+        self.request_json("PUT", url, body, &[], true)
     }
 
     /// PUT a JSON request with additional headers and return the response body as bytes.
@@ -192,12 +205,12 @@ impl HttpClient {
         body: &[u8],
         headers: &[(&str, &str)],
     ) -> Result<Vec<u8>, HttpError> {
-        self.request_json("PUT", url, body, headers)
+        self.request_json("PUT", url, body, headers, true)
     }
 
     /// Send a parameter-less DELETE request and return the response body.
     pub fn delete(&self, url: &str) -> Result<Vec<u8>, HttpError> {
-        self.request_json("DELETE", url, &[], &[])
+        self.request_json("DELETE", url, &[], &[], true)
     }
 
     /// Send a parameter-less DELETE request with extra headers (e.g. `npm-otp`)
@@ -207,7 +220,7 @@ impl HttpClient {
         url: &str,
         headers: &[(&str, &str)],
     ) -> Result<Vec<u8>, HttpError> {
-        self.request_json("DELETE", url, &[], headers)
+        self.request_json("DELETE", url, &[], headers, true)
     }
 
     /// Send a GET (following redirects) honoring the retry policy.
@@ -286,12 +299,20 @@ impl HttpClient {
         url: &str,
         body: &[u8],
         headers: &[(&str, &str)],
+        retry: bool,
     ) -> Result<Vec<u8>, HttpError> {
         self.requests.fetch_add(1, Ordering::Relaxed);
         let _in_flight = self.track_in_flight();
         let display_url = redact_url(url);
         let network = &self.config.network;
-        let attempts = network.retries.saturating_add(1);
+        // `retry = false` performs exactly one network attempt. Non-idempotent
+        // mutations (e.g. token creation) opt out so a transient failure cannot
+        // silently mint a second credential.
+        let attempts = if retry {
+            network.retries.saturating_add(1)
+        } else {
+            1
+        };
         for attempt in 0..attempts {
             let request = match method {
                 "POST" => self.client.post(url),
