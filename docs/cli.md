@@ -446,6 +446,48 @@ Removes `tag` from `pkg`. Requires publish rights.
 | `--registry <url>` | Registry base URL. Defaults to the config's registry, then `https://registry.npmjs.org`. |
 | `--json` | (`ls`) Emit machine-readable JSON. |
 
+## `bpm owner <action> [args] [flags]`
+
+npm `owner` compatibility: list, add, and remove a package's
+owners/collaborators.
+
+```bash
+bpm owner ls lodash                  # list lodash's maintainers
+bpm owner ls                         # list maintainers for the local package
+bpm owner add alice mypkg            # grant `alice` write access on mypkg
+bpm owner add alice                  # add to the local package's name
+bpm owner rm alice mypkg             # remove `alice` from mypkg
+```
+
+### `bpm owner ls [pkg]`
+
+Prints each maintainer as `name <email>` (omitting the email when absent),
+matching npm's `owner ls` output. Reads the packument's top-level
+`maintainers` field (the full packument, not the abbreviated install metadata,
+which omits it), so public packages need no authentication. With no package,
+reads the `name` from the local `package.json`. Add `--json` for
+machine-readable output.
+
+### `bpm owner add <user> [pkg]`
+
+Grants `user` write access on `pkg` via the registry's
+``/-/package/<name>/collaborators/<user>`` endpoint (body
+`{"permissions":"write"}`). With no package, targets the local `package.json`
+name. Requires an authenticated session with owner rights. (For scoped
+packages the name is percent-encoded, e.g. `@scope/name` → `@scope%2Fname`.)
+
+### `bpm owner rm <user> [pkg]`
+
+Removes `user` from `pkg`'s collaborators via the same endpoint (DELETE).
+Requires owner rights.
+
+### Flags
+
+| Flag | Meaning |
+|------|---------|
+| `--registry <url>` | Registry base URL. Defaults to the config's registry, then `https://registry.npmjs.org`. |
+| `--json` | (`ls`) Emit machine-readable JSON. |
+
 ## `bpm why <package>`
 
 Shows why a package is present in the dependency tree by walking the lockfile

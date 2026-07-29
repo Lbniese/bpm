@@ -16,6 +16,7 @@ mod link;
 mod ls;
 mod mutate;
 mod outdated;
+mod owner;
 mod publish;
 mod run;
 mod token;
@@ -274,6 +275,19 @@ pub(crate) fn run() -> ExitCode {
             registry,
             json,
         } => dist_tag::run(dist_tag::Options {
+            action,
+            target,
+            value,
+            registry,
+            json,
+        }),
+        Commands::Owner {
+            action,
+            target,
+            value,
+            registry,
+            json,
+        } => owner::run(owner::Options {
             action,
             target,
             value,
