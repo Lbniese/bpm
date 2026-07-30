@@ -82,9 +82,13 @@ pub(super) fn run(
     let response = client
         .post_json(&endpoint, serde_json::to_vec(&body)?.as_slice())
         .map_err(|e| anyhow::anyhow!("audit failed: {e}"))?;
-    let value: serde_json::Value = serde_json::from_slice(&response)
-        .unwrap_or_else(|_| json!({"raw": String::from_utf8_lossy(&response)}));
-    let counts = severity_counts(&value);
+    // Fail closed: a malformed or wrong-shaped advisory response is an error,
+    // never a silent zero-vulnerability success. Do not echo an invalid body
+    // back as valid JSON in `--json` mode.
+    let value: serde_json::Value = serde_json::from_slice(&response).map_err(|err| {
+        anyhow::anyhow!("audit endpoint {endpoint} returned malformed JSON: {err}")
+    })?;
+    let counts = severity_counts(&value)?;
     let total = counts.values().copied().sum::<u64>();
     let failing = counts
         .iter()
@@ -121,31 +125,23 @@ pub(super) fn run(
 /// advisory lists. Integrity hashes and the dependency graph are not required
 /// for the lookup.
 fn audit_bulk_body(root: &std::path::Path) -> anyhow::Result<serde_json::Value> {
-    let mut groups: BTreeMap<String, std::collections::BTreeSet<String>> = BTreeMap::new();
-
     let bpm_lock = root.join(bpm::lockfile::BPM_LOCK_FILE);
-    if bpm_lock.is_file() {
-        let lockfile = bpm::lockfile::Lockfile::from_path(&bpm_lock)?;
-        groups = bulk_groups_from_lockfile(&lockfile);
+    let groups = if bpm_lock.is_file() {
+        let lockfile = bpm::lockfile::Lockfile::from_path(&bpm_lock).map_err(|err| {
+            anyhow::anyhow!(
+                "failed to read bpm lockfile at {}: {err}",
+                bpm_lock.display()
+            )
+        })?;
+        bulk_groups_from_lockfile(&lockfile)
     } else {
-        // Fallback: derive name -> versions from an npm package-lock.json when
-        // no bpm.lock exists. package-lock v3 keys are `node_modules/...` paths;
-        // the package name is the final path segment (handling `@scope/name`).
-        let package_lock = root.join("package-lock.json");
-        if let Ok(text) = fs::read_to_string(&package_lock) {
-            if let Ok(lock) = serde_json::from_str::<serde_json::Value>(&text) {
-                if let Some(packages) = lock.get("packages").and_then(|v| v.as_object()) {
-                    for (path, entry) in packages {
-                        if let Some(name) = package_name_from_lock_path(path) {
-                            if let Some(version) = entry.get("version").and_then(|v| v.as_str()) {
-                                groups.entry(name).or_default().insert(version.to_string());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+        // Fail closed: when there is no bpm.lock, audit requires a valid npm
+        // package-lock.json with resolved versions. Declaration-only
+        // `package.json` data is not auditable because it lacks resolved
+        // versions. A missing, unreadable, malformed, or unsupported npm lock
+        // is a hard error rather than an empty inventory.
+        bulk_groups_from_npm_lock(root)?
+    };
 
     let body: serde_json::Map<String, serde_json::Value> = groups
         .into_iter()
@@ -158,7 +154,71 @@ fn audit_bulk_body(root: &std::path::Path) -> anyhow::Result<serde_json::Value> 
             )
         })
         .collect();
+    // A dependency-free (root-only) lock legitimately yields an empty object.
     Ok(serde_json::Value::Object(body))
+}
+
+/// Parse an npm v3 `package-lock.json` into name -> distinct resolved versions.
+///
+/// Strict shape validation distinguishes a real empty inventory from input
+/// failure: `lockfileVersion` must be numeric and equal to 3, and `packages`
+/// must be present as an object. The root entry (keyed `""`) is skipped
+/// because it represents the project itself. Entries without a resolved
+/// `version` are skipped (preserving the prior behavior).
+fn bulk_groups_from_npm_lock(
+    root: &std::path::Path,
+) -> anyhow::Result<BTreeMap<String, std::collections::BTreeSet<String>>> {
+    let package_lock = root.join("package-lock.json");
+    let text = fs::read_to_string(&package_lock).map_err(|err| {
+        anyhow::anyhow!(
+            "audit needs a valid bpm.lock or npm package-lock.json; could not read {}: {err}",
+            package_lock.display()
+        )
+    })?;
+    let lock: serde_json::Value = serde_json::from_str(&text).map_err(|err| {
+        anyhow::anyhow!("could not parse {} as JSON: {err}", package_lock.display())
+    })?;
+
+    // Validate the supported npm lock shape before grouping anything.
+    let version = lock.get("lockfileVersion").ok_or_else(|| {
+        anyhow::anyhow!("{} is missing `lockfileVersion`", package_lock.display())
+    })?;
+    let version_num = version.as_u64().ok_or_else(|| {
+        anyhow::anyhow!(
+            "`lockfileVersion` in {} must be a number",
+            package_lock.display()
+        )
+    })?;
+    if version_num != 3 {
+        anyhow::bail!(
+            "audit supports npm package-lock.json v3, but {} reports lockfileVersion {version_num}",
+            package_lock.display()
+        );
+    }
+    let packages = lock
+        .get("packages")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} is missing a top-level `packages` object",
+                package_lock.display()
+            )
+        })?;
+
+    let mut groups: BTreeMap<String, std::collections::BTreeSet<String>> = BTreeMap::new();
+    for (path, entry) in packages {
+        // The root entry (key "") represents the project itself; it has no
+        // installable dependency name even if it declares a version.
+        if path.is_empty() {
+            continue;
+        }
+        if let Some(name) = package_name_from_lock_path(path) {
+            if let Some(version) = entry.get("version").and_then(|v| v.as_str()) {
+                groups.entry(name).or_default().insert(version.to_string());
+            }
+        }
+    }
+    Ok(groups)
 }
 
 /// Group every resolved package in a bpm lockfile by name, collecting the
@@ -214,7 +274,7 @@ fn severity_zeroes() -> BTreeMap<&'static str, u64> {
 /// object without a parseable `id` is counted once per occurrence (preserving
 /// the previous behavior for malformed entries so they are not silently
 /// hidden).
-fn severity_counts(value: &serde_json::Value) -> BTreeMap<Severity, u64> {
+fn severity_counts(value: &serde_json::Value) -> anyhow::Result<BTreeMap<Severity, u64>> {
     let mut counts = BTreeMap::from([
         (Severity::Info, 0),
         (Severity::Low, 0),
@@ -226,29 +286,37 @@ fn severity_counts(value: &serde_json::Value) -> BTreeMap<Severity, u64> {
     // `id` are counted per-occurrence (see doc comment) and are not added
     // here, so two id-less entries do not collapse into one.
     let mut seen_ids: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
-    if let Some(map) = value.as_object() {
-        for advisories in map.values() {
-            if let Some(arr) = advisories.as_array() {
-                for advisory in arr {
-                    let Some(severity) = advisory.get("severity").and_then(|v| v.as_str()) else {
-                        continue;
-                    };
-                    let Ok(severity) = Severity::parse(severity) else {
-                        continue;
-                    };
-                    // If the advisory carries a numeric id we have already
-                    // counted, skip the duplicate occurrence.
-                    if let Some(id) = advisory.get("id").and_then(|v| v.as_u64()) {
-                        if !seen_ids.insert(id) {
-                            continue;
-                        }
-                    }
-                    *counts.entry(severity).or_default() += 1;
+    let map = value.as_object().ok_or_else(|| {
+        anyhow::anyhow!(
+            "audit response must be a JSON object mapping package names to advisory arrays"
+        )
+    })?;
+    for (package, advisories) in map {
+        let arr = advisories.as_array().ok_or_else(|| {
+            anyhow::anyhow!("audit response package `{package}` must map to an array of advisories")
+        })?;
+        for advisory in arr {
+            let advisory_obj = advisory.as_object().ok_or_else(|| {
+                anyhow::anyhow!("audit advisory for `{package}` must be a JSON object")
+            })?;
+            let severity = advisory_obj
+                .get("severity")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("audit advisory for `{package}` is missing a string `severity`")
+                })?;
+            let severity = Severity::parse(severity)?;
+            // If the advisory carries a numeric id we have already
+            // counted, skip the duplicate occurrence.
+            if let Some(id) = advisory_obj.get("id").and_then(|v| v.as_u64()) {
+                if !seen_ids.insert(id) {
+                    continue;
                 }
             }
+            *counts.entry(severity).or_default() += 1;
         }
     }
-    counts
+    Ok(counts)
 }
 
 #[cfg(test)]
@@ -364,7 +432,7 @@ mod tests {
             ],
             "clean-pkg": []
         });
-        let counts = severity_counts(&value);
+        let counts = severity_counts(&value).expect("valid bulk response");
         let failing_at_moderate = counts
             .iter()
             .filter(|(severity, _)| **severity >= Severity::Moderate)
@@ -379,7 +447,7 @@ mod tests {
     #[test]
     fn empty_bulk_response_counts_zero() {
         let value = json!({});
-        let counts = severity_counts(&value);
+        let counts = severity_counts(&value).expect("empty object is valid");
         assert_eq!(counts.values().copied().sum::<u64>(), 0);
     }
 
@@ -391,7 +459,7 @@ mod tests {
             "left-pad": [{"id": 42, "severity": "high", "title": "x", "url": "https://e.test/x"}],
             "right-pad": [{"id": 42, "severity": "high", "title": "x", "url": "https://e.test/x"}]
         });
-        let counts = severity_counts(&value);
+        let counts = severity_counts(&value).expect("valid response");
         assert_eq!(counts[&Severity::High], 1);
         let total: u64 = counts.values().copied().sum();
         assert_eq!(total, 1, "shared advisory id counted once overall");
@@ -407,9 +475,144 @@ mod tests {
             ],
             "right-pad": [{"id": 2, "severity": "low", "title": "b", "url": "https://e.test/b"}]
         });
-        let counts = severity_counts(&value);
+        let counts = severity_counts(&value).expect("valid response");
         // id 2 appears under two packages but counts once.
         assert_eq!(counts[&Severity::Low], 1);
         assert_eq!(counts[&Severity::High], 1);
+    }
+
+    #[test]
+    fn severity_counts_rejects_non_object_top_level() {
+        let value = json!([{"id": 1, "severity": "high"}]);
+        assert!(severity_counts(&value).is_err());
+    }
+
+    #[test]
+    fn severity_counts_rejects_non_array_package_value() {
+        // A syntactically valid but wrong-shaped response: a package key mapped
+        // to an object instead of an array.
+        let value = json!({"left-pad": {"id": 1, "severity": "high"}});
+        assert!(severity_counts(&value).is_err());
+    }
+
+    #[test]
+    fn severity_counts_rejects_non_object_advisory() {
+        let value = json!({"left-pad": ["not-an-object"]});
+        assert!(severity_counts(&value).is_err());
+    }
+
+    #[test]
+    fn severity_counts_rejects_missing_and_unknown_severity() {
+        // Missing severity entirely.
+        assert!(severity_counts(&json!({"left-pad": [{"id": 1}]})).is_err());
+        // Unknown severity string.
+        assert!(severity_counts(&json!({"left-pad": [{"id": 1, "severity": "boom"}]})).is_err());
+    }
+
+    #[test]
+    fn severity_counts_allows_non_numeric_id_and_per_occurrence() {
+        // A non-numeric id is allowed and counted per occurrence (no dedup).
+        let value = json!({
+            "left-pad": [{"id": "not-a-number", "severity": "high"}],
+            "right-pad": [{"id": "also-not-a-number", "severity": "high"}]
+        });
+        let counts = severity_counts(&value).expect("non-numeric ids are allowed");
+        assert_eq!(counts[&Severity::High], 2);
+    }
+
+    fn write_npm_lock(root: &std::path::Path, json: &str) {
+        fs::write(root.join("package-lock.json"), json).unwrap();
+    }
+
+    #[test]
+    fn npm_lock_valid_v3_groups_versions() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("package.json"),
+            r#"{"name":"app","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        write_npm_lock(
+            root.path(),
+            r#"{"name":"app","version":"1.0.0","lockfileVersion":3,"packages":{"":{"name":"app","version":"1.0.0"},"node_modules/left-pad":{"version":"1.3.0"}}}"#,
+        );
+        let body = audit_bulk_body(root.path()).expect("valid v3 lock");
+        assert_eq!(body["left-pad"].as_array().unwrap(), &vec![json!("1.3.0")]);
+        assert_eq!(body.as_object().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn npm_lock_root_only_yields_empty_inventory() {
+        // A dependency-free, valid npm v3 lock is a legitimate empty inventory.
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("package.json"),
+            r#"{"name":"app","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        write_npm_lock(
+            root.path(),
+            r#"{"name":"app","version":"1.0.0","lockfileVersion":3,"packages":{"":{"name":"app","version":"1.0.0"}}}"#,
+        );
+        let body = audit_bulk_body(root.path()).expect("root-only lock is valid");
+        assert_eq!(body.as_object().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn npm_lock_missing_is_a_hard_error() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("package.json"),
+            r#"{"name":"app","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        let err = audit_bulk_body(root.path()).unwrap_err().to_string();
+        assert!(
+            err.contains("package-lock.json") && err.contains("bpm.lock"),
+            "error should name both lock sources, got: {err}"
+        );
+    }
+
+    #[test]
+    fn npm_lock_malformed_json_is_a_hard_error() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("package.json"),
+            r#"{"name":"app","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        write_npm_lock(root.path(), "{ this is not json");
+        assert!(audit_bulk_body(root.path()).is_err());
+    }
+
+    #[test]
+    fn npm_lock_unsupported_version_is_a_hard_error() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("package.json"),
+            r#"{"name":"app","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        write_npm_lock(
+            root.path(),
+            r#"{"lockfileVersion":2,"packages":{"":{"name":"app"}}}"#,
+        );
+        let err = audit_bulk_body(root.path()).unwrap_err().to_string();
+        assert!(
+            err.contains("v3"),
+            "error should mention v3 support, got: {err}"
+        );
+    }
+
+    #[test]
+    fn npm_lock_missing_packages_is_a_hard_error() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("package.json"),
+            r#"{"name":"app","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        write_npm_lock(root.path(), r#"{"lockfileVersion":3}"#);
+        assert!(audit_bulk_body(root.path()).is_err());
     }
 }

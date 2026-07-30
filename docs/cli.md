@@ -618,8 +618,19 @@ never a bare "installation failed".
 
 `bpm publish` creates an npm-compatible package attachment from the current
 project and uploads it using the configured registry credentials. `bpm audit`
-posts the project's dependency inventory to the registry advisory endpoint;
-use `--json` for the raw advisory response.
+posts the project's resolved dependency inventory to the registry advisory
+endpoint; use `--json` for the raw advisory response.
+
+The audited inventory comes from `bpm.lock`, or from npm
+`package-lock.json` (lockfile version 3) when no `bpm.lock` exists.
+Declaration-only `package.json` data is **not** audited because it lacks
+resolved versions. Audit fails closed: a missing, unreadable, malformed, or
+unsupported-version lockfile is a hard error (exit nonzero), and a malformed
+or wrong-shaped advisory response is also a hard error rather than a silent
+zero-vulnerability success. A dependency-free valid lock and a valid empty
+advisory object (`{}`) remain a successful zero-finding result. Use
+`--audit-level` to control the severity threshold at which nonzero findings
+fail the command.
 
 `bpm import` accepts npm `package-lock.json` plus the supported text forms of
 Yarn, pnpm, and Bun lockfiles and writes the canonical `bpm.lock`.
