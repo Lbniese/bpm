@@ -242,6 +242,11 @@ fn is_default_exclude(path: &str) -> bool {
         || lower == "yarn.lock"
         || lower == "pnpm-lock.yaml"
         || lower == "bun.lockb"
+        // npm configuration files hold registry tokens at any depth and must
+        // never be publishable. Match the exact basename so a name such as
+        // `.npmrc.example` is unaffected.
+        || lower == ".npmrc"
+        || lower.ends_with("/.npmrc")
         || lower.ends_with(".tmp")
         || lower.starts_with(".git/")
         || lower.starts_with("node_modules/")
@@ -398,6 +403,66 @@ mod tests {
         // empty pattern never matches
         assert!(!ignore_match("anything", ""));
         assert!(!ignore_match("anything", "/"));
+    }
+
+    #[test]
+    fn package_file_list_always_excludes_npmrc() {
+        // A project-level `.npmrc` can carry a registry token. It must never
+        // be publishable at any depth, even when the manifest `files` array
+        // explicitly names it and neither `.npmignore` nor `.gitignore`
+        // excludes it. The fixture text is an obvious non-secret placeholder.
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("package.json"),
+            r#"{"name":"p","version":"1.0.0","files":[".npmrc","config/.npmrc","index.js"]}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.path().join(".npmrc"),
+            "registry=https://example.invalid/\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.path().join("config")).unwrap();
+        fs::write(
+            root.path().join("config/.npmrc"),
+            "//example.invalid/:_authToken=placeholder-not-a-real-secret\n",
+        )
+        .unwrap();
+        fs::write(root.path().join("index.js"), "module.exports = {};\n").unwrap();
+
+        let manifest: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(root.path().join("package.json")).unwrap())
+                .unwrap();
+        let files = package_file_list(root.path(), &manifest).unwrap();
+
+        assert!(
+            !files.iter().any(|f| f == ".npmrc"),
+            "root .npmrc must never be published, got: {files:?}"
+        );
+        assert!(
+            !files.iter().any(|f| f == "config/.npmrc"),
+            "nested .npmrc must never be published, got: {files:?}"
+        );
+        assert!(
+            files.contains(&"index.js".to_string()),
+            "ordinary file must remain publishable, got: {files:?}"
+        );
+        assert!(
+            files.contains(&"package.json".to_string()),
+            "package.json must remain present via always-include, got: {files:?}"
+        );
+    }
+
+    #[test]
+    fn is_default_exclude_rejects_npmrc_without_touching_examples() {
+        assert!(is_default_exclude(".npmrc"));
+        assert!(is_default_exclude(".NPMRC"));
+        assert!(is_default_exclude("config/.npmrc"));
+        assert!(is_default_exclude("deep/nested/path/.npmrc"));
+        // A template is not a real configuration file and must stay publishable
+        // (its eventual inclusion still depends on the `files` allowlist).
+        assert!(!is_default_exclude(".npmrc.example"));
+        assert!(!is_default_exclude("config/.npmrc.example"));
     }
 
     #[test]
