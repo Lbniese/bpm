@@ -9,7 +9,7 @@ use sha2::{Digest, Sha512};
 pub(super) fn run(
     registry: Option<String>,
     access: Option<String>,
-    otp: Option<String>,
+    prompt_otp: bool,
     provenance: bool,
 ) -> anyhow::Result<()> {
     let root = bpm::project::find_project_root(&env::current_dir()?)?;
@@ -79,6 +79,9 @@ pub(super) fn run(
     }
     let url = format!("{}/{}", config.registry(), name.replace('/', "%2f"));
     let body_bytes = serde_json::to_vec(&body)?;
+    // The OTP is a secret: resolve it from `$BPM_OTP` or an optional hidden
+    // prompt before sending, never from argv.
+    let otp = crate::cli::credentials::optional_otp(prompt_otp)?;
     let headers = otp
         .as_deref()
         .map(|otp| vec![("npm-otp", otp)])
@@ -93,7 +96,7 @@ pub(super) fn run(
                 )
             } else if message.contains("status 401") && otp.is_none() {
                 anyhow::anyhow!(
-                    "publish failed: registry requires authentication or two-factor OTP; retry with --otp <code> if 2FA is enabled"
+                    "publish failed: registry requires authentication or two-factor OTP; set $BPM_OTP or rerun with --prompt-otp if 2FA is enabled"
                 )
             } else {
                 anyhow::anyhow!("publish failed: {message}")

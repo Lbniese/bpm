@@ -6,10 +6,10 @@
 //!
 //! - `bpm token` / `bpm token list` — list tokens (`key`, readonly, cidr,
 //!   created).
-//! - `bpm token create [--read-only] [--cidr CIDR] [--password PASS] [--otp]`
+//! - `bpm token create [--read-only] [--cidr CIDR] [--prompt-otp]`
 //!   — mint a new token. npm requires re-authentication with the account
-//!   password (pass `--password` or set `$BPM_PASSWORD`); pass `--otp` when the
-//!   account enforces 2FA.
+//!   password, read from `$BPM_PASSWORD` or a hidden terminal prompt; pass
+//!   `--prompt-otp` (or set `$BPM_OTP`) when the account enforces 2FA.
 //! - `bpm token revoke <id>` — revoke a token by the `key` shown by `list`.
 
 use std::env;
@@ -26,8 +26,7 @@ pub(crate) struct Options {
     pub registry: Option<String>,
     pub read_only: bool,
     pub cidr: Vec<String>,
-    pub password: Option<String>,
-    pub otp: Option<String>,
+    pub prompt_otp: bool,
     pub json: bool,
 }
 
@@ -62,6 +61,14 @@ pub(crate) fn run(opts: Options) -> Result<()> {
     let action = opts.action.as_deref().unwrap_or("list");
     match action {
         "list" | "ls" => {
+            // `list` takes no positionals. Rejecting `id` prevents a leftover
+            // value (e.g. an old `--otp <code>` reinterpreted positionally)
+            // from being silently accepted.
+            if opts.id.is_some() {
+                anyhow::bail!(
+                    "`token list` takes no positional arguments; use `token revoke <id>` to revoke"
+                );
+            }
             let tokens = client.list_tokens().map_err(map_err)?;
             if opts.json {
                 println!("{}", serde_json::to_string_pretty(&tokens)?);
@@ -71,23 +78,21 @@ pub(crate) fn run(opts: Options) -> Result<()> {
             Ok(())
         }
         "create" | "new" => {
-            let password = opts
-                .password
-                .clone()
-                .or_else(|| env::var_os("BPM_PASSWORD").map(|s| s.to_string_lossy().into_owned()));
-            let password = password.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "creating a token requires a password: pass --password or set $BPM_PASSWORD"
-                )
-            })?;
+            // `create` takes no positionals; the password and OTP are secrets
+            // resolved from the environment or a hidden prompt, never argv.
+            if opts.id.is_some() {
+                anyhow::bail!("`token create` takes no positional arguments");
+            }
+            // Resolve the password and OTP immediately before the mutation so
+            // a missing required secret fails before the network.
+            let password = crate::cli::credentials::required_password()?;
+            let otp = crate::cli::credentials::optional_otp(opts.prompt_otp)?;
             let req = CreateTokenRequest {
                 password,
                 readonly: opts.read_only,
                 cidrs: opts.cidr.clone(),
             };
-            let token = client
-                .create_token(&req, opts.otp.as_deref())
-                .map_err(map_err)?;
+            let token = client.create_token(&req, otp.as_deref()).map_err(map_err)?;
             if opts.json {
                 println!("{}", serde_json::to_string_pretty(&token)?);
             } else {
@@ -101,9 +106,9 @@ pub(crate) fn run(opts: Options) -> Result<()> {
                     "revoke requires a token id: `bpm token revoke <id>` (see `bpm token list`)"
                 )
             })?;
-            client
-                .revoke_token(&id, opts.otp.as_deref())
-                .map_err(map_err)?;
+            // OTP is optional for revoke; resolved only when requested.
+            let otp = crate::cli::credentials::optional_otp(opts.prompt_otp)?;
+            client.revoke_token(&id, otp.as_deref()).map_err(map_err)?;
             println!("revoked token {id}");
             Ok(())
         }

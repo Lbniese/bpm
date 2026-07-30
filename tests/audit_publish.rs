@@ -55,12 +55,11 @@ fn publish_sends_otp_header_and_filtered_packument() {
 
     let output = Command::new(bpm_bin())
         .current_dir(project.path())
+        .env("BPM_OTP", "123456")
         .args([
             "publish",
             "--registry",
             &server.url(""),
-            "--otp",
-            "123456",
             "--access",
             "public",
         ])
@@ -317,5 +316,98 @@ fn audit_empty_lock_with_empty_response_succeeds() {
     assert!(
         stdout.contains("0 vulnerability finding(s)"),
         "valid empty response should report zero findings, got: {stdout}"
+    );
+}
+
+/// Write an `.npmrc` authenticating the given server authority so `bpm token`
+/// passes its bearer-token gate and reaches the secret-resolution step.
+fn write_auth_npmrc(project: &std::path::Path, authority: &str) {
+    fs::write(
+        project.join(".npmrc"),
+        format!("registry=http://{authority}/\n//{authority}/:_authToken=bearer-not-a-secret\n"),
+    )
+    .unwrap();
+}
+
+#[test]
+fn token_create_fails_without_password_before_network() {
+    // A noninteractive `token create` invocation has no terminal and no
+    // $BPM_PASSWORD; it must fail before the token-creation mutation request
+    // is sent. The child process inherits a non-terminal stdin by default.
+    let project = tempfile::tempdir().unwrap();
+    fs::write(
+        project.path().join("package.json"),
+        r#"{"name":"app","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    let server = MiniServer::start_routed(|_| Some(RouteBody(b"{}".to_vec(), "application/json")));
+    let url = server.url("");
+    let authority = url
+        .strip_prefix("http://")
+        .unwrap_or_else(|| panic!("expected http:// url, got {url}"));
+    write_auth_npmrc(project.path(), authority);
+
+    let output = Command::new(bpm_bin())
+        .current_dir(project.path())
+        .args(["token", "create", "--registry", &server.url("")])
+        .output()
+        .expect("run bpm token create");
+    assert!(
+        !output.status.success(),
+        "noninteractive token create without password must fail\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        server.requests().len(),
+        0,
+        "token create must not contact the registry before resolving the password"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("BPM_PASSWORD"),
+        "error should point to $BPM_PASSWORD, got: {stderr}"
+    );
+}
+
+#[test]
+fn token_rejects_positional_on_create() {
+    // An old `token create --otp <value>` must not silently treat `<value>` as
+    // the `id` positional after Clap rejects `--otp`. Verify a stray positional
+    // is rejected at the action-validation layer, not silently accepted.
+    let project = tempfile::tempdir().unwrap();
+    fs::write(
+        project.path().join("package.json"),
+        r#"{"name":"app","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    let server = MiniServer::start_routed(|_| Some(RouteBody(b"{}".to_vec(), "application/json")));
+    let url = server.url("");
+    let authority = url
+        .strip_prefix("http://")
+        .unwrap_or_else(|| panic!("expected http:// url, got {url}"));
+    write_auth_npmrc(project.path(), authority);
+
+    let output = Command::new(bpm_bin())
+        .current_dir(project.path())
+        .args([
+            "token",
+            "create",
+            "stray-value",
+            "--registry",
+            &server.url(""),
+        ])
+        .output()
+        .expect("run bpm token create");
+    assert!(
+        !output.status.success(),
+        "stray positional on token create must be rejected\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        server.requests().len(),
+        0,
+        "rejected token create must not contact the registry"
     );
 }

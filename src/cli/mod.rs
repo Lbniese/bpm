@@ -4,6 +4,7 @@ mod args;
 mod audit;
 mod bench;
 mod cache;
+mod credentials;
 mod dist_tag;
 mod doctor;
 mod exec;
@@ -124,9 +125,9 @@ pub(crate) fn run() -> ExitCode {
         Commands::Publish {
             registry,
             access,
-            otp,
+            prompt_otp,
             provenance,
-        } => publish::run(registry, access, otp, provenance),
+        } => publish::run(registry, access, prompt_otp, provenance),
         Commands::Audit {
             registry,
             json,
@@ -255,8 +256,7 @@ pub(crate) fn run() -> ExitCode {
             registry,
             read_only,
             cidr,
-            password,
-            otp,
+            prompt_otp,
             json,
         } => token::run(token::Options {
             action,
@@ -264,8 +264,7 @@ pub(crate) fn run() -> ExitCode {
             registry,
             read_only,
             cidr,
-            password,
-            otp,
+            prompt_otp,
             json,
         }),
         Commands::DistTag {
