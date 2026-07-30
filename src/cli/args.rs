@@ -168,9 +168,11 @@ pub(crate) enum Commands {
         registry: Option<String>,
         #[arg(long)]
         access: Option<String>,
-        /// One-time password for registries requiring npm two-factor auth.
-        #[arg(long)]
-        otp: Option<String>,
+        /// Prompt interactively for a two-factor OTP (hidden input). The OTP is
+        /// otherwise read from `$BPM_OTP`; it is never accepted as an argv
+        /// value because argv and shell history are not secret channels.
+        #[arg(long = "prompt-otp")]
+        prompt_otp: bool,
         /// Attach a minimal provenance statement to the publish document.
         #[arg(long)]
         provenance: bool,
@@ -538,12 +540,13 @@ pub(crate) enum Commands {
         /// CIDR whitelist entry for the new token (for `create`; repeatable).
         #[arg(long = "cidr")]
         cidr: Vec<String>,
-        /// Account password (for `create`); also read from `$BPM_PASSWORD`.
-        #[arg(long)]
-        password: Option<String>,
-        /// Two-factor OTP code, if the account requires it.
-        #[arg(long)]
-        otp: Option<String>,
+        /// Prompt interactively for a two-factor OTP (hidden input). The OTP is
+        /// otherwise read from `$BPM_OTP`; it is never accepted as an argv
+        /// value because argv and shell history are not secret channels. The
+        /// account password for `create` is read from `$BPM_PASSWORD` or a
+        /// hidden terminal prompt automatically.
+        #[arg(long = "prompt-otp")]
+        prompt_otp: bool,
         /// Emit machine-readable JSON.
         #[arg(long)]
         json: bool,
@@ -965,15 +968,14 @@ mod tests {
             "--read-only",
             "--cidr",
             "10.0.0.0/8",
-            "--password",
-            "pw",
+            "--prompt-otp",
         ])
         .unwrap();
         let Commands::Token {
             action,
             read_only,
             cidr,
-            password,
+            prompt_otp,
             id,
             ..
         } = cli.command
@@ -983,7 +985,7 @@ mod tests {
         assert_eq!(action.as_deref(), Some("create"));
         assert!(read_only);
         assert_eq!(cidr, vec!["10.0.0.0/8".to_string()]);
-        assert_eq!(password.as_deref(), Some("pw"));
+        assert!(prompt_otp, "--prompt-otp parses as a boolean");
         assert!(id.is_none());
 
         let cli = Cli::try_parse_from(["bpm", "token", "revoke", "abc"]).unwrap();
@@ -992,6 +994,34 @@ mod tests {
         };
         assert_eq!(action.as_deref(), Some("revoke"));
         assert_eq!(id.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn token_rejects_value_bearing_secret_flags() {
+        // Passwords and OTPs must never be supplied through argv. Both old
+        // value-bearing flags are now unknown and Clap must reject them.
+        let err = Cli::try_parse_from(["bpm", "token", "create", "--password", "pw"]);
+        assert!(err.is_err(), "--password must be rejected, got: {err:?}");
+        let err = Cli::try_parse_from(["bpm", "token", "create", "--otp", "123456"]);
+        assert!(err.is_err(), "--otp must be rejected, got: {err:?}");
+        let err = Cli::try_parse_from(["bpm", "publish", "--otp", "123456"]);
+        assert!(err.is_err(), "publish --otp must be rejected, got: {err:?}");
+    }
+
+    #[test]
+    fn publish_prompt_otp_parses_as_boolean() {
+        let cli = Cli::try_parse_from(["bpm", "publish", "--prompt-otp"])
+            .expect("--prompt-otp parses for publish");
+        let Commands::Publish { prompt_otp, .. } = cli.command else {
+            panic!("expected publish command");
+        };
+        assert!(prompt_otp);
+
+        let cli = Cli::try_parse_from(["bpm", "publish"]).unwrap();
+        let Commands::Publish { prompt_otp, .. } = cli.command else {
+            panic!("expected publish command");
+        };
+        assert!(!prompt_otp, "--prompt-otp defaults to false");
     }
 
     #[test]

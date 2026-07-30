@@ -33,6 +33,13 @@ futures-util = "0.3"
 httpdate = "1.0.3"
 tempfile = "3.12"
 
+# Hidden terminal input for interactive password/OTP entry. Secrets are
+# resolved from `$BPM_PASSWORD`/`$BPM_OTP` for automation or a hidden prompt for
+# interactive use; they are never accepted as argv values. Cross-platform
+# (unix/windows/macos) and pure-Rust, no system deps beyond the libc already
+# pulled in for reflinks.
+rpassword = "7"
+
 # Graph-plan cache (Milestone 3): deterministic graph + plan hashing
 blake3 = "1.5"
 

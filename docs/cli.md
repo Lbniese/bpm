@@ -376,8 +376,8 @@ authenticated session (a bearer token in `.npmrc`).
 
 ```bash
 bpm token                       # list tokens (alias: list)
-bpm token create --password p1  # mint a token (re-auth required)
-bpm token create --read-only --cidr 10.0.0.0/8 --password p1
+bpm token create                # mint a token (prompts for the password)
+BPM_PASSWORD=... bpm token create --read-only --cidr 10.0.0.0/8
 bpm token revoke abc123         # revoke by the `key` shown by `token list`
 ```
 
@@ -389,9 +389,11 @@ and creation time. Add `--json` for machine-readable output.
 ### `bpm token create`
 
 Mints a new token. npm requires re-authentication with the account password to
-mint a token: pass `--password` (or set `$BPM_PASSWORD`). Pass `--otp <code>`
-when the account enforces two-factor authentication. Prints the new token (the
-full secret is shown once); add `--json` for machine-readable output.
+mint a token. Set the password from the environment for automation or enter it
+at a hidden prompt in an interactive terminal. The two-factor OTP, if the
+account requires it, comes from `$BPM_OTP` or a hidden prompt via
+`--prompt-otp`. Prints the new token (the full secret is shown once); add
+`--json` for machine-readable output.
 
 ### `bpm token revoke <id>`
 
@@ -404,9 +406,16 @@ Revokes the token whose `key` (shown by `bpm token list`) equals `<id>`.
 | `--registry <url>` | Registry base URL. Defaults to the config's registry, then `https://registry.npmjs.org`. |
 | `--read-only` | (`create`) Mint a read-only token that cannot publish. |
 | `--cidr <CIDR>` | (`create`) CIDR whitelist entry; repeatable. |
-| `--password <pw>` | (`create`) Account password; also read from `$BPM_PASSWORD`. |
-| `--otp <code>` | (`create`/`revoke`) Two-factor OTP code. |
+| `--prompt-otp` | (`create`/`revoke`) Prompt for a two-factor OTP with hidden input. The OTP is otherwise read from `$BPM_OTP`. |
 | `--json` | (`list`/`create`) Emit machine-readable JSON. |
+
+Passwords and OTPs are never accepted on the command line: argv is visible to
+process listings and persists in shell history. The `create` password is read
+from nonempty `$BPM_PASSWORD`, or from a hidden `Password: ` prompt when stdin
+is a terminal; a noninteractive `create` without `$BPM_PASSWORD` fails before
+the network. The OTP comes from nonempty `$BPM_OTP`, or from a hidden prompt
+only when `--prompt-otp` is set. Empty values are rejected; OTPs with
+surrounding whitespace are rejected rather than silently trimmed.
 
 ## `bpm dist-tag <action> [args] [flags]`
 
@@ -617,9 +626,11 @@ never a bare "installation failed".
 ## Publish and audit
 
 `bpm publish` creates an npm-compatible package attachment from the current
-project and uploads it using the configured registry credentials. `bpm audit`
-posts the project's resolved dependency inventory to the registry advisory
-endpoint; use `--json` for the raw advisory response.
+project and uploads it using the configured registry credentials. If the
+account requires two-factor authentication, set the OTP from `$BPM_OTP` or pass
+`--prompt-otp` to enter it at a hidden prompt; it is never accepted as an argv
+value. `bpm audit` posts the project's resolved dependency inventory to the
+registry advisory endpoint; use `--json` for the raw advisory response.
 
 The audited inventory comes from `bpm.lock`, or from npm
 `package-lock.json` (lockfile version 3) when no `bpm.lock` exists.
