@@ -69,7 +69,7 @@ cold-vs-warm performance story with cited benchmark numbers, see
    (`probe_fs_capabilities`) confirms reflink at runtime; on unsupported
    filesystems (ext4, HFS+, cross-device) the backend transparently degrades
    to hardlink then copy. Windows uses a correctness-first local hardlink/copy
-   view; junctions and ReFS reflink performance remain deferred.
+   view; junctions and ReFS reflink are not implemented for this backend.
 8. **Materializer** — `src/materializer.rs` supports compatible npm-v3 layout
    and strict declared-edge validation. It has symlink, hardlink, copy, and
    copy-on-write reflink (`clonefile`/`FICLONE`) backends; package files are

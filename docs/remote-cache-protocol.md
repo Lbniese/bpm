@@ -125,8 +125,8 @@ invariants and are deferred.
 
 ## Reserved for future versions
 
-A conditional PUT with `If-None-Match: *` may be specified in a follow-up
-plan for idempotent upload. This protocol version does not implement upload.
+A conditional PUT with `If-None-Match: *` is a possible future extension
+for idempotent upload. This protocol version does not implement upload.
 The upload path would be:
 
 ```

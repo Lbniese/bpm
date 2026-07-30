@@ -119,7 +119,7 @@ lifecycle scripts enabled while avoiding pnpm's strict unreviewed-build exit.
 
 ## Known gap: cold resolution
 
-The cold path remains the primary outstanding performance bottleneck. The
+The cold path is the primary performance target. The
 `resolved_cold` scenario isolates the artifact pipeline; `true_cold` adds
 fresh dependency resolution. The resolver now uses the async path by default,
 with bounded concurrent exact-version packument prefetches and in-flight
