@@ -125,17 +125,17 @@ invariants and are deferred.
 
 ## Reserved for future versions
 
-A conditional PUT with `If-None-Match: *` is a possible future extension
-for idempotent upload. This protocol version does not implement upload.
-The upload path would be:
+Upload is implemented in v1, but the client does not yet send a conditional
+header. It currently treats `409 Conflict` as idempotent success when the
+server reports that the digest already exists.
+
+A future protocol refinement may make creation explicitly conditional:
 
 ```
 PUT <base>/v1/artifacts/sha512/<128-lowercase-hex>
 Content-Type: application/octet-stream
 If-None-Match: *
 ```
-
-A `409 Conflict` response would indicate the digest already exists.
 
 ## Compatibility and versioning
 
@@ -154,5 +154,5 @@ A `409 Conflict` response would indicate the digest already exists.
 | Token leakage via redirect | Redirects are refused; auth header never reaches another origin. |
 | Cache outage | Explicit fallback to origin; recorded metric for observability. |
 | Partial response | Client detects truncated stream; temp file is deleted and origin fallback used. |
-| Oversized response | Bounded by available disk; store temp directory enforces per-digest temp creation. |
+| Oversized response or extraction | Compressed artifact responses have a 512 MiB body cap (`MAX_ARTIFACT_BYTES`). Extraction separately permits at most 2 GiB total regular-file bytes, 512 MiB per regular file, and 100,000 archive entries. |
 | Concurrent local writers | Per-digest advisory lock serialises the ensure/publish step. |

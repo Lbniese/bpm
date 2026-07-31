@@ -6,9 +6,8 @@ title: Architecture
 # Architecture
 
 BPM is a Rust package manager organized around an immutable artifact store,
-deterministic dependency graphs, and reusable project views. The detailed
-product direction remains in [`IMPLEMENTATION.md`](../IMPLEMENTATION.md); this
-page records the architecture that is currently shipped. For the measured
+deterministic dependency graphs, and reusable project views. This page
+records the architecture that is currently shipped. For the measured
 cold-vs-warm performance story with cited benchmark numbers, see
 [Performance](performance.md).
 
@@ -87,8 +86,9 @@ cold-vs-warm performance story with cited benchmark numbers, see
    persists and dependencies resolve through the complete volume tree.
    `src/derived/store.rs` contains the content-addressed derived-artifact
    implementation described by the long-term plan, but the current graph
-   lifecycle path is volume-derived rather than publishing through that store;
-   reconciling those two strategies is an open hardening decision.
+   lifecycle path is volume-derived rather than publishing through that store.
+   Integrating the two strategies is explicitly deferred for the current
+   cold-path milestone.
 11. **CLI and measurement** — `src/cli/` exposes install, ci, import, exec,
    run, fetch, doctor, gc, audit, publish, bench, and uninstall. `bpm install`
    without `-g` and with targets performs local dependency mutation (add):
@@ -152,9 +152,11 @@ enumeration, task completion order, or network timing.
 
 ## Remaining architectural decisions
 
-- Integrate graph lifecycle execution with `src/derived/store.rs` for
-  cross-graph derived-artifact reuse, or formally commit to graph-keyed volume
-  derivation and retire the unused path.
+- Derived-artifact reuse via `src/derived/store.rs` is **explicitly deferred**
+  for the current cold-path milestone. The
+  active graph-volume lifecycle strategy must settle before wiring cross-graph
+  derived-artifact reuse; it offers no cold-install benefit, so the path stays
+  unused rather than being rushed in as a hardening item.
 - Auto-select the CoW reflink project view (`MaterializeBackend::Reflink` via
   `probe_fs_capabilities`/`preferred_backend`) for the local view on
   supporting filesystems, instead of requiring an explicit
@@ -165,12 +167,12 @@ enumeration, task completion order, or network timing.
 - Windows junction/reflink attachment performance (currently correctness-first
   local hardlink/copy; `attach_project_local_with_backend` accepts a backend
   for API symmetry but ignores it on Windows).
-- Combine the async resolver with the streaming install path for maximum cold
-  overlap.
 - ~~Default-flip the async resolver to `BPM_ASYNC_RESOLVE=1`~~ **DONE** (Plan 005,
-  Phase 5).  Async resolution is now the default; `BPM_ASYNC_RESOLVE=0` remains
-  as a kill-switch.  The blocking and async placement cores were unified into
+  Phase 5). Async resolution is now the default, combines with the streaming
+  install path, and retains `BPM_ASYNC_RESOLVE=0` as a blocking kill-switch.
+  The blocking and async placement cores were unified into
   `src/resolver/placement.rs` with an I/O-agnostic `PackumentSource` trait
-  (`src/resolver/fetch.rs`).  Cold-perf improvement vs the old baseline is
+  (`src/resolver/fetch.rs`). Cold-perf improvement vs the old baseline is
   recorded in  M7.
-- Upload support and conditional-PUT idempotent writes for the remote cache.
+- Potential conditional `PUT` idempotence with `If-None-Match` remains a remote
+  cache protocol refinement; best-effort upload itself is shipped.

@@ -21,21 +21,20 @@ in the repository.
 
 ## Current status
 
-BPM is in early implementation. What exists today and works end to end:
+BPM is in active development. Representative end-to-end capabilities include:
 
-- **`bpm doctor`** — locates a project's `package.json` and reports
-  structured, deterministic diagnostics.
-- **`bpm fetch <spec|url>`** — resolves an npm-style package spec (`lodash`,
-  `lodash@4.17.21`, `@scope/pkg@^1`) against the registry, or fetches a
-  tarball by exact URL / `file://` path; verifies its SHA-512 integrity,
-  stores it immutably, and safely extracts it exactly once. Repeated fetches
-  of the same artifact do no network or extraction work.
-- **`bpm import [package-lock.json]`** — imports an npm
-  `package-lock.json` (`lockfileVersion` 3) into a canonical, deterministic
-  `bpm.lock`.
+- **Installation and deterministic locks** — `bpm install` and `bpm ci`
+  resolve or consume canonical lockfiles, support workspaces and lifecycle
+  scripts, and reuse immutable artifacts, package images, and graph volumes.
+- **Dependency mutation** — install/add, remove/uninstall, upgrade, and dedupe
+  update supported registry dependencies while preserving lock authority.
+- **Execution and storage operations** — run/exec commands, verified fetches,
+  local and remote cache reuse, cache inspection, and garbage collection.
+- **Registry operations** — view/outdated queries plus publish, audit, whoami,
+  token, dist-tag, and owner administration.
 
-See  for what's done and what's next, and the
-[CLI reference](cli.md) for exact usage.
+This is intentionally narrower than full npm feature parity. See the
+[CLI reference](cli.md) for commands, supported cases, and exact usage.
 
 ## Design principles
 
@@ -61,8 +60,8 @@ See [Architecture](architecture.md) for the subsystem breakdown.
 ```bash
 git clone https://github.com/lbniese/bpm.git
 cd bpm
-make docker-up
-make docker-shell
+docker compose up -d --build
+docker compose exec dev bash
 cargo build --release
 ```
 
