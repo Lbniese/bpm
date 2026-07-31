@@ -34,6 +34,13 @@ use retry::{
 
 const USER_AGENT: &str = concat!("bpm/", env!("CARGO_PKG_VERSION"));
 
+/// Maximum decoded bytes buffered from a control-plane response (registry
+/// metadata, audit results, mutation responses). 64 MiB comfortably exceeds
+/// the largest known npm packument while bounding memory if an endpoint serves
+/// a malicious or broken oversized body. Artifact streams use a separate
+/// larger streaming limit and are not routed through this cap.
+pub(crate) const MAX_CONTROL_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
 /// A pooled, configured HTTP client suitable for cloning between consumers.
 ///
 /// Cloned clients share the same underlying [`reqwest::blocking::Client`] and
@@ -141,18 +148,15 @@ impl HttpClient {
         url: &str,
         headers: &[(&str, &str)],
     ) -> Result<HttpResponse, HttpError> {
-        let (response, _in_flight) = self.execute_get(url, headers)?;
+        let (mut response, _in_flight) = self.execute_get(url, headers)?;
         let status = response.status().as_u16();
         let collected = collect_headers(response.headers());
-        let body = response.bytes().map_err(|error| HttpError::Transport {
-            url: redact_url(url),
-            kind: format!("response read failed: {error}"),
-            attempts: 1,
-        })?;
+        check_content_length(&response, url, MAX_CONTROL_RESPONSE_BYTES)?;
+        let body = read_bounded(&mut response, url, 1, MAX_CONTROL_RESPONSE_BYTES)?;
         Ok(HttpResponse {
             status,
             headers: collected,
-            body: body.to_vec(),
+            body,
         })
     }
 
@@ -335,15 +339,14 @@ impl HttpClient {
                 Ok(mut response) => {
                     let status = response.status().as_u16();
                     if status < 400 {
-                        let mut out = Vec::new();
-                        response
-                            .read_to_end(&mut out)
-                            .map_err(|_| HttpError::Transport {
-                                url: display_url.clone(),
-                                kind: "response read failed".into(),
-                                attempts: attempt + 1,
-                            })?;
-                        return Ok(out);
+                        check_content_length(&response, url, MAX_CONTROL_RESPONSE_BYTES)?;
+                        let body = read_bounded(
+                            &mut response,
+                            url,
+                            attempt + 1,
+                            MAX_CONTROL_RESPONSE_BYTES,
+                        )?;
+                        return Ok(body);
                     }
                     let completed = attempt + 1;
                     if is_retryable_status(status) && completed < attempts {
@@ -425,6 +428,10 @@ pub enum HttpError {
         kind: String,
         attempts: usize,
     },
+    /// A control-plane response body exceeded the configured decoded-byte
+    /// limit. Carries only the redacted URL and the numeric limit — never
+    /// response content, auth headers, query strings, or credentials.
+    BodyTooLarge { url: String, limit: usize },
 }
 
 impl fmt::Display for HttpError {
@@ -445,6 +452,10 @@ impl fmt::Display for HttpError {
             } => write!(
                 formatter,
                 "HTTP GET {url} failed with transport error {kind} after {attempts} attempt(s)"
+            ),
+            Self::BodyTooLarge { url, limit } => write!(
+                formatter,
+                "HTTP GET {url} response body exceeds the {limit} byte limit"
             ),
         }
     }
@@ -518,6 +529,56 @@ fn retry_after_from(response: &Response) -> Option<Duration> {
         .get(RETRY_AFTER)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| parse_retry_after_at(value, SystemTime::now()))
+}
+
+/// Return [`HttpError::BodyTooLarge`] if the response declares a
+/// Content-Length above the limit. The streamed count in [`read_bounded`]
+/// remains authoritative; this is only an early rejection so a clearly
+/// oversized body is never buffered.
+fn check_content_length(response: &Response, url: &str, limit: usize) -> Result<(), HttpError> {
+    if let Some(len) = response.content_length() {
+        let limit_u64 = u64::try_from(limit).unwrap_or(u64::MAX);
+        if len > limit_u64 {
+            return Err(HttpError::BodyTooLarge {
+                url: redact_url(url),
+                limit,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Read at most `limit + 1` decoded bytes from `reader`. Returns the buffered
+/// bytes when the body completes within `limit`; returns [`HttpError::BodyTooLarge`]
+/// when it exceeds the limit. Reading one byte beyond the limit distinguishes
+/// an exact-boundary body from an oversized one without allowing unbounded
+/// work. A declared `Content-Length` is checked by the caller for an early
+/// rejection, but this streamed count remains authoritative because the header
+/// can be absent or false. Uses checked arithmetic throughout.
+fn read_bounded(
+    reader: &mut dyn Read,
+    url: &str,
+    attempts: usize,
+    limit: usize,
+) -> Result<Vec<u8>, HttpError> {
+    let limit_u64 = u64::try_from(limit).unwrap_or(u64::MAX);
+    // Cap the reader at limit + 1 so it stops as soon as the body is provably
+    // oversized, never buffering more than limit + 1 bytes.
+    let cap = limit_u64.saturating_add(1);
+    let mut bounded = reader.take(cap);
+    let mut out = Vec::new();
+    let consumed = io::copy(&mut bounded, &mut out).map_err(|error| HttpError::Transport {
+        url: redact_url(url),
+        kind: format!("response read failed: {error}"),
+        attempts,
+    })?;
+    if consumed > limit_u64 {
+        return Err(HttpError::BodyTooLarge {
+            url: redact_url(url),
+            limit,
+        });
+    }
+    Ok(out)
 }
 
 /// Drain a retryable-status response so its connection may return to the pool.
@@ -682,5 +743,68 @@ mod tests {
         assert_eq!(response.header("content-type"), Some("application/json"));
         assert_eq!(response.header("last-modified"), None);
         assert_eq!(response.into_string().unwrap(), "{}");
+    }
+
+    #[test]
+    fn read_bounded_accepts_zero_below_exact_and_rejects_over() {
+        // Empty body.
+        let mut empty = Cursor::new(Vec::new());
+        assert_eq!(
+            read_bounded(&mut empty, "https://r.test/p", 1, 10).unwrap(),
+            b""
+        );
+        // Below the limit.
+        let mut small = Cursor::new(vec![b'a'; 5]);
+        assert_eq!(
+            read_bounded(&mut small, "https://r.test/p", 1, 10).unwrap(),
+            vec![b'a'; 5]
+        );
+        // Exactly at the limit is allowed.
+        let mut exact = Cursor::new(vec![b'a'; 10]);
+        assert_eq!(
+            read_bounded(&mut exact, "https://r.test/p", 1, 10).unwrap(),
+            vec![b'a'; 10]
+        );
+    }
+
+    #[test]
+    fn read_bounded_rejects_one_byte_over_limit() {
+        let mut over = Cursor::new(vec![b'a'; 11]);
+        let err = read_bounded(&mut over, "https://r.test/p", 1, 10).unwrap_err();
+        match err {
+            HttpError::BodyTooLarge { url, limit } => {
+                assert_eq!(url, "https://r.test/p");
+                assert_eq!(limit, 10);
+            }
+            other => panic!("expected BodyTooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_bounded_redacts_url_in_error_display() {
+        let mut over = Cursor::new(vec![0u8; 5]);
+        let err =
+            read_bounded(&mut over, "https://user:secret@r.test/p?token=x", 1, 2).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("exceeds the 2 byte limit"), "{text}");
+        // Credentials, query, and fragment must not appear.
+        assert!(!text.contains("secret"), "userinfo leaked: {text}");
+        assert!(!text.contains("token"), "query leaked: {text}");
+        assert!(
+            text.contains("https://r.test/p"),
+            "redacted url missing: {text}"
+        );
+    }
+
+    #[test]
+    fn body_too_large_display_includes_limit_and_redacted_url() {
+        let err = HttpError::BodyTooLarge {
+            url: redact_url("https://r.test/pkg"),
+            limit: 64 * 1024 * 1024,
+        };
+        let text = err.to_string();
+        assert!(text.contains("response body exceeds"), "{text}");
+        assert!(text.contains("67108864"), "limit value present: {text}");
+        assert!(text.contains("https://r.test/pkg"), "{text}");
     }
 }
