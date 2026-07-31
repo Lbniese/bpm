@@ -59,6 +59,11 @@ pub struct NpmConfig {
     pub network: NetworkConfig,
 }
 
+fn path_is_within_auth_scope(target_path: &str, scope_prefix: &str) -> bool {
+    target_path.starts_with(scope_prefix)
+        || (scope_prefix != "/" && target_path == scope_prefix.trim_end_matches('/'))
+}
+
 impl Default for NpmConfig {
     fn default() -> Self {
         Self {
@@ -150,14 +155,17 @@ impl NpmConfig {
 
     /// Find the most-specific host-scoped token for a request URL.
     ///
-    /// This is crate-visible so the HTTP layer can construct an Authorization
-    /// header while callers cannot accidentally print or serialize tokens.
+    /// A slash-terminated auth scope covers the directory path with or without
+    /// its terminal slash, plus every descendant. This is crate-visible so the
+    /// HTTP layer can construct an Authorization header while callers cannot
+    /// accidentally print or serialize tokens.
     pub(crate) fn auth_token_for_url(&self, url: &str) -> Option<&str> {
         let target = parse_request_target(url)?;
         self.auth_tokens
             .iter()
             .filter(|(scope, _)| {
-                scope.authority == target.authority && target.path.starts_with(&scope.path_prefix)
+                scope.authority == target.authority
+                    && path_is_within_auth_scope(&target.path, &scope.path_prefix)
             })
             .max_by_key(|(scope, _)| scope.path_prefix.len())
             .map(|(_, token)| token.as_str())
@@ -515,6 +523,47 @@ mod tests {
         );
         assert_eq!(
             config.auth_token_for_url("https://other.example/private/pkg"),
+            None
+        );
+    }
+
+    #[test]
+    fn path_registry_auth_matches_only_directory_boundaries() {
+        let mut config = NpmConfig::default();
+        apply(
+            &mut config,
+            "auth.npmrc",
+            "//registry.example/:_authToken=root\n//registry.example/npm/:_authToken=path\n//registry.example/npm/private/:_authToken=nested\n//registry.example:8443/npm/:_authToken=port\n",
+        )
+        .unwrap();
+
+        assert!(config.has_auth_for_url("https://REGISTRY.EXAMPLE/npm"));
+        assert!(config.has_auth_for_url("https://registry.example/npm/-/whoami"));
+        assert!(config.has_auth_for_url("https://registry.example/npm/package"));
+        assert_eq!(
+            config.auth_token_for_url("https://registry.example/npm/private/pkg"),
+            Some("nested")
+        );
+        assert_eq!(
+            config.auth_token_for_url("https://registry.example/npm/pkg"),
+            Some("path")
+        );
+        assert_eq!(
+            config.auth_token_for_url("https://registry.example/npm-other"),
+            Some("root")
+        );
+        assert_eq!(
+            config.auth_token_for_url("https://registry.example/npm-other/package"),
+            Some("root")
+        );
+        assert!(config.has_auth_for_url("https://registry.example"));
+        assert!(config.has_auth_for_url("https://registry.example/anything"));
+        assert_eq!(
+            config.auth_token_for_url("https://registry.example:8443/npm"),
+            Some("port")
+        );
+        assert_eq!(
+            config.auth_token_for_url("https://registry.example:8444/npm"),
             None
         );
     }
