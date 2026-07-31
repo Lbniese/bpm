@@ -5,7 +5,7 @@
 //! version. Registry failures for individual packages are warnings, not fatal
 //! errors — the command returns partial results.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::path::PathBuf;
 
@@ -17,6 +17,19 @@ use bpm::project_lock::find_project_lock;
 use bpm::registry::RegistryClient;
 use semver::Version;
 use serde::Serialize;
+
+const MAX_OUTDATED_WORKERS: usize = 16;
+
+fn outdated_worker_count(jobs: usize) -> usize {
+    if jobs == 0 {
+        return 0;
+    }
+    std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(8)
+        .min(MAX_OUTDATED_WORKERS)
+        .min(jobs)
+}
 
 pub(super) fn run(
     target: Option<String>,
@@ -79,15 +92,10 @@ pub(super) fn run(
         lockfile.packages.iter().collect()
     };
 
-    // 4. For each package, query the registry concurrently and compare versions.
-    //
-    // The per-package queries are independent, so they are fanned out across
-    // OS threads via `std::thread::scope` (no new dependency). The blocking
-    // `RegistryClient` is `Send + Sync` (all fields are `Arc`-wrapped and it
-    // is already shared across the resolver's prefetch pool), so `&client` can
-    // be borrowed by every worker. Results are collected into a map keyed by
-    // package name and re-iterated in the original deterministic `packages`
-    // order so output is independent of fetch completion order.
+    // 4. Fetch one packument per unique package name through a bounded scoped
+    // worker pool, then compare every physical placement in lockfile order.
+    // `RegistryClient` is shared by reference just as it is by the resolver's
+    // own prefetch workers.
     let mut rows: Vec<OutdatedRow> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
 
@@ -102,6 +110,7 @@ pub(super) fn run(
     // link/workspace packages, and validate the current version up front so
     // we don't spend a round-trip on an unparseable version).
     let mut fetch_targets: Vec<&PackageEntry> = Vec::new();
+    let mut unique_names: BTreeSet<String> = BTreeSet::new();
     for package in &packages {
         if package.link || package.resolved.is_empty() {
             continue;
@@ -114,47 +123,59 @@ pub(super) fn run(
             continue;
         }
         fetch_targets.push(package);
+        unique_names.insert(package.name.clone());
     }
 
-    // Fan out the packument fetches concurrently.
+    let jobs: Vec<String> = unique_names.into_iter().collect();
+    let worker_count = outdated_worker_count(jobs.len());
     let fetched: BTreeMap<String, FetchOutcome> = std::thread::scope(|scope| {
-        let client_ref = &client;
-        let handles: Vec<_> = fetch_targets
-            .iter()
-            .map(|package| {
-                let name = package.name.as_str();
-                scope.spawn(move || {
-                    let outcome = match client_ref.packument(name) {
-                        Ok(p) => FetchOutcome::Packument(p),
-                        Err(e) => FetchOutcome::Warning(format!(
-                            "warning: failed to fetch metadata for {}: {e}",
-                            name
-                        )),
-                    };
-                    (name.to_string(), outcome)
-                })
-            })
-            .collect();
-
-        let mut results: BTreeMap<String, FetchOutcome> = BTreeMap::new();
-        for handle in handles {
-            let (name, outcome) = handle
-                .join()
-                .expect("registry query worker thread panicked");
-            results.insert(name, outcome);
+        let mut handles = Vec::with_capacity(worker_count);
+        for worker_index in 0..worker_count {
+            let worker_jobs: Vec<String> = jobs
+                .iter()
+                .skip(worker_index)
+                .step_by(worker_count)
+                .cloned()
+                .collect();
+            let client_ref = &client;
+            handles.push(scope.spawn(move || {
+                worker_jobs
+                    .into_iter()
+                    .map(|name| {
+                        let outcome = match client_ref.packument(&name) {
+                            Ok(packument) => FetchOutcome::Packument(packument),
+                            Err(error) => FetchOutcome::Warning(format!(
+                                "warning: failed to fetch metadata for {name}: {error}"
+                            )),
+                        };
+                        (name, outcome)
+                    })
+                    .collect::<Vec<_>>()
+            }));
         }
-        results
-    });
+
+        let mut results = BTreeMap::new();
+        for handle in handles {
+            let worker_results = handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("outdated metadata worker thread panicked"))?;
+            results.extend(worker_results);
+        }
+        Ok::<_, anyhow::Error>(results)
+    })?;
 
     // Iterate in the original deterministic `packages` order so output is
     // independent of fetch completion order.
+    let mut warned_fetches = BTreeSet::new();
     for package in &fetch_targets {
         let current = Version::parse(&package.version).expect("validated before fetch; qed");
 
         let packument = match fetched.get(&package.name) {
             Some(FetchOutcome::Packument(p)) => p,
             Some(FetchOutcome::Warning(w)) => {
-                warnings.push(w.clone());
+                if warned_fetches.insert(package.name.as_str()) {
+                    warnings.push(w.clone());
+                }
                 continue;
             }
             None => continue,

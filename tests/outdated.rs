@@ -4,11 +4,23 @@
 //! a mock registry, and verify the output of `bpm outdated`.
 
 mod common;
-use common::mock_registry;
+use common::{mock_registry, MiniServer, RouteBody};
 
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
+struct InFlightRequest {
+    counter: Arc<AtomicUsize>,
+}
+
+impl Drop for InFlightRequest {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 /// Path to the built `bpm` binary.
 fn bpm_binary() -> &'static str {
@@ -57,6 +69,40 @@ fn write_bpm_lock(dir: &Path, packages: &[(&str, &str, &str)]) {
     );
 
     fs::write(dir.join("bpm.lock"), json).unwrap();
+}
+
+/// Write a lock whose package path can differ from its package name.
+fn write_bpm_lock_with_paths(dir: &Path, packages: &[(&str, &str, &str)]) {
+    let entries = packages
+        .iter()
+        .map(|(path, name, version)| {
+            format!(
+                r#"{{
+                    "path":"{path}",
+                    "name":"{name}",
+                    "version":"{version}",
+                    "resolved":"https://registry.example/{name}-{version}.tgz",
+                    "integrity":"sha512-abc"
+                }}"#
+            )
+        })
+        .collect::<Vec<_>>();
+    let root_deps = packages
+        .iter()
+        .map(|(_, name, _)| *name)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .map(|name| format!(r#""{name}":"^1.0.0""#))
+        .collect::<Vec<_>>();
+    fs::write(
+        dir.join("bpm.lock"),
+        format!(
+            r#"{{"lockfileVersion":2,"generator":"bpm-test","root":{{"dependencies":{{{}}}}},"packages":[{}]}}"#,
+            root_deps.join(","),
+            entries.join(",")
+        ),
+    )
+    .unwrap();
 }
 
 /// Write a valid `package.json` at `dir`.
@@ -344,6 +390,156 @@ fn table_output_format() {
 // and a single per-package fetch failure must remain a warning, not a fatal
 // error. These tests run the mock registry in *online* mode (no `--offline`)
 // so the concurrent fetch path is actually exercised.
+
+#[test]
+fn duplicate_fetch_is_deduplicated_by_package_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_bpm_lock_with_paths(
+        tmp.path(),
+        &[
+            ("node_modules/dupe", "dupe", "1.0.0"),
+            ("node_modules/parent/node_modules/dupe", "dupe", "1.5.0"),
+        ],
+    );
+    write_package_json(tmp.path(), &["dupe"]);
+    let server = MiniServer::start_routed(|path| {
+        (path == "/dupe").then(|| {
+            RouteBody(
+                make_packument("dupe", &["1.0.0", "1.5.0", "2.0.0"], "2.0.0").into_bytes(),
+                "application/json",
+            )
+        })
+    });
+
+    let (stdout, stderr, code) = run_outdated(
+        tmp.path(),
+        &[
+            "--registry",
+            &server.url(""),
+            "--store",
+            tmp.path().join("store").to_str().unwrap(),
+        ],
+    );
+    assert_eq!(code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(
+        server
+            .requests()
+            .iter()
+            .filter(|request| request.path == "/dupe")
+            .count(),
+        1
+    );
+    let first = stdout.find("1.0.0").unwrap();
+    let second = stdout.find("1.5.0").unwrap();
+    assert!(first < second, "physical rows changed order: {stdout}");
+}
+
+#[test]
+fn duplicate_fetch_failure_warns_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_bpm_lock_with_paths(
+        tmp.path(),
+        &[
+            ("node_modules/missing", "missing", "1.0.0"),
+            (
+                "node_modules/parent/node_modules/missing",
+                "missing",
+                "1.1.0",
+            ),
+        ],
+    );
+    write_package_json(tmp.path(), &["missing"]);
+    let server = MiniServer::start_routed(|_| None);
+
+    let (stdout, stderr, code) = run_outdated(
+        tmp.path(),
+        &[
+            "--registry",
+            &server.url(""),
+            "--store",
+            tmp.path().join("store").to_str().unwrap(),
+        ],
+    );
+    assert_eq!(code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(server.requests().len(), 1);
+    assert_eq!(
+        stderr
+            .matches("failed to fetch metadata for missing")
+            .count(),
+        1,
+        "duplicate warning: {stderr}"
+    );
+}
+
+#[test]
+fn bounded_metadata_workers_limit_peak_concurrency() {
+    const JOBS: usize = 24;
+    const MAX_WORKERS: usize = 16;
+    let tmp = tempfile::tempdir().unwrap();
+    let names = (0..JOBS)
+        .map(|index| format!("pkg-{index:02}"))
+        .collect::<Vec<_>>();
+    let packages = names
+        .iter()
+        .map(|name| (format!("node_modules/{name}"), name.as_str(), "1.0.0"))
+        .collect::<Vec<_>>();
+    let package_refs = packages
+        .iter()
+        .map(|(path, name, version)| (path.as_str(), *name, *version))
+        .collect::<Vec<_>>();
+    write_bpm_lock_with_paths(tmp.path(), &package_refs);
+    write_package_json(
+        tmp.path(),
+        &names.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let responder_in_flight = Arc::clone(&in_flight);
+    let responder_peak = Arc::clone(&peak);
+    let server = MiniServer::start_routed(move |path| {
+        let name = path.trim_start_matches('/');
+        if !name.starts_with("pkg-") {
+            return None;
+        }
+        let current = responder_in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        responder_peak.fetch_max(current, Ordering::SeqCst);
+        let _request = InFlightRequest {
+            counter: Arc::clone(&responder_in_flight),
+        };
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        Some(RouteBody(
+            make_packument(name, &["1.0.0", "2.0.0"], "2.0.0").into_bytes(),
+            "application/json",
+        ))
+    });
+
+    let (stdout, stderr, code) = run_outdated(
+        tmp.path(),
+        &[
+            "--registry",
+            &server.url(""),
+            "--store",
+            tmp.path().join("store").to_str().unwrap(),
+        ],
+    );
+    assert_eq!(code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
+    let requests = server.requests();
+    assert_eq!(requests.len(), JOBS);
+    let unique_paths = requests
+        .iter()
+        .map(|request| request.path.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(unique_paths.len(), JOBS);
+    let observed_peak = peak.load(Ordering::SeqCst);
+    assert!(
+        observed_peak <= MAX_WORKERS,
+        "observed peak {observed_peak}"
+    );
+    if std::thread::available_parallelism().is_ok_and(|workers| workers.get() > 1) {
+        assert!(observed_peak > 1, "worker pool did not overlap requests");
+    }
+}
 
 #[test]
 fn concurrent_fetch_produces_deterministic_order() {
