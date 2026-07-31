@@ -244,14 +244,15 @@ pub fn import(json: &str) -> Result<ImportReport, NpmLockError> {
             continue;
         }
 
-        if link {
+        let link_target = link
+            .then(|| pkg.resolved.clone())
+            .flatten()
+            .filter(|target| !target.is_empty());
+        if link && link_target.is_none() {
             diagnostics.push(warn(
                 "LINK_PACKAGE_UNSUPPORTED",
                 name.clone(),
-                format!(
-                    "package \"{name}\" at {path} is a link/workspace entry; \
-                     BPM has not materialized it yet"
-                ),
+                format!("package \"{name}\" at {path} is a link entry without a resolved target"),
             ));
         }
 
@@ -307,7 +308,7 @@ pub fn import(json: &str) -> Result<ImportReport, NpmLockError> {
             name,
             version,
             resolved,
-            workspace_target: None,
+            workspace_target: link_target,
             integrity,
             link,
             dev: pkg.dev.unwrap_or(false),
@@ -356,16 +357,16 @@ fn format_constraints(os: &[String], cpu: &[String]) -> String {
 // manifest (where npm stores them) and physical placements from the lock.
 //
 // A strict support gate rejects graphs BPM cannot represent safely before
-// emitting a single byte: workspace links, Git/File/Tarball/Patch sources,
-// and packages missing `resolved` or `integrity`. Returning all unsupported
+// emitting a single byte: links without a deterministic target,
+// Git/File/Tarball/Patch artifacts, and packages missing `resolved` or
+// `integrity`. Returning all unsupported
 // paths in one error lets `bpm add` fail fast with an actionable list instead
 // of writing a plausible-but-lossy lock.
 
 /// Why a single package cannot be exported to npm v3 in this milestone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnsupportedReason {
-    /// `link: true` workspace/symlink entry; npm records it but BPM has not
-    /// materialized it and cannot represent its target deterministically.
+    /// `link: true` entry without a deterministic local target.
     Link,
     /// Registry tarball URL is absent.
     MissingResolved,
@@ -378,7 +379,7 @@ pub enum UnsupportedReason {
 impl UnsupportedReason {
     fn label(&self) -> &'static str {
         match self {
-            UnsupportedReason::Link => "workspace link",
+            UnsupportedReason::Link => "link missing target",
             UnsupportedReason::MissingResolved => "missing resolved URL",
             UnsupportedReason::MissingIntegrity => "missing integrity",
             UnsupportedReason::NonRegistrySource => "non-registry source",
@@ -421,6 +422,8 @@ struct NpmV3Package {
     #[serde(skip_serializing_if = "Option::is_none")]
     integrity: Option<String>,
     #[serde(skip_serializing_if = "skip_false")]
+    link: bool,
+    #[serde(skip_serializing_if = "skip_false")]
     dev: bool,
     #[serde(skip_serializing_if = "skip_false")]
     optional: bool,
@@ -459,7 +462,12 @@ fn bin_value(bin: &BTreeMap<String, String>) -> Option<Value> {
 /// npm v3. Returns `Some(reason)` when it cannot.
 fn unsupported_reason(package: &PackageEntry, lockfile: &Lockfile) -> Option<UnsupportedReason> {
     if package.link {
-        return Some(UnsupportedReason::Link);
+        return package
+            .workspace_target
+            .as_deref()
+            .filter(|target| !target.is_empty())
+            .is_none()
+            .then_some(UnsupportedReason::Link);
     }
     if package.resolved.is_empty() {
         return Some(UnsupportedReason::MissingResolved);
@@ -492,9 +500,11 @@ fn unsupported_reason(package: &PackageEntry, lockfile: &Lockfile) -> Option<Uns
 /// `package-lock.json` (lockfileVersion 3) bytes.
 ///
 /// The root `""` entry's dependency groups come from `manifest`; physical
-/// package entries come from `lockfile`. Rejects any graph containing a
-/// workspace link, a non-registry source, or a package missing `resolved` or
-/// `integrity`, returning every offending path in deterministic order.
+/// package entries come from `lockfile`. Link entries are emitted with their
+/// deterministic local target in npm's `resolved` field. Rejects any graph
+/// containing a targetless link, a non-registry artifact, or a package missing
+/// `resolved` or `integrity`, returning every offending path in deterministic
+/// order.
 pub fn export_v3(lockfile: &Lockfile, manifest: &PackageManifest) -> Result<Vec<u8>, NpmLockError> {
     let mut unsupported: Vec<UnsupportedPackage> = lockfile
         .packages
@@ -525,6 +535,7 @@ pub fn export_v3(lockfile: &Lockfile, manifest: &PackageManifest) -> Result<Vec<
             version: manifest.version.clone(),
             resolved: None,
             integrity: None,
+            link: false,
             dev: false,
             optional: false,
             bin: None,
@@ -545,8 +556,13 @@ pub fn export_v3(lockfile: &Lockfile, manifest: &PackageManifest) -> Result<Vec<
             NpmV3Package {
                 name: None,
                 version: Some(package.version.clone()),
-                resolved: Some(package.resolved.clone()),
+                resolved: if package.link {
+                    package.workspace_target.clone()
+                } else {
+                    Some(package.resolved.clone())
+                },
                 integrity: package.integrity.clone(),
+                link: package.link,
                 dev: package.dev,
                 optional: package.optional,
                 bin: bin_value(&package.bin),
@@ -928,9 +944,44 @@ mod tests {
         assert!(link < missing_integrity);
         assert!(missing_integrity < missing_resolved);
         assert!(error.contains("non-registry source"));
-        assert!(error.contains("workspace link"));
+        assert!(error.contains("link missing target"));
         assert!(error.contains("missing resolved URL"));
         assert!(error.contains("missing integrity"));
+    }
+
+    #[test]
+    fn export_and_import_preserve_a_link_target() {
+        let mut lockfile = Lockfile::new("bpm");
+        lockfile.packages.push(PackageEntry {
+            path: "node_modules/linked".into(),
+            name: "linked".into(),
+            version: "1.0.0".into(),
+            link: true,
+            workspace_target: Some("/tmp/bpm-links/linked".into()),
+            ..Default::default()
+        });
+        let manifest = PackageManifest::from_json(
+            r#"{"name":"app","version":"1.0.0","dependencies":{"linked":"file:/tmp/bpm-links/linked"}}"#,
+            Path::new("package.json"),
+        )
+        .unwrap();
+
+        let bytes = export_v3(&lockfile, &manifest).unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["packages"]["node_modules/linked"]["link"], true);
+        assert_eq!(
+            json["packages"]["node_modules/linked"]["resolved"],
+            "/tmp/bpm-links/linked"
+        );
+
+        let report = import(std::str::from_utf8(&bytes).unwrap()).unwrap();
+        assert!(report.diagnostics.is_empty());
+        let linked = report.lockfile.packages.first().unwrap();
+        assert!(linked.link);
+        assert_eq!(
+            linked.workspace_target.as_deref(),
+            Some("/tmp/bpm-links/linked")
+        );
     }
 
     #[test]

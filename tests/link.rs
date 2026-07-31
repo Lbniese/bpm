@@ -123,6 +123,145 @@ fn consume_materializes_node_modules_link() {
 }
 
 #[test]
+fn consume_failure_preserves_manifest_and_absent_lock() {
+    let tmp = TempDir::new().unwrap();
+    let store = tmp.path().join("store");
+    let lib = make_pkg(tmp.path(), "broken-link");
+    let app = tmp.path().join("app");
+    fs::create_dir_all(&app).unwrap();
+    let original_manifest = br#"{"name":"app","version":"1.0.0","custom":true}"#;
+    fs::write(app.join("package.json"), original_manifest).unwrap();
+    assert_eq!(run(&["link"], &lib, &store).2, Some(0));
+    fs::write(lib.join("package.json"), "{ malformed").unwrap();
+
+    let (stdout, _stderr, code) = run(&["link", "broken-link"], &app, &store);
+    assert_ne!(code, Some(0));
+    assert_eq!(
+        fs::read(app.join("package.json")).unwrap(),
+        original_manifest
+    );
+    assert!(!app.join("bpm.lock").exists());
+    assert!(!app.join("node_modules/broken-link").exists());
+    assert!(!stdout.contains("linked"));
+    assert!(!stdout.contains("already linked"));
+}
+
+#[test]
+fn consume_failure_preserves_existing_manifest_and_lock() {
+    let tmp = TempDir::new().unwrap();
+    let store = tmp.path().join("store");
+    let lib = make_pkg(tmp.path(), "existing-link");
+    let app = tmp.path().join("app");
+    fs::create_dir_all(&app).unwrap();
+    fs::write(
+        app.join("package.json"),
+        r#"{"name":"app","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    assert_eq!(run(&["link"], &lib, &store).2, Some(0));
+    assert_eq!(run(&["link", "existing-link"], &app, &store).2, Some(0));
+    let manifest_before = fs::read(app.join("package.json")).unwrap();
+    let lock_before = fs::read(app.join("bpm.lock")).unwrap();
+    fs::write(lib.join("package.json"), "not json").unwrap();
+
+    let (stdout, _, code) = run(&["link", "existing-link"], &app, &store);
+    assert_ne!(code, Some(0));
+    assert_eq!(fs::read(app.join("package.json")).unwrap(), manifest_before);
+    assert_eq!(fs::read(app.join("bpm.lock")).unwrap(), lock_before);
+    assert!(!stdout.contains("linked"));
+    assert!(!stdout.contains("already linked"));
+}
+
+#[test]
+fn consume_preserves_npm_v3_lock_authority() {
+    let tmp = TempDir::new().unwrap();
+    let store = tmp.path().join("store");
+    let lib = make_pkg(tmp.path(), "npm-link");
+    let app = tmp.path().join("app");
+    fs::create_dir_all(&app).unwrap();
+    fs::write(
+        app.join("package.json"),
+        r#"{"name":"app","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    fs::write(
+        app.join("package-lock.json"),
+        r#"{"name":"app","version":"1.0.0","lockfileVersion":3,"requires":true,"packages":{"":{"name":"app","version":"1.0.0"}}}"#,
+    )
+    .unwrap();
+    assert_eq!(run(&["link"], &lib, &store).2, Some(0));
+
+    let (_, stderr, code) = run(&["link", "npm-link"], &app, &store);
+    assert_eq!(code, Some(0), "consume failed: {stderr}");
+    assert!(!app.join("bpm.lock").exists());
+    let lock = fs::read_to_string(app.join("package-lock.json")).unwrap();
+    assert!(lock.contains("node_modules/npm-link"));
+    assert!(lock.contains(r#""link": true"#));
+
+    // The exported npm-v3 link remains directly installable after re-import,
+    // rather than working only for the in-memory consume graph.
+    let entry = app.join("node_modules/npm-link");
+    fs::remove_file(&entry).unwrap();
+    let (_, stderr, code) = run(&["install"], &app, &store);
+    assert_eq!(code, Some(0), "install from npm lock failed: {stderr}");
+    assert!(entry.is_symlink());
+}
+
+#[test]
+fn unchanged_consume_repairs_missing_materialized_link() {
+    let tmp = TempDir::new().unwrap();
+    let store = tmp.path().join("store");
+    let lib = make_pkg(tmp.path(), "repair-link");
+    let app = tmp.path().join("app");
+    fs::create_dir_all(&app).unwrap();
+    fs::write(
+        app.join("package.json"),
+        r#"{"name":"app","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    assert_eq!(run(&["link"], &lib, &store).2, Some(0));
+    assert_eq!(run(&["link", "repair-link"], &app, &store).2, Some(0));
+    let entry = app.join("node_modules/repair-link");
+    fs::remove_file(&entry).unwrap();
+
+    let (stdout, stderr, code) = run(&["link", "repair-link"], &app, &store);
+    assert_eq!(code, Some(0), "repair failed: {stderr}");
+    assert!(stdout.contains("already linked"));
+    assert!(entry.is_symlink());
+}
+
+#[test]
+fn repeated_consume_follows_reregistered_target() {
+    let tmp = TempDir::new().unwrap();
+    let store = tmp.path().join("store");
+    let first_parent = tmp.path().join("first");
+    let second_parent = tmp.path().join("second");
+    fs::create_dir_all(&first_parent).unwrap();
+    fs::create_dir_all(&second_parent).unwrap();
+    let first = make_pkg(&first_parent, "repoint-link");
+    let second = make_pkg(&second_parent, "repoint-link");
+    fs::write(second.join("index.js"), "module.exports = 'second';\n").unwrap();
+    let app = tmp.path().join("app");
+    fs::create_dir_all(&app).unwrap();
+    fs::write(
+        app.join("package.json"),
+        r#"{"name":"app","version":"1.0.0"}"#,
+    )
+    .unwrap();
+
+    assert_eq!(run(&["link"], &first, &store).2, Some(0));
+    assert_eq!(run(&["link", "repoint-link"], &app, &store).2, Some(0));
+    assert_eq!(run(&["link"], &second, &store).2, Some(0));
+    let (_, stderr, code) = run(&["link", "repoint-link"], &app, &store);
+    assert_eq!(code, Some(0), "reconsume failed: {stderr}");
+    assert!(
+        fs::read_to_string(app.join("node_modules/repoint-link/index.js"))
+            .unwrap()
+            .contains("second")
+    );
+}
+
+#[test]
 fn unconsume_removes_link() {
     let tmp = TempDir::new().unwrap();
     let store = tmp.path().join("store");

@@ -197,6 +197,91 @@ pub(super) fn run_add(options: &install::Options) -> anyhow::Result<()> {
     })
 }
 
+pub(super) struct LinkMutationOutcome {
+    pub changed: bool,
+}
+
+/// Consume one registered `file:` link through the same staged transaction as
+/// registry dependency mutations. The caller owns registration lookup and
+/// user-facing success output; this function does not publish partial state.
+pub(super) fn run_link_consume(
+    name: &str,
+    file_spec: &str,
+    options: &install::Options,
+) -> anyhow::Result<LinkMutationOutcome> {
+    let cwd = env::current_dir()?;
+    let (project_root, lock_kind) = project_root_and_lock_kind(&cwd)?;
+    let manifest_path = project_root.join("package.json");
+    if !manifest_path.is_file() {
+        anyhow::bail!(
+            "no package.json in {}; `bpm link <name>` consumes a link into a project",
+            project_root.display()
+        );
+    }
+
+    // Keep the project writer lock through resolution, two-file publication,
+    // and materialization so links participate in the same ordered project
+    // views as add/remove/upgrade/dedupe.
+    let _project_mutation_guard = manifest_edit::acquire_project_mutation_guard(&project_root)?;
+    let mut document = ManifestDocument::from_path(&manifest_path)?;
+    document.add_dependency(DependencySection::Production, name, file_spec)?;
+    let changed = document.changed();
+    let manifest = document
+        .to_manifest()
+        .map_err(|error| anyhow::anyhow!("edited package.json is invalid: {error}"))?;
+    let manifest_bytes = document.render();
+
+    let store_root_path = store_root(options.store.clone())?;
+    let config = install::effective_npm_config(&project_root, options.registry.as_deref())?;
+    let http = HttpClient::new(config.clone());
+    let client = open_registry_client(&store_root_path, config, http.clone(), options.cache_mode)?;
+    let workspace_layout = bpm::workspace::discover(&project_root);
+    let workspace_index = bpm::resolver::workspaces::WorkspaceIndex::from_project_root(
+        &project_root,
+        &workspace_layout,
+    )
+    .map_err(|error| anyhow::anyhow!("workspace resolution failed: {error}"))?;
+    let peer_mode = if options.legacy_peer_deps {
+        bpm::resolver::peer::PeerMode::LegacyIgnore
+    } else {
+        bpm::resolver::peer::PeerMode::Strict
+    };
+    let lockfile = bpm::resolver::resolve_manifest_with_options(
+        &manifest,
+        &client,
+        "bpm",
+        Some(&workspace_index),
+        peer_mode,
+    )
+    .map_err(|error| anyhow::anyhow!("dependency resolution failed: {error}"))?;
+    let (lock_path, lock_bytes, resolved_kind) =
+        serialize_lock(&project_root, lock_kind, &lockfile, &manifest)?;
+    let plan = PublishPlan {
+        manifest_path,
+        manifest_bytes,
+        lock_path: lock_path.clone(),
+        lock_bytes,
+    };
+    manifest_edit::publish(&plan).map_err(|error| publish_error(error, &lock_path))?;
+
+    install::install_resolved_lockfile(
+        &project_root,
+        &lock_path,
+        lockfile,
+        resolved_kind,
+        options,
+        &store_root_path,
+    )
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "package.json and lock were updated, but installation failed: {error}\n\
+             re-run `bpm install` to retry; the manifest and lock are already written"
+        )
+    })?;
+
+    Ok(LinkMutationOutcome { changed })
+}
+
 /// Run `bpm remove`/`bpm uninstall`: drop names from every dependency section,
 /// resolve, write the selected lock, and install.
 pub(super) fn run_uninstall(options: UninstallOptions) -> anyhow::Result<()> {

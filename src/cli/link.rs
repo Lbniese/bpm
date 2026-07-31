@@ -20,7 +20,6 @@ use anyhow::Context;
 
 use bpm::link_store::LinkStore;
 use bpm::manifest::PackageManifest;
-use bpm::manifest_edit::{DependencySection, ManifestDocument};
 use bpm::metadata_cache::CacheMode;
 use bpm::project::find_project_root;
 
@@ -125,34 +124,17 @@ fn run_consume(
         )
     })?;
 
-    let cwd = std::env::current_dir()?;
-    let project_root = find_project_root(&cwd).unwrap_or(cwd);
-    let manifest_path = project_root.join("package.json");
-    if !manifest_path.is_file() {
-        anyhow::bail!(
-            "no package.json in {}; `bpm link <name>` consumes a link into a project",
-            project_root.display()
-        );
-    }
-
     // Record the dependency as a `file:` spec pointing at the global symlink so
-    // the resolver's existing file-source handling produces a `link:true` entry
-    // and the materializer symlinks `node_modules/<name>` into place.
+    // re-registration remains observable on the next consume/install. The
+    // mutation owner stages manifest and selected lock together before install.
     let spec = format!("file:{}", links.root().join(name).display());
-    let mut document = ManifestDocument::from_path(&manifest_path)?;
-    document.add_dependency(DependencySection::Production, name, &spec)?;
-    let changed = document.changed();
-    std::fs::write(&manifest_path, document.render())
-        .with_context(|| format!("writing {}", manifest_path.display()))?;
-    if changed {
+    let install_options = install_options(store, registry);
+    let outcome = mutate::run_link_consume(name, &spec, &install_options)?;
+    if outcome.changed {
         println!("linked {name} -> {}", target.display());
     } else {
         println!("already linked: {name}");
     }
-
-    // Delegate to the normal install sync so the lockfile is written and
-    // `node_modules/<name>` is materialized through the proven file-source path.
-    install::run(install_options(store, registry))?;
     Ok(())
 }
 
