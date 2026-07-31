@@ -77,6 +77,35 @@ fn publish_sends_otp_header_and_filtered_packument() {
 }
 
 #[test]
+fn publish_rejects_invalid_package_name_before_network() {
+    let project = tempfile::tempdir().unwrap();
+    let server = MiniServer::start_routed(|_| Some(RouteBody(b"{}".to_vec(), "application/json")));
+
+    for name in ["bad?query", "@malformed"] {
+        fs::write(
+            project.path().join("package.json"),
+            format!(r#"{{"name":"{name}","version":"1.0.0"}}"#),
+        )
+        .unwrap();
+        let output = Command::new(bpm_bin())
+            .current_dir(project.path())
+            .args(["publish", "--registry", &server.url("")])
+            .output()
+            .expect("run bpm publish");
+        assert!(!output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("invalid npm package name") && stderr.contains(name),
+            "unexpected error for {name}: {stderr}"
+        );
+        assert!(!stdout.contains("published"));
+    }
+
+    assert!(server.requests().is_empty());
+}
+
+#[test]
 fn audit_level_controls_exit_policy() {
     let project = tempfile::tempdir().unwrap();
     write_package_json(project.path(), &[("left-pad", "1.3.0")]);

@@ -779,8 +779,8 @@ impl RegistryClient {
     /// the registry's `/-/package/<escaped>/dist-tags/<tag>` endpoint; requires
     /// an authenticated session with publish rights.
     pub fn set_dist_tag(&self, name: &str, tag: &str, version: &str) -> Result<(), RegistryError> {
+        let escaped = encode_package_name(name)?;
         let base = self.config.registry().trim_end_matches('/');
-        let escaped = name.replace('/', "%2f");
         let tag = encode_registry_segment(tag);
         let url = format!("{base}/-/package/{escaped}/dist-tags/{tag}");
         // npm expects the version as a bare JSON string.
@@ -795,8 +795,8 @@ impl RegistryClient {
     /// the registry's `/-/package/<escaped>/dist-tags/<tag>` endpoint; requires
     /// an authenticated session with publish rights.
     pub fn delete_dist_tag(&self, name: &str, tag: &str) -> Result<(), RegistryError> {
+        let escaped = encode_package_name(name)?;
         let base = self.config.registry().trim_end_matches('/');
-        let escaped = name.replace('/', "%2f");
         let tag = encode_registry_segment(tag);
         let url = format!("{base}/-/package/{escaped}/dist-tags/{tag}");
         self.http
@@ -809,8 +809,8 @@ impl RegistryClient {
     /// (not the abbreviated install metadata, which omits `maintainers`) so the
     /// list is available for public packages without authentication.
     pub fn maintainers(&self, name: &str) -> Result<Vec<Maintainer>, RegistryError> {
+        let escaped = encode_package_name(name)?;
         let base = self.config.registry().trim_end_matches('/');
-        let escaped = name.replace('/', "%2f");
         let url = format!("{base}/{escaped}");
         let response = self
             .http
@@ -840,8 +840,8 @@ impl RegistryClient {
     /// `/-/package/<escaped>/collaborators/<user>` endpoint; requires an
     /// authenticated session with owner rights.
     pub fn add_owner(&self, name: &str, user: &str) -> Result<(), RegistryError> {
+        let escaped = encode_package_name(name)?;
         let base = self.config.registry().trim_end_matches('/');
-        let escaped = name.replace('/', "%2f");
         let user = encode_registry_segment(user);
         let url = format!("{base}/-/package/{escaped}/collaborators/{user}");
         self.http
@@ -854,8 +854,8 @@ impl RegistryClient {
     /// the registry's `/-/package/<escaped>/collaborators/<user>` endpoint;
     /// requires an authenticated session with owner rights.
     pub fn remove_owner(&self, name: &str, user: &str) -> Result<(), RegistryError> {
+        let escaped = encode_package_name(name)?;
         let base = self.config.registry().trim_end_matches('/');
-        let escaped = name.replace('/', "%2f");
         let user = encode_registry_segment(user);
         let url = format!("{base}/-/package/{escaped}/collaborators/{user}");
         self.http
@@ -902,6 +902,7 @@ impl RegistryClient {
     /// request. A miss claims the slot and fetches inline. On error the slot is
     /// cleared so a later call (or prefetch) can retry.
     pub fn packument(&self, name: &str) -> Result<Packument, RegistryError> {
+        encode_package_name(name)?;
         let registry = self.config.registry_for_package(name);
         let key = format!("{}\0{name}", registry.trim_end_matches('/'));
         // Claim the slot or wait for an in-flight fetch. We never hold the
@@ -979,7 +980,7 @@ impl RegistryClient {
     /// closure fetcher, so the resolver thread mostly hits cache and runs at
     /// CPU speed instead of serializing on the dependency-tree depth.
     pub fn prefetch_packument(&self, name: &str, version_spec: Option<&str>) {
-        if self.prefetch_workers == 0 {
+        if self.prefetch_workers == 0 || !is_valid_npm_name(name) {
             return;
         }
         let pool = self.prefetch_pool.get_or_init(|| {
@@ -1886,6 +1887,18 @@ pub fn select_version(
                 })
         }
     }
+}
+
+/// Validate and encode an npm package name as the registry's single package
+/// path segment. Only the one structural slash in a scoped name is encoded.
+fn encode_package_name(name: &str) -> Result<String, RegistryError> {
+    if !is_valid_npm_name(name) {
+        return Err(RegistryError::InvalidSpec(
+            name.to_string(),
+            format!("'{name}' is not a valid npm package name"),
+        ));
+    }
+    Ok(name.replace('/', "%2f"))
 }
 
 /// Validate a package name per npm rules: `(@scope/)?name`, ASCII, <=214 chars,
@@ -3311,6 +3324,62 @@ mod tests {
         assert_eq!(tags.get("beta").map(String::as_str), Some("1.1.0"));
         shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
         let _ = server.join();
+    }
+
+    #[test]
+    fn invalid_package_names_are_rejected_before_endpoint_requests() {
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server_requests = Arc::clone(&requests);
+        let (registry, shutdown, server) = token_server(move |_method, _path, _body| {
+            server_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            (500, String::new())
+        });
+        let config = NpmConfig::default()
+            .with_registry_override(&registry)
+            .unwrap();
+        let client = RegistryClient::new(config);
+        let invalid_names = vec![
+            String::new(),
+            "@scope".into(),
+            "@scope/pkg/extra".into(),
+            "Uppercase".into(),
+            "has space".into(),
+            "nonascii-é".into(),
+            "bad?query".into(),
+            "bad#fragment".into(),
+            format!("a{}", "b".repeat(214)),
+        ];
+
+        for name in invalid_names {
+            assert!(matches!(
+                client.set_dist_tag(&name, "latest", "1.0.0"),
+                Err(RegistryError::InvalidSpec(_, _))
+            ));
+            assert!(matches!(
+                client.delete_dist_tag(&name, "latest"),
+                Err(RegistryError::InvalidSpec(_, _))
+            ));
+            assert!(matches!(
+                client.maintainers(&name),
+                Err(RegistryError::InvalidSpec(_, _))
+            ));
+            assert!(matches!(
+                client.add_owner(&name, "alice"),
+                Err(RegistryError::InvalidSpec(_, _))
+            ));
+            assert!(matches!(
+                client.remove_owner(&name, "alice"),
+                Err(RegistryError::InvalidSpec(_, _))
+            ));
+            assert!(matches!(
+                client.packument(&name),
+                Err(RegistryError::InvalidSpec(_, _))
+            ));
+        }
+
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().unwrap();
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[test]
