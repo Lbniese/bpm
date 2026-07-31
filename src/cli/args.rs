@@ -613,9 +613,40 @@ mod tests {
         path::PathBuf,
     };
 
-    use clap::{error::ErrorKind, Parser};
+    use clap::{error::ErrorKind, CommandFactory, Parser};
 
     use super::{Cli, Commands};
+
+    #[test]
+    fn documented_command_inventory() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let readme = std::fs::read_to_string(root.join("README.md")).unwrap();
+        let cli_reference = std::fs::read_to_string(root.join("docs/cli.md")).unwrap();
+        let command = Cli::command();
+        let names = command
+            .get_subcommands()
+            .filter(|subcommand| !subcommand.is_hide_set())
+            .map(|subcommand| subcommand.get_name())
+            .collect::<Vec<_>>();
+
+        for name in names {
+            let marker = format!("`bpm {name}");
+            assert!(
+                readme.contains(&marker),
+                "README.md does not document primary command {name}"
+            );
+            assert!(
+                cli_reference.contains(&marker),
+                "docs/cli.md does not document primary command {name}"
+            );
+        }
+
+        assert!(
+            readme.contains("[Changelog](CHANGELOG.md)"),
+            "README.md must link to CHANGELOG.md"
+        );
+    }
+
 
     #[test]
     fn exec_requires_a_command() {
