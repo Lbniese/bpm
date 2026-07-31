@@ -228,6 +228,14 @@ fn map_http_error(error: HttpError) -> DownloadError {
             url,
             attempts,
         },
+        // Artifact downloads stream through `HttpClient::stream`, which is not
+        // routed through the control-plane body cap, so this variant is
+        // unreachable here. Map it defensively if it ever surfaces.
+        HttpError::BodyTooLarge { url, limit } => DownloadError::Transport {
+            kind: format!("response body exceeds {limit} byte limit"),
+            url,
+            attempts: 1,
+        },
     }
 }
 

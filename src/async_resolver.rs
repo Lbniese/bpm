@@ -288,10 +288,7 @@ async fn async_fetch_with_cache(
         .get("Last-Modified")
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    let body = response.text().await.map_err(|e| AsyncResolveError::Http {
-        url: redact_url(url),
-        message: format!("body read failed: {e}"),
-    })?;
+    let body = read_bounded_text(response, url, crate::http::MAX_CONTROL_RESPONSE_BYTES).await?;
     fetch_bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
 
     // 7. Best-effort refresh: a cache write failure must never fail an install.
@@ -411,6 +408,57 @@ impl Drop for AsyncInFlightGuard {
     fn drop(&mut self) {
         self.counter.fetch_sub(1, Ordering::Relaxed);
     }
+}
+
+/// Read a response body as text while bounding the decoded byte count to
+/// `limit`. Returns the body if it completes within the limit; returns an
+/// [`AsyncResolveError::Http`] if either the declared `Content-Length` or the
+/// actual streamed byte count exceeds it. The streamed count is authoritative
+/// because the header can be absent or false. `limit` is parameterized so
+/// tests can inject tiny bounds without allocating large fixtures.
+async fn read_bounded_text(
+    response: reqwest::Response,
+    url: &str,
+    limit: usize,
+) -> Result<String, AsyncResolveError> {
+    use futures_util::StreamExt;
+    let limit_u64 = u64::try_from(limit).unwrap_or(u64::MAX);
+    // Early rejection on a declared oversized length; the streamed count below
+    // remains the authoritative enforcement.
+    if let Some(len) = response.content_length() {
+        if len > limit_u64 {
+            return Err(AsyncResolveError::Http {
+                url: redact_url(url),
+                message: format!("response body exceeds {limit} byte limit"),
+            });
+        }
+    }
+    let mut out: Vec<u8> = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk.map_err(|e| AsyncResolveError::Http {
+            url: redact_url(url),
+            message: format!("body read failed: {e}"),
+        })?;
+        let new_len =
+            out.len()
+                .checked_add(bytes.len())
+                .ok_or_else(|| AsyncResolveError::Http {
+                    url: redact_url(url),
+                    message: format!("response body exceeds {limit} byte limit"),
+                })?;
+        if new_len > limit {
+            return Err(AsyncResolveError::Http {
+                url: redact_url(url),
+                message: format!("response body exceeds {limit} byte limit"),
+            });
+        }
+        out.extend_from_slice(&bytes);
+    }
+    String::from_utf8(out).map_err(|e| AsyncResolveError::Http {
+        url: redact_url(url),
+        message: format!("response body was not valid UTF-8: {e}"),
+    })
 }
 
 /// Drain a retryable async response body only up to the shared retry-body
@@ -2532,5 +2580,80 @@ mod tests {
         second.resolve(&parse_spec("p").unwrap()).await.unwrap();
         // Exactly two requests: the warm-up 200 and the conditional 304.
         assert_eq!(requests.lock().unwrap().len(), 2);
+    }
+
+    /// Loopback server serving a fixed body, optionally with a Content-Length
+    /// header. When `with_content_length` is false, the body is served without
+    /// a declared length (connection close signals the end) so the streamed
+    /// byte count is the only bound.
+    fn async_body_server(body: Vec<u8>, with_content_length: bool) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let registry = format!("http://{address}");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut buf = [0_u8; 8192];
+                let _ = stream.read(&mut buf);
+                let head = if with_content_length {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                } else {
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_string()
+                };
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(&body);
+            }
+        });
+        registry
+    }
+
+    async fn fetch_response(registry: &str, path: &str) -> reqwest::Response {
+        reqwest::Client::new()
+            .get(format!("{registry}{path}"))
+            .send()
+            .await
+            .expect("loopback fetch")
+    }
+
+    #[tokio::test]
+    async fn read_bounded_text_rejects_oversized_declared_content_length() {
+        // Declared Content-Length (20) above the tiny limit (10): early
+        // rejection before the body is buffered.
+        let registry = async_body_server(vec![b'a'; 20], true);
+        let response = fetch_response(&registry, "/p").await;
+        let url = format!("{registry}/p");
+        let err = read_bounded_text(response, &url, 10)
+            .await
+            .expect_err("oversized declared length must be rejected");
+        let text = err.to_string();
+        assert!(text.contains("exceeds"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn read_bounded_text_rejects_oversized_streamed_body() {
+        // No Content-Length header: the streamed byte count is the only bound.
+        let registry = async_body_server(vec![b'a'; 20], false);
+        let response = fetch_response(&registry, "/p").await;
+        let url = format!("{registry}/p");
+        let err = read_bounded_text(response, &url, 10)
+            .await
+            .expect_err("streamed body over limit must be rejected");
+        assert!(err.to_string().contains("exceeds"));
+    }
+
+    #[tokio::test]
+    async fn read_bounded_text_accepts_exact_limit_and_below() {
+        // A body exactly at the tiny limit succeeds and decodes intact.
+        let registry = async_body_server(vec![b'a'; 10], true);
+        let response = fetch_response(&registry, "/p").await;
+        let url = format!("{registry}/p");
+        let text = read_bounded_text(response, &url, 10)
+            .await
+            .expect("exact-limit body succeeds");
+        assert_eq!(text.len(), 10);
+        assert!(text.chars().all(|c| c == 'a'));
     }
 }
