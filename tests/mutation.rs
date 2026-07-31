@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 
 use common::{build_tgz, integrity_of, MiniServer, RouteBody};
 
@@ -80,8 +80,15 @@ struct Package {
 }
 
 impl MockRegistry {
-    #[allow(clippy::type_complexity)]
     fn new(packages: Vec<Package>) -> Self {
+        Self::new_with_metadata_barrier(packages, None)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn new_with_metadata_barrier(
+        packages: Vec<Package>,
+        metadata_barrier: Option<Arc<Barrier>>,
+    ) -> Self {
         // Move the package table into the responder closure.
         let table: Arc<Vec<(String, String, BTreeMap<String, String>, Vec<u8>, String)>> = Arc::new(
             packages
@@ -101,6 +108,7 @@ impl MockRegistry {
         let table_for_metadata = table.clone();
         let base = Arc::new(std::sync::Mutex::new(String::new()));
         let base_for_metadata = base.clone();
+        let metadata_waiters = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let server = MiniServer::start_keep_alive_routed(move |path| {
             // Tarball request: /tarballs/<name>-<version>.tgz (checked first so
             // a package literally named "tarballs" cannot shadow it).
@@ -125,6 +133,13 @@ impl MockRegistry {
                     version
                 );
                 if path == packument_path {
+                    if let Some(barrier) = &metadata_barrier {
+                        let waiter =
+                            metadata_waiters.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if waiter < 2 {
+                            barrier.wait();
+                        }
+                    }
                     return Some(RouteBody(
                         serde_json::to_vec(&packument(
                             version,
@@ -229,6 +244,86 @@ fn one_package(name: &str, version: &str, deps: &BTreeMap<String, String>) -> Pa
         deps: deps.clone(),
         tarball: pkg_tarball(name, version, deps, None),
     }
+}
+
+#[test]
+fn concurrent_adds_preserve_both_project_mutations() {
+    let barrier = Arc::new(Barrier::new(2));
+    let registry = MockRegistry::new_with_metadata_barrier(
+        vec![
+            one_package("alpha", "1.0.0", &BTreeMap::new()),
+            one_package("beta", "1.0.0", &BTreeMap::new()),
+        ],
+        Some(barrier),
+    );
+    let project = tempfile::tempdir().unwrap();
+    let store = tempfile::tempdir().unwrap();
+    write_manifest(project.path(), r#"{"name":"app","version":"1.0.0"}"#);
+
+    let spawn_add = |name: &str| {
+        let mut command = Command::new(bin());
+        command
+            .args(["add", name, "--registry", registry.url()])
+            .current_dir(project.path())
+            .env("BPM_STORE", store.path())
+            .env("BPM_STREAM_INSTALL", "0")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        command.spawn().expect("spawn concurrent bpm add")
+    };
+    let alpha = spawn_add("alpha");
+    let beta = spawn_add("beta");
+    let alpha_output = alpha.wait_with_output().unwrap();
+    let beta_output = beta.wait_with_output().unwrap();
+    assert!(
+        alpha_output.status.success(),
+        "alpha add failed: {}",
+        String::from_utf8_lossy(&alpha_output.stderr)
+    );
+    assert!(
+        beta_output.status.success(),
+        "beta add failed: {}",
+        String::from_utf8_lossy(&beta_output.stderr)
+    );
+
+    let manifest = read_manifest(project.path());
+    assert_eq!(manifest["dependencies"]["alpha"], "^1.0.0");
+    assert_eq!(manifest["dependencies"]["beta"], "^1.0.0");
+    let lock = bpm::lockfile::Lockfile::from_json(
+        &fs::read_to_string(project.path().join("bpm.lock")).unwrap(),
+    )
+    .unwrap();
+    assert!(lock.root.dependencies.contains_key("alpha"));
+    assert!(lock.root.dependencies.contains_key("beta"));
+    assert!(lock.packages.iter().any(|package| package.name == "alpha"));
+    assert!(lock.packages.iter().any(|package| package.name == "beta"));
+    assert!(project.path().join("node_modules/alpha").is_dir());
+    assert!(project.path().join("node_modules/beta").is_dir());
+}
+
+#[test]
+fn failed_mutation_releases_project_guard() {
+    let registry = MockRegistry::new(vec![one_package("good", "1.0.0", &BTreeMap::new())]);
+    let project = tempfile::tempdir().unwrap();
+    let store = tempfile::tempdir().unwrap();
+    write_manifest(
+        project.path(),
+        r#"{"name":"app","version":"1.0.0","dependencies":{"missing":"^1.0.0"}}"#,
+    );
+
+    let (ok, _, _) = run_bpm(
+        &["add", "good", "--registry", registry.url()],
+        project.path(),
+        store.path(),
+    );
+    assert!(!ok);
+    write_manifest(project.path(), r#"{"name":"app","version":"1.0.0"}"#);
+    let (ok, stdout, stderr) = run_bpm(
+        &["add", "good", "--registry", registry.url()],
+        project.path(),
+        store.path(),
+    );
+    assert!(ok, "stderr: {stderr}\nstdout: {stdout}");
 }
 
 #[test]

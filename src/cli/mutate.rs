@@ -90,6 +90,10 @@ pub(super) fn run_add(options: &install::Options) -> anyhow::Result<()> {
     }
     reject_duplicate_additions(&additions)?;
 
+    // Serialize BPM writers from the first mutable-state read through
+    // resolution, publication, and the final installation handoff.
+    let _project_mutation_guard = manifest_edit::acquire_project_mutation_guard(&project_root)?;
+
     // 4. Edit all requested dependency entries in memory.
     let mut document = ManifestDocument::from_path(&manifest_path)?;
     let section = if options.save_dev {
@@ -150,9 +154,7 @@ pub(super) fn run_add(options: &install::Options) -> anyhow::Result<()> {
         lock_path: lock_path.clone(),
         lock_bytes,
     };
-    manifest_edit::publish(&plan).map_err(|error| {
-        anyhow::anyhow!("failed to publish manifest and lock; both files were restored: {error}")
-    })?;
+    manifest_edit::publish(&plan).map_err(|error| publish_error(error, &lock_path))?;
     eprintln!(
         "added {} package(s) and wrote {}",
         additions.len(),
@@ -225,6 +227,8 @@ pub(super) fn run_uninstall(options: UninstallOptions) -> anyhow::Result<()> {
         }
     }
 
+    // Intentionally held through resolution, publication, and installation.
+    let _project_mutation_guard = manifest_edit::acquire_project_mutation_guard(&project_root)?;
     let mut document = ManifestDocument::from_path(&manifest_path)?;
     let mut removed_any = false;
     for name in &options.names {
@@ -277,9 +281,7 @@ pub(super) fn run_uninstall(options: UninstallOptions) -> anyhow::Result<()> {
         lock_path: lock_path.clone(),
         lock_bytes,
     };
-    manifest_edit::publish(&plan).map_err(|error| {
-        anyhow::anyhow!("failed to publish manifest and lock; both files were restored: {error}")
-    })?;
+    manifest_edit::publish(&plan).map_err(|error| publish_error(error, &lock_path))?;
     eprintln!("removed {} package(s)", options.names.len());
 
     let install_options = install::Options {
@@ -318,6 +320,17 @@ pub(super) fn run_uninstall(options: UninstallOptions) -> anyhow::Result<()> {
 /// Locate the project root and the selected lock kind (Plan 002 precedence) for
 /// a mutation. Returns `(root, kind)` where `kind` is `None` when no lock
 /// exists yet (the mutation creates a `bpm.lock`).
+fn publish_error(error: manifest_edit::PublishError, lock_path: &Path) -> anyhow::Error {
+    if error.rollback_complete() {
+        anyhow::anyhow!("failed to publish manifest and lock; project files were restored: {error}")
+    } else {
+        anyhow::anyhow!(
+            "failed to publish manifest and lock; rollback incomplete; inspect package.json and {}: {error}",
+            lock_path.display()
+        )
+    }
+}
+
 fn project_root_and_lock_kind(cwd: &Path) -> anyhow::Result<(PathBuf, Option<ProjectLockKind>)> {
     match find_project_lock(cwd)? {
         Some(lock) => Ok((lock.project_root.clone(), Some(lock.kind))),
@@ -520,6 +533,9 @@ pub(super) fn run_upgrade(options: UpgradeOptions) -> anyhow::Result<()> {
             manifest_path.display()
         );
     }
+    // Intentionally held through the lock snapshot, resolution, rewrite, and
+    // installation so a newer graph cannot be followed by an older view.
+    let _project_mutation_guard = manifest_edit::acquire_project_mutation_guard(&project_root)?;
     let manifest = bpm::manifest::PackageManifest::from_path(&manifest_path)
         .map_err(|error| anyhow::anyhow!("cannot read package.json for upgrade: {error}"))?;
 
@@ -675,6 +691,9 @@ pub(super) fn run_dedupe(options: DedupeOptions) -> anyhow::Result<()> {
             manifest_path.display()
         );
     }
+    // Intentionally held through the lock snapshot, resolution, rewrite, and
+    // installation so every writer publishes one complete project view.
+    let _project_mutation_guard = manifest_edit::acquire_project_mutation_guard(&project_root)?;
     let manifest = bpm::manifest::PackageManifest::from_path(&manifest_path)
         .map_err(|error| anyhow::anyhow!("cannot read package.json for dedupe: {error}"))?;
 

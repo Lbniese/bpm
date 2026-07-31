@@ -226,6 +226,88 @@ impl ManifestDocument {
     }
 }
 
+/// An exclusive cross-process mutation lock for one canonical project.
+///
+/// The lock file name contains only a one-way digest of the canonical OS path.
+/// Lock files are intentionally retained after release so waiters can never be
+/// split across different inodes.
+#[derive(Debug)]
+pub struct ProjectMutationGuard {
+    file: fs::File,
+}
+
+impl Drop for ProjectMutationGuard {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum ProjectMutationLockError {
+    #[error("cannot canonicalize project for mutation locking: {source}")]
+    Canonicalize { source: io::Error },
+    #[error("cannot create BPM mutation lock directory: {source}")]
+    CreateDirectory { source: io::Error },
+    #[error("cannot open project mutation lock at {path}: {source}")]
+    Open { path: PathBuf, source: io::Error },
+    #[error("cannot acquire project mutation lock at {path}: {source}")]
+    Acquire { path: PathBuf, source: io::Error },
+}
+
+/// Acquire the project-scoped mutation critical section.
+pub fn acquire_project_mutation_guard(
+    project_root: &Path,
+) -> Result<ProjectMutationGuard, ProjectMutationLockError> {
+    let lock_path = project_mutation_lock_path(project_root)?;
+    let lock_dir = lock_path.parent().expect("mutation lock has a parent");
+    fs::create_dir_all(lock_dir)
+        .map_err(|source| ProjectMutationLockError::CreateDirectory { source })?;
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|source| ProjectMutationLockError::Open {
+            path: lock_path.clone(),
+            source,
+        })?;
+    file.lock()
+        .map_err(|source| ProjectMutationLockError::Acquire {
+            path: lock_path,
+            source,
+        })?;
+    Ok(ProjectMutationGuard { file })
+}
+
+fn project_mutation_lock_path(project_root: &Path) -> Result<PathBuf, ProjectMutationLockError> {
+    let canonical = fs::canonicalize(project_root)
+        .map_err(|source| ProjectMutationLockError::Canonicalize { source })?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"bpm-project-mutation-v1\0");
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        hasher.update(canonical.as_os_str().as_bytes());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        for unit in canonical.as_os_str().encode_wide() {
+            hasher.update(&unit.to_le_bytes());
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        // Fallback targets cannot preserve non-Unicode path identity because
+        // std exposes no platform byte representation there.
+        hasher.update(canonical.as_os_str().to_string_lossy().as_bytes());
+    }
+    Ok(std::env::temp_dir()
+        .join("bpm-project-mutation-locks")
+        .join(format!("{}.lock", hasher.finalize().to_hex())))
+}
+
 /// The two files a mutation can publish.
 #[derive(Debug, Clone)]
 pub struct PublishPlan {
@@ -246,19 +328,87 @@ pub enum PublishStage {
     Manifest,
 }
 
-/// Publish the manifest and lock with best-effort cross-file rollback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RollbackDestination {
+    Lock,
+    Manifest,
+}
+
+impl std::fmt::Display for RollbackDestination {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Lock => formatter.write_str("lock"),
+            Self::Manifest => formatter.write_str("manifest"),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct RollbackFailure {
+    pub destination: RollbackDestination,
+    pub source: io::Error,
+}
+
+/// A publication error that records whether rollback was complete.
+#[derive(Debug)]
+pub struct PublishError {
+    primary: io::Error,
+    publication_began: bool,
+    rollback_failures: Vec<RollbackFailure>,
+}
+
+impl PublishError {
+    pub fn publication_began(&self) -> bool {
+        self.publication_began
+    }
+
+    pub fn rollback_complete(&self) -> bool {
+        self.rollback_failures.is_empty()
+    }
+
+    pub fn rollback_failures(&self) -> &[RollbackFailure] {
+        &self.rollback_failures
+    }
+}
+
+impl std::fmt::Display for PublishError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "publication failed: {}", self.primary)?;
+        if !self.rollback_failures.is_empty() {
+            let destinations = self
+                .rollback_failures
+                .iter()
+                .map(|failure| failure.destination.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            write!(formatter, "; rollback incomplete for {destinations}")
+        } else if self.publication_began {
+            formatter.write_str("; both destinations were restored")
+        } else {
+            formatter.write_str("; publication had not begun")
+        }
+    }
+}
+
+impl std::error::Error for PublishError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.primary)
+    }
+}
+
+/// Publish the manifest and lock with cross-file rollback reporting.
 ///
 /// Both temp files are written first; the lock is then published, then the
-/// manifest. If either publish (or an injected failure between them) errors,
-/// both destinations are restored to their pre-publish bytes or absence.
-pub fn publish(plan: &PublishPlan) -> io::Result<()> {
-    publish_impl(plan, None)
+/// manifest. If either publish errors, restoration of both destinations is
+/// attempted and every restoration failure is retained in [`PublishError`].
+pub fn publish(plan: &PublishPlan) -> Result<(), PublishError> {
+    publish_impl(plan, None, RestoreFaults::default())
 }
 
 /// Publish with a deterministic injected failure at `fail_at`. Exposed for
 /// rollback tests; production code calls [`publish`].
-pub fn publish_with_failure(plan: &PublishPlan, fail_at: PublishStage) -> io::Result<()> {
-    publish_impl(plan, Some(fail_at))
+pub fn publish_with_failure(plan: &PublishPlan, fail_at: PublishStage) -> Result<(), PublishError> {
+    publish_impl(plan, Some(fail_at), RestoreFaults::default())
 }
 
 #[derive(Clone)]
@@ -303,9 +453,24 @@ fn restore(path: &Path, original: &Original) -> io::Result<()> {
     }
 }
 
-fn publish_impl(plan: &PublishPlan, fail_at: Option<PublishStage>) -> io::Result<()> {
-    let manifest_original = capture_original(&plan.manifest_path)?;
-    let lock_original = capture_original(&plan.lock_path)?;
+#[derive(Debug, Clone, Copy, Default)]
+struct RestoreFaults {
+    lock: bool,
+    manifest: bool,
+}
+
+fn publish_impl(
+    plan: &PublishPlan,
+    fail_at: Option<PublishStage>,
+    restore_faults: RestoreFaults,
+) -> Result<(), PublishError> {
+    let before_publication = |primary| PublishError {
+        primary,
+        publication_began: false,
+        rollback_failures: Vec::new(),
+    };
+    let manifest_original = capture_original(&plan.manifest_path).map_err(before_publication)?;
+    let lock_original = capture_original(&plan.lock_path).map_err(before_publication)?;
 
     let manifest_parent = plan
         .manifest_path
@@ -327,6 +492,7 @@ fn publish_impl(plan: &PublishPlan, fail_at: Option<PublishStage>) -> io::Result
             .unwrap_or("bpm.lock"),
     );
 
+    let mut publication_began = false;
     let outcome = (|| -> io::Result<()> {
         write_temp(&manifest_tmp, &plan.manifest_bytes)?;
         write_temp(&lock_tmp, &plan.lock_bytes)?;
@@ -335,6 +501,7 @@ fn publish_impl(plan: &PublishPlan, fail_at: Option<PublishStage>) -> io::Result
             return Err(io::Error::other("injected failure before lock publish"));
         }
 
+        publication_began = true;
         rename_or_replace(&lock_tmp, &plan.lock_path)?;
         // The lock temp has been consumed by the rename. Only the manifest
         // temp remains to clean up on failure.
@@ -350,14 +517,39 @@ fn publish_impl(plan: &PublishPlan, fail_at: Option<PublishStage>) -> io::Result
     let _ = fs::remove_file(&manifest_tmp);
     let _ = fs::remove_file(&lock_tmp);
 
-    if outcome.is_err() {
-        // Restore both destinations to their pre-publish state. A published
-        // lock must be rolled back so the manifest (restored to its prior
-        // bytes) and lock never disagree.
-        let _ = restore(&plan.lock_path, &lock_original);
-        let _ = restore(&plan.manifest_path, &manifest_original);
+    match outcome {
+        Ok(()) => Ok(()),
+        Err(primary) => {
+            let mut rollback_failures = Vec::new();
+            let lock_restore = if restore_faults.lock {
+                Err(io::Error::other("injected lock restoration failure"))
+            } else {
+                restore(&plan.lock_path, &lock_original)
+            };
+            if let Err(source) = lock_restore {
+                rollback_failures.push(RollbackFailure {
+                    destination: RollbackDestination::Lock,
+                    source,
+                });
+            }
+            let manifest_restore = if restore_faults.manifest {
+                Err(io::Error::other("injected manifest restoration failure"))
+            } else {
+                restore(&plan.manifest_path, &manifest_original)
+            };
+            if let Err(source) = manifest_restore {
+                rollback_failures.push(RollbackFailure {
+                    destination: RollbackDestination::Manifest,
+                    source,
+                });
+            }
+            Err(PublishError {
+                primary,
+                publication_began,
+                rollback_failures,
+            })
+        }
     }
-    outcome
 }
 
 /// Write a unique sibling temp file with `O_CREAT|O_EXCL` so two concurrent
@@ -559,6 +751,72 @@ mod tests {
         );
     }
 
+    #[test]
+    fn project_mutation_distinct_projects_lock_independently() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let first_guard = acquire_project_mutation_guard(first.path()).unwrap();
+        let second_guard = acquire_project_mutation_guard(second.path()).unwrap();
+        drop((first_guard, second_guard));
+    }
+
+    #[test]
+    fn project_mutation_second_acquisition_blocks_until_drop() {
+        let project = tempfile::tempdir().unwrap();
+        let first_guard = acquire_project_mutation_guard(project.path()).unwrap();
+        let project_path = project.path().to_path_buf();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let guard = acquire_project_mutation_guard(&project_path).unwrap();
+            acquired_tx.send(()).unwrap();
+            drop(guard);
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        assert!(
+            acquired_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "second mutation lock unexpectedly acquired while the first was held"
+        );
+        drop(first_guard);
+        acquired_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        waiter.join().unwrap();
+    }
+
+    #[test]
+    fn project_mutation_guard_releases_during_error_unwind() {
+        let project = tempfile::tempdir().unwrap();
+        let operation = || -> io::Result<()> {
+            let _guard =
+                acquire_project_mutation_guard(project.path()).map_err(io::Error::other)?;
+            Err(io::Error::other("injected operation failure"))
+        };
+        assert!(operation().is_err());
+        acquire_project_mutation_guard(project.path()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_mutation_symlink_route_has_same_identity() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let alias = root.path().join("alias");
+        fs::create_dir(&project).unwrap();
+        symlink(&project, &alias).unwrap();
+        assert_eq!(
+            project_mutation_lock_path(&project).unwrap(),
+            project_mutation_lock_path(&alias).unwrap()
+        );
+    }
+
     fn plan_for(dir: &Path, manifest: &str, lock: &str) -> PublishPlan {
         PublishPlan {
             manifest_path: dir.join("package.json"),
@@ -633,5 +891,73 @@ mod tests {
         publish_with_failure(&plan, PublishStage::Manifest).unwrap_err();
         assert!(!dir.path().join("package.json").exists());
         assert!(!dir.path().join("bpm.lock").exists());
+    }
+
+    #[test]
+    fn publish_error_reports_complete_rollback_truthfully() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("package.json"), b"old manifest").unwrap();
+        fs::write(dir.path().join("bpm.lock"), b"old lock").unwrap();
+        let plan = plan_for(dir.path(), "new manifest", "new lock");
+        let error = publish_with_failure(&plan, PublishStage::Manifest).unwrap_err();
+        assert!(error.publication_began());
+        assert!(error.rollback_complete());
+        assert!(error
+            .to_string()
+            .contains("both destinations were restored"));
+        assert!(!error.to_string().contains("old manifest"));
+        assert!(!error.to_string().contains("old lock"));
+    }
+
+    #[test]
+    fn publish_error_collects_both_restore_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("package.json"), b"old manifest").unwrap();
+        fs::write(dir.path().join("bpm.lock"), b"old lock").unwrap();
+        let plan = plan_for(dir.path(), "new manifest", "new lock");
+        let error = publish_impl(
+            &plan,
+            Some(PublishStage::Manifest),
+            RestoreFaults {
+                lock: true,
+                manifest: true,
+            },
+        )
+        .unwrap_err();
+        assert!(!error.rollback_complete());
+        assert_eq!(error.rollback_failures().len(), 2);
+        assert_eq!(
+            error.rollback_failures()[0].destination,
+            RollbackDestination::Lock
+        );
+        assert_eq!(
+            error.rollback_failures()[1].destination,
+            RollbackDestination::Manifest
+        );
+        assert!(error.to_string().contains("rollback incomplete"));
+        assert!(!error.to_string().contains("old manifest"));
+        assert!(!error.to_string().contains("old lock"));
+    }
+
+    #[test]
+    fn failed_lock_restore_does_not_skip_manifest_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("package.json"), b"old manifest").unwrap();
+        fs::write(dir.path().join("bpm.lock"), b"old lock").unwrap();
+        let plan = plan_for(dir.path(), "new manifest", "new lock");
+        let error = publish_impl(
+            &plan,
+            Some(PublishStage::Manifest),
+            RestoreFaults {
+                lock: true,
+                manifest: false,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.rollback_failures().len(), 1);
+        assert_eq!(
+            fs::read(dir.path().join("package.json")).unwrap(),
+            b"old manifest"
+        );
     }
 }
