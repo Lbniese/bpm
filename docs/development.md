@@ -36,9 +36,6 @@ comparable evidence. Report median, p95, and variance when benchmarking.
 
 ## Working rules (summary)
 
-The authoritative rules live in [`development guide`](development guide) at the repository
-root. In short:
-
 - **Benchmark before optimizing.** Identify the scenario, record a
   baseline, profile, make the smallest change, rerun, report median/p95/
   variance.

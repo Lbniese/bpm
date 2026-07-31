@@ -730,25 +730,27 @@ rest of the graph is resolved.
 Set `BPM_STREAM_INSTALL=0` to resolve the whole graph before downloading
 anything — useful for benchmarking or isolating streaming-related regressions.
 
-### Async resolver (experimental)
+### Async resolver (default)
 
-`BPM_ASYNC_RESOLVE=1` replaces the blocking resolver with a non-blocking async
-counterpart that never stalls on inline packument fetches. The output
-`bpm.lock` is byte-identical to the blocking path.
+By default, `bpm install` uses the non-blocking async resolver and combines it
+with the streaming install path. The resolver never stalls on inline packument
+fetches, and its output `bpm.lock` is byte-identical to the blocking path.
 
-When `BPM_ASYNC_RESOLVE=1` and `BPM_STREAM_INSTALL` is set to its default of
-`1`, the async resolver feeds each placed package to the download pipeline via
-a non-blocking sink, combining concurrent packument fetches with overlapped
-downloads. Missing pipeline units (from channel backpressure) are fetched in a
-sequential pass after resolution completes.
+With streaming enabled (also the default), the async resolver feeds each placed
+package to the download pipeline via a non-blocking sink, combining concurrent
+packument fetches with overlapped downloads. Missing pipeline units (from
+channel backpressure) are fetched in a sequential pass after resolution
+completes.
 
-`BPM_RESOLVER_MAX_IN_FLIGHT` bounds async registry request bodies (default
+Set `BPM_ASYNC_RESOLVE=0` or `BPM_ASYNC_RESOLVE=false` to force the blocking
+resolver as a diagnostic kill-switch. Independently, `BPM_STREAM_INSTALL=0`
+disables download overlap while retaining async resolution unless the async
+kill-switch is also set.
+
+`BPM_RESOLVER_MAX_IN_FLIGHT` bounds concurrent async registry requests (default
 `32`, clamped to `1..64`). Lower it for a constrained registry or raise it for
 high-latency HTTP/1.1 environments; lockfile placement remains deterministic.
 
 Artifact downloads use HTTP/2 via ALPN by default so concurrent response bodies
 can share a connection. Set `BPM_HTTP2=0` to force HTTP/1.1 when diagnosing a
 registry or transport compatibility issue.
-
-Set `BPM_STREAM_INSTALL=0` alongside `BPM_ASYNC_RESOLVE=1` to use the async
-resolver without the download overlap.
