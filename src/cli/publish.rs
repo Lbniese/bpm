@@ -21,6 +21,9 @@ pub(super) fn run(
         .name
         .clone()
         .ok_or_else(|| anyhow::anyhow!("package.json requires a name for publish"))?;
+    if !bpm::registry::is_valid_npm_name(&name) {
+        anyhow::bail!("cannot publish invalid npm package name '{name}'");
+    }
     let version = manifest
         .version
         .clone()
