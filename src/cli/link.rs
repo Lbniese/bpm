@@ -1,7 +1,8 @@
 //! `bpm link` / `bpm unlink` — npm-compatible developer linking (global two-step).
 //!
 //! - `bpm link` (in a package dir): register the cwd package globally as
-//!   `$BPM_STORE/links/<name>` -> `<cwd>`.
+//!   `$BPM_STORE/links/<name>` -> `<cwd>` (scoped names use
+//!   `$BPM_STORE/links/@scope/pkg`).
 //! - `bpm link <name>` (in a consumer project): add
 //!   `<name>: "file:$BPM_STORE/links/<name>"` to `package.json` and run the
 //!   normal install, which materializes `node_modules/<name>` -> the target.
@@ -117,7 +118,7 @@ fn run_consume(
     store: Option<std::path::PathBuf>,
     registry: Option<String>,
 ) -> anyhow::Result<()> {
-    let target = links.resolve(name).ok_or_else(|| {
+    let target = links.resolve(name)?.ok_or_else(|| {
         anyhow::anyhow!(
             "no global link named '{name}'; run `bpm link` in that package's directory first to \
              register it"
@@ -127,7 +128,7 @@ fn run_consume(
     // Record the dependency as a `file:` spec pointing at the global symlink so
     // re-registration remains observable on the next consume/install. The
     // mutation owner stages manifest and selected lock together before install.
-    let spec = format!("file:{}", links.root().join(name).display());
+    let spec = format!("file:{}", links.registration_path(name)?.display());
     let install_options = install_options(store, registry);
     let outcome = mutate::run_link_consume(name, &spec, &install_options)?;
     if outcome.changed {
@@ -172,6 +173,21 @@ fn run_unconsume(
         // A directory symlink on Windows needs `remove_dir`.
         std::fs::remove_dir(&node_modules_entry)
             .with_context(|| format!("removing {}", node_modules_entry.display()))?;
+    }
+    if let Some((scope, _)) = name.split_once('/') {
+        let scope_dir = project_root.join("node_modules").join(scope);
+        match std::fs::remove_dir(&scope_dir) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+                ) => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("removing empty scope {}", scope_dir.display()));
+            }
+        }
     }
     Ok(())
 }

@@ -262,6 +262,70 @@ fn repeated_consume_follows_reregistered_target() {
 }
 
 #[test]
+fn scoped_link_full_lifecycle_is_isolated() {
+    let tmp = TempDir::new().unwrap();
+    let store = tmp.path().join("store");
+    let package_parent = tmp.path().join("packages");
+    let first = make_pkg(&package_parent, "@scope/first");
+    let second = make_pkg(&package_parent, "@scope/second");
+    let app = tmp.path().join("app");
+    fs::create_dir_all(&app).unwrap();
+    fs::write(
+        app.join("package.json"),
+        r#"{"name":"app","version":"1.0.0"}"#,
+    )
+    .unwrap();
+
+    let (_, stderr, code) = run(&["link"], &first, &store);
+    assert_eq!(code, Some(0), "first register failed: {stderr}");
+    let (_, stderr, code) = run(&["link"], &second, &store);
+    assert_eq!(code, Some(0), "second register failed: {stderr}");
+    let global_scope = store.join("links/@scope");
+    let first_registration = global_scope.join("first");
+    let second_registration = global_scope.join("second");
+    assert!(global_scope.is_dir() && !global_scope.is_symlink());
+    assert!(first_registration.is_symlink());
+    assert!(second_registration.is_symlink());
+
+    let (_, stderr, code) = run(&["link", "@scope/first"], &app, &store);
+    assert_eq!(code, Some(0), "first consume failed: {stderr}");
+    let (_, stderr, code) = run(&["link", "@scope/second"], &app, &store);
+    assert_eq!(code, Some(0), "second consume failed: {stderr}");
+    let first_entry = app.join("node_modules/@scope/first");
+    let second_entry = app.join("node_modules/@scope/second");
+    assert!(first_entry.is_symlink());
+    assert!(second_entry.is_symlink());
+    assert_eq!(
+        fs::canonicalize(&first_entry).unwrap(),
+        fs::canonicalize(&first).unwrap()
+    );
+    let manifest = fs::read_to_string(app.join("package.json")).unwrap();
+    assert!(manifest.contains(r#""@scope/first""#));
+    assert!(manifest.contains(&first_registration.display().to_string()));
+    let lock = fs::read_to_string(app.join("bpm.lock")).unwrap();
+    assert!(lock.contains("node_modules/@scope/first"));
+    assert!(lock.contains(r#""link": true"#));
+
+    let (_, stderr, code) = run(&["unlink", "@scope/first"], &app, &store);
+    assert_eq!(code, Some(0), "first unconsume failed: {stderr}");
+    assert!(!first_entry.exists());
+    assert!(
+        second_entry.is_symlink(),
+        "sibling consumer link was removed"
+    );
+
+    let (_, stderr, code) = run(&["unlink", "--global"], &first, &store);
+    assert_eq!(code, Some(0), "first unregister failed: {stderr}");
+    assert!(!first_registration.exists());
+    assert!(second_registration.is_symlink());
+    assert!(global_scope.is_dir(), "nonempty global scope was removed");
+
+    assert_eq!(run(&["unlink", "@scope/second"], &app, &store).2, Some(0));
+    assert_eq!(run(&["unlink", "--global"], &second, &store).2, Some(0));
+    assert!(!global_scope.exists(), "empty global scope was not cleaned");
+}
+
+#[test]
 fn unconsume_removes_link() {
     let tmp = TempDir::new().unwrap();
     let store = tmp.path().join("store");
