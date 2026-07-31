@@ -34,9 +34,11 @@ const FILE_SCHEME: &str = "file://";
 /// Maximum **compressed bytes** read from any artifact source (registry
 /// tarball, direct local/file dependency, hosted-Git tarball, or remote-cache
 /// download) before integrity verification. This bounds disk/memory growth a
-/// malicious or compromised source can force before the SHA-512 check fails;
-/// it is NOT the extracted package size (the extraction trust boundary enforces
-/// its own limits). One policy governs every artifact read path.
+/// malicious or compromised source can force before the SHA-512 check fails.
+/// It is NOT the extracted package size: extraction enforces its own budgets —
+/// 2 GiB total decompressed/materialized bytes, 512 MiB per regular file, and
+/// 100,000 entries (`src/archive.rs`). One policy governs every artifact read
+/// path.
 pub(crate) const MAX_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Process-wide default client used by compatibility callers that do not

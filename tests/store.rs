@@ -114,6 +114,46 @@ fn integrity_mismatch_is_rejected_and_tmp_cleaned() {
     assert_eq!(server.hits(), 1);
 }
 
+/// Any extraction failure (a malformed archive, or a resource-budget excess)
+/// must delete the partially extracted temporary image directory and publish
+/// no final image. The immutable archive and unrelated images are untouched.
+#[test]
+fn extraction_failure_deletes_partial_image() {
+    // Valid bytes with matching integrity, but not a valid gzip/tar stream:
+    // this fails inside `archive::extract` (InvalidArchive), exercising the
+    // partial-image cleanup for every extraction error class.
+    let malformed = b"this is not a gzip or tar stream".to_vec();
+    let integrity = integrity_of(&malformed);
+    let integ = Integrity::parse(&integrity).unwrap();
+    let server = MiniServer::start(malformed.clone());
+    let url = server.url_for();
+
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = ArtifactStore::open(store_dir.path()).unwrap();
+
+    let mut m = Metrics::new();
+    let artifact = store.ensure_artifact(&url, Some(&integ), &mut m).unwrap();
+
+    let mut m2 = Metrics::new();
+    let err = store
+        .ensure_image(&artifact.id, &mut m2)
+        .expect_err("malformed archive must fail extraction");
+    let text = format!("{err}");
+    assert!(
+        text.contains("extraction failed"),
+        "expected an extraction error, got: {text}"
+    );
+
+    // No final image was published for this artifact.
+    assert!(!store.image_path(&artifact.id).exists());
+    // The temp directory has no leftover image scratch.
+    let tmp_count = fs::read_dir(store.root().join("tmp")).unwrap().count();
+    assert_eq!(
+        tmp_count, 0,
+        "temp scratch not cleaned after extraction failure"
+    );
+}
+
 /// Plan 012: a retrieval error (not just an integrity mismatch) must not leave a
 /// scratch file in the store's temp directory.
 #[test]
