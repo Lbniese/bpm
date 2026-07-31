@@ -504,9 +504,17 @@ impl ArtifactStore {
         fs::create_dir_all(&tmp).map_err(|source| io_err(&tmp, source))?;
         metrics
             .measure("artifact_extract", || archive::extract(&archive, &tmp))
-            .map_err(|source| StoreError::Extract {
-                id: id.to_hex(),
-                source,
+            .map_err(|source| {
+                // Any extraction failure (including a resource-limit budget)
+                // must not leave a partial image in the store's temp
+                // directory. Best-effort removal of the unique temp path;
+                // the immutable archive and already-published images are
+                // untouched. Preserve the original extraction error.
+                let _ = fs::remove_dir_all(&tmp);
+                StoreError::Extract {
+                    id: id.to_hex(),
+                    source,
+                }
             })?;
         if let Some(parent) = img.parent() {
             fs::create_dir_all(parent).map_err(|source| io_err(parent, source))?;
