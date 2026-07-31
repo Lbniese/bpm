@@ -351,7 +351,7 @@ fn baseline_comparison_rejects_environment_mismatch_unless_informational() {
     let error =
         compare_results_against_baseline(&baseline, &[current.clone()], &CompareOptions::default())
             .unwrap_err();
-    assert!(format!("{error:#}").contains("matching machine/system and versions"));
+    assert!(format!("{error:#}").contains("matching machine/system"));
 
     let rows = compare_results_against_baseline(
         &baseline,
@@ -363,6 +363,100 @@ fn baseline_comparison_rejects_environment_mismatch_unless_informational() {
     )
     .unwrap();
     assert_eq!(rows.len(), 1);
+}
+
+#[test]
+fn strict_comparison_accepts_differing_bpm_version_only() {
+    // A regression gate intentionally compares two BPM builds on the same
+    // host; a BPM-only version difference must succeed in strict mode.
+    let baseline = vec![result_with_tools(
+        "minimal",
+        "repeat_install",
+        vec![("bpm", 10.0, vec![0])],
+    )];
+    let mut current = result_with_tools("minimal", "repeat_install", vec![("bpm", 10.0, vec![0])]);
+    // Only the BPM version differs; host and node/npm/pnpm stay identical.
+    current
+        .versions
+        .insert("bpm".to_string(), "bpm 0.0.1".to_string());
+    current
+        .system
+        .runtime_versions
+        .insert("bpm".to_string(), "bpm 0.0.1".to_string());
+
+    let rows = compare_results_against_baseline(&baseline, &[current], &CompareOptions::default())
+        .expect("BPM-only version difference is comparable in strict mode");
+    assert_eq!(rows.len(), 1);
+}
+
+#[test]
+fn strict_comparison_rejects_differing_external_runtime() {
+    // Node/npm/pnpm or kernel differences remain strict errors even when BPM
+    // is also allowed to differ.
+    let baseline = vec![result_with_tools(
+        "minimal",
+        "repeat_install",
+        vec![("bpm", 10.0, vec![0])],
+    )];
+    let mut current = result_with_tools("minimal", "repeat_install", vec![("bpm", 10.0, vec![0])]);
+    current
+        .versions
+        .insert("node".to_string(), "v99.0.0".to_string());
+
+    let error = compare_results_against_baseline(&baseline, &[current], &CompareOptions::default())
+        .expect_err("external runtime mismatch must fail strictly");
+    assert!(format!("{error:#}").contains("matching machine/system"));
+}
+
+#[test]
+fn strict_comparison_rejects_ratio_above_envelope() {
+    let baseline = vec![result_with_tools(
+        "minimal",
+        "repeat_install",
+        vec![("bpm", 10.0, vec![0])],
+    )];
+    let current = vec![result_with_tools(
+        "minimal",
+        "repeat_install",
+        vec![("bpm", 100.0, vec![0])], // ratio 10x exceeds envelope 2.0
+    )];
+
+    let error = compare_results_against_baseline(
+        &baseline,
+        &current,
+        &CompareOptions {
+            regression_envelope: 2.0,
+            informational: false,
+        },
+    )
+    .expect_err("ratio above envelope must fail strictly");
+    assert!(format!("{error:#}").contains("regression exceeds envelope"));
+}
+
+#[test]
+fn informational_comparison_returns_row_despite_ratio_excess() {
+    let baseline = vec![result_with_tools(
+        "minimal",
+        "repeat_install",
+        vec![("bpm", 10.0, vec![0])],
+    )];
+    let current = vec![result_with_tools(
+        "minimal",
+        "repeat_install",
+        vec![("bpm", 100.0, vec![0])], // ratio 10x exceeds envelope 2.0
+    )];
+
+    let rows = compare_results_against_baseline(
+        &baseline,
+        &current,
+        &CompareOptions {
+            regression_envelope: 2.0,
+            informational: true,
+        },
+    )
+    .expect("informational mode reports without gating");
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].ratio > 2.0);
 }
 
 #[test]

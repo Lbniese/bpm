@@ -31,12 +31,44 @@ warning rather than failing the run.
 
 ## Baselines
 
-`baselines/` holds machine-stamped baseline files produced by `--save-baseline`.
-Machine-stamped files are local measurement artifacts — `.gitignore`d — while
-`baselines/reference.json` is the curated, **checked-in** reference baseline
-(the `.gitignore` explicitly exempts it). Regenerate the reference cells on a
-given machine with the command above and copy the result into
-`reference.json` when the materialization or lifecycle strategy changes.
+There are two distinct kinds of baseline, with different purposes:
+
+- **`baselines/reference.json`** — the curated, **checked-in** reference
+  baseline (the `.gitignore` explicitly exempts it). It is a same-machine
+  historical/product narrative: a fixed record of past measurements used to
+  tell the performance story over time. It is **not** a portable CI gate,
+  because strict comparison requires exact system and version equality and the
+  reference was recorded on a different machine than CI runners.
+- **Manual CI regression baseline** — a manually dispatched
+  `benchmark-baseline` workflow job that dynamically benchmarks a selected
+  `baseline_ref` (default `HEAD^`) and the current commit **on the same
+  runner**, BPM only, then enforces the regression envelope. Comparing two
+  builds on one host is what makes the gate meaningful.
+
+`baselines/` also holds machine-stamped files produced by `--save-baseline`
+(`.gitignore`d); regenerate the reference cells on a given machine with the
+command above and copy the result into `reference.json` when the
+materialization or lifecycle strategy changes.
+
+### Strict vs informational comparison
+
+The benchmark comparator accepts a BPM version difference between baseline
+and current (comparing two BPM builds is the gate's purpose), but still
+requires the same `machine`, `operating_system`, `kernel`, and identical
+non-BPM runtime versions (`node`/`npm`/`pnpm`). Any other mismatch is a strict
+error. **Informational** comparison (`--baseline-informational` or the
+workflow's `informational_baseline` input) reports comparison rows without
+gating on environment mismatch or ratio excess; strict comparison fails on
+both.
+
+### Choosing a baseline ref
+
+The default `HEAD^` compares against the previous commit. For a longer-range
+comparison choose a stable release tag or a known-good commit (for example
+`v0.2.0` or a full SHA). The baseline ref must contain a compatible `bpm
+bench` interface; if the harness CLI has changed, pick a more recent baseline
+or the comparison step will report a clear error rather than silently
+substituting the current binary or the historical reference.
 
 ## bpm metrics
 
