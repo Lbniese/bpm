@@ -61,18 +61,34 @@ Turbopack can keep dependency realpaths inside the project.
 | Command | Description |
 |---|---|
 | `bpm doctor` | Inspect the nearest `package.json` and report diagnostics |
-| `bpm fetch <spec\|url>` | Resolve a package by spec (`lodash`, `lodash@4.17.21`) or fetch a tarball by exact URL, then verify, store, and extract. Supports `--offline`, `--prefer-offline`, `--prefer-online` |
-| `bpm install [<spec\|url>]` | Install the project lockfile, or add registry targets to the local manifest; use `bpm install -g <spec>` for global bin linking. Supports `--offline`, `--prefer-offline`, `--prefer-online` |
-| `bpm upgrade [<pkg>...]` | Re-resolve within declared ranges and bump locked versions to the newest satisfying ones; rewrites `bpm.lock` without editing `package.json` ranges |
-| `bpm dedupe` | Re-resolve to minimize duplicate versions and rewrite `bpm.lock` |
-| `bpm ci` | Reproducible frozen install from `bpm.lock` (npm `ci` compatibility) |
-| `bpm import` | Convert npm `package-lock.json` v3 to `bpm.lock` and preserve root manifest metadata |
-| `bpm exec <command>` | Execute a local dependency binary with the project bin path |
-| `bpm run <script>` | Execute a root package script with npm-compatible environment variables |
-| `bpm bench` | Run performance benchmark scenarios and emit timing results |
-| `bpm outdated [<pkg>]` | Show packages with newer versions available on the registry |
-| `bpm why <pkg>` | Show why a package is in the dependency tree (reverse-edge walk) |
-| `bpm gc` | Garbage-collect unused global store data |
+| `bpm gc` | Garbage-collect unreferenced global-store data |
+| `bpm cache [ls\|verify\|clean]` | Inspect, repair, or reclaim the global artifact and metadata cache |
+| `bpm fetch <spec\|url>` | Resolve or directly fetch, verify, store, and extract a package; supports offline/preference modes |
+| `bpm bench` | Run benchmark fixtures, compare baselines, and emit timing results |
+| `bpm import [path]` | Convert a supported external lockfile to canonical `bpm.lock` |
+| `bpm init` | Create a validated `package.json` interactively or from flags |
+| `bpm publish` | Pack and publish the current package to an npm-compatible registry |
+| `bpm audit` | Query registry advisories for versions resolved in the project lock |
+| `bpm install [<registry-spec>...]` (`bpm i`, `bpm add`) | Install the selected lock, add registry packages transactionally, or use `-g` to link package bins |
+| `bpm link [<name>]` | Register or consume an unscoped or scoped developer link, such as `@scope/pkg` |
+| `bpm unlink [<name>]` | Remove a consumed link, or unregister it with `--global` |
+| `bpm uninstall <pkg>...` (`bpm remove`, `bpm rm`, `bpm un`) | Remove dependencies transactionally and reinstall the resolved graph |
+| `bpm upgrade [<pkg>...]` | Re-resolve within declared ranges without editing manifest ranges |
+| `bpm dedupe` | Re-resolve to minimize duplicate versions and rewrite the selected lock |
+| `bpm ci` | Perform a reproducible frozen install from `bpm.lock` or supported npm v3 lock |
+| `bpm bin` | Print the user-level executable-shim directory |
+| `bpm root` | Print the project `node_modules` root or global store root |
+| `bpm prefix` | Print the project prefix or global BPM prefix |
+| `bpm exec <command>` (`bpm x`) | Execute with the nearest project's dependency bins on `PATH` |
+| `bpm run <script>` (`bpm run-script`) | Execute a root lifecycle script with npm-compatible environment variables |
+| `bpm outdated [<pkg>]` | Show stale locked versions using bounded, deduplicated metadata lookups |
+| `bpm view <package> [field]` | Read package metadata from the configured registry |
+| `bpm whoami` | Print the registry-authenticated username |
+| `bpm token [action]` | List, create, or revoke registry authentication tokens |
+| `bpm dist-tag [action]` | List, set, or remove package distribution tags |
+| `bpm owner [action]` | List or mutate package owners/collaborators |
+| `bpm why <pkg>` | Explain why a package is in the dependency tree |
+| `bpm ls [<pkg>]` (`bpm list`) | Render the installed dependency tree |
 
 ## Documentation
 

@@ -49,6 +49,45 @@ bpm init --name @scope/lib --license Apache-2.0
 bpm init
 ```
 
+## `bpm publish [flags]`
+
+Packs the current project and uploads an npm-compatible publish document to the
+configured registry. The manifest must contain a valid npm package name and a
+version; invalid names fail before packing, credential lookup, or network
+access. Registry conflicts and authentication failures are hard errors, and
+success is printed only after the upload completes.
+
+| Flag | Meaning |
+|---|---|
+| `--registry <url>` | Override the configured registry. |
+| `--access <value>` | Set the npm publish access field (normally `public` or `restricted`); defaults to `restricted`. |
+| `--prompt-otp` | Read a two-factor OTP from a hidden prompt; otherwise `$BPM_OTP` is used when set. |
+| `--provenance` | Attach BPM's minimal provenance statement. |
+
+```bash
+bpm publish --access public
+BPM_OTP='<redacted>' bpm publish --provenance
+```
+
+## `bpm audit [flags]`
+
+Builds an advisory request from the exact versions in `bpm.lock` or a supported
+npm v3 lock and queries the registry's bulk advisory endpoint. It never treats
+manifest declarations as resolved inventory. Missing/malformed locks and
+malformed advisory responses fail closed.
+
+| Flag | Meaning |
+|---|---|
+| `--registry <url>` | Override the configured registry. |
+| `--audit-level <severity>` | Fail for findings at or above `info`, `low`, `moderate`, `high`, or `critical` (default `low`). |
+| `--json` | Print the validated advisory response as JSON. |
+| `--offline` | Normalize and summarize local lock data without a registry request. |
+
+```bash
+bpm audit --audit-level high
+bpm audit --offline --json
+```
+
 ## `bpm fetch <target> [flags]`
 
 Fetches a package by **npm-style spec** or **exact URL**. For a spec, BPM
@@ -129,8 +168,8 @@ Notes:
 
 | Flag | Meaning |
 |---|---|
-| `<target>` | Package spec or exact URL/`file://`/path, resolved like `bpm fetch`. Omit for lockfile install. |
-| `--registry <url>` | Registry base URL for spec resolution (bin-install mode only). |
+| `<target>` | In local mutation mode, one or more registry package specs. With `-g`, one spec or exact URL/`file://`/path resolved like `bpm fetch`. Omit for lockfile install. |
+| `--registry <url>` | Registry base URL for package-spec resolution. |
 | `--store <dir>` | Store root. Defaults to `$BPM_STORE`, then `$HOME/.bpm`. |
 | `--frozen`, `--concurrency`, `--json-metrics`, `--ignore-scripts`, `--legacy-peer-deps` | Apply to the lockfile install mode (no `<target>`). `--frozen` accepts either `bpm.lock` or supported `package-lock.json` v3 and reports drift against the selected lock filename. |
 | `--git-prepare` | Run npm-compatible Git build-context `prepare` for Git dependencies using a transient regular+dev closure. **Enabled by default** for Git dependencies; disable with `--no-git-prepare` or `BPM_GIT_PREPARE=0`. |
@@ -147,9 +186,27 @@ still writes `bpm.lock`.
 Precedence is deterministic: nearest directory wins, and within the same
 directory `bpm.lock` wins over `package-lock.json`. `bpm import` is optional for
 teams that want to migrate to BPM's native lock format; it is not required for
-install or CI. Package-lock versions 1 and 2 are rejected clearly. Workspace or
-`link` package-lock entries and non-link entries without `resolved` are currently
-unsupported for direct install and fail before fetching or materializing.
+install or CI. Package-lock versions 1 and 2 are rejected clearly. Link
+entries with a resolved local target are supported; targetless links and
+non-link entries without `resolved` fail before fetching or materializing.
+
+## `bpm ci [flags]`
+
+Performs the same install path as `bpm install --frozen`: it requires the
+manifest and selected `bpm.lock` or supported npm v3 lock to agree, performs no
+fresh dependency resolution, and leaves the authoritative lock format
+unchanged. Fetch/extract concurrency, lifecycle, cache-mode, metrics, and remote
+cache flags match lockfile install mode.
+
+```bash
+bpm ci
+bpm ci --offline --ignore-scripts
+```
+
+Important flags include `--registry`, `--store`, `--concurrency`,
+`--json-metrics`, `--ignore-scripts`, `--legacy-peer-deps`, `--offline`,
+`--prefer-offline`, `--prefer-online`, `--remote-cache`, and the experimental
+`--derived-store` lifecycle cache.
 
 ## `bpm link [name] [flags]`
 
@@ -157,13 +214,17 @@ npm `link` compatibility: developer package linking via a global registry under
 `$BPM_STORE/links/`.
 
 **`bpm link`** (run inside a package directory) registers the cwd package
-globally as a symlink `$BPM_STORE/links/<name>` -> the package directory. The
-package name is read from `package.json`.
+globally as a symlink `$BPM_STORE/links/<name>` -> the package directory. Scoped
+registrations use `$BPM_STORE/links/@scope/pkg`, with `@scope` kept as a real
+structural directory. The package name is read from `package.json`.
 
 **`bpm link <name>`** (run inside a consumer project) consumes a registration:
 it adds `<name>: "file:$BPM_STORE/links/<name>"` to `package.json` and runs the
 normal install, which materializes `node_modules/<name>` -> the registered
-target. The dependency is recorded with `"link": true` in `bpm.lock`.
+target. The dependency is recorded with `"link": true` in the selected lock.
+Manifest editing, full resolution, and lock serialization complete before the
+manifest and lock are published together; a pre-publication failure leaves both
+files byte-identical (or absent).
 
 Re-registering a name repoints the global symlink; consumers follow the repoint
 on their next `bpm install` (their `package.json` points at the symlink, not the
@@ -171,8 +232,10 @@ resolved target, so each resolution re-canonicalizes through the current
 registration).
 
 ```bash
-cd ~/dev/mylib && bpm link          # register mylib globally
-cd ~/dev/myapp && bpm link mylib    # consume: node_modules/mylib -> mylib
+cd ~/dev/mylib && bpm link                    # register mylib globally
+cd ~/dev/myapp && bpm link mylib              # consume an unscoped link
+cd ~/dev/scoped-lib && bpm link               # registers links/@scope/lib
+cd ~/dev/myapp && bpm link @scope/lib         # node_modules/@scope/lib
 ```
 
 | Flag | Meaning |
@@ -207,6 +270,27 @@ cd ~/dev/mylib  && bpm unlink --global     # unregister mylib globally
 | `--store <dir>` | Store root. Defaults to `$BPM_STORE`, then `$HOME/.bpm`. |
 | `--registry <url>` | Registry base URL (passed through to the unconsume reinstall step). |
 
+## `bpm uninstall <name>... [flags]`
+
+Removes one or more names from every root dependency group, resolves the full
+remaining graph, publishes the manifest and selected lock transactionally, and
+reinstalls. Aliases are `bpm remove`, `bpm rm`, and `bpm un`. An undeclared name
+is a byte-stable no-op. `--global` is rejected because BPM does not yet have
+safe global-bin ownership metadata.
+
+Pre-publication parsing, resolution, export, or publication failure leaves the
+manifest and lock unchanged. A later installation failure keeps the published
+files and reports that `bpm install` can retry.
+
+```bash
+bpm uninstall lodash
+bpm remove eslint prettier --ignore-scripts
+```
+
+Install-related flags include `--registry`, `--store`, `--concurrency`,
+`--json-metrics`, `--ignore-scripts`, `--legacy-peer-deps`, cache preference
+flags, and `--remote-cache`.
+
 ## `bpm import [path] [flags]`
 
 Imports an npm `package-lock.json` (`lockfileVersion` 3 only) into a
@@ -220,10 +304,11 @@ writing `bpm.lock`.
 | `--out <path>` | Output `bpm.lock` path. Defaults to `bpm.lock` next to the input. |
 | `--json` | Emit the resulting lockfile plus diagnostics as JSON to stdout instead of a human summary. |
 
-Unsupported constructs (workspace/`link` entries, `os`/`cpu` platform
-constraints) are recorded and reported as warnings/info diagnostics, not
-silently dropped. An unsupported `lockfileVersion`, a missing `packages`
-table, or a malformed `bin` field fails with a clear, nonzero-exit error.
+Targetless link entries and `os`/`cpu` platform constraints are recorded and
+reported as warning/info diagnostics rather than silently dropped; links with a
+resolved local target retain that target. An unsupported `lockfileVersion`, a
+missing `packages` table, or a malformed `bin` field fails with a clear,
+nonzero-exit error.
 
 ### Remote artifact cache (experimental)
 
@@ -251,11 +336,60 @@ bpm import                        # ./package-lock.json -> ./bpm.lock
 bpm import path/to/lock.json --out path/to/bpm.lock --json
 ```
 
+## `bpm bin [-g]`
+
+Prints the user-level directory where global executable shims are linked.
+`-g`/`--global` is accepted for npm-compatible spelling; the command is
+read-only.
+
+```bash
+bpm bin
+bpm bin -g
+```
+
+## `bpm root [-g]`
+
+Prints the nearest project's `node_modules` directory. With `-g`/`--global`,
+prints the BPM store root instead. It reads project/store configuration and
+does not mutate either location.
+
+```bash
+bpm root
+bpm root --global
+```
+
+## `bpm prefix [-g]`
+
+Prints the nearest project root, or the BPM store root with `-g`/`--global`.
+This is a read-only path discovery command.
+
+```bash
+bpm prefix
+bpm prefix -g
+```
+
 ## `bpm exec <command> [args...]`
 
 Runs a command from the nearest project's `node_modules/.bin` with that
 folder prepended to `PATH`, preserving native arguments and the child's exit
-status.
+status. Alias: `bpm x`.
+
+```bash
+bpm exec eslint .
+bpm x vite --host
+```
+
+## `bpm run <script>`
+
+Runs one root `package.json` lifecycle script with BPM's npm-compatible script
+environment and local dependency bins on `PATH`. The child runs with the
+project as its working directory, and missing scripts or nonzero child status
+fail the command. Alias: `bpm run-script`.
+
+```bash
+bpm run build
+bpm run-script test
+```
 
 ## `bpm outdated [target] [flags]`
 
@@ -278,7 +412,9 @@ date." and exits zero.
 
 An optional package name argument limits the check to that one package.
 Registry failures for individual packages produce warnings on stderr but do not
-stop the command — other packages are still reported.
+stop the command — other packages are still reported. Metadata work is
+deduplicated by package name and runs through at most 16 workers; physical
+placements are still compared and printed in deterministic lockfile order.
 
 | Flag | Meaning |
 |------|---------|
@@ -368,6 +504,13 @@ bpm whoami --registry https://npm.example  # …on a private registry
 |------|---------|
 | `--registry <url>` | Registry base URL. Defaults to the config's registry, then `https://registry.npmjs.org`. |
 
+Authenticated registry commands use normal npmrc host-and-path credential
+scoping. A registry mounted below a path (for example
+`https://registry.example/npm/`) selects the longest matching
+`//registry.example/npm/:_authToken` scope at a directory boundary, so the same
+configuration applies to `publish`, `whoami`, token, dist-tag, and owner
+operations without exposing credentials in command arguments.
+
 ## `bpm token <action> [flags]`
 
 npm `token` compatibility: list, create, and revoke registry authentication
@@ -377,14 +520,16 @@ authenticated session (a bearer token in `.npmrc`).
 ```bash
 bpm token                       # list tokens (alias: list)
 bpm token create                # mint a token (prompts for the password)
-BPM_PASSWORD=... bpm token create --read-only --cidr 10.0.0.0/8
+BPM_PASSWORD='<redacted>' bpm token create --read-only --cidr 10.0.0.0/8
 bpm token revoke abc123         # revoke by the `key` shown by `token list`
 ```
 
 ### `bpm token list`
 
 Prints each token's id (`key`), whether it is read-only, its CIDR whitelist,
-and creation time. Add `--json` for machine-readable output.
+and creation time. Add `--json` for machine-readable output. When the registry
+paginates npm token responses, BPM follows all advertised pages and preserves
+the registry's list order.
 
 ### `bpm token create`
 
@@ -571,6 +716,32 @@ bpm ls --depth 0              # direct dependencies only
 bpm ls --json                 # machine-readable output
 ```
 
+## `bpm bench [flags]`
+
+Runs isolated benchmark fixture/scenario combinations for npm, pnpm, and BPM,
+reports median/p95/deviation statistics, and can write or compare semantic JSON
+baselines. It creates benchmark work/cache directories but does not mutate the
+caller's project. Requested missing tools are skipped unless `--require-tools`
+is set.
+
+| Flag | Meaning |
+|---|---|
+| `--fixture <name>` | Fixture to benchmark (default `minimal`). |
+| `--scenario <name>` | Run one scenario instead of all applicable scenarios. |
+| `--tools <list>` | Comma-separated managers (default `npm,pnpm,bpm`). |
+| `--runs <n>` | Samples per scenario (default `3`). |
+| `--json <path>` | Write machine-readable results. |
+| `--save-baseline <dir>` | Write a machine/date-stamped baseline. |
+| `--compare-baseline <path>` | Compare against an existing semantic baseline. |
+| `--regression-envelope <ratio>` | Maximum median ratio for a comparison (default `2.0`). |
+| `--profile-bpm <dir>` | Write separate BPM phase profiles. |
+| `--list` | List fixtures and scenarios without benchmarking. |
+
+```bash
+bpm bench --list
+bpm bench --fixture minimal --runs 3 --json results.json
+```
+
 ## `bpm gc [flags]`
 
 Removes unreferenced store objects older than 30 days. Use `--older-than 30d` to
@@ -622,29 +793,6 @@ bpm cache clean                 # reclaim all unreferenced objects
 mismatch, unsupported lockfile version) or when `bpm doctor` finds an
 `error`-severity diagnostic. Error messages are structured and actionable,
 never a bare "installation failed".
-
-## Publish and audit
-
-`bpm publish` creates an npm-compatible package attachment from the current
-project and uploads it using the configured registry credentials. If the
-account requires two-factor authentication, set the OTP from `$BPM_OTP` or pass
-`--prompt-otp` to enter it at a hidden prompt; it is never accepted as an argv
-value. `bpm audit` posts the project's resolved dependency inventory to the
-registry advisory endpoint; use `--json` for the raw advisory response.
-
-The audited inventory comes from `bpm.lock`, or from npm
-`package-lock.json` (lockfile version 3) when no `bpm.lock` exists.
-Declaration-only `package.json` data is **not** audited because it lacks
-resolved versions. Audit fails closed: a missing, unreadable, malformed, or
-unsupported-version lockfile is a hard error (exit nonzero), and a malformed
-or wrong-shaped advisory response is also a hard error rather than a silent
-zero-vulnerability success. A dependency-free valid lock and a valid empty
-advisory object (`{}`) remain a successful zero-finding result. Use
-`--audit-level` to control the severity threshold at which nonzero findings
-fail the command.
-
-`bpm import` accepts npm `package-lock.json` plus the supported text forms of
-Yarn, pnpm, and Bun lockfiles and writes the canonical `bpm.lock`.
 
 ## Adding and removing dependencies
 
