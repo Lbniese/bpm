@@ -1285,14 +1285,20 @@ pub fn compare_results_against_baseline(
 
         let system_matches = baseline_entry.result.system == current_entry.result.system;
         let versions_match = baseline_entry.result.versions == current_entry.result.versions;
-        if (!system_matches || !versions_match) && !options.informational {
+        // BPM version may differ between baseline and current (comparing two
+        // BPM builds is the gate's purpose); every other host/runtime version
+        // must still match in strict mode.
+        let comparable = environments_comparable(baseline_entry.result, current_entry.result);
+        if (!system_matches || !versions_match) && !comparable && !options.informational {
             anyhow::bail!(
-                "baseline comparison requires matching machine/system and versions for fixture={}, scenario={}, tool={}; baseline_machine={} current_machine={} baseline_versions={:?} current_versions={:?}",
+                "baseline comparison requires a matching machine/system and matching non-bpm runtime versions for fixture={}, scenario={}, tool={}; baseline_machine={} current_machine={} baseline_runtime={:?} current_runtime={:?} baseline_versions={:?} current_versions={:?}",
                 key.fixture,
                 key.scenario,
                 key.tool,
                 baseline_entry.result.system.machine,
                 current_entry.result.system.machine,
+                baseline_entry.result.system.runtime_versions,
+                current_entry.result.system.runtime_versions,
                 baseline_entry.result.versions,
                 current_entry.result.versions
             );
@@ -1310,7 +1316,7 @@ pub fn compare_results_against_baseline(
             current_median / baseline_median
         };
 
-        if ratio > options.regression_envelope {
+        if ratio > options.regression_envelope && !options.informational {
             anyhow::bail!(
                 "benchmark regression exceeds envelope for fixture={}, scenario={}, tool={}: baseline={:.3}ms current={:.3}ms ratio={:.3} limit={:.3} baseline_machine={} current_machine={} baseline_versions={:?} current_versions={:?}",
                 key.fixture,
@@ -1345,6 +1351,35 @@ pub fn compare_results_against_baseline(
         (&a.fixture, &a.scenario, &a.tool).cmp(&(&b.fixture, &b.scenario, &b.tool))
     });
     Ok(rows)
+}
+
+/// Whether two results share a comparable environment, ignoring only the BPM
+/// version (the intentional subject of a regression comparison). Compares
+/// `machine`, `operating_system`, `kernel`, and every recorded runtime/result
+/// version except `bpm`. Does not mutate the maps.
+fn environments_comparable(baseline: &BenchmarkResult, current: &BenchmarkResult) -> bool {
+    let (bs, cs) = (&baseline.system, &current.system);
+    if bs.machine != cs.machine
+        || bs.operating_system != cs.operating_system
+        || bs.kernel != cs.kernel
+    {
+        return false;
+    }
+    if !maps_equal_excluding_bpm(&bs.runtime_versions, &cs.runtime_versions) {
+        return false;
+    }
+    if !maps_equal_excluding_bpm(&baseline.versions, &current.versions) {
+        return false;
+    }
+    true
+}
+
+/// Compare two version maps while ignoring the `bpm` key in both, without
+/// mutating either map.
+fn maps_equal_excluding_bpm(a: &BTreeMap<String, String>, b: &BTreeMap<String, String>) -> bool {
+    a.iter()
+        .filter(|(k, _)| k.as_str() != "bpm")
+        .eq(b.iter().filter(|(k, _)| k.as_str() != "bpm"))
 }
 
 struct IndexedEntry<'a> {
