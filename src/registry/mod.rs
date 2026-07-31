@@ -658,24 +658,60 @@ impl RegistryClient {
 
     /// List the caller's authentication tokens (`GET /-/npm/v1/tokens`).
     pub fn list_tokens(&self) -> Result<Vec<RegistryToken>, RegistryError> {
+        const MAX_TOKEN_LIST_PAGES: usize = 1_000;
+
         let base = self.config.registry().trim_end_matches('/');
-        let url = format!("{base}/-/npm/v1/tokens");
-        let response = self
-            .http
-            .get_with_headers(&url, &[])
-            .map_err(token_http_error)?;
-        let body = response
-            .into_string()
-            .map_err(|source| RegistryError::Network {
-                package: "-/npm/v1/tokens".to_string(),
-                source: Box::new(source),
+        let first_url = reqwest::Url::parse(&format!("{base}/-/npm/v1/tokens")).map_err(|_| {
+            RegistryError::TokenPagination {
+                reason: "the initial endpoint URL is malformed",
+            }
+        })?;
+        let allowed_origin =
+            token_page_origin(&first_url).ok_or(RegistryError::TokenPagination {
+                reason: "the initial endpoint must use HTTP or HTTPS",
             })?;
-        let tokens: Vec<RegistryToken> =
-            serde_json::from_str(&body).map_err(|source| RegistryError::BadJson {
-                package: "-/npm/v1/tokens".to_string(),
-                source,
-            })?;
-        Ok(tokens)
+        let mut current_url = first_url;
+        let mut visited = std::collections::BTreeSet::new();
+        let mut tokens = Vec::new();
+
+        loop {
+            record_token_page(&mut visited, &current_url, MAX_TOKEN_LIST_PAGES)?;
+            let response = self
+                .http
+                .get_with_headers(current_url.as_str(), &[])
+                .map_err(token_http_error)?;
+            let body = response
+                .into_string()
+                .map_err(|source| RegistryError::Network {
+                    package: "-/npm/v1/tokens".to_string(),
+                    source: Box::new(source),
+                })?;
+            let page: TokenListPage =
+                serde_json::from_str(&body).map_err(|source| RegistryError::BadJson {
+                    package: "-/npm/v1/tokens".to_string(),
+                    source,
+                })?;
+            tokens.extend(page.objects);
+
+            let Some(next) = page.urls.next.filter(|next| !next.is_empty()) else {
+                return Ok(tokens);
+            };
+            let next_url = current_url
+                .join(&next)
+                .map_err(|_| RegistryError::TokenPagination {
+                    reason: "the next-page link is malformed",
+                })?;
+            let next_origin =
+                token_page_origin(&next_url).ok_or(RegistryError::TokenPagination {
+                    reason: "the next-page link must use HTTP or HTTPS",
+                })?;
+            if next_origin != allowed_origin {
+                return Err(RegistryError::TokenPagination {
+                    reason: "the next-page link has a different origin",
+                });
+            }
+            current_url = next_url;
+        }
     }
 
     /// Mint a new authentication token (`POST /-/npm/v1/tokens`). npm requires
@@ -1327,6 +1363,48 @@ pub struct RegistryToken {
     pub updated: Option<String>,
 }
 
+/// Wire envelope returned by npm's token-list endpoint. `urls` is required so
+/// an omitted pagination contract is rejected rather than treated as complete.
+#[derive(Debug, serde::Deserialize)]
+struct TokenListPage {
+    objects: Vec<RegistryToken>,
+    urls: TokenPageUrls,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct TokenPageUrls {
+    next: Option<String>,
+}
+
+fn token_page_origin(url: &reqwest::Url) -> Option<(String, String, u16)> {
+    match url.scheme() {
+        "http" | "https" => Some((
+            url.scheme().to_string(),
+            url.host_str()?.to_string(),
+            url.port_or_known_default()?,
+        )),
+        _ => None,
+    }
+}
+
+fn record_token_page(
+    visited: &mut std::collections::BTreeSet<String>,
+    url: &reqwest::Url,
+    max_pages: usize,
+) -> Result<(), RegistryError> {
+    if visited.len() >= max_pages {
+        return Err(RegistryError::TokenPagination {
+            reason: "the page limit was exceeded",
+        });
+    }
+    if !visited.insert(url.as_str().to_string()) {
+        return Err(RegistryError::TokenPagination {
+            reason: "a pagination cycle was detected",
+        });
+    }
+    Ok(())
+}
+
 /// Request body for `POST /-/npm/v1/tokens` (mint a new token). npm requires
 /// re-authenticating with the account password to create a token.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1386,6 +1464,8 @@ pub enum RegistryError {
         #[source]
         source: serde_json::Error,
     },
+    #[error("invalid token-list pagination: {reason}")]
+    TokenPagination { reason: &'static str },
     #[error("packument for {package} has no versions")]
     NoVersions { package: String },
     #[error("no version of {package} satisfies {req}")]
@@ -2902,9 +2982,8 @@ mod tests {
     }
 
     #[test]
-    fn list_tokens_returns_array() {
-        let body = r#"[{"key":"abc123","readonly":false,"cidr_whitelist":["10.0.0.0/8"],"created":"2021-01-01T00:00:00.000Z"}]"#;
-        let body = body.to_string();
+    fn list_tokens_reads_one_enveloped_page() {
+        let body = r#"{"objects":[{"key":"abc123","readonly":false,"cidr_whitelist":["10.0.0.0/8"],"created":"2021-01-01T00:00:00.000Z"}],"urls":{"next":null},"total":1}"#.to_string();
         let (registry, shutdown, server) =
             token_server(move |_method, _path, _body| (200, body.clone()));
         let config = NpmConfig::default()
@@ -2919,6 +2998,163 @@ mod tests {
         assert_eq!(cidrs, &vec!["10.0.0.0/8".to_string()]);
         shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
         let _ = server.join();
+    }
+
+    #[test]
+    fn list_tokens_paginates_in_wire_order() {
+        let paths = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server_paths = std::sync::Arc::clone(&paths);
+        let (registry, shutdown, server) = token_server(move |_method, path, _body| {
+            server_paths.lock().unwrap().push(path.to_string());
+            match path {
+                "/-/npm/v1/tokens" => (
+                    200,
+                    r#"{"objects":[{"key":"first"}],"urls":{"next":"?page=2"},"total":2}"#
+                        .to_string(),
+                ),
+                "/-/npm/v1/tokens?page=2" => (
+                    200,
+                    r#"{"objects":[{"key":"second"}],"urls":{"next":null},"total":2}"#.to_string(),
+                ),
+                _ => (404, "{}".to_string()),
+            }
+        });
+        let client = RegistryClient::new(
+            NpmConfig::default()
+                .with_registry_override(&registry)
+                .unwrap(),
+        );
+        let tokens = client.list_tokens().unwrap();
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = server.join();
+        assert_eq!(
+            tokens
+                .iter()
+                .map(|token| token.key.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+        assert_eq!(
+            *paths.lock().unwrap(),
+            ["/-/npm/v1/tokens", "/-/npm/v1/tokens?page=2"]
+        );
+    }
+
+    #[test]
+    fn list_tokens_accepts_an_empty_final_page() {
+        let body = r#"{"objects":[],"urls":{"next":null},"total":0}"#.to_string();
+        let (registry, shutdown, server) =
+            token_server(move |_method, _path, _body| (200, body.clone()));
+        let client = RegistryClient::new(
+            NpmConfig::default()
+                .with_registry_override(&registry)
+                .unwrap(),
+        );
+        assert!(client.list_tokens().unwrap().is_empty());
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = server.join();
+    }
+
+    #[test]
+    fn list_tokens_rejects_a_malformed_envelope() {
+        let body = r#"{"urls":{"next":null},"total":0}"#.to_string();
+        let (registry, shutdown, server) =
+            token_server(move |_method, _path, _body| (200, body.clone()));
+        let client = RegistryClient::new(
+            NpmConfig::default()
+                .with_registry_override(&registry)
+                .unwrap(),
+        );
+        assert!(matches!(
+            client.list_tokens(),
+            Err(RegistryError::BadJson { .. })
+        ));
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = server.join();
+    }
+
+    #[test]
+    fn list_tokens_rejects_cycles_without_echoing_the_link() {
+        let body = r#"{"objects":[],"urls":{"next":"/-/npm/v1/tokens?private=marker"},"total":0}"#
+            .to_string();
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server_requests = std::sync::Arc::clone(&requests);
+        let (registry, shutdown, server) = token_server(move |_method, _path, _body| {
+            server_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            (200, body.clone())
+        });
+        let client = RegistryClient::new(
+            NpmConfig::default()
+                .with_registry_override(&registry)
+                .unwrap(),
+        );
+        let error = client.list_tokens().unwrap_err();
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = server.join();
+        assert!(matches!(error, RegistryError::TokenPagination { .. }));
+        assert!(!error.to_string().contains("marker"));
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn list_tokens_rejects_cross_origin_next_before_request() {
+        let cross_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cross_server_requests = std::sync::Arc::clone(&cross_requests);
+        let (cross_registry, cross_shutdown, cross_server) =
+            token_server(move |_method, _path, _body| {
+                cross_server_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                (200, r#"{"objects":[],"urls":{"next":null}}"#.to_string())
+            });
+        let next = format!("{cross_registry}/next?private=marker");
+        let body = format!(
+            r#"{{"objects":[],"urls":{{"next":{}}},"total":0}}"#,
+            serde_json::to_string(&next).unwrap()
+        );
+        let (registry, shutdown, server) =
+            token_server(move |_method, _path, _body| (200, body.clone()));
+        let client = RegistryClient::new(
+            NpmConfig::default()
+                .with_registry_override(&registry)
+                .unwrap(),
+        );
+        let error = client.list_tokens().unwrap_err();
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        cross_shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = server.join();
+        let _ = cross_server.join();
+        assert!(matches!(error, RegistryError::TokenPagination { .. }));
+        assert!(!error.to_string().contains("marker"));
+        assert_eq!(cross_requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn list_tokens_rejects_malformed_next_links() {
+        let body = r#"{"objects":[],"urls":{"next":"http://[invalid"},"total":0}"#.to_string();
+        let (registry, shutdown, server) =
+            token_server(move |_method, _path, _body| (200, body.clone()));
+        let client = RegistryClient::new(
+            NpmConfig::default()
+                .with_registry_override(&registry)
+                .unwrap(),
+        );
+        assert!(matches!(
+            client.list_tokens(),
+            Err(RegistryError::TokenPagination { .. })
+        ));
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = server.join();
+    }
+
+    #[test]
+    fn list_tokens_enforces_page_limit_without_network_requests() {
+        let first = reqwest::Url::parse("https://registry.example/one").unwrap();
+        let second = reqwest::Url::parse("https://registry.example/two").unwrap();
+        let mut visited = std::collections::BTreeSet::new();
+        record_token_page(&mut visited, &first, 1).unwrap();
+        assert!(matches!(
+            record_token_page(&mut visited, &second, 1),
+            Err(RegistryError::TokenPagination { .. })
+        ));
     }
 
     #[test]
