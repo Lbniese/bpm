@@ -1141,7 +1141,10 @@ pub fn project_attached(project_root: &Path, volume_path: &Path) -> bool {
     for entry in fs::read_dir(&vol_nm).into_iter().flatten().flatten() {
         seen = true;
         let project_entry = proj_nm.join(entry.file_name());
-        if !project_entry.is_dir() {
+        let Ok(meta) = fs::symlink_metadata(&project_entry) else {
+            return false;
+        };
+        if meta.file_type().is_symlink() || !meta.is_dir() {
             return false;
         }
     }
@@ -1160,7 +1163,10 @@ pub fn project_attached(project_root: &Path, volume_path: &Path) -> bool {
         found = true;
         let name = entry.file_name();
         let project_entry = proj_nm.join(name);
-        if !project_entry.exists() {
+        let Ok(meta) = fs::symlink_metadata(&project_entry) else {
+            return false;
+        };
+        if meta.file_type().is_symlink() || !meta.is_dir() {
             return false;
         }
     }
