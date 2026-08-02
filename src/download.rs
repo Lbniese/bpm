@@ -238,6 +238,11 @@ fn map_http_error(error: HttpError) -> DownloadError {
             url,
             attempts: 1,
         },
+        HttpError::Redirect { source, reason, .. } => DownloadError::Transport {
+            kind: format!("redirect refused: {reason}"),
+            url: source,
+            attempts: 1,
+        },
     }
 }
 

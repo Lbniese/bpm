@@ -4,10 +4,11 @@
 //! share its connection pool and negotiate HTTP/2 over TLS (ALPN). Concurrent
 //! requests from cloned clients — for example the download worker pool —
 //! therefore multiplex over a single connection per host. Requests apply npmrc
-//! authentication only to the exact host/path selected by [`NpmConfig`], mark
-//! the credential sensitive so reqwest never forwards it across a cross-host
-//! redirect, and retry only transient failures within configured bounds.
+//! authentication only to the exact host/path selected by [`NpmConfig`],
+//! explicitly re-authorize safe GET redirects, refuse mutation redirects, and
+//! retry only transient failures within configured bounds.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::io::{self, Read};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -16,8 +17,9 @@ use std::thread;
 use std::time::{Duration, SystemTime};
 
 use reqwest::blocking::{Client, ClientBuilder, Response};
-use reqwest::header::RETRY_AFTER;
-use reqwest::Version;
+use reqwest::header::{LOCATION, RETRY_AFTER};
+use reqwest::redirect::Policy;
+use reqwest::{Url, Version};
 
 /// Best-effort record of whether any response arrived over HTTP/2. The cold
 /// resolver depends on HTTP/2 multiplexing for throughput; if this stays false
@@ -75,10 +77,9 @@ impl fmt::Debug for HttpClient {
 impl HttpClient {
     /// Build a client from effective npm configuration.
     ///
-    /// The default redirect policy is retained (follow up to ten redirects),
-    /// and any `Authorization` header set on a request is marked sensitive, so
-    /// reqwest strips it on a cross-host redirect rather than leaking a
-    /// registry credential to another origin.
+    /// Redirects are disabled in reqwest and handled explicitly so every safe
+    /// GET hop is authorized for its own target and mutations are never
+    /// replayed.
     pub fn new(config: NpmConfig) -> Self {
         Self {
             client: build_client(config.network.fetch_timeout),
@@ -227,7 +228,8 @@ impl HttpClient {
         self.request_json("DELETE", url, &[], headers, true)
     }
 
-    /// Send a GET (following redirects) honoring the retry policy.
+    /// Send a GET (following safe redirects explicitly) honoring the retry
+    /// policy. Each redirect hop is rebuilt and authorized for its target.
     ///
     /// The returned [`Response`] is for any terminal status below 400
     /// (including `304 Not Modified`). Statuses at or above 400 are retried
@@ -244,40 +246,82 @@ impl HttpClient {
         let attempts = network.retries.saturating_add(1);
 
         for attempt in 0..attempts {
-            let request = self.build_get(url, headers);
-            match request.send() {
-                Ok(response) => {
-                    if response.version() == Version::HTTP_2 {
-                        SAW_HTTP2.store(true, Ordering::Relaxed);
-                    }
-                    let status = response.status().as_u16();
-                    if status < 400 {
-                        return Ok((response, in_flight));
-                    }
-                    let completed = attempt + 1;
-                    if is_retryable_status(status) && completed < attempts {
-                        let retry_after = retry_after_from(&response);
-                        drain_response(response);
-                        thread::sleep(retry_delay(network, attempt, retry_after));
-                        continue;
-                    }
-                    return Err(HttpError::Status {
-                        url: display_url,
-                        code: status,
-                        attempts: completed,
+            let mut current = Url::parse(url).map_err(|error| HttpError::Transport {
+                url: display_url.clone(),
+                kind: format!("invalid URL: {error}"),
+                attempts: 1,
+            })?;
+            let origin = current.origin();
+            let mut visited = HashSet::new();
+            let mut hop = 0usize;
+            loop {
+                let current_text = current.as_str().to_owned();
+                if !visited.insert(current_text.clone()) {
+                    return Err(HttpError::Redirect {
+                        source: display_url.clone(),
+                        target: Some(redact_url(&current_text)),
+                        reason: "redirect loop",
                     });
                 }
-                Err(error) => {
-                    let completed = attempt + 1;
-                    if is_retryable_transport(&error) && completed < attempts {
-                        thread::sleep(retry_delay(network, attempt, None));
-                        continue;
+                let request_headers = if hop == 0 || current.origin() == origin {
+                    headers
+                } else {
+                    &[]
+                };
+                match self.build_get(&current_text, request_headers).send() {
+                    Ok(response) => {
+                        if response.version() == Version::HTTP_2 {
+                            SAW_HTTP2.store(true, Ordering::Relaxed);
+                        }
+                        let status = response.status().as_u16();
+                        if is_redirect_status(status) {
+                            let Some(target) = redirect_target(&current, &response) else {
+                                return Err(HttpError::Redirect {
+                                    source: redact_url(&current_text),
+                                    target: None,
+                                    reason: "malformed location",
+                                });
+                            };
+                            if hop >= 10 {
+                                return Err(HttpError::Redirect {
+                                    source: redact_url(&current_text),
+                                    target: Some(redact_url(target.as_str())),
+                                    reason: "redirect hop limit",
+                                });
+                            }
+                            drain_response(response);
+                            current = target;
+                            hop += 1;
+                            continue;
+                        }
+                        if status < 400 {
+                            return Ok((response, in_flight));
+                        }
+                        let completed = attempt + 1;
+                        if is_retryable_status(status) && completed < attempts {
+                            let retry_after = retry_after_from(&response);
+                            drain_response(response);
+                            thread::sleep(retry_delay(network, attempt, retry_after));
+                            break;
+                        }
+                        return Err(HttpError::Status {
+                            url: display_url.clone(),
+                            code: status,
+                            attempts: completed,
+                        });
                     }
-                    return Err(HttpError::Transport {
-                        url: display_url,
-                        kind: transport_kind(&error),
-                        attempts: completed,
-                    });
+                    Err(error) => {
+                        let completed = attempt + 1;
+                        if is_retryable_transport(&error) && completed < attempts {
+                            thread::sleep(retry_delay(network, attempt, None));
+                            break;
+                        }
+                        return Err(HttpError::Transport {
+                            url: display_url.clone(),
+                            kind: transport_kind(&error),
+                            attempts: completed,
+                        });
+                    }
                 }
             }
         }
@@ -289,7 +333,9 @@ impl HttpClient {
     fn build_get(&self, url: &str, headers: &[(&str, &str)]) -> reqwest::blocking::RequestBuilder {
         let mut request = self.client.get(url);
         for (name, value) in headers {
-            request = request.header(*name, *value);
+            if !is_sensitive_redirect_header(name) {
+                request = request.header(*name, *value);
+            }
         }
         if let Some(token) = self.config.auth_token_for_url(url) {
             request = request.bearer_auth(token);
@@ -338,6 +384,20 @@ impl HttpClient {
             match request.send() {
                 Ok(mut response) => {
                     let status = response.status().as_u16();
+                    if is_redirect_status(status) {
+                        let target = response
+                            .headers()
+                            .get(LOCATION)
+                            .and_then(|value| value.to_str().ok())
+                            .and_then(|location| Url::parse(url).ok()?.join(location).ok())
+                            .map(|target| redact_url(target.as_str()));
+                        drain_response(response);
+                        return Err(HttpError::Redirect {
+                            source: display_url.clone(),
+                            target,
+                            reason: "mutation redirect refused",
+                        });
+                    }
                     if status < 400 {
                         check_content_length(&response, url, MAX_CONTROL_RESPONSE_BYTES)?;
                         let body = read_bounded(
@@ -432,6 +492,11 @@ pub enum HttpError {
     /// limit. Carries only the redacted URL and the numeric limit — never
     /// response content, auth headers, query strings, or credentials.
     BodyTooLarge { url: String, limit: usize },
+    Redirect {
+        source: String,
+        target: Option<String>,
+        reason: &'static str,
+    },
 }
 
 impl fmt::Display for HttpError {
@@ -457,6 +522,17 @@ impl fmt::Display for HttpError {
                 formatter,
                 "HTTP GET {url} response body exceeds the {limit} byte limit"
             ),
+            Self::Redirect {
+                source,
+                target,
+                reason,
+            } => {
+                write!(formatter, "HTTP redirect from {source}")?;
+                if let Some(target) = target {
+                    write!(formatter, " to {target}")?;
+                }
+                write!(formatter, " refused: {reason}")
+            }
         }
     }
 }
@@ -512,15 +588,38 @@ fn build_client(timeout: Duration) -> Client {
         .unwrap_or(1)
         != 0;
 
-    let mut builder = ClientBuilder::new().user_agent(USER_AGENT).timeout(timeout);
+    let mut builder = ClientBuilder::new()
+        .user_agent(USER_AGENT)
+        .timeout(timeout)
+        .redirect(Policy::none());
     if use_http2 {
         builder = builder.pool_max_idle_per_host(64);
     } else {
         builder = builder.http1_only().pool_max_idle_per_host(64);
     }
-    builder
-        .build()
-        .unwrap_or_else(|_| ClientBuilder::new().build().expect("default client builds"))
+    builder.build().unwrap_or_else(|_| {
+        ClientBuilder::new()
+            .redirect(Policy::none())
+            .build()
+            .expect("default client builds")
+    })
+}
+
+fn is_redirect_status(status: u16) -> bool {
+    matches!(status, 301 | 302 | 303 | 307 | 308)
+}
+
+fn is_sensitive_redirect_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "authorization" | "proxy-authorization" | "cookie" | "npm-otp"
+    )
+}
+
+fn redirect_target(current: &Url, response: &Response) -> Option<Url> {
+    let location = response.headers().get(LOCATION)?.to_str().ok()?;
+    let target = current.join(location).ok()?;
+    matches!(target.scheme(), "http" | "https").then_some(target)
 }
 
 fn retry_after_from(response: &Response) -> Option<Duration> {
@@ -632,6 +731,35 @@ pub fn redact_url(url: &str) -> String {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn redirect_statuses_and_sensitive_headers_are_classified() {
+        assert!(is_redirect_status(301));
+        assert!(is_redirect_status(302));
+        assert!(is_redirect_status(303));
+        assert!(is_redirect_status(307));
+        assert!(is_redirect_status(308));
+        assert!(!is_redirect_status(300));
+        assert!(is_sensitive_redirect_header("Authorization"));
+        assert!(is_sensitive_redirect_header("npm-otp"));
+        assert!(!is_sensitive_redirect_header("If-None-Match"));
+    }
+
+    #[test]
+    fn redirect_error_is_redacted_and_actionable() {
+        let error = HttpError::Redirect {
+            source: redact_url("https://user:secret@example.test/private?token=x#frag"),
+            target: Some(redact_url("https://other.test/public?token=y")),
+            reason: "mutation redirect refused",
+        };
+        let text = error.to_string();
+        assert!(text.contains("mutation redirect refused"));
+        assert!(text.contains("https://example.test/private"));
+        assert!(text.contains("https://other.test/public"));
+        assert!(!text.contains("secret"));
+        assert!(!text.contains("token"));
+        assert!(!text.contains("frag"));
+    }
 
     #[test]
     fn retry_body_drain_is_bounded_and_detects_reusable_bodies() {
