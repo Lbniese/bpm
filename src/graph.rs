@@ -36,12 +36,12 @@ pub const PLAN_FILE: &str = ".bpm-state";
 /// as project-relative `node_modules/...` entries and identities carry a
 /// versioned encoding (`relay:<target>` or `tree-blake3-v1:<hex>`). Existing
 /// version-2 plans remain readable but never cache-hit.
-pub const PLAN_VERSION: u32 = 3;
+pub const PLAN_VERSION: u32 = 4;
 
 /// Bumped when the materializer's output semantics change (e.g. bin linking
 /// strategy, symlink vs hardlink volume layout). Incompatible materializer
 /// versions invalidate a cached plan even if the graph is identical.
-pub const MATERIALIZER_VERSION: u32 = 5;
+pub const MATERIALIZER_VERSION: u32 = 6;
 
 /// A 256-bit blake3 digest identifying a canonical dependency graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -602,7 +602,8 @@ pub fn validate_plan(
         }
     }
 
-    // Project attachment: the project must still relay into this volume.
+    // Project attachment: the project must still contain every isolated view
+    // entry from this graph volume.
     if !crate::volume::project_attached(project_root, &volume_dir) {
         return Err(PlanInvalid::StateDrift);
     }
@@ -611,31 +612,11 @@ pub fn validate_plan(
 
 /// Whether a graph-volume entry still reflects its pristine store image.
 ///
-/// Accepts both the legacy symlink layout (the entry is a symlink to the store
-/// image) and the current hardlink layout (the entry is a real directory whose
-/// `package.json` shares an inode with the store image's `package.json`).
-fn volume_entry_intact(entry: &Path, image: &Path) -> bool {
-    if let Ok(target) = fs::read_link(entry) {
-        return target == image;
-    }
-    same_file(&entry.join("package.json"), &image.join("package.json"))
-}
-
-/// `true` when `a` and `b` are the same on-disk file (same device + inode on
-/// Unix). Used to confirm a hardlinked volume entry matches its store image.
-fn same_file(a: &Path, b: &Path) -> bool {
-    let (Ok(a), Ok(b)) = (fs::metadata(a), fs::metadata(b)) else {
-        return false;
-    };
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        a.dev() == b.dev() && a.ino() == b.ino()
-    }
-    #[cfg(not(unix))]
-    {
-        a.len() == b.len()
-    }
+/// New graph volumes contain isolated real directories. Validation checks the
+/// durable entry shape and required manifest rather than relying on writable
+/// store/volume inode aliasing.
+fn volume_entry_intact(entry: &Path, _image: &Path) -> bool {
+    entry.is_dir() && entry.join("package.json").is_file()
 }
 
 // --- length-prefixed encoding helpers (deterministic, no map iteration) ---

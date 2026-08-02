@@ -71,8 +71,8 @@ pub enum MaterializeBackend {
     /// Copy-on-write reflink/clone of the store image into the project view.
     /// Cheaper than `IsolatedCopy` (shared extents until first write) with the
     /// same isolation guarantee (writes copy-on-write away from the read-only
-    /// content-addressed store). Falls back to `Hardlink` then `IsolatedCopy`
-    /// when the filesystem lacks reflink support (`ENOTSUP`/`EPERM`/`EXDEV`).
+    /// content-addressed store). Falls back directly to `IsolatedCopy` when
+    /// the filesystem lacks reflink support (`ENOTSUP`/`EPERM`/`EXDEV`).
     /// Requires a supporting filesystem (macOS APFS `clonefile`, Linux
     /// btrfs/xfs `FICLONE`); the capability is probed at runtime by
     /// [`probe_fs_capabilities`].
@@ -102,15 +102,12 @@ pub struct FsCapabilities {
 }
 
 impl FsCapabilities {
-    /// `Auto`-selection ranking: prefer reflink (CoW isolation for free),
-    /// fall back to symlink (cheapest), then hardlink, then copy.
+    /// Safe automatic selection: prefer reflink and otherwise use an
+    /// independent copy. Symlinks and hardlinks are intentionally excluded
+    /// because both expose writable aliases to shared content.
     pub fn preferred_backend(self) -> MaterializeBackend {
         if self.reflink {
             MaterializeBackend::Reflink
-        } else if self.symlink {
-            MaterializeBackend::Symlink
-        } else if self.hardlink {
-            MaterializeBackend::Hardlink
         } else {
             MaterializeBackend::IsolatedCopy
         }
@@ -293,19 +290,20 @@ pub fn materialize_with_backend(
                 cfg!(unix)
             }
             MaterializeBackend::Reflink => {
-                // Clone each file copy-on-write where the filesystem supports
-                // it (writes never reach the store image); on unsupported
-                // filesystems `reflink_tree` degrades to the hardlink local
-                // view. `.bin` stays relative symlinks like the other backends.
+                // Unsupported reflink filesystems use independent copies;
+                // they never fall back to a writable hardlink alias.
                 reflink_tree(&image_dir, &target)?;
                 cfg!(unix)
             }
             MaterializeBackend::Auto => {
+                // Auto remains the explicit legacy symlink primitive for
+                // internal compatibility tests. Project-facing install routes
+                // select Reflink or IsolatedCopy instead.
                 if let Err(error) = link_path(&target, &image_dir) {
                     if !matches!(error, MaterializeError::SymlinksUnsupported) {
                         return Err(error);
                     }
-                    hardlink_tree(&image_dir, &target)?;
+                    copy_tree(&image_dir, &target)?;
                     false
                 } else {
                     true
@@ -365,7 +363,7 @@ pub(crate) fn hardlink_tree(source: &Path, target: &Path) -> Result<(), Material
 
 /// Materialize `source` into `target` using copy-on-write reflink where the
 /// filesystem supports it (macOS APFS `clonefile(2)`, Linux btrfs/xfs `FICLONE`
-/// ioctl), transparently falling back to hardlink then copy when the reflink
+/// ioctl), transparently falling back to independent copies when the reflink
 /// syscall is unavailable or rejected (`ENOTSUP`/`EOPNOTSUPP`/`EPERM`/`EXDEV`).
 ///
 /// The store image is read-only and content-addressed, so a CoW reflink is
@@ -378,12 +376,11 @@ pub(crate) fn reflink_tree(source: &Path, target: &Path) -> Result<(), Materiali
     link_tree(source, target, reflink_or_fallback_file)
 }
 
-/// Non-Unix platforms have no reflink syscall binding; degrade to the
-/// hardlink→copy chain. Correctness is preserved; only the CoW fast path is
-/// unavailable.
+/// Non-Unix platforms have no reflink syscall binding; use an independent
+/// copy rather than exposing a hardlink alias.
 #[cfg(not(unix))]
 pub(crate) fn reflink_tree(source: &Path, target: &Path) -> Result<(), MaterializeError> {
-    hardlink_tree(source, target)
+    copy_tree(source, target)
 }
 
 /// Materialize `source` into `target` using a directory junction (reparse
@@ -509,8 +506,8 @@ fn hardlink_or_copy_file(from: &Path, to: &Path) -> Result<(), MaterializeError>
 }
 
 /// Materialize a single file via copy-on-write reflink where the filesystem
-/// supports it, transparently falling back to [`hardlink_or_copy_file`] when
-/// the reflink syscall is unavailable or rejected (`ENOTSUP`/`EOPNOTSUPP`/
+/// supports it, transparently falling back to an independent copy when the
+/// reflink syscall is unavailable or rejected (`ENOTSUP`/`EOPNOTSUPP`/
 /// `EPERM`/`EXDEV`). Other errors (e.g. an unreadable source) propagate.
 ///
 /// On a successful reflink, the source's mode is copied onto the target so the
@@ -523,7 +520,9 @@ fn reflink_or_fallback_file(from: &Path, to: &Path) -> Result<(), MaterializeErr
             copy_mode(from, to)?;
             Ok(())
         }
-        Err(error) if is_reflink_unsupported(&error) => hardlink_or_copy_file(from, to),
+        Err(error) if is_reflink_unsupported(&error) => fs::copy(from, to)
+            .map(|_| ())
+            .map_err(|source| io_err(to, source)),
         Err(error) => Err(io_err(to, error)),
     }
 }

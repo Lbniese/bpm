@@ -28,8 +28,6 @@ use crate::graph::{graph_id_with_prepared, ManagedEntry, IDENTITY_RELAY, IDENTIT
 use crate::integrity::ArtifactId;
 use crate::lockfile::Lockfile;
 #[cfg(unix)]
-use crate::materializer::hardlink_tree;
-#[cfg(unix)]
 use crate::materializer::reflink_tree;
 use crate::materializer::{
     materialize_with_backend, MaterializeBackend, MaterializeError, MaterializeStats,
@@ -76,7 +74,7 @@ const META_FILE: &str = "metadata.json";
 /// differs is discarded and rebuilt so every project sees the current layout.
 /// v7 also writes the complete artifact/derived inventory so the metadata
 /// index can rebuild graph edges from durable filesystem state alone.
-const VOLUME_LAYOUT_VERSION: u32 = 7;
+const VOLUME_LAYOUT_VERSION: u32 = 8;
 
 /// Current durable-inventory schema version written into [`VolumeMeta`]. A
 /// volume whose `inventory_version` is below this is treated as
@@ -240,7 +238,7 @@ pub fn ensure_graph_volume(
     lockfile: &Lockfile,
     artifact_ids: &[Option<ArtifactId>],
     metrics: &mut Metrics,
-) -> Result<VolumeRef, VolumeError> {
+) -> Result<EnsuredVolume, VolumeError> {
     ensure_graph_volume_with_prepared(store, lockfile, artifact_ids, &BTreeMap::new(), metrics)
 }
 
@@ -255,7 +253,7 @@ pub fn ensure_graph_volume_with_prepared(
     artifact_ids: &[Option<ArtifactId>],
     prepared: &BTreeMap<String, crate::lifecycle::PreparedImage>,
     metrics: &mut Metrics,
-) -> Result<VolumeRef, VolumeError> {
+) -> Result<EnsuredVolume, VolumeError> {
     let build_start = std::time::Instant::now();
     let prepared_keys = prepared
         .iter()
@@ -274,11 +272,11 @@ pub fn ensure_graph_volume_with_prepared(
         if let Ok(meta) = serde_json::from_slice::<VolumeMeta>(&meta_bytes) {
             if meta.graph_id_hex == graph_hex && meta.layout_version == VOLUME_LAYOUT_VERSION {
                 metrics.record("graph_volume_hit", std::time::Duration::ZERO);
-                return Ok(VolumeRef {
+                return Ok(EnsuredVolume::Ready(VolumeRef {
                     path: volume_dir,
                     cached: true,
                     stats: MaterializeStats::default(),
-                });
+                }));
             }
             stale = true;
         }
@@ -293,11 +291,11 @@ pub fn ensure_graph_volume_with_prepared(
         if let Ok(meta) = serde_json::from_slice::<VolumeMeta>(&meta_bytes) {
             if meta.graph_id_hex == graph_hex && meta.layout_version == VOLUME_LAYOUT_VERSION {
                 metrics.record("graph_volume_hit", std::time::Duration::ZERO);
-                return Ok(VolumeRef {
+                return Ok(EnsuredVolume::Ready(VolumeRef {
                     path: volume_dir,
                     cached: true,
                     stats: MaterializeStats::default(),
-                });
+                }));
             }
         }
     }
@@ -341,7 +339,7 @@ pub fn ensure_graph_volume_with_prepared(
         staging.as_path(),
         store,
         &resolved,
-        MaterializeBackend::Hardlink,
+        MaterializeBackend::Reflink,
     )?;
     for package in lockfile.packages.iter().filter(|package| package.link) {
         let Some(source) = package.workspace_target.as_deref() else {
@@ -364,10 +362,8 @@ pub fn ensure_graph_volume_with_prepared(
         inventory: build_graph_inventory(lockfile, artifact_ids, prepared),
         _lock: lock,
     };
-    let vref = pending.publish()?;
-
     metrics.record("graph_volume_build", build_start.elapsed());
-    Ok(vref)
+    Ok(EnsuredVolume::Building(pending))
 }
 
 /// Acquire an exclusive per-graph lock file at `<store>/locks/graph-<hex>.lock`.
@@ -679,40 +675,9 @@ pub fn attach_project(
     project_root: &Path,
     volume: &VolumeRef,
 ) -> Result<AttachOutcome, VolumeError> {
-    use std::os::unix::fs::symlink;
-    let vol_nm = volume.path.join("node_modules");
-    let proj_nm = project_root.join("node_modules");
-    fs::create_dir_all(&proj_nm).map_err(|source| io_err(&proj_nm, source))?;
-
-    let mut stats = AttachStats::default();
-    let mut owned = Vec::new();
-    let entries = fs::read_dir(&vol_nm).map_err(|source| io_err(&vol_nm, source))?;
-    for entry in entries {
-        let entry = entry.map_err(|source| io_err(&vol_nm, source))?;
-        let name = entry.file_name();
-        // Only symlink top-level entries; nested trees live inside the volume.
-        let vol_target = entry.path();
-        let proj_link = proj_nm.join(&name);
-        // Idempotent: if it already points at the volume entry, leave it.
-        if let Ok(existing) = fs::read_link(&proj_link) {
-            if existing == vol_target {
-                stats.relays_unchanged += 1;
-                record_entry(&name.to_string_lossy(), &proj_link, "relay", &mut owned);
-                continue;
-            }
-            let _ = fs::remove_file(&proj_link);
-        } else if proj_link.exists() {
-            if proj_link.is_dir() {
-                fs::remove_dir_all(&proj_link).map_err(|source| io_err(&proj_link, source))?;
-            } else {
-                fs::remove_file(&proj_link).map_err(|source| io_err(&proj_link, source))?;
-            }
-        }
-        symlink(&vol_target, &proj_link).map_err(|source| io_err(&proj_link, source))?;
-        stats.relays_created += 1;
-        record_entry(&name.to_string_lossy(), &proj_link, "relay", &mut owned);
-    }
-    Ok(AttachOutcome::new(stats, owned))
+    // Published graphs are immutable sources. Every project receives an
+    // isolated local view; no project-facing symlink may alias the graph.
+    attach_project_local_with_backend(project_root, volume, MaterializeBackend::Reflink)
 }
 
 #[cfg(windows)]
@@ -910,7 +875,7 @@ pub fn attach_project_local(
     project_root: &Path,
     volume: &VolumeRef,
 ) -> Result<AttachOutcome, VolumeError> {
-    attach_project_local_with_backend(project_root, volume, MaterializeBackend::Hardlink)
+    attach_project_local_with_backend(project_root, volume, MaterializeBackend::Reflink)
 }
 
 /// Like [`attach_project_local`], but selects the per-package linking strategy
@@ -948,7 +913,7 @@ pub fn attach_project_local_with_backend(
         if matches!(backend, MaterializeBackend::Reflink) {
             reflink_tree(&source, &target).map_err(VolumeError::Materialize)?;
         } else {
-            hardlink_tree(&source, &target).map_err(VolumeError::Materialize)?;
+            crate::materializer::copy_tree(&source, &target).map_err(VolumeError::Materialize)?;
         }
         stats.relays_created += 1;
         record_entry(&name.to_string_lossy(), &target, mode, &mut owned);
@@ -974,22 +939,9 @@ pub fn attach_project_local(
     for entry in entries {
         let name = entry.file_name();
         let target = proj_nm.join(&name);
-        // Use junction_tree: tries a directory junction for directories,
-        // falling back to hardlink→copy. Files always use hardlink. Inspecting
-        // the result records the actual mode/identity conservatively: a
-        // junction is a reparse point (symlink-like), recorded as relay; a
-        // hardlink/copy fallback is a real directory recorded as local.
-        crate::materializer::junction_tree(&entry.path(), &target)
-            .map_err(VolumeError::Materialize)?;
+        crate::materializer::copy_tree(&entry.path(), &target).map_err(VolumeError::Materialize)?;
         stats.relays_created += 1;
-        let mode = if fs::symlink_metadata(&target)
-            .map(|m| m.file_type().is_symlink())
-            .unwrap_or(false)
-        {
-            "relay"
-        } else {
-            "local"
-        };
+        let mode = "local";
         record_entry(&name.to_string_lossy(), &target, mode, &mut owned);
     }
     Ok(AttachOutcome::new(stats, owned))
@@ -1003,10 +955,8 @@ pub fn attach_project_local_with_backend(
     volume: &VolumeRef,
     _backend: MaterializeBackend,
 ) -> Result<AttachOutcome, VolumeError> {
-    // The explicit local backend is the deterministic hardlink/copy fallback
-    // on Windows. Keep it separate from `attach_project`, which may use a
-    // junction when the platform permits it; callers selecting this backend
-    // need stable `local` ownership identities for reconciliation and tests.
+    // Windows project views are always independent copies. Junctions and
+    // hardlinks would expose writable aliases to the published graph.
     let vol_nm = volume.path.join("node_modules");
     let proj_nm = project_root.join("node_modules");
     fs::create_dir_all(&proj_nm).map_err(|source| io_err(&proj_nm, source))?;
@@ -1020,8 +970,7 @@ pub fn attach_project_local_with_backend(
     for entry in entries {
         let name = entry.file_name();
         let target = proj_nm.join(&name);
-        crate::materializer::hardlink_tree(&entry.path(), &target)
-            .map_err(VolumeError::Materialize)?;
+        crate::materializer::copy_tree(&entry.path(), &target).map_err(VolumeError::Materialize)?;
         stats.relays_created += 1;
         record_entry(&name.to_string_lossy(), &target, "local", &mut owned);
     }
@@ -1039,39 +988,25 @@ pub fn attach_project_local_with_backend(
     ))
 }
 
-/// Whether a project's `node_modules` still correctly relays into a graph
-/// volume. Every top-level entry in the volume's `node_modules` must have a
-/// matching symlink under the project (`<project>/node_modules/<entry>` →
-/// `<volume>/node_modules/<entry>`). A single missing or wrong relay invalidates
-/// attachment, so deleting a package relay forces a re-attach on the next install.
+/// Whether a project contains every top-level entry of an isolated graph
+/// view. Matching inode identity or symlink targets is intentionally not part
+/// of validation: the project and graph are independent sources.
 #[cfg(unix)]
 pub fn project_attached(project_root: &Path, volume_path: &Path) -> bool {
     let proj_nm = project_root.join("node_modules");
     let vol_nm = volume_path.join("node_modules");
-    if !proj_nm.exists() || !vol_nm.exists() {
+    if !proj_nm.is_dir() || !vol_nm.is_dir() {
         return false;
     }
-    let entries = match fs::read_dir(&vol_nm) {
-        Ok(e) => e,
-        Err(_) => return false,
-    };
-    let mut seen = 0usize;
-    for entry in entries.flatten() {
-        seen += 1;
-        let vol_target = entry.path();
-        let proj_link = proj_nm.join(entry.file_name());
-        match fs::read_link(&proj_link) {
-            Ok(t) if t == vol_target => {}
-            Ok(_) => return false,
-            Err(_) if proj_link.is_dir() || proj_link.is_file() => {
-                // A local compatibility view is also valid. Its package files
-                // are hardlinked/copied from the volume, while `.bin` entries
-                // remain relative symlinks inside the project tree.
-            }
-            Err(_) => return false,
+    let mut seen = false;
+    for entry in fs::read_dir(&vol_nm).into_iter().flatten().flatten() {
+        seen = true;
+        let project_entry = proj_nm.join(entry.file_name());
+        if !project_entry.is_dir() {
+            return false;
         }
     }
-    seen > 0
+    seen
 }
 
 #[cfg(windows)]
@@ -1140,7 +1075,7 @@ mod tests {
             .unwrap()
             .file_type()
             .is_symlink());
-        assert_eq!(
+        assert_ne!(
             fs::metadata(project_pkg.join("package.json"))
                 .unwrap()
                 .ino(),
@@ -1276,7 +1211,7 @@ mod ownership_tests {
     }
 
     #[test]
-    fn relay_attachment_records_exact_owned_paths_and_identities() {
+    fn isolated_attachment_records_exact_owned_paths_and_identities() {
         let volume_root = tempdir().unwrap();
         let project = tempdir().unwrap();
         make_volume(
@@ -1290,16 +1225,8 @@ mod ownership_tests {
             vec!["node_modules/foo".to_string()]
         );
         let entry = &outcome.owned[0];
-        assert_eq!(entry.mode, "relay");
-        assert!(
-            entry.identity.starts_with(IDENTITY_RELAY),
-            "relay identity must carry the relay prefix"
-        );
-        let target = entry.identity.strip_prefix(IDENTITY_RELAY).unwrap();
-        assert_eq!(
-            Path::new(target),
-            volume_root.path().join("node_modules").join("foo")
-        );
+        assert!(matches!(entry.mode.as_str(), "reflink" | "local"));
+        assert!(entry.identity.starts_with(IDENTITY_TREE));
     }
 
     #[test]
@@ -1317,7 +1244,7 @@ mod ownership_tests {
             vec!["node_modules/foo".to_string()]
         );
         let entry = &outcome.owned[0];
-        assert_eq!(entry.mode, "local");
+        assert!(matches!(entry.mode.as_str(), "reflink" | "local"));
         assert!(entry.identity.starts_with(IDENTITY_TREE));
         // The recorded identity must match the live project tree.
         let live = tree_fingerprint(&project.path().join("node_modules").join("foo")).unwrap();

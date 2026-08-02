@@ -171,14 +171,11 @@ fn windows_frozen_install_materializes_packages_and_bins() {
     );
 }
 
-/// `attach_project_local_with_backend(.., Reflink)` must succeed on Windows by
-/// ignoring the reflink backend (unsupported on NTFS, no `clonefile`/`FICLONE`)
-/// and hardlinking each package tree into the project, matching the
-/// established `BPM_PROJECT_VIEW=local` shape. This is the safety net for the
-/// current Windows fallback; when real junction/ReFS reflink support lands in
-/// Plan 006 Phase 5, an additional test will cover that path.
+/// `attach_project_local_with_backend(.., Reflink)` must use an independent
+/// copy on Windows when CoW is unavailable. A project write must not mutate
+/// the published graph source.
 #[test]
-fn windows_attach_with_reflink_backend_falls_back_to_hardlink() {
+fn windows_attach_with_reflink_backend_isolates_source() {
     use bpm::materializer::{MaterializeBackend, MaterializeStats};
     use bpm::volume::{attach_project_local_with_backend, VolumeRef};
 
@@ -197,14 +194,13 @@ fn windows_attach_with_reflink_backend_falls_back_to_hardlink() {
 
     let stats =
         attach_project_local_with_backend(project.path(), &volume_ref, MaterializeBackend::Reflink)
-            .expect("reflink backend must not error on windows (hardlink fallback)");
+            .expect("reflink backend must not error on windows (copy fallback)");
     assert_eq!(
         stats.stats.relays_created, 1,
         "one package should be attached"
     );
-    // Plan 011: attachment records the entry it actually created. On the
-    // NTFS hardlink/copy fallback this is a real directory recorded as
-    // `local` with a versioned tree fingerprint.
+    // Attachment records the isolated real directory with a versioned tree
+    // fingerprint.
     assert_eq!(
         stats.owned.len(),
         1,
@@ -216,18 +212,24 @@ fn windows_attach_with_reflink_backend_falls_back_to_hardlink() {
         !owned.identity.is_empty(),
         "owned entry must carry an identity"
     );
-    assert_eq!(owned.mode, "local", "hardlink fallback records local mode");
+    assert_eq!(owned.mode, "local", "copy fallback records local mode");
     assert!(owned.identity.starts_with("tree-blake3-v1:"));
 
     let pkg = project.path().join("node_modules/demo/package.json");
     assert!(
         pkg.exists(),
-        "hardlinked package should exist: {}",
+        "isolated package should exist: {}",
         pkg.display()
     );
     assert_eq!(
         fs::read(&pkg).unwrap(),
         payload,
-        "hardlinked content must match the volume source"
+        "isolated content must match the volume source"
+    );
+    fs::write(&pkg, b"project mutation").unwrap();
+    assert_eq!(
+        fs::read(volume.join("demo/package.json")).unwrap(),
+        payload,
+        "project mutation must not reach the graph source"
     );
 }
