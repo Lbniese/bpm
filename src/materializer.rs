@@ -362,16 +362,49 @@ pub(crate) fn hardlink_tree(source: &Path, target: &Path) -> Result<(), Material
 }
 
 /// Materialize `source` into `target` using copy-on-write reflink where the
-/// filesystem supports it (macOS APFS `clonefile(2)`, Linux btrfs/xfs `FICLONE`
-/// ioctl), transparently falling back to independent copies when the reflink
-/// syscall is unavailable or rejected (`ENOTSUP`/`EOPNOTSUPP`/`EPERM`/`EXDEV`).
+/// filesystem supports it, transparently falling back to independent copies
+/// when the reflink syscall is unavailable or rejected
+/// (`ENOTSUP`/`EOPNOTSUPP`/`EPERM`/`EXDEV`).
 ///
 /// The store image is read-only and content-addressed, so a CoW reflink is
 /// safe: writes in the project view copy-on-write away from the store image —
 /// the same isolation guarantee as `IsolatedCopy`, but cheaper on supporting
 /// filesystems. The per-file fallback keeps the result correct even on a
 /// filesystem that reports support but rejects an individual clone.
-#[cfg(unix)]
+///
+/// On macOS the fast path clones the entire package tree with a single
+/// directory-level `clonefile(2)` (recursive, atomic, CoW) instead of one
+/// syscall per file; on rejection it falls back to the per-file path below.
+#[cfg(target_os = "macos")]
+pub(crate) fn reflink_tree(source: &Path, target: &Path) -> Result<(), MaterializeError> {
+    // `clonefile(2)` requires an absent target. `link_tree` also removes the
+    // target internally; removing it once here keeps the fast path to a single
+    // syscall. On `Unsupported`, `clonefile` is all-or-nothing and leaves no
+    // target behind, so the fallback's own removal is a harmless no-op.
+    if target.exists() || symlink_exists(target) {
+        remove_any(target)?;
+    }
+    if source.is_dir() {
+        // `clonefile(2)` creates `target` but requires its parent directory to
+        // exist (e.g. `node_modules/greet/node_modules` for a nested dep). The
+        // per-file fallback creates ancestors via `create_dir_all(target)`;
+        // the fast path must do the equivalent for the parent only, since the
+        // clone itself creates `target`.
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).map_err(|source| io_err(parent, source))?;
+        }
+        match clonefile_directory(source, target)? {
+            DirClone::Cloned => return Ok(()),
+            DirClone::Unsupported => {}
+        }
+    }
+    link_tree(source, target, reflink_or_fallback_file)
+}
+
+/// Linux has no directory-level `FICLONE` equivalent, so it keeps the per-file
+/// reflink path (`try_reflink_file` via the `FICLONE` ioctl) with its usual
+/// fallback to independent copies.
+#[cfg(all(unix, not(target_os = "macos")))]
 pub(crate) fn reflink_tree(source: &Path, target: &Path) -> Result<(), MaterializeError> {
     link_tree(source, target, reflink_or_fallback_file)
 }
@@ -568,6 +601,35 @@ fn try_reflink_file(from: &Path, to: &Path) -> std::io::Result<()> {
         Ok(())
     } else {
         Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Outcome of attempting a single directory-level `clonefile(2)` on macOS.
+#[cfg(target_os = "macos")]
+enum DirClone {
+    /// The whole tree was cloned in one syscall.
+    Cloned,
+    /// The filesystem rejected the directory clone; fall back to per-file.
+    Unsupported,
+}
+
+/// Clone an entire directory tree with a single macOS `clonefile(2)` (recursive,
+/// atomic, copy-on-write). `source` must be a directory and `target` must not
+/// exist (its parent directory must exist). `clonefile(2)` accepts a directory
+/// source and clones the whole hierarchy — symlinks and mode bits included —
+/// turning an O(files) per-file walk into one kernel-walked syscall.
+///
+/// Returns [`DirClone::Unsupported`] when the filesystem rejects the clone
+/// (`ENOTSUP`/`EOPNOTSUPP`/`EPERM`/`EXDEV`) so the caller can fall back to the
+/// independent per-file copy; other I/O errors propagate as `Err`. Because the
+/// syscall is all-or-nothing, an `Unsupported` outcome leaves no `target`
+/// behind for the fallback to clean up.
+#[cfg(target_os = "macos")]
+fn clonefile_directory(source: &Path, target: &Path) -> Result<DirClone, MaterializeError> {
+    match try_reflink_file(source, target) {
+        Ok(()) => Ok(DirClone::Cloned),
+        Err(error) if is_reflink_unsupported(&error) => Ok(DirClone::Unsupported),
+        Err(error) => Err(io_err(target, error)),
     }
 }
 
@@ -1674,5 +1736,185 @@ mod tests {
         let target = tmp.path().join("out");
         hardlink_tree(&source, &target).unwrap();
         assert_eq!(fs::read(target.join("f.txt")).unwrap(), b"walked");
+    }
+
+    // === Plan 030: macOS directory-level clonefile materialization ===
+
+    /// Recursively collect a tree's entries as `rel_path -> (kind, payload)`
+    /// for byte-exact comparison: regular files carry their bytes, symlinks
+    /// carry their link target, and directories have no payload.
+    #[cfg(unix)]
+    fn collect_tree(root: &Path) -> std::collections::BTreeMap<String, (String, Option<Vec<u8>>)> {
+        let mut out = std::collections::BTreeMap::new();
+        let mut stack = vec![(root.to_path_buf(), String::new())];
+        while let Some((dir, rel)) = stack.pop() {
+            let entries = match fs::read_dir(&dir) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            for ent in entries.flatten() {
+                let name = ent.file_name().to_string_lossy().into_owned();
+                let path = ent.path();
+                let child_rel = if rel.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{rel}/{name}")
+                };
+                let meta = match fs::symlink_metadata(&path) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                let ft = meta.file_type();
+                if ft.is_dir() {
+                    out.insert(child_rel.clone(), ("dir".to_string(), None));
+                    stack.push((path, child_rel));
+                } else if ft.is_symlink() {
+                    let target = fs::read_link(&path).unwrap().to_string_lossy().into_owned();
+                    out.insert(
+                        child_rel,
+                        ("symlink".to_string(), Some(target.into_bytes())),
+                    );
+                } else {
+                    let bytes = fs::read(&path).unwrap();
+                    out.insert(child_rel, ("file".to_string(), Some(bytes)));
+                }
+            }
+        }
+        out
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_clonefile_produces_byte_identical_tree() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempdir().unwrap();
+        let caps = probe_fs_capabilities(dir.path());
+        if !caps.reflink {
+            eprintln!("skipping: filesystem does not support reflink");
+            return;
+        }
+        let source = dir.path().join("image");
+        let target = dir.path().join("clone");
+        // A tree with nested dirs, a regular file, an executable file, and a
+        // symlink — the shapes a directory-level `clonefile(2)` must preserve.
+        fs::create_dir_all(source.join("sub")).unwrap();
+        fs::write(source.join("package.json"), br#"{"name":"foo"}"#).unwrap();
+        fs::write(source.join("sub/nested.txt"), b"nested bytes").unwrap();
+        fs::write(source.join("bin.sh"), b"#!/bin/sh\necho hi\n").unwrap();
+        std::os::unix::fs::symlink("package.json", source.join("link-to-pkg")).unwrap();
+        // An executable mode bit the directory clone must carry across.
+        fs::set_permissions(source.join("bin.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+
+        reflink_tree(&source, &target).expect("reflink_tree on a reflink-capable FS");
+
+        assert_eq!(
+            collect_tree(&source),
+            collect_tree(&target),
+            "reflinked tree must be byte-identical to the source image"
+        );
+
+        let src_mode = fs::metadata(source.join("bin.sh")).unwrap().mode() & 0o777;
+        let dst_mode = fs::metadata(target.join("bin.sh")).unwrap().mode() & 0o777;
+        assert_eq!(src_mode, dst_mode, "executable mode must be preserved");
+        assert_eq!(dst_mode, 0o755);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_clonefile_fallback_matches_fast_path() {
+        let dir = tempdir().unwrap();
+        let caps = probe_fs_capabilities(dir.path());
+        if !caps.reflink {
+            eprintln!("skipping: filesystem does not support reflink");
+            return;
+        }
+        let source = dir.path().join("image");
+        fs::create_dir_all(source.join("sub")).unwrap();
+        fs::write(source.join("a.txt"), b"alpha").unwrap();
+        fs::write(source.join("sub/b.txt"), b"beta").unwrap();
+        std::os::unix::fs::symlink("../a.txt", source.join("sub/l")).unwrap();
+
+        // What `reflink_tree` produced: directory clone on macOS, per-file
+        // `FICLONE` on Linux, or the independent-copy fallback when the clone
+        // is rejected.
+        let via_reflink = dir.path().join("via-reflink");
+        reflink_tree(&source, &via_reflink).unwrap();
+        // The canonical per-file fallback `reflink_tree` falls through to when
+        // the directory clone is `Unsupported`.
+        let via_fallback = dir.path().join("via-fallback");
+        link_tree(&source, &via_fallback, reflink_or_fallback_file).unwrap();
+
+        assert_eq!(
+            collect_tree(&via_reflink),
+            collect_tree(&via_fallback),
+            "the directory-clone fast path and the per-file fallback must agree"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_clonefile_isolates_writes() {
+        let dir = tempdir().unwrap();
+        let caps = probe_fs_capabilities(dir.path());
+        if !caps.reflink {
+            eprintln!("skipping: filesystem does not support reflink");
+            return;
+        }
+        let source = dir.path().join("image");
+        let target = dir.path().join("clone");
+        fs::create_dir_all(source.join("sub")).unwrap();
+        let original = b"original store bytes";
+        fs::write(source.join("sub/file.txt"), original).unwrap();
+        fs::write(source.join("top.txt"), b"top").unwrap();
+
+        reflink_tree(&source, &target).expect("reflink_tree on a reflink-capable FS");
+
+        // Mutate two files in the project-view clone (nested + top-level).
+        fs::write(target.join("sub/file.txt"), b"mutated project bytes").unwrap();
+        fs::write(target.join("top.txt"), b"mutated").unwrap();
+
+        // The store image must be untouched (CoW isolation).
+        assert_eq!(
+            fs::read(source.join("sub/file.txt")).unwrap(),
+            original,
+            "a project-view write reached the store image"
+        );
+        assert_eq!(
+            fs::read(source.join("top.txt")).unwrap(),
+            b"top",
+            "a project-view write reached the store image"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_clonefile_creates_missing_parent_directories() {
+        let dir = tempdir().unwrap();
+        let caps = probe_fs_capabilities(dir.path());
+        if !caps.reflink {
+            eprintln!("skipping: filesystem does not support reflink");
+            return;
+        }
+        let source = dir.path().join("image");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("package.json"), br#"{"name":"deep"}"#).unwrap();
+
+        // A nested target whose parent directories do not yet exist — the
+        // shape `node_modules/greet/node_modules/dep` takes during
+        // materialization. `clonefile(2)` creates `target` but not its
+        // ancestors; the fast path must, like the per-file fallback.
+        let target = dir.path().join("node_modules/greet/node_modules/dep");
+        assert!(
+            !target.parent().unwrap().exists(),
+            "test premise: parent must not pre-exist"
+        );
+
+        reflink_tree(&source, &target).expect("fast path must create missing parents");
+
+        assert_eq!(
+            fs::read(target.join("package.json")).unwrap(),
+            br#"{"name":"deep"}"#
+        );
     }
 }
