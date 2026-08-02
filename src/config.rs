@@ -332,17 +332,11 @@ fn normalize_registry(value: &str) -> Result<String, String> {
     let target = parse_http_target(value).ok_or_else(|| {
         "registry must be an absolute http:// or https:// URL without credentials".to_string()
     })?;
-    if value.contains(['?', '#']) {
+    if target.has_query || target.has_fragment {
         return Err("registry URL must not contain a query or fragment".to_string());
     }
-    let scheme_end = value.find("://").expect("validated URL has scheme");
     let path = target.path.trim_end_matches('/');
-    Ok(format!(
-        "{}://{}{}",
-        value[..scheme_end].to_ascii_lowercase(),
-        target.authority,
-        path
-    ))
+    Ok(format!("{}://{}{}", target.scheme, target.authority, path))
 }
 
 fn parse_auth_scope(key: &str) -> Result<AuthScope, String> {
@@ -350,26 +344,32 @@ fn parse_auth_scope(key: &str) -> Result<AuthScope, String> {
         .strip_prefix("//")
         .and_then(|key| key.strip_suffix(":_authToken"))
         .ok_or_else(|| "invalid auth token key".to_string())?;
-    let (authority, path) = raw
-        .split_once('/')
-        .ok_or_else(|| "auth token key must include a host and `/` path".to_string())?;
-    if authority.is_empty() || authority.contains('@') || path.contains(['?', '#']) {
+    if !raw.contains('/') {
+        return Err("auth token key must include a host and `/` path".to_string());
+    }
+    let target = parse_http_target(&format!("https://{raw}"))
+        .ok_or_else(|| "invalid host-scoped auth token key".to_string())?;
+    if target.has_query || target.has_fragment {
         return Err("invalid host-scoped auth token key".to_string());
     }
-    let path_prefix = format!("/{}/", path.trim_matches('/'));
+    let path = target.path.trim_end_matches('/');
+    let path_prefix = if path.is_empty() {
+        "/".to_string()
+    } else {
+        format!("{path}/")
+    };
     Ok(AuthScope {
-        authority: authority.to_ascii_lowercase(),
-        path_prefix: if path_prefix == "//" {
-            "/".to_string()
-        } else {
-            path_prefix
-        },
+        authority: target.authority,
+        path_prefix,
     })
 }
 
 struct RequestTarget {
+    scheme: String,
     authority: String,
     path: String,
+    has_query: bool,
+    has_fragment: bool,
 }
 
 fn parse_request_target(value: &str) -> Option<RequestTarget> {
@@ -377,21 +377,24 @@ fn parse_request_target(value: &str) -> Option<RequestTarget> {
 }
 
 fn parse_http_target(value: &str) -> Option<RequestTarget> {
-    let rest = value
-        .strip_prefix("https://")
-        .or_else(|| value.strip_prefix("http://"))?;
-    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let authority = &rest[..authority_end];
-    if authority.is_empty() || authority.contains('@') || authority.chars().any(char::is_whitespace)
+    if value.trim() != value {
+        return None;
+    }
+    let parsed = url::Url::parse(value).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || !parsed[url::Position::BeforeUsername..url::Position::BeforeHost].is_empty()
     {
         return None;
     }
-    let remainder = &rest[authority_end..];
-    let path_end = remainder.find(['?', '#']).unwrap_or(remainder.len());
-    let path = &remainder[..path_end];
     Some(RequestTarget {
-        authority: authority.to_ascii_lowercase(),
-        path: if path.is_empty() { "/" } else { path }.to_string(),
+        scheme: parsed.scheme().to_string(),
+        authority: parsed[url::Position::BeforeHost..url::Position::AfterPort].to_ascii_lowercase(),
+        path: parsed.path().to_string(),
+        has_query: parsed.query().is_some(),
+        has_fragment: parsed.fragment().is_some(),
     })
 }
 
@@ -524,6 +527,47 @@ mod tests {
         assert_eq!(
             config.auth_token_for_url("https://other.example/private/pkg"),
             None
+        );
+    }
+
+    #[test]
+    fn auth_matching_uses_normalized_request_and_scope_paths() {
+        let mut config = NpmConfig::default();
+        apply(
+            &mut config,
+            "auth.npmrc",
+            "registry=https://registry.example/private/../public/\n//registry.example/:_authToken=root-sentinel\n//registry.example/private/:_authToken=private-sentinel\n//registry.example/stale/../public/:_authToken=public-sentinel\n",
+        )
+        .unwrap();
+
+        assert_eq!(config.registry(), "https://registry.example/public");
+        assert!(
+            config.auth_token_for_url("https://registry.example/private/../public/pkg")
+                == Some("public-sentinel")
+        );
+        assert!(
+            config.auth_token_for_url("https://registry.example/private/%2e%2e/public/pkg")
+                == Some("public-sentinel")
+        );
+        assert!(
+            config.auth_token_for_url("https://registry.example/private/pkg")
+                == Some("private-sentinel")
+        );
+
+        let mut root_fallback = NpmConfig::default();
+        apply(
+            &mut root_fallback,
+            "auth.npmrc",
+            "//registry.example/:_authToken=root-sentinel\n//registry.example/private/:_authToken=private-sentinel\n",
+        )
+        .unwrap();
+        assert!(
+            root_fallback.auth_token_for_url("https://registry.example/private/../public/pkg")
+                == Some("root-sentinel")
+        );
+        assert!(
+            root_fallback.auth_token_for_url("https://registry.example/private/%2e%2e/public/pkg")
+                == Some("root-sentinel")
         );
     }
 

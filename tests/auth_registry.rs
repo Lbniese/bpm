@@ -51,3 +51,53 @@ fn whoami_accepts_path_registry_auth_at_the_base_boundary() {
     assert_eq!(requests[0].path, "/npm/-/whoami");
     assert!(requests[0].header("authorization").is_some());
 }
+
+#[test]
+fn whoami_authenticates_the_normalized_registry_path() {
+    let server = MiniServer::start_routed(|path| match path {
+        "/public/-/whoami" => Some(RouteBody(
+            br#"{"username":"normalized-user"}"#.to_vec(),
+            "application/json",
+        )),
+        _ => None,
+    });
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let project = temp.path().join("project");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&project).unwrap();
+
+    let authority = server
+        .url("")
+        .strip_prefix("http://")
+        .unwrap()
+        .trim_end_matches('/')
+        .to_string();
+    fs::write(
+        home.join(".npmrc"),
+        format!(
+            "registry=http://{authority}/private/../public/\n//{authority}/:_authToken=root-sentinel\n//{authority}/private/:_authToken=private-sentinel\n"
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bpm"))
+        .arg("whoami")
+        .current_dir(&project)
+        .env("HOME", &home)
+        .output()
+        .expect("run bpm whoami");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "normalized-user"
+    );
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].path, "/public/-/whoami");
+    assert!(
+        requests[0].header("authorization") == Some("Bearer root-sentinel"),
+        "normalized request must use only the token covering its wire path"
+    );
+}
