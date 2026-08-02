@@ -3,6 +3,7 @@ use std::{env, fs, path::PathBuf};
 
 use base64::Engine;
 use flate2::{write::GzEncoder, Compression};
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use serde_json::json;
 use sha2::{Digest, Sha512};
 
@@ -153,22 +154,11 @@ fn package_file_list(
     root: &std::path::Path,
     manifest_json: &serde_json::Value,
 ) -> anyhow::Result<Vec<String>> {
-    let declared_files = manifest_json
-        .get("files")
-        .and_then(|value| value.as_array())
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(|value| value.as_str())
-                .map(normalize_manifest_path)
-                .filter(|value| !value.is_empty())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let ignore_patterns = load_ignore_patterns(root)?;
+    let declared_files = build_manifest_files_matcher(root, manifest_json)?;
+    let ignore_patterns = load_ignore_matcher(root)?;
     let mut files = Vec::new();
     collect_files(root, root, &mut files)?;
-    files.retain(|path| should_publish(path, &declared_files, &ignore_patterns));
+    files.retain(|path| should_publish(path, declared_files.as_ref(), ignore_patterns.as_ref()));
     let mut set = files.into_iter().collect::<BTreeSet<_>>();
     for always in always_include(root) {
         set.insert(always);
@@ -225,23 +215,29 @@ fn validate_publish_symlink(rel: &str) -> anyhow::Result<()> {
     )
 }
 
-fn should_publish(path: &str, declared_files: &[String], ignore_patterns: &[String]) -> bool {
-    if is_always_include(path) {
-        return true;
-    }
+fn should_publish(
+    path: &str,
+    declared_files: Option<&Gitignore>,
+    ignore_patterns: Option<&Gitignore>,
+) -> bool {
     if is_default_exclude(path) {
         return false;
     }
-    if !declared_files.is_empty()
-        && !declared_files
-            .iter()
-            .any(|pattern| path == pattern || path.starts_with(&format!("{}/", pattern)))
-    {
+    if is_always_include(path) {
+        return true;
+    }
+    if declared_files.is_some_and(|matcher| {
+        !matcher
+            .matched_path_or_any_parents(std::path::Path::new(path), false)
+            .is_ignore()
+    }) {
         return false;
     }
-    !ignore_patterns
-        .iter()
-        .any(|pattern| ignore_match(path, pattern))
+    !ignore_patterns.is_some_and(|matcher| {
+        matcher
+            .matched_path_or_any_parents(std::path::Path::new(path), false)
+            .is_ignore()
+    })
 }
 
 fn always_include(root: &std::path::Path) -> Vec<String> {
@@ -284,95 +280,50 @@ fn is_default_exclude(path: &str) -> bool {
         || lower.starts_with("target/")
 }
 
-fn load_ignore_patterns(root: &std::path::Path) -> anyhow::Result<Vec<String>> {
+fn build_manifest_files_matcher(
+    root: &std::path::Path,
+    manifest_json: &serde_json::Value,
+) -> anyhow::Result<Option<Gitignore>> {
+    let patterns = manifest_json
+        .get("files")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(normalize_manifest_path)
+        .filter(|pattern| !pattern.is_empty())
+        .collect::<Vec<_>>();
+    if patterns.is_empty() {
+        return Ok(None);
+    }
+
+    let mut builder = GitignoreBuilder::new(root);
+    for pattern in patterns {
+        builder.add_line(None, &pattern).map_err(|error| {
+            anyhow::anyhow!("invalid package files pattern {pattern:?}: {error}")
+        })?;
+    }
+    Ok(Some(builder.build()?))
+}
+
+fn load_ignore_matcher(root: &std::path::Path) -> anyhow::Result<Option<Gitignore>> {
     let path = if root.join(".npmignore").is_file() {
         root.join(".npmignore")
     } else {
         root.join(".gitignore")
     };
     if !path.is_file() {
-        return Ok(Vec::new());
+        return Ok(None);
     }
-    let patterns = fs::read_to_string(path)?
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#') && !line.starts_with('!'))
-        .map(normalize_manifest_path)
-        .collect();
-    Ok(patterns)
-}
 
-fn ignore_match(path: &str, pattern: &str) -> bool {
-    let pattern = pattern.trim_end_matches('/');
-    if pattern.is_empty() {
-        return false;
+    let mut builder = GitignoreBuilder::new(root);
+    if let Some(error) = builder.add(&path) {
+        return Err(anyhow::anyhow!(
+            "failed to parse ignore file {}: {error}",
+            path.display()
+        ));
     }
-    if path == pattern || path.starts_with(&format!("{pattern}/")) {
-        return true;
-    }
-    // Final-segment glob: split the pattern on the last `/` so the wildcard
-    // applies to the basename only. A pattern with no `/` matches any basename
-    // at any depth (gitignore "pattern with no slash matches at any depth");
-    // a pattern with a `/` matches only the same directory prefix.
-    let (pat_dir, pat_name) = match pattern.rsplit_once('/') {
-        Some((d, n)) => (Some(d), n),
-        None => (None, pattern),
-    };
-    let (path_dir, path_name) = match path.rsplit_once('/') {
-        Some((d, n)) => (Some(d), n),
-        None => (None, path),
-    };
-    match (pat_dir, path_dir) {
-        (Some(pd), Some(pthd)) if !glob_segment(pthd, pd) => return false,
-        (Some(_), None) => return false,
-        _ => {}
-    }
-    glob_segment(path_name, pat_name)
-}
-
-/// Return true if a single path segment `seg` matches a glob `pat` where `pat`
-/// may contain `*` (zero or more bytes within this segment) and `?` (exactly
-/// one byte). Literal bytes match themselves. Case-sensitive (gitignore is
-/// case-sensitive by default and npm follows gitignore). No `**` semantics
-/// here — cross-segment handling is in `ignore_match`, which splits on `/`.
-fn glob_segment(seg: &str, pat: &str) -> bool {
-    let seg = seg.as_bytes();
-    let pat = pat.as_bytes();
-    let (mut si, mut pi) = (0usize, 0usize);
-    let (mut star_si, mut star_pi): (Option<usize>, usize) = (None, 0);
-    while si < seg.len() {
-        match pi < pat.len() {
-            true if pat[pi] == b'*' => {
-                star_si = Some(si);
-                star_pi = pi;
-                pi += 1;
-            }
-            true if pat[pi] == b'?' || pat[pi] == seg[si] => {
-                si += 1;
-                pi += 1;
-            }
-            true => match star_si {
-                Some(ss) => {
-                    si = ss + 1;
-                    star_si = Some(si);
-                    pi = star_pi + 1;
-                }
-                None => return false,
-            },
-            false => match star_si {
-                Some(ss) => {
-                    si = ss + 1;
-                    star_si = Some(si);
-                    pi = star_pi + 1;
-                }
-                None => return false,
-            },
-        }
-    }
-    while pi < pat.len() && pat[pi] == b'*' {
-        pi += 1;
-    }
-    pi == pat.len()
+    Ok(Some(builder.build()?))
 }
 
 fn normalize_manifest_path(value: &str) -> String {
@@ -497,29 +448,120 @@ mod tests {
         assert_eq!(files, ["README.md", "dist/index.js", "package.json"]);
     }
 
+    fn write_fixture_files(root: &std::path::Path, files: &[&str]) {
+        for file in files {
+            let path = root.join(file);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(path, file).unwrap();
+        }
+    }
+
     #[test]
-    fn ignore_match_supports_glob_patterns() {
-        // glob in final segment, bare basename (no slash) → any depth
-        assert!(ignore_match("debug.log", "*.log"));
-        assert!(ignore_match("logs/x.log", "*.log"));
-        assert!(ignore_match("dist/bundle.js.map", "*.map"));
-        assert!(ignore_match("a.js", "*.js"));
-        // must NOT over-match: a non-matching extension is kept
-        assert!(!ignore_match("debug.txt", "*.log"));
-        assert!(!ignore_match("logger.js", "*.log"));
-        // directory-scoped glob
-        assert!(ignore_match("dist/a.js", "dist/*.js"));
-        assert!(ignore_match("dist/b.js", "dist/*.js"));
-        // existing exact / prefix behaviors preserved
-        assert!(ignore_match("secret.txt", "secret.txt"));
-        assert!(ignore_match("build/x", "build"));
-        assert!(ignore_match("build/x", "build/"));
-        // single-char wildcard
-        assert!(ignore_match("a.txt", "?.txt"));
-        assert!(!ignore_match("ab.txt", "?.txt"));
-        // empty pattern never matches
-        assert!(!ignore_match("anything", ""));
-        assert!(!ignore_match("anything", "/"));
+    fn package_file_list_supports_manifest_glob_syntax() {
+        let cases = [
+            (
+                "dist/*.js",
+                vec!["dist/index.js", "dist/index.txt", "other.js"],
+                vec!["dist/index.js", "package.json"],
+            ),
+            (
+                "dist/**/index?.js",
+                vec![
+                    "dist/index1.js",
+                    "dist/nested/index2.js",
+                    "dist/nested/index-long.js",
+                ],
+                vec!["dist/index1.js", "dist/nested/index2.js", "package.json"],
+            ),
+            (
+                "lib/[ab].js",
+                vec!["lib/a.js", "lib/b.js", "lib/c.js"],
+                vec!["lib/a.js", "lib/b.js", "package.json"],
+            ),
+        ];
+
+        for (pattern, paths, expected) in cases {
+            let root = tempfile::tempdir().unwrap();
+            let manifest = json!({"name": "p", "version": "1.0.0", "files": [pattern]});
+            fs::write(root.path().join("package.json"), manifest.to_string()).unwrap();
+            write_fixture_files(root.path(), &paths);
+            assert_eq!(
+                package_file_list(root.path(), &manifest).unwrap(),
+                expected,
+                "pattern {pattern:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn package_file_list_honors_ordered_ignore_negation_and_precedence() {
+        for ignore_name in [".npmignore", ".gitignore"] {
+            let root = tempfile::tempdir().unwrap();
+            let manifest = json!({"name": "p", "version": "1.0.0", "files": ["dist"]});
+            fs::write(root.path().join("package.json"), manifest.to_string()).unwrap();
+            fs::write(root.path().join(ignore_name), "dist/*\n!dist/keep.js\n").unwrap();
+            write_fixture_files(root.path(), &["dist/drop.js", "dist/keep.js"]);
+            assert_eq!(
+                package_file_list(root.path(), &manifest).unwrap(),
+                ["dist/keep.js", "package.json"]
+            );
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let manifest = json!({"name": "p", "version": "1.0.0", "files": ["dist"]});
+        fs::write(root.path().join("package.json"), manifest.to_string()).unwrap();
+        fs::write(root.path().join(".npmignore"), "dist/drop.js\n").unwrap();
+        fs::write(root.path().join(".gitignore"), "dist/keep.js\n").unwrap();
+        write_fixture_files(root.path(), &["dist/drop.js", "dist/keep.js"]);
+        assert_eq!(
+            package_file_list(root.path(), &manifest).unwrap(),
+            ["dist/keep.js", "package.json"]
+        );
+    }
+
+    #[test]
+    fn ignore_negation_cannot_restore_hard_exclusions() {
+        let root = tempfile::tempdir().unwrap();
+        let manifest = json!({"name": "p", "version": "1.0.0"});
+        fs::write(root.path().join("package.json"), manifest.to_string()).unwrap();
+        fs::write(
+            root.path().join(".npmignore"),
+            "*\n!.npmrc\n!nested/.npmrc\n!package-lock.json\n!node_modules/pkg/index.js\n!.git/config\n!target/output\n!safe.js\n",
+        )
+        .unwrap();
+        write_fixture_files(
+            root.path(),
+            &[
+                ".npmrc",
+                "nested/.npmrc",
+                "package-lock.json",
+                "node_modules/pkg/index.js",
+                ".git/config",
+                "target/output",
+                "safe.js",
+            ],
+        );
+
+        assert_eq!(
+            package_file_list(root.path(), &manifest).unwrap(),
+            ["package.json", "safe.js"]
+        );
+    }
+
+    #[test]
+    fn root_always_includes_override_allowlist_and_ignore_rules() {
+        let root = tempfile::tempdir().unwrap();
+        let manifest = json!({"name": "p", "version": "1.0.0", "files": ["dist/*.js"]});
+        fs::write(root.path().join("package.json"), manifest.to_string()).unwrap();
+        fs::write(root.path().join(".npmignore"), "*\n").unwrap();
+        write_fixture_files(root.path(), &["README.md", "LICENSE", "dist/index.js"]);
+
+        assert_eq!(
+            package_file_list(root.path(), &manifest).unwrap(),
+            ["LICENSE", "README.md", "package.json"]
+        );
     }
 
     #[test]
