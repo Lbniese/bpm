@@ -304,8 +304,8 @@ pub fn ensure_graph_volume_with_prepared(
     // stale and must be rebuilt from scratch.
     let mut stale = false;
     if let Ok(meta_bytes) = fs::read(volume_dir.join(META_FILE)) {
-        if let Ok(meta) = serde_json::from_slice::<VolumeMeta>(&meta_bytes) {
-            if current_meta(&meta, &graph_hex, &volume_dir) {
+        match serde_json::from_slice::<VolumeMeta>(&meta_bytes) {
+            Ok(meta) if current_meta(&meta, &graph_hex, &volume_dir) => {
                 metrics.record("graph_volume_hit", std::time::Duration::ZERO);
                 return Ok(EnsuredVolume::Ready(VolumeRef {
                     path: volume_dir,
@@ -313,7 +313,7 @@ pub fn ensure_graph_volume_with_prepared(
                     stats: MaterializeStats::default(),
                 }));
             }
-            stale = true;
+            _ => stale = true,
         }
     }
 
