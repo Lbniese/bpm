@@ -452,6 +452,11 @@ fn serialize_lock(
     }
 }
 
+fn publish_lock_bytes(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    manifest_edit::publish_bytes(path, bytes)
+        .map_err(|error| anyhow::anyhow!("failed to publish lock {}: {error}", path.display()))
+}
+
 fn lock_error(error: &LockfileError) -> String {
     match error {
         LockfileError::Write { source, .. } => source.to_string(),
@@ -682,8 +687,7 @@ pub(super) fn run_upgrade(options: UpgradeOptions) -> anyhow::Result<()> {
     if !lock_bytes.ends_with(b"\n") {
         lock_bytes.push(b'\n');
     }
-    std::fs::write(&lock_path, &lock_bytes)
-        .map_err(|error| anyhow::anyhow!("failed to write {}: {error}", lock_path.display()))?;
+    publish_lock_bytes(&lock_path, &lock_bytes)?;
 
     // Report only the requested packages (or all bumps if none named).
     let filter = |name: &str| -> bool {
@@ -818,8 +822,7 @@ pub(super) fn run_dedupe(options: DedupeOptions) -> anyhow::Result<()> {
     if !lock_bytes.ends_with(b"\n") {
         lock_bytes.push(b'\n');
     }
-    std::fs::write(&lock_path, &lock_bytes)
-        .map_err(|error| anyhow::anyhow!("failed to write {}: {error}", lock_path.display()))?;
+    publish_lock_bytes(&lock_path, &lock_bytes)?;
 
     if before == after {
         eprintln!(
