@@ -1,5 +1,5 @@
 use serde_json::json;
-use std::{collections::BTreeMap, env, fs, path::PathBuf};
+use std::{collections::BTreeMap, env, path::PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Severity {
@@ -158,67 +158,19 @@ fn audit_bulk_body(root: &std::path::Path) -> anyhow::Result<serde_json::Value> 
     Ok(serde_json::Value::Object(body))
 }
 
-/// Parse an npm v3 `package-lock.json` into name -> distinct resolved versions.
-///
-/// Strict shape validation distinguishes a real empty inventory from input
-/// failure: `lockfileVersion` must be numeric and equal to 3, and `packages`
-/// must be present as an object. The root entry (keyed `""`) is skipped
-/// because it represents the project itself. Entries without a resolved
-/// `version` are skipped (preserving the prior behavior).
+/// Normalize an npm v3 lock through the shared importer, then group it through
+/// the same canonical-name path as a native BPM lock.
 fn bulk_groups_from_npm_lock(
     root: &std::path::Path,
 ) -> anyhow::Result<BTreeMap<String, std::collections::BTreeSet<String>>> {
     let package_lock = root.join("package-lock.json");
-    let text = fs::read_to_string(&package_lock).map_err(|err| {
+    let report = bpm::project_lock::load_npm_package_lock(&package_lock).map_err(|error| {
         anyhow::anyhow!(
-            "audit needs a valid bpm.lock or npm package-lock.json; could not read {}: {err}",
+            "audit needs a valid bpm.lock or npm package-lock.json; failed to load {}: {error}",
             package_lock.display()
         )
     })?;
-    let lock: serde_json::Value = serde_json::from_str(&text).map_err(|err| {
-        anyhow::anyhow!("could not parse {} as JSON: {err}", package_lock.display())
-    })?;
-
-    // Validate the supported npm lock shape before grouping anything.
-    let version = lock.get("lockfileVersion").ok_or_else(|| {
-        anyhow::anyhow!("{} is missing `lockfileVersion`", package_lock.display())
-    })?;
-    let version_num = version.as_u64().ok_or_else(|| {
-        anyhow::anyhow!(
-            "`lockfileVersion` in {} must be a number",
-            package_lock.display()
-        )
-    })?;
-    if version_num != 3 {
-        anyhow::bail!(
-            "audit supports npm package-lock.json v3, but {} reports lockfileVersion {version_num}",
-            package_lock.display()
-        );
-    }
-    let packages = lock
-        .get("packages")
-        .and_then(|v| v.as_object())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "{} is missing a top-level `packages` object",
-                package_lock.display()
-            )
-        })?;
-
-    let mut groups: BTreeMap<String, std::collections::BTreeSet<String>> = BTreeMap::new();
-    for (path, entry) in packages {
-        // The root entry (key "") represents the project itself; it has no
-        // installable dependency name even if it declares a version.
-        if path.is_empty() {
-            continue;
-        }
-        if let Some(name) = package_name_from_lock_path(path) {
-            if let Some(version) = entry.get("version").and_then(|v| v.as_str()) {
-                groups.entry(name).or_default().insert(version.to_string());
-            }
-        }
-    }
-    Ok(groups)
+    Ok(bulk_groups_from_lockfile(&report.lockfile))
 }
 
 /// Group every resolved package in a bpm lockfile by name, collecting the
@@ -234,24 +186,11 @@ fn bulk_groups_from_lockfile(
             continue;
         }
         groups
-            .entry(package.name.clone())
+            .entry(lockfile.registry_name_for(package).to_string())
             .or_default()
             .insert(package.version.clone());
     }
     groups
-}
-
-/// Derive a package name from a package-lock v3 `packages` key
-/// (`node_modules/...` path). Takes the segment after the last
-/// `node_modules/` so scoped (`@scope/name`) and nested installs resolve to
-/// the installed package's name.
-fn package_name_from_lock_path(path: &str) -> Option<String> {
-    let tail = path.rsplit("node_modules/").next()?;
-    if tail.is_empty() {
-        None
-    } else {
-        Some(tail.to_string())
-    }
 }
 
 fn severity_zeroes() -> BTreeMap<&'static str, u64> {
@@ -322,6 +261,7 @@ fn severity_counts(value: &serde_json::Value) -> anyhow::Result<BTreeMap<Severit
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn sample_lockfile() -> bpm::lockfile::Lockfile {
         use bpm::lockfile::{Lockfile, PackageEntry, RootEntry};
@@ -404,20 +344,29 @@ mod tests {
     }
 
     #[test]
-    fn package_name_from_lock_path_handles_scoped_and_nested() {
+    fn bulk_groups_use_canonical_alias_identity() {
+        let mut lockfile = bpm::lockfile::Lockfile::new("test");
+        lockfile.packages.push(bpm::lockfile::PackageEntry {
+            path: "node_modules/alias".into(),
+            name: "alias".into(),
+            version: "1.2.3".into(),
+            resolved: "https://registry.example/real-package.tgz".into(),
+            ..Default::default()
+        });
+        lockfile
+            .resolution
+            .registry_names
+            .insert("node_modules/alias".into(), "real-package".into());
+
+        let groups = bulk_groups_from_lockfile(&lockfile);
         assert_eq!(
-            package_name_from_lock_path("node_modules/@scope/pkg").as_deref(),
-            Some("@scope/pkg")
+            groups["real-package"]
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["1.2.3"]
         );
-        assert_eq!(
-            package_name_from_lock_path("node_modules/foo").as_deref(),
-            Some("foo")
-        );
-        assert_eq!(
-            package_name_from_lock_path("node_modules/a/node_modules/b").as_deref(),
-            Some("b")
-        );
-        assert_eq!(package_name_from_lock_path(""), None);
+        assert!(!groups.contains_key("alias"));
     }
 
     #[test]
@@ -542,6 +491,23 @@ mod tests {
     }
 
     #[test]
+    fn npm_lock_alias_groups_by_explicit_canonical_name() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("package.json"),
+            r#"{"name":"app","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        write_npm_lock(
+            root.path(),
+            r#"{"name":"app","lockfileVersion":3,"packages":{"":{"version":"1.0.0","dependencies":{"alias":"npm:real-package@1.2.3"}},"node_modules/alias":{"name":"real-package","version":"1.2.3","resolved":"https://example/real.tgz","integrity":"sha512-abc"}}}"#,
+        );
+        let body = audit_bulk_body(root.path()).expect("valid alias lock");
+        assert_eq!(body["real-package"], json!(["1.2.3"]));
+        assert!(body.get("alias").is_none());
+    }
+
+    #[test]
     fn npm_lock_root_only_yields_empty_inventory() {
         // A dependency-free, valid npm v3 lock is a legitimate empty inventory.
         let root = tempfile::tempdir().unwrap();
@@ -599,8 +565,8 @@ mod tests {
         );
         let err = audit_bulk_body(root.path()).unwrap_err().to_string();
         assert!(
-            err.contains("v3"),
-            "error should mention v3 support, got: {err}"
+            err.contains("version 3"),
+            "error should mention version 3 support, got: {err}"
         );
     }
 

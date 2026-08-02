@@ -274,6 +274,98 @@ fn detects_outdated_package_with_mock_registry() {
 }
 
 #[test]
+fn alias_queries_canonical_package_but_filters_and_displays_placement_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(
+        tmp.path().join("bpm.lock"),
+        r#"{
+          "lockfileVersion":2,
+          "generator":"bpm-test",
+          "root":{"dependencies":{"alias":"npm:real-package@^1"}},
+          "packages":[{
+            "path":"node_modules/alias",
+            "name":"alias",
+            "version":"1.2.3",
+            "resolved":"https://registry.example/real-package.tgz",
+            "integrity":"sha512-abc"
+          }],
+          "resolution":{"registryNames":{"node_modules/alias":"real-package"}}
+        }"#,
+    )
+    .unwrap();
+    let body = make_packument("real-package", &["1.2.3", "1.9.0", "2.0.0"], "2.0.0");
+    let server = MiniServer::start_routed(move |path| {
+        (path == "/real-package").then(|| RouteBody(body.as_bytes().to_vec(), "application/json"))
+    });
+
+    let (stdout, stderr, code) = run_outdated(
+        tmp.path(),
+        &[
+            "alias",
+            "--registry",
+            &server.url(""),
+            "--store",
+            tmp.path().join("store").to_str().unwrap(),
+        ],
+    );
+
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert!(stdout.lines().any(|line| {
+        line.contains("alias")
+            && line.contains("1.2.3")
+            && line.contains("1.9.0")
+            && line.contains("2.0.0")
+    }));
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].path, "/real-package");
+}
+
+#[test]
+fn duplicate_alias_placements_share_one_canonical_query_and_warning() {
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(
+        tmp.path().join("bpm.lock"),
+        r#"{
+          "lockfileVersion":2,
+          "generator":"bpm-test",
+          "root":{"dependencies":{"alias":"npm:real-package@^1"}},
+          "packages":[
+            {"path":"node_modules/alias","name":"alias","version":"1.2.3","resolved":"https://registry.example/real.tgz","integrity":"sha512-a"},
+            {"path":"node_modules/parent/node_modules/alias","name":"alias","version":"1.2.3","resolved":"https://registry.example/real.tgz","integrity":"sha512-a"}
+          ],
+          "resolution":{"registryNames":{
+            "node_modules/alias":"real-package",
+            "node_modules/parent/node_modules/alias":"real-package"
+          }}
+        }"#,
+    )
+    .unwrap();
+    let server = MiniServer::start_routed(|_| None);
+
+    let (_stdout, stderr, code) = run_outdated(
+        tmp.path(),
+        &[
+            "--registry",
+            &server.url(""),
+            "--store",
+            tmp.path().join("store").to_str().unwrap(),
+        ],
+    );
+
+    assert_eq!(code, Some(0));
+    assert_eq!(
+        stderr
+            .matches("failed to fetch metadata for real-package")
+            .count(),
+        1
+    );
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].path, "/real-package");
+}
+
+#[test]
 fn outdated_accepts_json_flag() {
     // Verify the --json flag is accepted (parse check).
     let tmp = tempfile::tempdir().unwrap();

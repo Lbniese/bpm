@@ -268,6 +268,14 @@ pub fn canonical_graph_bytes(lockfile: &Lockfile) -> Vec<u8> {
             write_field(&mut buf, dspec);
         }
     }
+    if !lockfile.resolution.registry_names.is_empty() {
+        buf.extend_from_slice(b"registry-names\n");
+        write_u64(&mut buf, lockfile.resolution.registry_names.len() as u64);
+        for (path, canonical_name) in &lockfile.resolution.registry_names {
+            write_field(&mut buf, path);
+            write_field(&mut buf, canonical_name);
+        }
+    }
     buf
 }
 
@@ -697,6 +705,42 @@ mod tests {
         a.packages[0].version = "1.3.1".into();
         let id1 = graph_id(&a).to_hex();
         assert_ne!(id0, id1, "version change must alter the graph id");
+    }
+
+    #[test]
+    fn alias_registry_identity_is_deterministic_and_changes_graph_id() {
+        let ordinary = lf();
+        let ordinary_bytes = canonical_graph_bytes(&ordinary);
+
+        let mut alias_a = ordinary.clone();
+        alias_a.packages[0].name = "alias".into();
+        alias_a
+            .resolution
+            .registry_names
+            .insert("node_modules/left-pad".into(), "left-pad".into());
+        let mut alias_b = alias_a.clone();
+        let entry = alias_b
+            .resolution
+            .registry_names
+            .remove("node_modules/left-pad")
+            .unwrap();
+        alias_b
+            .resolution
+            .registry_names
+            .insert("node_modules/left-pad".into(), entry);
+        assert_eq!(graph_id(&alias_a), graph_id(&alias_b));
+
+        let original_alias_id = graph_id(&alias_a);
+        alias_b
+            .resolution
+            .registry_names
+            .insert("node_modules/left-pad".into(), "other-package".into());
+        assert_ne!(original_alias_id, graph_id(&alias_b));
+
+        let mut empty = ordinary.clone();
+        empty.resolution.registry_names.clear();
+        assert_eq!(ordinary_bytes, canonical_graph_bytes(&empty));
+        assert_ne!(graph_id(&ordinary), original_alias_id);
     }
 
     #[test]

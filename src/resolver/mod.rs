@@ -24,7 +24,8 @@ use thiserror::Error;
 
 use crate::integrity::Integrity;
 use crate::lockfile::{
-    LockDependency, Lockfile, PackageEntry, PackageResolution, RootEntry, RootResolution,
+    LockDependency, LockSource, Lockfile, PackageEntry, PackageResolution, RootEntry,
+    RootResolution,
 };
 use crate::manifest::PackageManifest;
 use crate::registry::{parse_spec, RegistryClient, RegistryError, VersionMetadata};
@@ -343,6 +344,13 @@ pub fn resolve_manifest_with_options_and_target_sink(
     }
 
     for node in resolver.nodes.values() {
+        if matches!(&node.source, LockSource::Registry { .. })
+            && node.metadata.name != node.placement_name
+        {
+            lock.resolution
+                .registry_names
+                .insert(node.path.clone(), node.metadata.name.clone());
+        }
         lock.packages.push(PackageEntry {
             path: node.path.clone(),
             name: node.placement_name.clone(),
