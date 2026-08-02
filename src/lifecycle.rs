@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::derived::{
@@ -138,6 +138,18 @@ const ENV_INPUT_VARS: &[&str] = &[
 
 #[derive(Debug, Error)]
 pub enum LifecycleError {
+    #[error("io error reading lifecycle manifest at {path}: {source}")]
+    ManifestRead {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("invalid lifecycle manifest at {path}: {source}")]
+    ManifestParse {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
     #[error("io error during lifecycle at {path}: {source}")]
     Io {
         path: String,
@@ -261,10 +273,7 @@ pub fn run_lifecycle(
                 continue;
             }
             let image = store.image_path(&id);
-            let scripts = match read_scripts(&image.join("package.json")) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
+            let scripts = read_scripts(&image.join("package.json"))?;
             if LIFECYCLE_PHASES.iter().any(|p| scripts.contains_key(*p)) {
                 stats.packages_with_scripts += 1;
                 stats.derived_paths.push(pkg.path.clone());
@@ -303,10 +312,7 @@ pub fn run_lifecycle(
         };
         // Read the package's own scripts from its (immutable) image manifest.
         let image = store.image_path(&id);
-        let scripts = match read_scripts(&image.join("package.json")) {
-            Ok(s) => s,
-            Err(_) => continue, // unreadable manifest => no scripts to run
-        };
+        let scripts = read_scripts(&image.join("package.json"))?;
         let has_lifecycle = LIFECYCLE_PHASES.iter().any(|p| scripts.contains_key(*p));
         if !has_lifecycle {
             continue;
@@ -572,11 +578,7 @@ pub fn prepare_git_packages(
             continue;
         };
         let image = store.image_path(artifact_id);
-        let scripts =
-            read_scripts(&image.join("package.json")).map_err(|source| LifecycleError::Io {
-                path: image.join("package.json").display().to_string(),
-                source,
-            })?;
+        let scripts = read_scripts(&image.join("package.json"))?;
         if !scripts.contains_key("prepare") {
             continue;
         }
@@ -738,23 +740,44 @@ fn materialize_prepare_closure(
     Ok(())
 }
 
+#[derive(Debug, Deserialize)]
+struct LifecycleManifest {
+    #[serde(default)]
+    scripts: BTreeMap<String, String>,
+}
+
 /// Read the `scripts` map from a `package.json` at `manifest_path`.
-fn read_scripts(manifest_path: &Path) -> Result<BTreeMap<String, String>, std::io::Error> {
-    let bytes = fs::read(manifest_path)?;
-    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
-    let Some(obj) = v.as_object() else {
-        return Ok(BTreeMap::new());
-    };
-    let Some(scripts) = obj.get("scripts").and_then(|s| s.as_object()) else {
-        return Ok(BTreeMap::new());
-    };
-    let mut out = BTreeMap::new();
-    for (k, vv) in scripts {
-        if let Some(s) = vv.as_str() {
-            out.insert(k.clone(), s.to_string());
-        }
+fn read_scripts(manifest_path: &Path) -> Result<BTreeMap<String, String>, LifecycleError> {
+    let bytes = fs::read(manifest_path).map_err(|source| LifecycleError::ManifestRead {
+        path: manifest_path.to_path_buf(),
+        source,
+    })?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|source| LifecycleError::ManifestParse {
+            path: manifest_path.to_path_buf(),
+            source,
+        })?;
+    let valid_shape = value.is_object()
+        && value.get("scripts").is_none_or(|scripts| {
+            scripts
+                .as_object()
+                .is_some_and(|map| map.values().all(serde_json::Value::is_string))
+        });
+    if !valid_shape {
+        return Err(LifecycleError::ManifestParse {
+            path: manifest_path.to_path_buf(),
+            source: serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "lifecycle manifest has an invalid scripts shape",
+            )),
+        });
     }
-    Ok(out)
+    let manifest: LifecycleManifest =
+        serde_json::from_value(value).map_err(|source| LifecycleError::ManifestParse {
+            path: manifest_path.to_path_buf(),
+            source,
+        })?;
+    Ok(manifest.scripts)
 }
 
 /// Execute one script via `sh -c` with an npm-compatible environment.
@@ -1175,6 +1198,38 @@ fn lc_io(path: &Path, source: std::io::Error) -> LifecycleError {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn read_scripts_accepts_missing_scripts() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("package.json");
+        fs::write(&path, br#"{"name":"pkg"}"#).unwrap();
+        assert!(read_scripts(&path).unwrap().is_empty());
+    }
+
+    #[test]
+    fn read_scripts_rejects_invalid_json_and_shapes_with_path() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("package.json");
+        for (index, bytes) in [
+            br#"{"#.as_slice(),
+            br#"[]"#.as_slice(),
+            br#"{"scripts":[]}"#.as_slice(),
+            br#"{"scripts":{"install":42}}"#.as_slice(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            fs::write(&path, bytes).unwrap();
+            let error = match read_scripts(&path) {
+                Ok(_) => panic!("case {index} unexpectedly accepted"),
+                Err(error) => error,
+            };
+            let text = error.to_string();
+            assert!(text.contains("invalid lifecycle manifest"));
+            assert!(text.contains("package.json"));
+        }
+    }
 
     /// Stage a pristine image and a hardlinked volume entry (with a nested dep),
     /// the layout the graph volume produces before lifecycle runs.
