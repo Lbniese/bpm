@@ -10,7 +10,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -54,11 +54,15 @@ fn seed_tarball(dir: &Path, name: &str, bytes: &[u8]) -> (PathBuf, Integrity) {
 fn assert_resolves(p: &Path) {
     let meta = fs::symlink_metadata(p).expect("path missing");
     assert!(
-        meta.file_type().is_symlink(),
-        "not a symlink: {}",
+        meta.is_dir(),
+        "package view is not a directory: {}",
         p.display()
     );
-    assert!(Path::new(p).exists(), "dangling symlink: {}", p.display());
+    assert!(
+        !meta.file_type().is_symlink(),
+        "writable alias: {}",
+        p.display()
+    );
 }
 
 fn is_executable(p: &Path) -> bool {
@@ -242,31 +246,20 @@ fn frozen_install_materializes_node_modules_and_bins() {
         stdout.contains("installed 2 package(s)"),
         "stdout: {stdout}"
     );
-    // The project attaches to a reusable graph volume via shallow relays.
+    // The project receives an isolated view of the reusable graph volume.
     assert!(stdout.contains("graph volume built"), "stdout: {stdout}");
 
     let nm = project.path().join("node_modules");
-    // Top-level relay: a symlink into the shared graph volume.
     assert_resolves(&nm.join("greet"));
-    // Nested packages live inside the volume as hardlinked real files/dirs
-    // (not symlinks), reached transitively through the top-level relay. Bins
-    // intentionally remain relative symlinks so Node preserves package-relative
+    // Nested packages remain complete and bins preserve package-relative
     // resolution when launching a CLI.
     assert!(nm.join("greet/node_modules/dep").exists());
     assert!(nm.join("greet/package.json").exists());
     assert!(nm.join("greet/node_modules/dep/package.json").exists());
 
-    // The volume entry itself (the relay target) must be a REAL directory, not
-    // a symlink: hardlink materialization keeps a package's realpath inside the
-    // volume so self-referential requires resolve.
-    let volume_entry = fs::read_link(nm.join("greet")).unwrap();
-    let volume_meta = fs::symlink_metadata(&volume_entry).unwrap();
-    assert!(
-        volume_meta.is_dir(),
-        "volume entry should be a real directory, not a symlink: {}",
-        volume_entry.display()
-    );
-    assert!(!volume_meta.file_type().is_symlink());
+    let project_meta = fs::symlink_metadata(nm.join("greet")).unwrap();
+    assert!(project_meta.is_dir());
+    assert!(!project_meta.file_type().is_symlink());
 
     let bin = nm.join(".bin").join("hello");
     assert!(bin.exists(), "bin must be reachable through the relay");
@@ -427,9 +420,9 @@ fn repeat_install_is_a_no_op_on_the_store() {
     let first = run_install(project.path(), store.path());
     assert!(first.status.success());
 
-    // Snapshot the greet symlink so we can prove the second run didn't rewrite it.
+    // Snapshot the isolated package bytes so the second run is a no-op.
     let greet_link = project.path().join("node_modules/greet");
-    let before = fs::read_link(&greet_link).unwrap();
+    let before = fs::read(greet_link.join("package.json")).unwrap();
 
     let second = run_install(project.path(), store.path());
     let stdout = String::from_utf8_lossy(&second.stdout);
@@ -452,8 +445,8 @@ fn repeat_install_is_a_no_op_on_the_store() {
         "successful refresh path should preserve complete graph inventory"
     );
 
-    let after = fs::read_link(&greet_link).unwrap();
-    assert_eq!(before, after, "idempotent rerun rewrote the symlink");
+    let after = fs::read(greet_link.join("package.json")).unwrap();
+    assert_eq!(before, after, "idempotent rerun rewrote the package view");
 }
 
 #[test]
@@ -758,7 +751,7 @@ fn plan_cache_hit_is_recorded_in_metrics() {
 }
 
 #[test]
-fn plan_cache_invalidates_when_a_symlink_disappears() {
+fn plan_cache_invalidates_when_a_project_view_disappears() {
     let (project, store, _tgz) = setup_project();
 
     let first = run_install(project.path(), store.path());
@@ -768,10 +761,10 @@ fn plan_cache_invalidates_when_a_symlink_disappears() {
     let stdout = String::from_utf8_lossy(&second.stdout);
     assert!(stdout.contains("nothing to install"), "stdout: {stdout}");
 
-    // Drift: someone deleted a materialized package symlink. The cached plan's
+    // Drift: someone deleted a materialized package view. The cached plan's
     // project-state validation must reject it and force a full re-install.
     let target = project.path().join("node_modules/greet");
-    fs::remove_file(&target).unwrap();
+    fs::remove_dir_all(&target).unwrap();
 
     let third = run_install(project.path(), store.path());
     let stdout = String::from_utf8_lossy(&third.stdout);
@@ -781,7 +774,7 @@ fn plan_cache_invalidates_when_a_symlink_disappears() {
         stdout.contains("installed 2 package(s)"),
         "expected a full re-install after drift, stdout: {stdout}"
     );
-    assert!(target.exists(), "package symlink should be restored");
+    assert!(target.is_dir(), "package view should be restored");
 }
 
 /// Plan 011: a fresh frozen install persists nonempty, sorted project-view
@@ -1021,7 +1014,7 @@ fn second_project_with_same_graph_reuses_the_volume() {
     let stdout_b = String::from_utf8_lossy(&out_b.stdout);
     let stderr_b = String::from_utf8_lossy(&out_b.stderr);
     assert!(out_b.status.success(), "second install failed: {stderr_b}");
-    // The volume is reused (no rebuild); only the project relays were created.
+    // The volume is reused (no rebuild); project B receives an isolated view.
     assert!(
         stdout_b.contains("graph volume reused"),
         "expected volume reuse, stdout: {stdout_b}"
@@ -1036,12 +1029,20 @@ fn second_project_with_same_graph_reuses_the_volume() {
         .join("node_modules/greet/node_modules/dep/package.json")
         .exists());
     assert!(proj_b.path().join("node_modules/.bin/hello").exists());
-    // Project B's node_modules is a relay layer INTO the shared volume.
-    let relay = fs::read_link(proj_b.path().join("node_modules/greet")).unwrap();
-    assert!(
-        relay.to_string_lossy().contains("graphs/blake3"),
-        "relay should point into the graph volume: {}",
-        relay.display()
+    let project_entry = proj_b.path().join("node_modules/greet");
+    let graph_entry = single_graph_volume_path(store.path()).join("node_modules/greet");
+    assert!(!fs::symlink_metadata(&project_entry)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    #[cfg(unix)]
+    assert_ne!(
+        fs::metadata(project_entry.join("package.json"))
+            .unwrap()
+            .ino(),
+        fs::metadata(graph_entry.join("package.json"))
+            .unwrap()
+            .ino()
     );
 }
 

@@ -734,7 +734,7 @@ fn materialize_prepare_closure(
         closure,
         &artifact_ids,
         crate::materializer::MaterializeMode::Compatible,
-        crate::materializer::MaterializeBackend::Hardlink,
+        crate::materializer::MaterializeBackend::Reflink,
     )
     .map_err(|error| LifecycleError::Prepare(error.to_string()))?;
     Ok(())

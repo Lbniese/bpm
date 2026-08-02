@@ -422,9 +422,7 @@ pub(super) fn install_resolved_lockfile(
 /// `BPM_PROJECT_VIEW` or auto-detected from the resolved graph.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ProjectView {
-    /// Shallow top-level relays into the graph volume (the warm fast path).
-    Relay,
-    /// Project-local hardlink tree per package (realpaths stay project-local).
+    /// Project-local independent tree per package (realpaths stay project-local).
     Local,
     /// Project-local copy-on-write reflink tree per package; isolated from the
     /// store image on supporting filesystems, hardlink fallback otherwise.
@@ -439,28 +437,20 @@ fn resolve_project_view(lockfile: &Lockfile, project_root: &Path) -> ProjectView
 }
 
 fn resolve_project_view_with(
-    lockfile: &Lockfile,
-    project_root: &Path,
+    _lockfile: &Lockfile,
+    _project_root: &Path,
     view: Option<&str>,
 ) -> ProjectView {
-    let auto = || {
-        if auto_local_project_view(lockfile) {
-            // Probe filesystem capabilities and select the best backend.
-            // On APFS/btrfs/xfs this selects Reflink (copy-on-write);
-            // unsupported filesystems fall back to Local (hardlink).
-            let caps = bpm::materializer::probe_fs_capabilities(project_root);
-            match caps.preferred_backend() {
-                bpm::materializer::MaterializeBackend::Reflink => ProjectView::Reflink,
-                _ => ProjectView::Local,
-            }
-        } else {
-            ProjectView::Relay
-        }
-    };
+    let auto = || ProjectView::Reflink;
     match view {
         Some("reflink") => ProjectView::Reflink,
         Some("local") => ProjectView::Local,
-        Some("relay") => ProjectView::Relay,
+        Some("relay") => {
+            eprintln!(
+                "warning: BPM_PROJECT_VIEW=relay is unsafe; using isolated reflink/copy view"
+            );
+            ProjectView::Reflink
+        }
         Some(value) => {
             eprintln!(
                 "warning: unsupported BPM_PROJECT_VIEW={value:?}; expected relay, local, or reflink; using auto"
@@ -482,6 +472,7 @@ fn resolve_project_view_with(
 /// comma-separated list of package names that is merged with the built-in
 /// `next` default; the built-in `next` entry is always retained so existing
 /// Next.js installs never regress even if the env list omits it.
+#[cfg(test)]
 fn local_view_fragile_packages() -> Vec<String> {
     let mut packages = vec!["next".to_string()];
     if let Ok(value) = env::var("BPM_LOCAL_VIEW_PACKAGES") {
@@ -498,6 +489,7 @@ fn local_view_fragile_packages() -> Vec<String> {
     packages
 }
 
+#[cfg(test)]
 fn auto_local_project_view(lockfile: &Lockfile) -> bool {
     // Check the resolved graph rather than only root declarations. Imported
     // lockfiles and workspace layouts can represent the app's Next package as
@@ -1792,7 +1784,8 @@ fn finalize_install(
     // projects, but use a local hardlink view automatically for Next projects;
     // callers can override this with BPM_PROJECT_VIEW=relay|local.
     let project_view = resolve_project_view(lockfile, project_root);
-    let local_project_view = !matches!(project_view, ProjectView::Relay);
+    // Graph attachment is always an isolated local view; the selected project
+    // view only chooses the direct-materialization backend.
     // `final_ownership` is the sorted `ManagedEntry` set BPM actually created
     // this install, used both as the reconciliation desired set and persisted
     // into the next plan. For graph-volume views it is the final attachment
@@ -1802,7 +1795,7 @@ fn finalize_install(
     let mut final_ownership: Vec<bpm::graph::ManagedEntry> = Vec::new();
     let mut graph_hex: Option<String> = None;
     let materialization_start = Instant::now();
-    let (volume, mut view_entry_count) = if direct_materialization {
+    let (volume, view_entry_count, lifecycle) = if direct_materialization {
         bpm::materializer::materialize_lockfile_with_backend(
             project_root,
             store,
@@ -1811,23 +1804,65 @@ fn finalize_install(
             bpm::materializer::MaterializeMode::Compatible,
             match project_view {
                 ProjectView::Reflink => bpm::materializer::MaterializeBackend::Reflink,
-                ProjectView::Local => bpm::materializer::MaterializeBackend::Hardlink,
-                ProjectView::Relay => bpm::materializer::MaterializeBackend::Auto,
+                ProjectView::Local => bpm::materializer::MaterializeBackend::IsolatedCopy,
             },
         )?;
-        (None, 0usize)
+        (
+            None,
+            0usize,
+            run_lifecycle_if_enabled(
+                project_root,
+                store,
+                lockfile,
+                artifact_ids,
+                None,
+                options.ignore_scripts,
+                false,
+                options.derived_store,
+                metrics,
+            )?,
+        )
     } else {
-        let volume = bpm::volume::ensure_graph_volume_with_prepared(
+        let ensured = bpm::volume::ensure_graph_volume_with_prepared(
             store,
             lockfile,
             artifact_ids,
             &prepared,
             metrics,
         )?;
+        let (volume, lifecycle) = match ensured {
+            bpm::volume::EnsuredVolume::Ready(volume) => {
+                let lifecycle = run_lifecycle_if_enabled(
+                    project_root,
+                    store,
+                    lockfile,
+                    artifact_ids,
+                    Some(&volume.path),
+                    options.ignore_scripts,
+                    true,
+                    options.derived_store,
+                    metrics,
+                )?;
+                (volume, lifecycle)
+            }
+            bpm::volume::EnsuredVolume::Building(pending) => {
+                let lifecycle = run_lifecycle_if_enabled(
+                    project_root,
+                    store,
+                    lockfile,
+                    artifact_ids,
+                    Some(pending.path()),
+                    options.ignore_scripts,
+                    false,
+                    options.derived_store,
+                    metrics,
+                )?;
+                let volume = pending.publish()?;
+                (volume, lifecycle)
+            }
+        };
         let attach = bpm::volume::attach_project(project_root, &volume)?;
         final_ownership.clone_from(&attach.owned);
-        // The graph id is read from the volume path so it always matches the
-        // volume that was actually built or reused.
         let hex = volume
             .path
             .file_name()
@@ -1838,40 +1873,11 @@ fn finalize_install(
         (
             Some(volume),
             attach.stats.relays_created + attach.stats.relays_unchanged,
+            lifecycle,
         )
     };
     metrics.record("materialization", materialization_start.elapsed());
-    let lifecycle = run_lifecycle_if_enabled(
-        project_root,
-        store,
-        lockfile,
-        artifact_ids,
-        volume.as_ref().map(|v| v.path.as_path()),
-        options.ignore_scripts,
-        // A reused graph volume already holds the derived lifecycle output
-        // from the install that built it, so the scripts must not run again.
-        // This only applies to the volume path; the workspace/compatible
-        // path (volume == None) uses disposable sandboxes and still runs.
-        volume.as_ref().is_some_and(|v| v.cached),
-        options.derived_store,
-        metrics,
-    )?;
     let local_view_start = Instant::now();
-    if local_project_view {
-        if let Some(volume) = volume.as_ref() {
-            let backend = match project_view {
-                ProjectView::Reflink => bpm::materializer::MaterializeBackend::Reflink,
-                _ => bpm::materializer::MaterializeBackend::Hardlink,
-            };
-            let attached =
-                bpm::volume::attach_project_local_with_backend(project_root, volume, backend)?;
-            view_entry_count = attached.stats.relays_created + attached.stats.relays_unchanged;
-            // The local view replaces the transient relay set as the final
-            // ownership: it is what BPM created and what reconciliation must
-            // preserve/remove on the next graph change.
-            final_ownership = attached.owned;
-        }
-    }
     metrics.record("project_local_view", local_view_start.elapsed());
 
     // Reconcile stale project-view entries from the prior install AFTER the
@@ -2233,17 +2239,16 @@ mod tests {
         );
         assert_eq!(
             resolve_project_view_with(&lockfile, project_root, Some("relay")),
-            ProjectView::Relay
+            ProjectView::Reflink
         );
-        // No override on a graph with no fragile package stays relay.
+        // Automatic and unsupported values always select an isolated view.
         assert_eq!(
             resolve_project_view_with(&lockfile, project_root, None),
-            ProjectView::Relay
+            ProjectView::Reflink
         );
-        // An unrecognized value warns and falls back to auto (relay here).
         assert_eq!(
             resolve_project_view_with(&lockfile, project_root, Some("bogus")),
-            ProjectView::Relay
+            ProjectView::Reflink
         );
     }
 }
