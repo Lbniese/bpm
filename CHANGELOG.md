@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Git clone and fetch failures redact credential-bearing remote forms before
+  returning subprocess diagnostics.
+- HTTP GET redirects are re-authorized per hop, while POST, PUT, and DELETE
+  redirects are refused without replaying credentials or request bodies.
+
+### Fixed
+
+- Upgrade and dedupe publish lockfiles through synchronized atomic replacement.
+- Malformed lifecycle package manifests now fail with path-specific typed errors.
+- Graph publication completes lifecycle work before exposing a reusable volume;
+  graph and project views no longer use writable aliases to shared content.
+- Named upgrades preserve unselected dependency closures and return a true
+  no-op for unknown-only selections.
+
+### Changed
+
+- Project ownership reuses published graph-entry identities instead of
+  rehashing copied file bodies during normal attachment; live-tree hashing is
+  retained for conservative stale-view deletion.
+
 ## [0.2.1] - 2026-07-28
 
 Supersedes 0.2.0: the release signing keypair was rotated after the 0.2.0
@@ -25,12 +47,13 @@ push on top of 0.1.0.
 
 ### Added
 
-- **Mutation and diagnostic commands**. `bpm upgrade` and `bpm dedupe`
-  update manifest dependencies in place; `bpm why` traces why a package is
-  in the graph, and `bpm outdated` reports available updates (registry
-  dist-tags are queried concurrently).
-- **Remote-cache push**. A best-effort `PUT` uploads package images to a
-  remote cache so other machines can install without re-downloading.
+- **Mutation and diagnostic commands**. `bpm upgrade` and `bpm dedupe` rewrite
+  lock state within declared ranges without editing `package.json` ranges;
+  `bpm why` traces why a package is in the graph, and `bpm outdated` reports
+  available updates (registry dist-tags are queried concurrently).
+- **Remote-cache push**. A best-effort `PUT` uploads verified raw `.tgz`
+  artifacts keyed by SHA-512 so other machines can install without
+  re-downloading.
 - **Persistent resolution snapshot cache**. Successful fresh resolves store
   a snapshot keyed by manifest, workspace, registry configuration, peer
   mode, and target platform; `--prefer-offline`/`--offline` installs reuse
@@ -117,10 +140,10 @@ downloads, extraction, resolution, and materialization.
 - **Graph-plan cache**. A canonical graph id (blake3 over a byte-stable
   encoding of the lockfile graph and platform) keys a compiled install plan;
   an unchanged repeated install skips resolution and materialization entirely.
-- **Reusable graph volumes**. A second project that resolves the same graph
-  reuses every byte of the first through shallow project relays, with a local
-  hardlink compatibility view for tools (e.g. Turbopack) that reject dependency
-  realpaths outside the project.
+- **Reusable graph volumes** (0.0.1 historical behavior). A second project that
+  resolved the same graph reused every byte of the first through shallow
+  project relays, with a local hardlink compatibility view for tools (e.g.
+  Turbopack) that rejected dependency realpaths outside the project.
 - **Lifecycle scripts** (`bpm run`). npm-compatible `preinstall`/`install`/
   `postinstall` execution with a disposable sandbox; scripts are skipped when a
   cached graph volume is reused.
@@ -149,6 +172,8 @@ downloads, extraction, resolution, and materialization.
   package and bin path before mutation; git-source argument hardening against
   argument injection; and integrity verification before publication.
 
-[Unreleased]: https://github.com/lbniese/bpm/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/lbniese/bpm/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/lbniese/bpm/compare/v0.2.0...v0.2.1
+[0.2.0]: https://github.com/lbniese/bpm/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/lbniese/bpm/releases/tag/v0.1.0
 [0.0.1]: https://github.com/lbniese/bpm/releases/tag/v0.0.1

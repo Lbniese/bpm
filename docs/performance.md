@@ -24,16 +24,17 @@ dependency graph on every install. BPM caches three layers on top of that:
 1. **Immutable artifacts** — every downloaded tarball is verified by SHA-512 and
    stored once, content-addressed. Extraction happens once per unique archive.
 2. **Dependency-graph volumes** — once a project's resolved graph is materialized,
-   its `node_modules` can be re-attached from the store via hardlinks/reflinks
-   without re-resolving or re-downloading.
-3. **Project views** — hardlink (default) and reflink (copy-on-write) views
-   attach store images into `node_modules` without copying file bodies.
+   its `node_modules` can be attached from the published graph without
+   re-resolving, re-downloading, re-extracting, or rerunning lifecycle scripts.
+3. **Project views** — isolated Reflink-or-Copy views attach lifecycle-complete
+   graph entries to `node_modules`; unsupported CoW filesystems use deep copy.
 
 The payoff is on the **warm path**: when the graph already exists in the store,
-re-attaching `node_modules` is a few hardlink/reflink operations instead of a
-full download+extract+resolve. The cold path (first-ever install on a machine
-with an empty store) still pays the network and resolution cost — that is the
-gap the cold-path work targets and has not yet closed.
+re-attaching `node_modules` avoids download, extraction, resolution, and
+lifecycle work, while the project still receives a safe isolated view. The
+cold path (first-ever install on a machine with an empty store) still pays the
+network and resolution cost — that is the gap the cold-path work targets and
+has not yet closed.
 
 ## What each scenario means
 
@@ -65,11 +66,13 @@ p95 and standard deviation quoted for the headline cells:
 | `resolved_cold` | 4180 | 4406 | 7350 | — | — |
 | `repeat_install` | 670 | 313 | **7** | 10 | 1.3 |
 
-The contrast is stark: on `repeat_install` bpm attaches `node_modules` in
-**~7 ms** versus npm's ~670 ms and pnpm's ~313 ms — the graph-volume path is a
-two-orders-of-magnitude win once the graph exists. On `true_cold`, bpm is
-**~6.8× slower than pnpm** (25824 ms vs 3819 ms): the cold resolver is the
-remaining bottleneck.
+These are historical 0.0.1 measurements, not a current measurement of the
+isolated project-view implementation. The post-Plan-026 path still avoids
+network, extraction, resolution, and lifecycle work when reusing a graph, but
+project attachment performs isolated per-entry/file work. A same-version
+benchmark is required before claiming a current repeat-install time or speedup.
+On the historical `true_cold` run, bpm was **~6.8× slower than pnpm** (25824 ms
+vs 3819 ms): the cold resolver was the remaining bottleneck.
 
 ### All fixtures (median wall-clock, bpm vs pnpm)
 
@@ -88,11 +91,11 @@ remaining bottleneck.
 | native-addon | resolved_cold | 549 | 493 | 662 | 1.34× |
 | native-addon | true_cold | 955 | 507 | 3894 | 7.68× |
 
-Reading the table: on **warm/repeat** installs bpm is one to two orders of
-magnitude faster than pnpm (tens of ms vs hundreds). On **small cold graphs**
-(`many-small-files`) bpm already beats pnpm. On **large cold graphs**
-(`large-frontend`, `native-addon` true/resolved cold) bpm is still several times
-slower than pnpm — that is the gap the cold-path work targets.
+Reading the table: these historical 0.0.1 results describe the former
+materialization behavior. They remain useful baseline evidence, but must not be
+generalized to current warm-install timings after the isolation change. The
+historical large cold graphs were several times slower than pnpm; refreshing the
+baseline is follow-up measurement rather than a shipped performance claim.
 
 ## How to reproduce
 
