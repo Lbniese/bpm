@@ -49,30 +49,30 @@ cold-vs-warm performance story with cited benchmark numbers, see
    install plans beside the lockfile in `.bpm-state`. Plan validation checks
    graph-volume integrity and the live project view.
 7. **Reusable graph volumes** — `src/volume.rs` builds a complete graph-keyed
-   `node_modules` projection under `graphs/blake3/<id>/`. Package files are
-   hardlinked to immutable store images, while `.bin` entries remain relative
-   symlinks so Node resolves bin scripts from their package directory. Ordinary
-   projects use shallow top-level relays for the O(top-level) fast path.
-   Projects depending on `next` automatically receive a project-local hardlink
-   view so tools such as Turbopack and Next.js do not reject dependency
-   realpaths outside the project; the auto-detection set defaults to `next` and
-   is extended via `BPM_LOCAL_VIEW_PACKAGES` (comma-separated package names,
-   merged with the built-in default so Next.js installs never regress).
-   Workspace-linked installs use the same hardlink backend for registry
-   packages. `BPM_PROJECT_VIEW=relay|local|reflink` overrides that choice:
+   `node_modules` projection under `graphs/blake3/<id>/` is built in private
+   staging and lifecycle-completed before atomic publication. Graph entries are
+   isolated Reflink-or-Copy materializations of immutable store images; `.bin`
+   entries remain relative symlinks so Node resolves bin scripts correctly.
+   Projects never receive writable hardlink, symlink, junction, or relay aliases.
+   Nested dependency resolution and relative `.bin` semantics remain npm-
+   compatible, including for tools such as Turbopack that require project-local
+   realpaths. `BPM_PROJECT_VIEW=relay|local|reflink` is accepted for
+   compatibility, but every value selects a safe isolated view:
    `reflink` selects the project-local view via the copy-on-write `Reflink`
    backend, which clones each package file with macOS `clonefile(2)` / Linux
    `FICLONE` (distinct inode, shared data extents) so writes in the project
    view never reach the read-only store image — the same isolation as a full
-   copy, cheaper on APFS/btrfs/xfs. A filesystem-capability probe
+   copy, with deep-copy fallback on unsupported filesystems. A filesystem-capability probe
    (`probe_fs_capabilities`) confirms reflink at runtime; on unsupported
    filesystems (ext4, HFS+, cross-device) the backend transparently degrades
-   to hardlink then copy. Windows uses a correctness-first local hardlink/copy
-   view; junctions and ReFS reflink are not implemented for this backend.
+   to an independent deep copy. Windows uses the same correctness-first
+   isolated-copy fallback; no junction or hardlink exposes shared content.
+   Published graph metadata stores canonical ownership identities so normal
+   attachment does not rehash copied project file bodies.
 8. **Materializer** — `src/materializer.rs` supports compatible npm-v3 layout
-   and strict declared-edge validation. It has symlink, hardlink, copy, and
-   copy-on-write reflink (`clonefile`/`FICLONE`) backends; package files are
-   never exposed as writable store symlinks in graph volumes. On Windows, safe
+   and strict declared-edge validation. Its isolated Reflink backend falls back
+   directly to independent copying; explicit Hardlink/Symlink primitives are
+   not selected for graph or project publication. On Windows, safe
    archive symlinks are materialized as copied content, and `.cmd`/`.ps1` bin
    shims are generated.
 9. **Platform primitives** — `src/platform.rs` provides `find_executable`,
@@ -80,15 +80,12 @@ cold-vs-warm performance story with cited benchmark numbers, see
    execution. The platform script command produces `sh -c` on Unix and
    `cmd.exe /D /S /C` on Windows, with `COMSPEC` fallback.
 10. **Lifecycle runner** — `src/lifecycle.rs` supplies npm-compatible script
-   environments and `--ignore-scripts`. Workspace/compatible installs retain
-   the disposable sandbox. Graph-volume installs execute scripts in the
-   volume after isolating each package from the store, so derived output
-   persists and dependencies resolve through the complete volume tree.
-   `src/derived/store.rs` contains the content-addressed derived-artifact
-   implementation described by the long-term plan, but the current graph
-   lifecycle path is volume-derived rather than publishing through that store.
-   Integrating the two strategies is explicitly deferred for the current
-   cold-path milestone.
+   environments and `--ignore-scripts`. Graph-volume installs execute scripts
+   against unpublished isolated staging, so derived output persists only after
+   successful lifecycle completion and dependencies resolve through the complete
+   volume tree. Malformed manifests fail with typed path-specific errors;
+   workspace/compatible installs retain the disposable sandbox. The separate
+   derived-artifact store remains an explicit future optimization.
 11. **CLI and measurement** — `src/cli/` exposes install, ci, import, exec,
    run, fetch, doctor, gc, audit, publish, bench, and uninstall. `bpm install`
    without `-g` and with targets performs local dependency mutation (add):
@@ -139,16 +136,16 @@ enumeration, task completion order, or network timing.
 
 ## Materialization and lifecycle invariants
 
-1. A store image is never mutated through a project path.
-2. Graph package files are hardlinked or copied up before lifecycle scripts can
-   mutate them; `.bin` scripts retain package-relative symlink semantics.
-3. Ordinary project attachment is shallow and reusable; the local compatibility
-   view is selected when realpath containment is required by the toolchain.
-4. A plan-cache hit skips resolution, fetching, materialization, and lifecycle
-   when both the graph volume and project view remain valid.
+1. Store images and published graphs are immutable sources; no project path
+   aliases a writable shared inode.
+2. Graphs are isolated and lifecycle-complete before their marker is published;
+   `.bin` scripts retain package-relative symlink semantics.
+3. Project attachment is an isolated Reflink-or-Copy view and records validated
+   graph-entry ownership identities without rereading copied file bodies.
+4. A plan-cache hit skips resolution, fetching, extraction, and lifecycle when
+   both the graph volume and project view remain valid.
 5. Old volume/plan layouts are invalidated by explicit materializer/layout
-   versions rather than changing the canonical graph header or frozen-lockfile
-   identity.
+   versions; stale deletion still hashes the live tree before removal.
 
 ## Remaining architectural decisions
 
@@ -157,16 +154,11 @@ enumeration, task completion order, or network timing.
   active graph-volume lifecycle strategy must settle before wiring cross-graph
   derived-artifact reuse; it offers no cold-install benefit, so the path stays
   unused rather than being rushed in as a hardening item.
-- Auto-select the CoW reflink project view (`MaterializeBackend::Reflink` via
-  `probe_fs_capabilities`/`preferred_backend`) for the local view on
-  supporting filesystems, instead of requiring an explicit
-  `BPM_PROJECT_VIEW=reflink`. The syscall binding (`clonefile`/`FICLONE`),
-  capability probe, fallback chain, and `BPM_PROJECT_VIEW=reflink` path have
-  landed; only routing the *automatic* local view (Next.js-style detection)
-  through reflink remains, gated on not regressing the warm path.
-- Windows junction/reflink attachment performance (currently correctness-first
-  local hardlink/copy; `attach_project_local_with_backend` accepts a backend
-  for API symmetry but ignores it on Windows).
+- Refresh same-version benchmark measurements after the isolated project-view
+  change; graph reuse still avoids resolution, download, extraction, and
+  lifecycle work, while safe attachment performs per-entry/file operations.
+- Reflink attachment performance remains an optimization opportunity, but its
+  fallback must stay an independent copy on every platform.
 - ~~Default-flip the async resolver to `BPM_ASYNC_RESOLVE=1`~~ **DONE** (Plan 005,
   Phase 5). Async resolution is now the default, combines with the streaming
   install path, and retains `BPM_ASYNC_RESOLVE=0` as a blocking kill-switch.

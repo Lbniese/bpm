@@ -6,7 +6,10 @@
 BPM is an npm-compatible package manager that installs projects faster by
 eliminating repeated downloads, repeated extraction, repeated dependency-graph
 work, and repeated filesystem materialization. Packages are stored immutably in
-a global content-addressed store and shared across projects.
+a global content-addressed store and shared across projects. Graphs are built
+in private staging, lifecycle-completed, and atomically published; each project
+receives a real isolated Reflink-or-Copy view, with deep-copy fallback when CoW
+is unavailable.
 
 ## Quick start
 
@@ -39,10 +42,10 @@ If the Rust toolchain is not available, download a pre-built binary from the
 
 Most package managers cache individual packages. BPM caches **complete
 dependency graphs** — when two projects resolve the same graph, the second
-install reuses every byte of the first. No re-downloading, no re-extracting,
-no re-resolving. Ordinary projects attach through shallow graph-volume relays;
-Next.js projects automatically receive a local hardlink compatibility view so
-Turbopack can keep dependency realpaths inside the project.
+install reuses the resolve, download, extraction, and lifecycle work. Graphs are
+completed privately before publication, and projects receive isolated local
+Reflink-or-Copy views, preserving nested dependency and relative `.bin`
+semantics without writable hardlink or relay aliases.
 
 - **Immutable by design** — downloaded archives, extracted images, and
   dependency graphs are never mutated; they are built, verified, and published
@@ -73,7 +76,7 @@ Turbopack can keep dependency realpaths inside the project.
 | `bpm link [<name>]` | Register or consume an unscoped or scoped developer link, such as `@scope/pkg` |
 | `bpm unlink [<name>]` | Remove a consumed link, or unregister it with `--global` |
 | `bpm uninstall <pkg>...` (`bpm remove`, `bpm rm`, `bpm un`) | Remove dependencies transactionally and reinstall the resolved graph |
-| `bpm upgrade [<pkg>...]` | Re-resolve within declared ranges without editing manifest ranges |
+| `bpm upgrade [<pkg>...]` | Select named dependency closures, or all dependencies when omitted, within declared ranges without editing manifest ranges |
 | `bpm dedupe` | Re-resolve to minimize duplicate versions and rewrite the selected lock |
 | `bpm ci` | Perform a reproducible frozen install from `bpm.lock` or supported npm v3 lock |
 | `bpm bin` | Print the user-level executable-shim directory |
