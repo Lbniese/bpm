@@ -106,6 +106,50 @@ fn publish_rejects_invalid_package_name_before_network() {
 }
 
 #[test]
+fn offline_audit_uses_canonical_alias_identity() {
+    let project = tempfile::tempdir().unwrap();
+    fs::write(
+        project.path().join("package.json"),
+        r#"{"name":"app","version":"1.0.0","dependencies":{"alias":"npm:real-package@1.2.3"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        project.path().join("bpm.lock"),
+        r#"{
+          "lockfileVersion":2,
+          "generator":"bpm-test",
+          "root":{"dependencies":{"alias":"npm:real-package@1.2.3"}},
+          "packages":[{
+            "path":"node_modules/alias",
+            "name":"alias",
+            "version":"1.2.3",
+            "resolved":"https://registry.example/real-package.tgz",
+            "integrity":"sha512-abc"
+          }],
+          "resolution":{"registryNames":{"node_modules/alias":"real-package"}}
+        }"#,
+    )
+    .unwrap();
+
+    let output = Command::new(bpm_bin())
+        .current_dir(project.path())
+        .args(["audit", "--offline", "--json"])
+        .output()
+        .expect("run offline audit");
+    assert!(
+        output.status.success(),
+        "offline audit failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        value["request"]["real-package"],
+        serde_json::json!(["1.2.3"])
+    );
+    assert!(value["request"].get("alias").is_none());
+}
+
+#[test]
 fn audit_level_controls_exit_policy() {
     let project = tempfile::tempdir().unwrap();
     write_package_json(project.path(), &[("left-pad", "1.3.0")]);

@@ -43,6 +43,8 @@ pub enum NpmLockError {
     UnsupportedVersion(u32),
     #[error("package-lock.json has no \"packages\" table")]
     NoPackages,
+    #[error("package \"{path}\" has invalid canonical registry name \"{name}\"")]
+    InvalidCanonicalName { path: String, name: String },
     #[error("package \"{path}\" has invalid \"bin\": {reason}")]
     InvalidBin { path: String, reason: String },
     #[error("cannot record package.json root resolution metadata: {0}")]
@@ -67,6 +69,8 @@ struct RawLock {
 
 #[derive(Debug, Default, Deserialize)]
 struct RawPkg {
+    #[serde(default)]
+    name: Option<String>,
     #[serde(default)]
     version: Option<String>,
     #[serde(default)]
@@ -301,6 +305,21 @@ pub fn import(json: &str) -> Result<ImportReport, NpmLockError> {
                 path: path.clone(),
                 reason: format!("unsafe bin target {bin_target:?}: {e}"),
             })?;
+        }
+
+        if !link {
+            if let Some(canonical_name) = pkg.name.as_deref().filter(|value| *value != name) {
+                if !crate::registry::is_valid_npm_read_name(canonical_name) {
+                    return Err(NpmLockError::InvalidCanonicalName {
+                        path: path.clone(),
+                        name: canonical_name.to_string(),
+                    });
+                }
+                lockfile
+                    .resolution
+                    .registry_names
+                    .insert(path.clone(), canonical_name.to_string());
+            }
         }
 
         lockfile.packages.push(PackageEntry {
@@ -647,6 +666,69 @@ mod tests {
             .unwrap();
         assert_eq!(bar.path, "node_modules/@scope/bar");
         assert_eq!(bar.version, "4.5.6");
+    }
+
+    #[test]
+    fn imports_npm_alias_canonical_name_without_changing_placement() {
+        let json = r#"{
+          "name":"app",
+          "lockfileVersion":3,
+          "packages":{
+            "":{"version":"1.0.0","dependencies":{"alias":"npm:real-package@1.2.3"}},
+            "node_modules/alias":{
+              "name":"real-package",
+              "version":"1.2.3",
+              "resolved":"https://example/real-package-1.2.3.tgz",
+              "integrity":"sha512-AAA",
+              "bin":"cli.js"
+            },
+            "node_modules/plain":{
+              "version":"2.0.0",
+              "resolved":"https://example/plain-2.0.0.tgz",
+              "integrity":"sha512-BBB"
+            }
+          }
+        }"#;
+        let report = import(json).unwrap();
+        let alias = report
+            .lockfile
+            .packages
+            .iter()
+            .find(|package| package.path == "node_modules/alias")
+            .unwrap();
+        assert_eq!(alias.name, "alias");
+        assert_eq!(alias.bin.get("alias").map(String::as_str), Some("cli.js"));
+        assert_eq!(report.lockfile.registry_name_for(alias), "real-package");
+        assert_eq!(report.lockfile.resolution.registry_names.len(), 1);
+        assert!(report.lockfile.to_json().unwrap().contains("registryNames"));
+
+        let plain = report
+            .lockfile
+            .packages
+            .iter()
+            .find(|package| package.path == "node_modules/plain")
+            .unwrap();
+        assert_eq!(report.lockfile.registry_name_for(plain), "plain");
+    }
+
+    #[test]
+    fn rejects_invalid_explicit_canonical_name() {
+        let json = r#"{
+          "lockfileVersion":3,
+          "packages":{
+            "":{},
+            "node_modules/alias":{
+              "name":"bad?query",
+              "version":"1.0.0",
+              "resolved":"https://example/package.tgz",
+              "integrity":"sha512-AAA"
+            }
+          }
+        }"#;
+        assert!(matches!(
+            import(json),
+            Err(NpmLockError::InvalidCanonicalName { .. })
+        ));
     }
 
     #[test]

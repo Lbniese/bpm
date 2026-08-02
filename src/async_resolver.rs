@@ -1908,6 +1908,13 @@ pub async fn resolve_manifest_with_options_and_target_async_sink(
 
     // ── Emit packages ───────────────────────────────────────────────────
     for node in res.nodes.values() {
+        if matches!(&node.source, LockSource::Registry { .. })
+            && node.metadata.name != node.placement_name
+        {
+            lock.resolution
+                .registry_names
+                .insert(node.path.clone(), node.metadata.name.clone());
+        }
         lock.packages.push(PackageEntry {
             path: node.path.clone(),
             name: node.placement_name.clone(),
@@ -2016,6 +2023,7 @@ pub async fn resolve_manifest_with_options_and_target_async(
 mod tests {
     use super::*;
     use crate::resolver;
+    use std::thread;
 
     #[tokio::test]
     async fn test_looks_like_registry_spec() {
@@ -2113,6 +2121,64 @@ mod tests {
         let (name, spec) = resolver::registry_request("react", "^18.0.0");
         assert_eq!(name, "react");
         assert_eq!(spec, "^18.0.0");
+    }
+
+    #[tokio::test]
+    async fn blocking_and_async_resolvers_preserve_alias_identity_identically() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 2048];
+                let length = stream.read(&mut request).unwrap();
+                assert!(String::from_utf8_lossy(&request[..length]).starts_with("GET /real "));
+                let body = r#"{"name":"real","dist-tags":{"latest":"1.2.3"},"versions":{"1.2.3":{"name":"real","version":"1.2.3","dist":{"tarball":"/real.tgz","integrity":"sha512-61000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"}}}}"#;
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+        });
+        let config = NpmConfig::default()
+            .with_registry_override(&format!("http://{address}"))
+            .unwrap();
+        let manifest = PackageManifest::from_json(
+            r#"{"name":"app","version":"1.0.0","dependencies":{"alias":"npm:real@^1.2.0"}}"#,
+            std::path::Path::new("package.json"),
+        )
+        .unwrap();
+
+        let blocking_manifest = manifest.clone();
+        let blocking_config = config.clone();
+        let blocking = tokio::task::spawn_blocking(move || {
+            crate::resolver::resolve_manifest(
+                &blocking_manifest,
+                &crate::registry::RegistryClient::new(blocking_config),
+                "bpm-test",
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let asynchronous =
+            resolve_manifest_async(&manifest, &AsyncRegistryClient::new(config), "bpm-test")
+                .await
+                .unwrap();
+        server.join().unwrap();
+
+        let alias = blocking
+            .packages
+            .iter()
+            .find(|package| package.path == "node_modules/alias")
+            .unwrap();
+        assert_eq!(alias.name, "alias");
+        assert_eq!(blocking.registry_name_for(alias), "real");
+        assert_eq!(blocking.resolution.registry_names.len(), 1);
+        assert_eq!(blocking.to_json().unwrap(), asynchronous.to_json().unwrap());
     }
 
     #[tokio::test]

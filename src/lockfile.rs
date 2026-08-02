@@ -45,11 +45,16 @@ pub struct ResolutionMetadata {
     /// Package path to resolver semantics. `BTreeMap` fixes output order.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub packages: BTreeMap<String, PackageResolution>,
+    /// Placement path to canonical registry name for npm aliases only.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub registry_names: BTreeMap<String, String>,
 }
 
 impl ResolutionMetadata {
     fn is_empty(&self) -> bool {
-        self.root == RootResolution::default() && self.packages.is_empty()
+        self.root == RootResolution::default()
+            && self.packages.is_empty()
+            && self.registry_names.is_empty()
     }
 }
 
@@ -280,6 +285,18 @@ impl Lockfile {
         self.packages.sort_by(|a, b| a.path.cmp(&b.path));
     }
 
+    /// Return the canonical registry identity for a package placement.
+    ///
+    /// Older locks and ordinary packages have no alias metadata, so their
+    /// placement-facing package name remains the backward-compatible fallback.
+    pub fn registry_name_for<'a>(&'a self, package: &'a PackageEntry) -> &'a str {
+        self.resolution
+            .registry_names
+            .get(&package.path)
+            .map(String::as_str)
+            .unwrap_or(package.name.as_str())
+    }
+
     /// Canonical pretty-printed JSON. Deterministic regardless of insertion
     /// order: struct fields emit in declaration order, maps emit sorted-key
     /// order, and package paths/workspace patterns are normalized here.
@@ -411,6 +428,29 @@ impl Lockfile {
             }
             previous = Some(&package.path);
             paths.insert(package.path.as_str());
+        }
+
+        for (path, canonical_name) in &self.resolution.registry_names {
+            let Some(package) = self.packages.iter().find(|entry| entry.path == *path) else {
+                return Err(LockfileError::Invalid(format!(
+                    "registry name refers to unknown package path {path:?}"
+                )));
+            };
+            if canonical_name.is_empty() {
+                return Err(LockfileError::Invalid(format!(
+                    "registry name for {path:?} must not be empty"
+                )));
+            }
+            if canonical_name == &package.name {
+                return Err(LockfileError::Invalid(format!(
+                    "registry name for {path:?} must differ from its placement name"
+                )));
+            }
+            if !crate::registry::is_valid_npm_read_name(canonical_name) {
+                return Err(LockfileError::Invalid(format!(
+                    "registry name for {path:?} is not a safe npm package name"
+                )));
+            }
         }
 
         for (path, metadata) in &self.resolution.packages {
@@ -590,6 +630,52 @@ mod tests {
         assert_eq!(lf, back);
         let json2 = back.to_json().unwrap();
         assert_eq!(json, json2, "serialization is not canonical");
+    }
+
+    #[test]
+    fn registry_alias_names_roundtrip_and_fall_back() {
+        let mut lockfile = sample();
+        lockfile
+            .resolution
+            .registry_names
+            .insert("node_modules/foo".into(), "real-foo".into());
+
+        let json = lockfile.to_json().unwrap();
+        assert!(json.contains("\"registryNames\""));
+        let roundtrip = Lockfile::from_json(&json).unwrap();
+        let alias = roundtrip
+            .packages
+            .iter()
+            .find(|package| package.name == "foo")
+            .unwrap();
+        let ordinary = roundtrip
+            .packages
+            .iter()
+            .find(|package| package.name == "zoo")
+            .unwrap();
+        assert_eq!(roundtrip.registry_name_for(alias), "real-foo");
+        assert_eq!(roundtrip.registry_name_for(ordinary), "zoo");
+        assert_eq!(json, roundtrip.to_json().unwrap());
+    }
+
+    #[test]
+    fn registry_alias_names_reject_dangling_empty_and_redundant_entries() {
+        for (path, name, expected) in [
+            ("node_modules/missing", "real", "unknown package path"),
+            ("node_modules/foo", "", "must not be empty"),
+            ("node_modules/foo", "foo", "must differ"),
+        ] {
+            let mut lockfile = sample();
+            lockfile
+                .resolution
+                .registry_names
+                .insert(path.into(), name.into());
+            let json = lockfile.to_json().unwrap();
+            assert!(matches!(
+                Lockfile::from_json(&json),
+                Err(LockfileError::Invalid(message)) if message.contains(expected)
+            ));
+        }
     }
 
     #[test]

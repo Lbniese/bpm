@@ -109,7 +109,7 @@ pub(super) fn run(
     // Build the list of packages that actually need a registry query (skip
     // link/workspace packages, and validate the current version up front so
     // we don't spend a round-trip on an unparseable version).
-    let mut fetch_targets: Vec<&PackageEntry> = Vec::new();
+    let mut fetch_targets: Vec<(&PackageEntry, String)> = Vec::new();
     let mut unique_names: BTreeSet<String> = BTreeSet::new();
     for package in &packages {
         if package.link || package.resolved.is_empty() {
@@ -122,8 +122,9 @@ pub(super) fn run(
             ));
             continue;
         }
-        fetch_targets.push(package);
-        unique_names.insert(package.name.clone());
+        let registry_name = lockfile.registry_name_for(package).to_string();
+        fetch_targets.push((package, registry_name.clone()));
+        unique_names.insert(registry_name);
     }
 
     let jobs: Vec<String> = unique_names.into_iter().collect();
@@ -167,13 +168,13 @@ pub(super) fn run(
     // Iterate in the original deterministic `packages` order so output is
     // independent of fetch completion order.
     let mut warned_fetches = BTreeSet::new();
-    for package in &fetch_targets {
+    for (package, registry_name) in &fetch_targets {
         let current = Version::parse(&package.version).expect("validated before fetch; qed");
 
-        let packument = match fetched.get(&package.name) {
+        let packument = match fetched.get(registry_name) {
             Some(FetchOutcome::Packument(p)) => p,
             Some(FetchOutcome::Warning(w)) => {
-                if warned_fetches.insert(package.name.as_str()) {
+                if warned_fetches.insert(registry_name.as_str()) {
                     warnings.push(w.clone());
                 }
                 continue;
@@ -184,10 +185,7 @@ pub(super) fn run(
         let latest_str = match packument.dist_tags.get("latest") {
             Some(v) => v.clone(),
             None => {
-                warnings.push(format!(
-                    "warning: no 'latest' dist-tag for {}",
-                    package.name
-                ));
+                warnings.push(format!("warning: no 'latest' dist-tag for {registry_name}"));
                 continue;
             }
         };
@@ -196,8 +194,7 @@ pub(super) fn run(
             Ok(v) => v,
             Err(_) => {
                 warnings.push(format!(
-                    "warning: could not parse 'latest' version '{}' for {}",
-                    latest_str, package.name
+                    "warning: could not parse 'latest' version '{latest_str}' for {registry_name}"
                 ));
                 continue;
             }
@@ -207,7 +204,7 @@ pub(super) fn run(
         // the declared semver range from the root manifest.
         let wanted = if let Some(range_str) = lockfile.root.dependencies.get(package.name.as_str())
         {
-            compute_wanted(&package.name, range_str, packument)
+            compute_wanted(registry_name, range_str, packument)
                 .unwrap_or_else(|| package.version.clone())
         } else {
             // Transitive dependencies fall back to the resolved version.
@@ -247,13 +244,16 @@ pub(super) fn run(
 
 /// Compute the highest published version satisfying `range_str` for `name`.
 fn compute_wanted(
-    name: &str,
+    registry_name: &str,
     range_str: &str,
     packument: &bpm::registry::Packument,
 ) -> Option<String> {
     use bpm::registry::{parse_spec, select_version};
-    let spec = parse_spec(&format!("{name}@{range_str}")).ok()?;
-    let version = select_version(name, &spec.req, packument).ok()?;
+    let spec = match range_str.strip_prefix("npm:") {
+        Some(alias_spec) => parse_spec(alias_spec).ok()?,
+        None => parse_spec(&format!("{registry_name}@{range_str}")).ok()?,
+    };
+    let version = select_version(&spec.name, &spec.req, packument).ok()?;
     Some(version.to_string())
 }
 
