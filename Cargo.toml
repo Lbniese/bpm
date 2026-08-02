@@ -55,6 +55,7 @@ lru = "0.16"
 
 # Persistent metadata index (filesystem objects remain the source of truth).
 rusqlite = { version = "0.40.1", features = ["bundled"] }
+url = "2.5"
 
 # Unix-only: copy-on-write reflink/clone syscalls for the project-local view
 # backend (macOS `clonefile(2)`, Linux `FICLONE` ioctl). The `Reflink`
