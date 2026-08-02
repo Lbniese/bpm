@@ -94,6 +94,29 @@ fn run_view(workdir: &Path, registry_url: &str, args: &[&str]) -> (String, Strin
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[test]
+fn reads_legacy_uppercase_package_without_changing_its_spelling() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut responses = BTreeMap::new();
+    responses.insert(
+        "JSONStream".to_string(),
+        r#"{
+            "name":"JSONStream",
+            "dist-tags":{"latest":"1.0.0"},
+            "versions":{"1.0.0":{"name":"JSONStream","version":"1.0.0"}}
+        }"#
+        .to_string(),
+    );
+    let (url, shutdown, server) = mock_registry(responses);
+
+    let (stdout, stderr, code) = run_view(tmp.path(), &url, &["JSONStream"]);
+    shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+    server.join().unwrap();
+
+    assert_eq!(code, Some(0), "expected zero exit; stderr: {stderr}");
+    assert!(stdout.contains("JSONStream@1.0.0"));
+}
+
+#[test]
 fn shows_default_latest_metadata() {
     let tmp = tempfile::tempdir().unwrap();
     let (url, shutdown, server) = demo_registry();
