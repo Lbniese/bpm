@@ -490,7 +490,7 @@ fn archive_git_commit_locally(url: &str, commit: &str) -> Result<std::process::O
             .output()
             .map_err(|error| format!("cannot clone Git source: {error}"))?;
         if !clone.status.success() {
-            return Err(String::from_utf8_lossy(&clone.stderr).trim().to_owned());
+            return Err(git_status_error("clone", &clone.stderr, url, url));
         }
         if !staging.join(".git").is_dir() {
             return Err(format!(
@@ -519,7 +519,12 @@ fn archive_git_commit_locally(url: &str, commit: &str) -> Result<std::process::O
         .output()
         .map_err(|error| format!("cannot fetch Git commit: {error}"))?;
     if !fetch.status.success() {
-        return Err(String::from_utf8_lossy(&fetch.stderr).trim().to_owned());
+        return Err(git_status_error(
+            "fetch",
+            &fetch.stderr,
+            &clone_dir.display().to_string(),
+            url,
+        ));
     }
     Command::new("git")
         .args([
@@ -670,6 +675,15 @@ fn sanitize_git_stderr(stderr: &[u8], remote: &str, url: &str) -> String {
         msg = msg.replace(url, &redact_url(url));
     }
     msg
+}
+
+fn git_status_error(operation: &str, stderr: &[u8], remote: &str, url: &str) -> String {
+    let detail = sanitize_git_stderr(stderr, remote, url);
+    if detail.is_empty() {
+        format!("git {operation} failed for {}", redact_url(url))
+    } else {
+        format!("git {operation} failed for {}: {detail}", redact_url(url))
+    }
 }
 
 fn git_archive_tarball(
@@ -953,6 +967,58 @@ fn hosted_tarball(base: &str, rest: &str, suffix: &str, reference: &str) -> Opti
 mod tests {
     use super::*;
     use std::io::{Cursor, Write};
+
+    #[test]
+    fn sanitize_git_stderr_redacts_original_url_and_sensitive_parts() {
+        let url =
+            "https://synthetic-user:synthetic-secret@example.test/repo.git?token=sentinel#fragment";
+        let error = git_status_error(
+            "clone",
+            format!("fatal: unable to access '{url}': denied").as_bytes(),
+            url,
+            url,
+        );
+        assert!(!error.contains("synthetic-secret"));
+        assert!(!error.contains("token=sentinel"));
+        assert!(!error.contains("fragment"));
+        assert!(error.contains("git clone failed"));
+    }
+
+    #[test]
+    fn sanitize_git_stderr_redacts_original_and_normalized_git_urls() {
+        let original = "git+https://synthetic-user:synthetic-secret@example.test/repo.git";
+        let remote = "https://synthetic-user:synthetic-secret@example.test/repo.git";
+        let stderr = format!("clone {original} as {remote} failed");
+        let error = git_status_error("fetch", stderr.as_bytes(), remote, original);
+        assert!(!error.contains("synthetic-secret"));
+        assert!(!error.contains(original));
+        assert!(!error.contains(remote));
+        assert!(error.contains("git fetch failed"));
+    }
+
+    #[test]
+    fn sanitize_git_stderr_preserves_actionable_plain_diagnostics() {
+        let error = git_status_error(
+            "fetch",
+            b"remote rejected the requested object",
+            "",
+            "file:///repo",
+        );
+        assert!(error.contains("remote rejected the requested object"));
+        assert!(error.contains("git fetch failed"));
+    }
+
+    #[test]
+    fn sanitize_git_stderr_handles_non_utf8_without_panicking() {
+        let error = git_status_error(
+            "clone",
+            &[b'f', b'a', b'i', b'l', 0xff, b'\n'],
+            "https://example.test/repo.git",
+            "https://example.test/repo.git",
+        );
+        assert!(error.contains("fail"));
+        assert!(error.contains('�'));
+    }
 
     #[test]
     fn read_bounded_accepts_exactly_at_limit() {
