@@ -411,6 +411,50 @@ pub fn publish_with_failure(plan: &PublishPlan, fail_at: PublishStage) -> Result
     publish_impl(plan, Some(fail_at), RestoreFaults::default())
 }
 
+/// An error while atomically publishing one file.
+#[derive(Debug, Error)]
+#[error("cannot atomically publish {path}: {source}")]
+pub struct PublishBytesError {
+    path: PathBuf,
+    #[source]
+    source: io::Error,
+}
+
+/// Publish bytes through a unique, synchronized sibling and an atomic
+/// replace-existing operation. The helper does not alter the supplied bytes.
+pub fn publish_bytes(path: &Path, bytes: &[u8]) -> Result<(), PublishBytesError> {
+    publish_bytes_impl(path, bytes, false)
+}
+
+fn publish_bytes_impl(
+    path: &Path,
+    bytes: &[u8],
+    fail_before_replace: bool,
+) -> Result<(), PublishBytesError> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|source| PublishBytesError {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let hint = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("document");
+    let tmp = unique_sibling(parent, hint);
+    let result = (|| -> io::Result<()> {
+        write_temp(&tmp, bytes)?;
+        if fail_before_replace {
+            return Err(io::Error::other("injected failure before replacement"));
+        }
+        replace_destination(&tmp, path)
+    })();
+    let _ = fs::remove_file(&tmp);
+    result.map_err(|source| PublishBytesError {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
 #[derive(Clone)]
 struct Original {
     existed: bool,
@@ -575,16 +619,62 @@ fn write_temp(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// lock) is still not globally atomic — see [`publish`] and the plan's crash
 /// documentation.
 fn rename_or_replace(tmp: &Path, dest: &Path) -> io::Result<()> {
-    match fs::rename(tmp, dest) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            if dest.exists() {
-                let _ = fs::remove_file(dest);
-                fs::rename(tmp, dest)
-            } else {
-                Err(error)
+    replace_destination(tmp, dest)
+}
+
+fn replace_destination(tmp: &Path, dest: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        fs::rename(tmp, dest)?;
+        let parent = dest.parent().unwrap_or_else(|| Path::new("."));
+        fs::File::open(parent)?.sync_all()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            MoveFileExW, ReplaceFileW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+            REPLACEFILE_WRITE_THROUGH,
+        };
+        let wide = |path: &Path| {
+            path.as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect::<Vec<_>>()
+        };
+        let tmp_wide = wide(tmp);
+        let dest_wide = wide(dest);
+        let success = if dest.exists() {
+            // ReplaceFileW preserves the destination name and performs a
+            // write-through replace without a remove-then-rename window.
+            unsafe {
+                ReplaceFileW(
+                    dest_wide.as_ptr(),
+                    tmp_wide.as_ptr(),
+                    std::ptr::null(),
+                    REPLACEFILE_WRITE_THROUGH,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
             }
+        } else {
+            unsafe {
+                MoveFileExW(
+                    tmp_wide.as_ptr(),
+                    dest_wide.as_ptr(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                )
+            }
+        };
+        if success == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
         }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        fs::rename(tmp, dest)
     }
 }
 
@@ -815,6 +905,54 @@ mod tests {
             project_mutation_lock_path(&project).unwrap(),
             project_mutation_lock_path(&alias).unwrap()
         );
+    }
+
+    #[test]
+    fn publish_bytes_replaces_existing_file_without_changing_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bpm.lock");
+        fs::write(&path, b"old").unwrap();
+        publish_bytes(&path, b"new\n").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new\n");
+    }
+
+    #[test]
+    fn publish_bytes_creates_missing_parent_and_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("bpm.lock");
+        publish_bytes(&path, b"lock\n").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"lock\n");
+    }
+
+    #[test]
+    fn publish_bytes_failure_before_replace_preserves_old_bytes_and_cleans_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bpm.lock");
+        fs::write(&path, b"old").unwrap();
+        publish_bytes_impl(&path, b"new", true).unwrap_err();
+        assert_eq!(fs::read(&path).unwrap(), b"old");
+        let leftovers = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".bpm-"))
+            .count();
+        assert_eq!(leftovers, 0);
+    }
+
+    #[test]
+    fn publish_bytes_staging_failure_leaves_no_sibling_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing-parent").join("bpm.lock");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::create_dir(path.with_file_name("bpm.lock")).unwrap();
+        let error = publish_bytes(&path, b"new").unwrap_err();
+        assert!(error.to_string().contains("bpm.lock"));
+        let leftovers = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".bpm-"))
+            .count();
+        assert_eq!(leftovers, 0);
     }
 
     fn plan_for(dir: &Path, manifest: &str, lock: &str) -> PublishPlan {
