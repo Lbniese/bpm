@@ -19,6 +19,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -58,6 +59,16 @@ struct VolumeMeta {
     /// Sorted derived-image BLAKE3 hex ids published for this graph.
     #[serde(default)]
     derived: Vec<String>,
+    /// Canonical identities for every direct entry under node_modules. These
+    /// are computed once before publication and inherited by isolated views.
+    #[serde(default)]
+    entry_identities: Vec<VolumeEntryIdentity>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct VolumeEntryIdentity {
+    name: String,
+    identity: String,
 }
 
 /// One artifact entry in the durable graph inventory.
@@ -228,6 +239,30 @@ fn valid_hex(value: &str, expected_len: usize) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
 }
 
+fn valid_entry_identities(meta: &VolumeMeta, volume: &Path) -> Option<BTreeMap<String, String>> {
+    let mut identities = BTreeMap::new();
+    for entry in &meta.entry_identities {
+        if entry.name.is_empty()
+            || entry.name.contains('/')
+            || entry.name.contains('\\')
+            || !entry.identity.starts_with(IDENTITY_TREE)
+            || identities
+                .insert(entry.name.clone(), entry.identity.clone())
+                .is_some()
+            || !volume.join("node_modules").join(&entry.name).exists()
+        {
+            return None;
+        }
+    }
+    Some(identities)
+}
+
+fn current_meta(meta: &VolumeMeta, graph_hex: &str, volume: &Path) -> bool {
+    meta.graph_id_hex == graph_hex
+        && meta.layout_version == VOLUME_LAYOUT_VERSION
+        && valid_entry_identities(meta, volume).is_some()
+}
+
 /// Ensure the graph volume for `graph_hex` exists and is complete. Idempotent:
 /// if `<volume>/metadata.json` already records this graph id, the volume is
 /// reused untouched (cached). Otherwise the volume's `node_modules` is built
@@ -270,7 +305,7 @@ pub fn ensure_graph_volume_with_prepared(
     let mut stale = false;
     if let Ok(meta_bytes) = fs::read(volume_dir.join(META_FILE)) {
         if let Ok(meta) = serde_json::from_slice::<VolumeMeta>(&meta_bytes) {
-            if meta.graph_id_hex == graph_hex && meta.layout_version == VOLUME_LAYOUT_VERSION {
+            if current_meta(&meta, &graph_hex, &volume_dir) {
                 metrics.record("graph_volume_hit", std::time::Duration::ZERO);
                 return Ok(EnsuredVolume::Ready(VolumeRef {
                     path: volume_dir,
@@ -289,7 +324,7 @@ pub fn ensure_graph_volume_with_prepared(
     // completed the volume under lock while we were waiting.
     if let Ok(meta_bytes) = fs::read(volume_dir.join(META_FILE)) {
         if let Ok(meta) = serde_json::from_slice::<VolumeMeta>(&meta_bytes) {
-            if meta.graph_id_hex == graph_hex && meta.layout_version == VOLUME_LAYOUT_VERSION {
+            if current_meta(&meta, &graph_hex, &volume_dir) {
                 metrics.record("graph_volume_hit", std::time::Duration::ZERO);
                 return Ok(EnsuredVolume::Ready(VolumeRef {
                     path: volume_dir,
@@ -391,6 +426,49 @@ pub fn acquire_graph_lock(store: &ArtifactStore, graph_hex: &str) -> Result<fs::
     Ok(file)
 }
 
+fn compute_entry_identities(node_modules: &Path) -> Result<Vec<VolumeEntryIdentity>, VolumeError> {
+    let mut entries = fs::read_dir(node_modules)
+        .map_err(|source| io_err(node_modules, source))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| io_err(node_modules, source))?;
+    entries.sort_by_key(|entry| entry.file_name());
+    let mut identities = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.is_empty() || name.contains('/') || name.contains('\\') {
+            return Err(io_err(
+                &entry.path(),
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "unsafe volume entry name"),
+            ));
+        }
+        identities.push(VolumeEntryIdentity {
+            name,
+            identity: tree_fingerprint(&entry.path())?,
+        });
+    }
+    Ok(identities)
+}
+
+fn read_entry_identities(volume: &Path) -> Result<BTreeMap<String, String>, VolumeError> {
+    let meta_path = volume.join(META_FILE);
+    let bytes = fs::read(&meta_path).map_err(|source| io_err(&meta_path, source))?;
+    let meta: VolumeMeta = serde_json::from_slice(&bytes).map_err(|source| {
+        io_err(
+            &meta_path,
+            std::io::Error::new(std::io::ErrorKind::InvalidData, source),
+        )
+    })?;
+    valid_entry_identities(&meta, volume).ok_or_else(|| {
+        io_err(
+            &meta_path,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "missing or invalid graph entry identities",
+            ),
+        )
+    })
+}
+
 impl PendingVolume {
     /// The staging path where lifecycle and materialization happen.
     pub fn path(&self) -> &Path {
@@ -400,7 +478,10 @@ impl PendingVolume {
     /// Atomically publish the staging tree to the final graph path.
     /// After success the volume is ready for reuse.
     pub fn publish(mut self) -> Result<VolumeRef, VolumeError> {
-        // Write metadata inside staging before the rename.
+        // Compute ownership identities only after lifecycle has completed and
+        // immediately before publication. Attachments inherit these identities
+        // without rereading copied project file bodies.
+        let entry_identities = compute_entry_identities(&self.staging.join("node_modules"))?;
         let meta = VolumeMeta {
             graph_id_hex: self.graph_id_hex.clone(),
             layout_version: VOLUME_LAYOUT_VERSION,
@@ -417,6 +498,7 @@ impl PendingVolume {
                 })
                 .collect(),
             derived: self.inventory.derived.clone(),
+            entry_identities,
         };
         let meta_bytes = serde_json::to_vec_pretty(&meta).unwrap_or_default();
         fs::write(self.staging.join(META_FILE), meta_bytes)
@@ -589,10 +671,7 @@ pub fn tree_fingerprint(root: &Path) -> Result<String, VolumeError> {
                 let target = fs::read_link(&abs).map_err(|source| io_err(&abs, source))?;
                 len_str(&mut hasher, target.to_string_lossy().as_bytes());
             }
-            b'f' => {
-                let bytes = fs::read(&abs).map_err(|source| io_err(&abs, source))?;
-                len_str(&mut hasher, &bytes);
-            }
+            b'f' => hash_file_contents(&mut hasher, &abs, meta.len())?,
             _ => {}
         }
     }
@@ -641,29 +720,47 @@ fn len_str(h: &mut blake3::Hasher, bytes: &[u8]) {
     h.update(bytes);
 }
 
-/// Record a single shallow top-level `node_modules/<name>` entry as owned.
-/// `name` is the bare entry name (no separators); `proj_path` is the
-/// project-relative joined path just attached; `mode`/`identity` describe the
-/// live result. Symlinks/junctions record a `relay:` identity from `read_link`;
-/// directory views record a `tree-blake3-v1:` fingerprint. Missing/unreadable
-/// results skip the entry rather than claim unverified ownership.
-fn record_entry(name: &str, proj_path: &Path, mode: &str, owned: &mut Vec<ManagedEntry>) {
-    let path = format!("node_modules/{name}");
-    let identity = if mode == "relay" {
-        // On Unix relays are symlinks; `read_link` is the exact target.
-        fs::read_link(proj_path)
-            .ok()
-            .map(|t| format!("{IDENTITY_RELAY}{}", t.to_string_lossy()))
-    } else {
-        tree_fingerprint(proj_path).ok()
-    };
-    if let Some(identity) = identity {
-        owned.push(ManagedEntry {
-            path,
-            mode: mode.to_string(),
-            identity,
-        });
+fn hash_file_contents(
+    hasher: &mut blake3::Hasher,
+    path: &Path,
+    expected_len: u64,
+) -> Result<(), VolumeError> {
+    hasher.update(&expected_len.to_le_bytes());
+    let mut file = fs::File::open(path).map_err(|source| io_err(path, source))?;
+    let mut remaining = expected_len;
+    let mut buffer = [0u8; 64 * 1024];
+    while remaining > 0 {
+        let wanted = remaining.min(buffer.len() as u64) as usize;
+        let read = file
+            .read(&mut buffer[..wanted])
+            .map_err(|source| io_err(path, source))?;
+        if read == 0 {
+            return Err(io_err(
+                path,
+                std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "file changed while fingerprinting",
+                ),
+            ));
+        }
+        hasher.update(&buffer[..read]);
+        remaining -= read as u64;
     }
+    let mut extra = [0u8; 1];
+    if file
+        .read(&mut extra)
+        .map_err(|source| io_err(path, source))?
+        != 0
+    {
+        return Err(io_err(
+            path,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "file grew while fingerprinting",
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Attach a project to a graph volume via shallow top-level relays: for every
@@ -892,6 +989,7 @@ pub fn attach_project_local_with_backend(
     let vol_nm = volume.path.join("node_modules");
     let proj_nm = project_root.join("node_modules");
     fs::create_dir_all(&proj_nm).map_err(|source| io_err(&proj_nm, source))?;
+    let identities = read_entry_identities(&volume.path)?;
 
     let mut entries = fs::read_dir(&vol_nm)
         .map_err(|source| io_err(&vol_nm, source))?
@@ -909,6 +1007,7 @@ pub fn attach_project_local_with_backend(
     for entry in entries {
         let source = entry.path();
         let name = entry.file_name();
+        let name_str = name.to_string_lossy().into_owned();
         let target = proj_nm.join(&name);
         if matches!(backend, MaterializeBackend::Reflink) {
             reflink_tree(&source, &target).map_err(VolumeError::Materialize)?;
@@ -916,7 +1015,20 @@ pub fn attach_project_local_with_backend(
             crate::materializer::copy_tree(&source, &target).map_err(VolumeError::Materialize)?;
         }
         stats.relays_created += 1;
-        record_entry(&name.to_string_lossy(), &target, mode, &mut owned);
+        let identity = identities.get(&name_str).ok_or_else(|| {
+            io_err(
+                &source,
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "graph identity missing for entry",
+                ),
+            )
+        })?;
+        owned.push(ManagedEntry {
+            path: format!("node_modules/{name_str}"),
+            mode: mode.to_string(),
+            identity: identity.clone(),
+        });
     }
     Ok(AttachOutcome::new(stats, owned))
 }
@@ -929,6 +1041,7 @@ pub fn attach_project_local(
     let vol_nm = volume.path.join("node_modules");
     let proj_nm = project_root.join("node_modules");
     fs::create_dir_all(&proj_nm).map_err(|source| io_err(&proj_nm, source))?;
+    let identities = read_entry_identities(&volume.path)?;
     let mut entries = fs::read_dir(&vol_nm)
         .map_err(|source| io_err(&vol_nm, source))?
         .filter_map(Result::ok)
@@ -941,8 +1054,20 @@ pub fn attach_project_local(
         let target = proj_nm.join(&name);
         crate::materializer::copy_tree(&entry.path(), &target).map_err(VolumeError::Materialize)?;
         stats.relays_created += 1;
-        let mode = "local";
-        record_entry(&name.to_string_lossy(), &target, mode, &mut owned);
+        let identity = identities.get(&name.to_string_lossy()).ok_or_else(|| {
+            io_err(
+                &entry.path(),
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "graph identity missing for entry",
+                ),
+            )
+        })?;
+        owned.push(ManagedEntry {
+            path: format!("node_modules/{name}"),
+            mode: "local".to_string(),
+            identity: identity.clone(),
+        });
     }
     Ok(AttachOutcome::new(stats, owned))
 }
@@ -960,6 +1085,7 @@ pub fn attach_project_local_with_backend(
     let vol_nm = volume.path.join("node_modules");
     let proj_nm = project_root.join("node_modules");
     fs::create_dir_all(&proj_nm).map_err(|source| io_err(&proj_nm, source))?;
+    let identities = read_entry_identities(&volume.path)?;
     let mut entries = fs::read_dir(&vol_nm)
         .map_err(|source| io_err(&vol_nm, source))?
         .filter_map(Result::ok)
@@ -972,7 +1098,20 @@ pub fn attach_project_local_with_backend(
         let target = proj_nm.join(&name);
         crate::materializer::copy_tree(&entry.path(), &target).map_err(VolumeError::Materialize)?;
         stats.relays_created += 1;
-        record_entry(&name.to_string_lossy(), &target, "local", &mut owned);
+        let identity = identities.get(&name.to_string_lossy()).ok_or_else(|| {
+            io_err(
+                &entry.path(),
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "graph identity missing for entry",
+                ),
+            )
+        })?;
+        owned.push(ManagedEntry {
+            path: format!("node_modules/{name}"),
+            mode: "local".to_string(),
+            identity: identity.clone(),
+        });
     }
     Ok(AttachOutcome::new(stats, owned))
 }
@@ -1046,6 +1185,20 @@ mod tests {
     use std::os::unix::fs::{symlink, MetadataExt};
     use tempfile::tempdir;
 
+    fn write_test_meta(root: &Path) {
+        let meta = VolumeMeta {
+            graph_id_hex: String::new(),
+            layout_version: VOLUME_LAYOUT_VERSION,
+            packages_materialized: 0,
+            bins_linked: 0,
+            inventory_version: INVENTORY_VERSION,
+            artifacts: Vec::new(),
+            derived: Vec::new(),
+            entry_identities: compute_entry_identities(&root.join("node_modules")).unwrap(),
+        };
+        fs::write(root.join(META_FILE), serde_json::to_vec(&meta).unwrap()).unwrap();
+    }
+
     #[test]
     fn local_attachment_keeps_realpaths_inside_project_and_bins_relative() {
         let volume_root = tempdir().unwrap();
@@ -1060,6 +1213,7 @@ mod tests {
         .unwrap();
         fs::write(volume.join("foo/cli.js"), b"#!/usr/bin/env node\n").unwrap();
         symlink("../foo/cli.js", volume.join(".bin/foo")).unwrap();
+        write_test_meta(volume_root.path());
 
         let volume_ref = VolumeRef {
             path: volume_root.path().to_path_buf(),
@@ -1100,6 +1254,7 @@ mod tests {
         fs::create_dir_all(volume.join("foo")).unwrap();
         let payload = b"original volume bytes";
         fs::write(volume.join("foo/file.txt"), payload).unwrap();
+        write_test_meta(&volume_root);
 
         let volume_ref = VolumeRef {
             path: volume_root.clone(),
@@ -1167,6 +1322,21 @@ mod ownership_tests {
             fs::create_dir_all(vol.join(name)).unwrap();
             fs::write(vol.join(name).join("package.json"), body).unwrap();
         }
+        let meta = VolumeMeta {
+            graph_id_hex: String::new(),
+            layout_version: VOLUME_LAYOUT_VERSION,
+            packages_materialized: pkgs.len(),
+            bins_linked: 0,
+            inventory_version: INVENTORY_VERSION,
+            artifacts: Vec::new(),
+            derived: Vec::new(),
+            entry_identities: compute_entry_identities(&vol).unwrap(),
+        };
+        fs::write(
+            volume_root.join(META_FILE),
+            serde_json::to_vec(&meta).unwrap(),
+        )
+        .unwrap();
     }
 
     fn read_owned_names(outcome: &AttachOutcome) -> Vec<String> {
