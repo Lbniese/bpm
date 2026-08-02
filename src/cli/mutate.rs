@@ -15,6 +15,7 @@
 //! `link:`, workspace, patch, optional, and peer mutation require separate
 //! compatibility work and are rejected before any file is touched.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::path::{Path, PathBuf};
 
@@ -457,6 +458,108 @@ fn publish_lock_bytes(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
         .map_err(|error| anyhow::anyhow!("failed to publish lock {}: {error}", path.display()))
 }
 
+fn selective_upgrade_lock(
+    prior: &Lockfile,
+    fresh: &Lockfile,
+    selected: &BTreeSet<String>,
+) -> anyhow::Result<Lockfile> {
+    let old_roots = selected_root_paths(prior, selected);
+    if old_roots.is_empty() {
+        anyhow::bail!("named upgrade selection is absent from the current lock");
+    }
+    let new_roots = selected_root_paths(fresh, selected);
+    if new_roots.is_empty() {
+        anyhow::bail!("named upgrade selection could not be resolved");
+    }
+    let old_movable = lock_closure(prior, &old_roots);
+    let new_movable = lock_closure(fresh, &new_roots);
+
+    let mut result = prior.clone();
+    result
+        .packages
+        .retain(|package| !old_movable.contains(&package.path));
+    result.packages.extend(
+        fresh
+            .packages
+            .iter()
+            .filter(|package| new_movable.contains(&package.path))
+            .cloned(),
+    );
+    result.packages.sort_by(|a, b| a.path.cmp(&b.path));
+
+    result
+        .resolution
+        .packages
+        .retain(|path, _| !old_movable.contains(path));
+    for (path, resolution) in &fresh.resolution.packages {
+        if new_movable.contains(path) {
+            result
+                .resolution
+                .packages
+                .insert(path.clone(), resolution.clone());
+        }
+    }
+    result
+        .resolution
+        .registry_names
+        .retain(|path, _| !old_movable.contains(path));
+    for (path, name) in &fresh.resolution.registry_names {
+        if new_movable.contains(path) {
+            result
+                .resolution
+                .registry_names
+                .insert(path.clone(), name.clone());
+        }
+    }
+    result.resolution.root = fresh.resolution.root.clone();
+    Ok(result)
+}
+
+fn selected_root_paths(lock: &Lockfile, selected: &BTreeSet<String>) -> BTreeSet<String> {
+    selected
+        .iter()
+        .flat_map(|name| {
+            let direct = format!("node_modules/{name}");
+            lock.packages
+                .iter()
+                .filter(move |package| {
+                    package.path == direct
+                        || (package.name == *name
+                            && package.path.matches("node_modules").count() == 1)
+                })
+                .map(|package| package.path.clone())
+        })
+        .collect()
+}
+
+fn lock_closure(lock: &Lockfile, roots: &BTreeSet<String>) -> BTreeSet<String> {
+    let mut closure = roots.clone();
+    let mut pending = roots.iter().cloned().collect::<Vec<_>>();
+    while let Some(path) = pending.pop() {
+        let Some(resolution) = lock.resolution.packages.get(&path) else {
+            continue;
+        };
+        let targets = resolution
+            .dependencies
+            .values()
+            .chain(resolution.optional_dependencies.values())
+            .chain(resolution.peer_dependencies.values())
+            .map(|dependency| dependency.target.clone())
+            .chain(
+                resolution
+                    .peer_context
+                    .values()
+                    .map(|provider| provider.path.clone()),
+            );
+        for target in targets {
+            if !target.is_empty() && closure.insert(target.clone()) {
+                pending.push(target);
+            }
+        }
+    }
+    closure
+}
+
 fn lock_error(error: &LockfileError) -> String {
     match error {
         LockfileError::Write { source, .. } => source.to_string(),
@@ -629,29 +732,61 @@ pub(super) fn run_upgrade(options: UpgradeOptions) -> anyhow::Result<()> {
     let manifest = bpm::manifest::PackageManifest::from_path(&manifest_path)
         .map_err(|error| anyhow::anyhow!("cannot read package.json for upgrade: {error}"))?;
 
-    // Validate named packages: warn (don't fail) on unknown names.
-    let mut warnings: Vec<String> = Vec::new();
+    // Validate and normalize named packages before opening a registry client.
+    // Unknown-only requests are true no-ops: no metadata, lock, or install
+    // work is allowed to occur.
+    let mut warnings = Vec::new();
+    let mut recognized = BTreeSet::new();
+    let mut unknown = BTreeSet::new();
+    for name in &options.names {
+        if !bpm::manifest::is_valid_package_name(name) {
+            anyhow::bail!("'{name}' is not a valid npm package name");
+        }
+        if declares_dependency(&manifest, name) {
+            recognized.insert(name.clone());
+        } else {
+            unknown.insert(name.clone());
+        }
+    }
+    for name in unknown {
+        warnings.push(format!(
+            "warning: '{name}' is not declared in package.json; skipping"
+        ));
+    }
+    if !options.names.is_empty() && recognized.is_empty() {
+        for warning in warnings {
+            eprintln!("{warning}");
+        }
+        eprintln!("upgraded 0 package(s); no declared packages selected");
+        return Ok(());
+    }
+
+    let prior_lock = find_project_lock(&cwd)?;
     if !options.names.is_empty() {
-        for name in &options.names {
-            if !bpm::manifest::is_valid_package_name(name) {
-                anyhow::bail!("'{name}' is not a valid npm package name");
-            }
-            if !declares_dependency(&manifest, name) {
-                warnings.push(format!(
-                    "warning: '{name}' is not declared in package.json; skipping"
-                ));
-            }
+        let Some(prior) = prior_lock.as_ref() else {
+            anyhow::bail!("named upgrade requires a current lock; run bpm install or bpm upgrade without names first");
+        };
+        if prior.lockfile.root.dependencies != manifest.root_dependency_declarations() {
+            anyhow::bail!(
+                "named upgrade requires a lock matching package.json; run a full upgrade first"
+            );
+        }
+        if prior.lockfile.resolution.packages.is_empty() {
+            anyhow::bail!(
+                "named upgrade requires complete v2 lock metadata; run a full upgrade first"
+            );
         }
     }
 
     // Snapshot the current locked versions for the upgrade report.
-    let before = find_project_lock(&cwd)?
+    let before = prior_lock
+        .as_ref()
         .map(|lock| {
             lock.lockfile
                 .packages
                 .iter()
                 .map(|p| (p.name.clone(), p.version.clone()))
-                .collect::<std::collections::BTreeMap<String, String>>()
+                .collect::<BTreeMap<String, String>>()
         })
         .unwrap_or_default();
 
@@ -671,7 +806,7 @@ pub(super) fn run_upgrade(options: UpgradeOptions) -> anyhow::Result<()> {
     } else {
         bpm::resolver::peer::PeerMode::Strict
     };
-    let lockfile = bpm::resolver::resolve_manifest_with_options(
+    let resolved_lockfile = bpm::resolver::resolve_manifest_with_options(
         &manifest,
         &client,
         "bpm",
@@ -679,6 +814,14 @@ pub(super) fn run_upgrade(options: UpgradeOptions) -> anyhow::Result<()> {
         peer_mode,
     )
     .map_err(|error| anyhow::anyhow!("dependency resolution failed: {error}"))?;
+    let lockfile = if options.names.is_empty() {
+        resolved_lockfile
+    } else {
+        let prior = prior_lock
+            .as_ref()
+            .expect("named upgrade lock preflight checked above");
+        selective_upgrade_lock(&prior.lockfile, &resolved_lockfile, &recognized)?
+    };
 
     // package.json ranges are NEVER edited by upgrade (npm default).
     let (lock_path, mut lock_bytes, resolved_kind) =
