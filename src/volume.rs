@@ -254,6 +254,14 @@ fn valid_entry_identities(meta: &VolumeMeta, volume: &Path) -> Option<BTreeMap<S
             return None;
         }
     }
+    let actual = fs::read_dir(volume.join("node_modules"))
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect::<BTreeSet<_>>();
+    if actual != identities.keys().cloned().collect::<BTreeSet<_>>() {
+        return None;
+    }
     Some(identities)
 }
 
