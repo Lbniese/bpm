@@ -91,11 +91,13 @@ jobs:
       - name: cargo build --release
         run: cargo build --release --workspace
 
-      # Runs only the deliberately windows-gated suite
-      # (`tests/install_windows.rs`, `#![cfg(windows)]`); the Unix-oriented
-      # integration suites rely on symlink/exec-bit/`/tmp` semantics and are
-      # not run here. Covers Windows bin shims and the
-      # `attach_project_local_with_backend` reflink→hardlink fallback.
+      # Library and binary unit tests are portable and run on Windows. The
+      # Unix-oriented integration suites remain excluded because they rely on
+      # symlink/exec-bit/`/tmp` semantics. `tests/install_windows.rs` remains
+      # the dedicated Windows integration gate.
+      - name: cargo test (portable unit suites)
+        run: cargo test --workspace --lib --bins
+
       - name: cargo test (windows-gated suite)
         run: cargo test --test install_windows
 
