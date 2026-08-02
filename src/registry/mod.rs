@@ -980,7 +980,7 @@ impl RegistryClient {
     /// closure fetcher, so the resolver thread mostly hits cache and runs at
     /// CPU speed instead of serializing on the dependency-tree depth.
     pub fn prefetch_packument(&self, name: &str, version_spec: Option<&str>) {
-        if self.prefetch_workers == 0 || !is_valid_npm_name(name) {
+        if self.prefetch_workers == 0 || !is_valid_npm_read_name(name) {
             return;
         }
         let pool = self.prefetch_pool.get_or_init(|| {
@@ -1510,7 +1510,7 @@ pub fn parse_spec(spec: &str) -> Result<PackageSpec, RegistryError> {
         Some(i) => (&spec[..i], Some(&spec[i + 1..])),
     };
 
-    if !is_valid_npm_name(name) {
+    if !is_valid_npm_read_name(name) {
         return Err(RegistryError::InvalidSpec(
             spec.to_string(),
             format!("'{name}' is not a valid npm package name"),
@@ -1892,7 +1892,7 @@ pub fn select_version(
 /// Validate and encode an npm package name as the registry's single package
 /// path segment. Only the one structural slash in a scoped name is encoded.
 fn encode_package_name(name: &str) -> Result<String, RegistryError> {
-    if !is_valid_npm_name(name) {
+    if !is_valid_npm_read_name(name) {
         return Err(RegistryError::InvalidSpec(
             name.to_string(),
             format!("'{name}' is not a valid npm package name"),
@@ -1901,32 +1901,51 @@ fn encode_package_name(name: &str) -> Result<String, RegistryError> {
     Ok(name.replace('/', "%2f"))
 }
 
-/// Validate a package name per npm rules: `(@scope/)?name`, ASCII, <=214 chars,
-/// each segment starts with a lowercase letter or digit and otherwise contains
-/// only `[a-z0-9._-]`.
+/// Validate a package name for newly published packages.
+///
+/// New names must be lowercase ASCII and structurally match `(@scope/)?name`.
 pub fn is_valid_npm_name(name: &str) -> bool {
+    valid_npm_name(name, false)
+}
+
+/// Validate a structurally safe package name for registry reads.
+///
+/// Historical registry records may contain uppercase ASCII letters. Their
+/// spelling is retained while URL delimiters and malformed scoped names remain
+/// forbidden.
+pub fn is_valid_npm_read_name(name: &str) -> bool {
+    valid_npm_name(name, true)
+}
+
+fn valid_npm_name(name: &str, allow_uppercase: bool) -> bool {
     if name.is_empty() || name.len() > 214 || !name.is_ascii() {
         return false;
     }
     match name.strip_prefix('@') {
         Some(rest) => match rest.split_once('/') {
-            Some((scope, pkg)) => valid_segment(scope.as_bytes()) && valid_segment(pkg.as_bytes()),
+            Some((scope, pkg)) => {
+                valid_name_segment(scope.as_bytes(), allow_uppercase)
+                    && valid_name_segment(pkg.as_bytes(), allow_uppercase)
+            }
             None => false,
         },
-        None => valid_segment(name.as_bytes()),
+        None => valid_name_segment(name.as_bytes(), allow_uppercase),
     }
 }
 
-fn valid_segment(seg: &[u8]) -> bool {
-    if seg.is_empty() {
+fn valid_name_segment(segment: &[u8], allow_uppercase: bool) -> bool {
+    let Some((&first, _)) = segment.split_first() else {
         return false;
-    }
-    let first = seg[0];
-    if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
-        return false;
-    }
-    seg.iter()
-        .all(|&b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'-' | b'_'))
+    };
+    let valid_alphanumeric = |byte: u8| {
+        byte.is_ascii_lowercase()
+            || byte.is_ascii_digit()
+            || (allow_uppercase && byte.is_ascii_uppercase())
+    };
+    valid_alphanumeric(first)
+        && segment
+            .iter()
+            .all(|&byte| valid_alphanumeric(byte) || matches!(byte, b'.' | b'-' | b'_'))
 }
 
 #[cfg(test)]
@@ -2052,11 +2071,26 @@ mod tests {
     }
 
     #[test]
-    fn rejects_uppercase_and_invalid_names() {
-        assert!(parse_spec("Lodash").is_err());
-        assert!(parse_spec("has space").is_err());
-        assert!(parse_spec("@noslash").is_err());
-        assert!(parse_spec("@scope/").is_err());
+    fn rejects_malformed_read_names() {
+        for name in [
+            "has space",
+            "@noslash",
+            "@scope/",
+            "@scope/pkg/extra",
+            "bad%escape",
+            "bad?query",
+            "bad#fragment",
+            "bad\\path",
+            ".leading",
+            "../escape",
+            "nonascii-é",
+        ] {
+            assert!(
+                parse_spec(name).is_err(),
+                "accepted malformed name {name:?}"
+            );
+        }
+        assert!(parse_spec(&format!("a{}", "b".repeat(214))).is_err());
     }
 
     #[test]
@@ -2065,13 +2099,36 @@ mod tests {
     }
 
     #[test]
-    fn name_validation_examples() {
+    fn name_validation_separates_publish_and_read_policies() {
         assert!(is_valid_npm_name("lodash"));
         assert!(is_valid_npm_name("@scope/pkg"));
-        assert!(!is_valid_npm_name("Lodash"));
-        assert!(!is_valid_npm_name(""));
-        assert!(!is_valid_npm_name("@scope"));
-        assert!(!is_valid_npm_name("has space"));
+        assert!(!is_valid_npm_name("JSONStream"));
+        assert!(!is_valid_npm_name("Base64"));
+
+        for name in ["lodash", "JSONStream", "Base64", "@Scope/Package"] {
+            assert!(is_valid_npm_read_name(name));
+        }
+        let parsed = parse_spec("JSONStream@1.2.3").unwrap();
+        assert_eq!(parsed.name, "JSONStream");
+        let parsed = parse_spec("@Scope/Package@^2").unwrap();
+        assert_eq!(parsed.name, "@Scope/Package");
+
+        for name in [
+            "",
+            "@scope",
+            "@scope/",
+            "@scope/pkg/extra",
+            "has space",
+            "bad%escape",
+            "bad?query",
+            "bad#fragment",
+            "bad\\path",
+            ".leading",
+            "nonascii-é",
+        ] {
+            assert!(!is_valid_npm_name(name));
+            assert!(!is_valid_npm_read_name(name));
+        }
     }
 
     #[test]
@@ -3342,7 +3399,6 @@ mod tests {
             String::new(),
             "@scope".into(),
             "@scope/pkg/extra".into(),
-            "Uppercase".into(),
             "has space".into(),
             "nonascii-é".into(),
             "bad?query".into(),
@@ -3380,6 +3436,26 @@ mod tests {
         shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
         server.join().unwrap();
         assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn legacy_uppercase_name_is_preserved_on_registry_reads() {
+        let (registry, shutdown, server) = token_server(|method, path, _body| {
+            assert_eq!(method, "GET");
+            assert_eq!(path, "/JSONStream");
+            (
+                200,
+                r#"{"name":"JSONStream","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"JSONStream","version":"1.0.0"}}}"#.to_string(),
+            )
+        });
+        let config = NpmConfig::default()
+            .with_registry_override(&registry)
+            .unwrap();
+        let client = RegistryClient::new(config);
+        let result = client.packument("JSONStream").unwrap();
+        assert_eq!(result.name, "JSONStream");
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().unwrap();
     }
 
     #[test]

@@ -81,7 +81,7 @@ fn publish_rejects_invalid_package_name_before_network() {
     let project = tempfile::tempdir().unwrap();
     let server = MiniServer::start_routed(|_| Some(RouteBody(b"{}".to_vec(), "application/json")));
 
-    for name in ["bad?query", "@malformed"] {
+    for name in ["bad?query", "@malformed", "JSONStream"] {
         fs::write(
             project.path().join("package.json"),
             format!(r#"{{"name":"{name}","version":"1.0.0"}}"#),
