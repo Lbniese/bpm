@@ -49,18 +49,19 @@ pub(super) fn run(
         base64::engine::general_purpose::STANDARD.encode(hash.finalize())
     );
     let encoded = base64::engine::general_purpose::STANDARD.encode(&tarball);
+    let tarball_url = format!(
+        "{}/{}/-/{}",
+        config.registry(),
+        name.replace('/', "%2f"),
+        filename
+    );
+    let version_metadata =
+        build_version_metadata(&manifest_json, &name, &version, &integrity, &tarball_url)?;
     let mut body = json!({
         "name": name,
         "_id": format!("{name}@{version}"),
         "versions": {
-            version.clone(): {
-                "name": name,
-                "version": version,
-                "dist": {
-                    "integrity": integrity,
-                    "tarball": format!("{}/{}/-/{}", config.registry(), name.replace('/', "%2f"), filename)
-                }
-            }
+            version.clone(): version_metadata
         },
         "access": access.unwrap_or_else(|| "restricted".into()),
         "dist-tags": {"latest": version},
@@ -111,6 +112,30 @@ pub(super) fn run(
         tarball.len()
     );
     Ok(())
+}
+
+fn build_version_metadata(
+    manifest_json: &serde_json::Value,
+    name: &str,
+    version: &str,
+    integrity: &str,
+    tarball_url: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let mut metadata = manifest_json
+        .as_object()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("package manifest must be a JSON object"))?;
+    metadata.insert("name".into(), json!(name));
+    metadata.insert("version".into(), json!(version));
+    metadata.insert("_id".into(), json!(format!("{name}@{version}")));
+    metadata.insert(
+        "dist".into(),
+        json!({
+            "integrity": integrity,
+            "tarball": tarball_url,
+        }),
+    );
+    Ok(serde_json::Value::Object(metadata))
 }
 
 fn pack(root: &std::path::Path, files: &[String]) -> anyhow::Result<Vec<u8>> {
@@ -361,6 +386,92 @@ fn normalize_manifest_path(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_metadata_preserves_publishable_and_extension_fields() {
+        let manifest = json!({
+            "name": "stale-name",
+            "version": "0.0.0",
+            "dependencies": {"dep": "^1"},
+            "optionalDependencies": {"optional": "~2"},
+            "peerDependencies": {"peer": ">=3"},
+            "peerDependenciesMeta": {"peer": {"optional": true}},
+            "bin": {"tool": "bin/tool.js"},
+            "engines": {"node": ">=20"},
+            "scripts": {"test": "node test.js"},
+            "os": ["linux"],
+            "cpu": ["x64"],
+            "exports": {".": "./index.js"},
+            "x-bpm-extension": {"enabled": true}
+        });
+        let original = manifest.clone();
+
+        let metadata = build_version_metadata(
+            &manifest,
+            "trusted-name",
+            "1.2.3",
+            "sha512-placeholder",
+            "https://registry.example.invalid/trusted-name/-/trusted-name-1.2.3.tgz",
+        )
+        .unwrap();
+
+        for key in [
+            "dependencies",
+            "optionalDependencies",
+            "peerDependencies",
+            "peerDependenciesMeta",
+            "bin",
+            "engines",
+            "scripts",
+            "os",
+            "cpu",
+            "exports",
+            "x-bpm-extension",
+        ] {
+            assert_eq!(metadata[key], original[key]);
+        }
+        assert_eq!(manifest, original);
+    }
+
+    #[test]
+    fn version_metadata_overwrites_authoritative_fields() {
+        let manifest = json!({
+            "name": "hostile",
+            "version": "9.9.9",
+            "_id": "hostile@9.9.9",
+            "dist": {"integrity": "untrusted", "tarball": "https://evil.invalid/a.tgz"}
+        });
+        let metadata = build_version_metadata(
+            &manifest,
+            "trusted",
+            "1.2.3",
+            "sha512-trusted",
+            "https://registry.example.invalid/trusted/-/trusted-1.2.3.tgz",
+        )
+        .unwrap();
+
+        assert_eq!(metadata["name"], "trusted");
+        assert_eq!(metadata["version"], "1.2.3");
+        assert_eq!(metadata["_id"], "trusted@1.2.3");
+        assert_eq!(metadata["dist"]["integrity"], "sha512-trusted");
+        assert_eq!(
+            metadata["dist"]["tarball"],
+            "https://registry.example.invalid/trusted/-/trusted-1.2.3.tgz"
+        );
+    }
+
+    #[test]
+    fn version_metadata_rejects_non_object_manifest() {
+        let error = build_version_metadata(
+            &json!(["not", "an", "object"]),
+            "name",
+            "1.0.0",
+            "sha512-placeholder",
+            "https://registry.example.invalid/name/-/name-1.0.0.tgz",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("JSON object"));
+    }
 
     #[test]
     fn package_file_list_honors_files_and_ignore_with_npm_always_includes() {
