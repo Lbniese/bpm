@@ -465,7 +465,12 @@ fn compute_entry_identities(node_modules: &Path) -> Result<Vec<VolumeEntryIdenti
         .collect::<Result<Vec<_>, _>>()
         .map_err(|source| io_err(node_modules, source))?;
     entries.sort_by_key(|entry| entry.file_name());
-    let mut identities = Vec::with_capacity(entries.len());
+
+    // Validate names up front and hand each worker an owned (name, path) job.
+    // Top-level package trees are disjoint, so per-package fingerprinting is
+    // safe to run concurrently — unlike `materialize_with_backend`, whose
+    // nested ancestor/descendant targets race under parallel `create_dir_all`.
+    let mut jobs: Vec<(String, PathBuf)> = Vec::with_capacity(entries.len());
     for entry in entries {
         let name = entry.file_name().to_string_lossy().into_owned();
         if name.is_empty() || name.contains('/') || name.contains('\\') {
@@ -474,12 +479,61 @@ fn compute_entry_identities(node_modules: &Path) -> Result<Vec<VolumeEntryIdenti
                 std::io::Error::new(std::io::ErrorKind::InvalidData, "unsafe volume entry name"),
             ));
         }
-        identities.push(VolumeEntryIdentity {
-            name,
-            identity: tree_fingerprint(&entry.path())?,
-        });
+        jobs.push((name, entry.path()));
     }
-    Ok(identities)
+
+    // `tree_fingerprint` is CPU+I/O bound (it reads and blake3-hashes every
+    // file in the package). Hashing parallelizes well across cores, unlike
+    // APFS `clonefile`, which is kernel-serialized — that asymmetry is why the
+    // graph-volume *relay* loop stays serial while this *fingerprint* loop does
+    // not. `std::thread::scope` is used instead of rayon (not a dependency).
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .saturating_mul(2)
+        .min(16)
+        .min(jobs.len().max(1))
+        .max(1);
+
+    let mut pairs: Vec<(String, String)> = if workers <= 1 {
+        jobs.iter()
+            .map(|(name, path)| {
+                Ok::<(String, String), VolumeError>((name.clone(), tree_fingerprint(path)?))
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        let chunk = jobs.len().div_ceil(workers).max(1);
+        std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(workers);
+            for jobs_chunk in jobs.chunks(chunk) {
+                handles.push(s.spawn(move || {
+                    jobs_chunk
+                        .iter()
+                        .map(|(name, path)| Ok((name.clone(), tree_fingerprint(path)?)))
+                        .collect::<Result<Vec<(String, String)>, VolumeError>>()
+                }));
+            }
+            // Chunks were sliced from a name-sorted job list, so `out` is in
+            // name order; the post-merge sort below is cheap insurance.
+            let mut out = Vec::with_capacity(jobs.len());
+            for handle in handles {
+                match handle.join() {
+                    Ok(Ok(values)) => out.extend(values),
+                    Ok(Err(err)) => return Err(err),
+                    Err(panic) => std::panic::resume_unwind(panic),
+                }
+            }
+            Ok(out)
+        })?
+    };
+
+    // Guarantee a byte-identical `entry_identities` regardless of thread
+    // scheduling: sort by name once, matching the original serial output.
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(pairs
+        .into_iter()
+        .map(|(name, identity)| VolumeEntryIdentity { name, identity })
+        .collect())
 }
 
 fn read_entry_identities(volume: &Path) -> Result<BTreeMap<String, String>, VolumeError> {
@@ -1417,6 +1471,86 @@ mod ownership_tests {
         symlink("../pkg/other.js", root.join("pkg/link.js")).unwrap();
         let fp2 = tree_fingerprint(&root).unwrap();
         assert_ne!(fp, fp2, "symlink target change must alter the fingerprint");
+    }
+
+    #[test]
+    fn parallel_compute_entry_identities_matches_serial() {
+        // Several top-level packages (so the parallel path engages), each with
+        // nested files and a symlink so tree_fingerprint does non-trivial work.
+        let dir = tempdir().unwrap();
+        let vol = dir.path().join("node_modules");
+        for name in ["alpha", "beta", "gamma", "delta", "epsilon"] {
+            let pkg = vol.join(name);
+            fs::create_dir_all(pkg.join("lib")).unwrap();
+            fs::write(pkg.join("package.json"), format!("{{\"name\":\"{name}\"}}")).unwrap();
+            fs::write(pkg.join("lib/index.js"), b"module.exports = 1;").unwrap();
+        }
+        symlink("../alpha/package.json", vol.join("beta/link.js")).unwrap();
+
+        let got: Vec<(String, String)> = compute_entry_identities(&vol)
+            .unwrap()
+            .into_iter()
+            .map(|i| (i.name, i.identity))
+            .collect();
+
+        // Serial reference: sort entries by name, fingerprint each.
+        let mut entries = fs::read_dir(&vol)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        entries.sort_by_key(|e| e.file_name());
+        let want: Vec<(String, String)> = entries
+            .iter()
+            .map(|e| {
+                (
+                    e.file_name().to_string_lossy().into_owned(),
+                    tree_fingerprint(&e.path()).unwrap(),
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            got, want,
+            "parallel output must equal serial, in name order"
+        );
+    }
+
+    #[test]
+    fn parallel_compute_entry_identities_is_stable_across_runs() {
+        let dir = tempdir().unwrap();
+        let vol = dir.path().join("node_modules");
+        for name in ["a", "b", "c", "d"] {
+            fs::create_dir_all(vol.join(name)).unwrap();
+            fs::write(vol.join(name).join("package.json"), name.as_bytes()).unwrap();
+        }
+        let first = compute_entry_identities(&vol).unwrap();
+        for _ in 0..20 {
+            let again = compute_entry_identities(&vol).unwrap();
+            assert_eq!(
+                again, first,
+                "identities must be stable across concurrent runs"
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_compute_entry_identities_rejects_unsafe_names() {
+        let dir = tempdir().unwrap();
+        let vol = dir.path().join("node_modules");
+        fs::create_dir_all(vol.join("good")).unwrap();
+        fs::write(vol.join("good").join("package.json"), b"{}").unwrap();
+        // A backslash is a legal filename character on Unix and is NOT a path
+        // separator there, so this makes one top-level entry whose name holds
+        // a '\', which the name-validation guard must reject as InvalidData.
+        fs::create_dir_all(vol.join("bad\\name")).unwrap();
+        fs::write(vol.join("bad\\name").join("package.json"), b"{}").unwrap();
+
+        match compute_entry_identities(&vol).unwrap_err() {
+            VolumeError::Io { source, .. } => {
+                assert_eq!(source.kind(), std::io::ErrorKind::InvalidData);
+            }
+            other => panic!("expected InvalidData io error, got {other:?}"),
+        }
     }
 
     #[test]
