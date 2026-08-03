@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-03
+
+npm-compatible developer and registry-management commands, dev-only install
+profiles, and further cold-path performance on top of 0.2.1.
+
+### Added
+
+- **npm-compatible developer commands**. `bpm init` scaffolds a `package.json`;
+  `bpm ls` prints the installed dependency tree; `bpm view` shows registry
+  package metadata; `bpm cache` inspects and reclaims the local cache; and
+  `bpm whoami` prints the registry-authenticated user.
+- **npm-compatible registry-management commands**. `bpm token` lists, creates,
+  and revokes registry tokens; `bpm dist-tag` lists, adds, and removes
+  distribution tags; and `bpm owner` lists, adds, and removes package owners.
+- **npm-compatible developer linking**. `bpm link` performs the global
+  two-step developer link.
+- **Dev-only install profiles**. `bpm install` and `bpm ci` accept repeatable
+  typed `--omit=dev` and `--include=dev` flags (include wins regardless of
+  order), with `NODE_ENV=production` as the default omit trigger. Filtering is
+  an in-memory runtime projection only, so `bpm.lock` and direct npm
+  `package-lock.json` authority stay complete and byte-unchanged; omitted
+  installs get separate graph/volume/plan identities and reconcile safely
+  with the full tree.
+- **npm `package-lock.json` lockfileVersion 2 and 3 import** through the shared
+  packages-table importer for import, install/CI, audit, and npm-authority
+  mutations; mutations and exports canonicalize npm authority to strict
+  lockfileVersion 3.
+
 ### Security
 
 - Git clone and fetch failures redact credential-bearing remote forms before
@@ -22,12 +50,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   graph and project views no longer use writable aliases to shared content.
 - Named upgrades preserve unselected dependency closures and return a true
   no-op for unknown-only selections.
+- Graph ownership metadata is validated as complete and rebuilt when malformed,
+  and aliased project views are rejected.
 
 ### Changed
 
 - Project ownership reuses published graph-entry identities instead of
   rehashing copied file bodies during normal attachment; live-tree hashing is
   retained for conservative stale-view deletion.
+- **Directory clonefile materialization** (Plan 030). Whole package trees are
+  cloned in a single `clonefile` syscall on macOS — the major cold-install
+  materialization win.
+- **Parallel graph-package fingerprinting** (Plan 034). Per-package
+  `tree_fingerprint` runs in parallel during publish, a modest (~21%)
+  identity-build improvement.
 
 ## [0.2.1] - 2026-07-28
 
@@ -172,7 +208,8 @@ downloads, extraction, resolution, and materialization.
   package and bin path before mutation; git-source argument hardening against
   argument injection; and integrity verification before publication.
 
-[Unreleased]: https://github.com/lbniese/bpm/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/lbniese/bpm/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/lbniese/bpm/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/lbniese/bpm/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/lbniese/bpm/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/lbniese/bpm/releases/tag/v0.1.0
