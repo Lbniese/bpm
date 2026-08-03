@@ -158,8 +158,8 @@ fn audit_bulk_body(root: &std::path::Path) -> anyhow::Result<serde_json::Value> 
     Ok(serde_json::Value::Object(body))
 }
 
-/// Normalize an npm v3 lock through the shared importer, then group it through
-/// the same canonical-name path as a native BPM lock.
+/// Normalize an npm v2/v3 lock through the shared importer, then group it
+/// through the same canonical-name path as a native BPM lock.
 fn bulk_groups_from_npm_lock(
     root: &std::path::Path,
 ) -> anyhow::Result<BTreeMap<String, std::collections::BTreeSet<String>>> {
@@ -491,6 +491,22 @@ mod tests {
     }
 
     #[test]
+    fn npm_lock_valid_v2_uses_packages_table_for_inventory() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("package.json"),
+            r#"{"name":"app","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        write_npm_lock(
+            root.path(),
+            r#"{"name":"app","version":"1.0.0","lockfileVersion":2,"dependencies":{"left-pad":{"version":"9.9.9"}},"packages":{"":{"name":"app","version":"1.0.0"},"node_modules/left-pad":{"version":"1.3.0","resolved":"https://example/left-pad.tgz","integrity":"sha512-abc"}}}"#,
+        );
+        let body = audit_bulk_body(root.path()).expect("valid v2 lock");
+        assert_eq!(body["left-pad"].as_array().unwrap(), &vec![json!("1.3.0")]);
+    }
+
+    #[test]
     fn npm_lock_alias_groups_by_explicit_canonical_name() {
         let root = tempfile::tempdir().unwrap();
         fs::write(
@@ -561,12 +577,12 @@ mod tests {
         .unwrap();
         write_npm_lock(
             root.path(),
-            r#"{"lockfileVersion":2,"packages":{"":{"name":"app"}}}"#,
+            r#"{"lockfileVersion":1,"packages":{"":{"name":"app"}}}"#,
         );
         let err = audit_bulk_body(root.path()).unwrap_err().to_string();
         assert!(
-            err.contains("version 3"),
-            "error should mention version 3 support, got: {err}"
+            err.contains("versions 2 and 3"),
+            "error should mention versions 2 and 3 support, got: {err}"
         );
     }
 

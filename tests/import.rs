@@ -1,5 +1,5 @@
-//! End-to-end import tests: npm `package-lock.json` v3 -> canonical `bpm.lock`,
-//! including determinism and a real-fixture import.
+//! End-to-end import tests: npm `package-lock.json` v2/v3 -> canonical
+//! `bpm.lock`, including determinism and a real-fixture import.
 
 use std::collections::BTreeMap;
 
@@ -107,6 +107,38 @@ const REAL_V3_REVERSED_KEYS: &str = r#"{
   }
 }"#;
 
+fn real_v2_with_conflicting_legacy_dependencies() -> String {
+    let mut value: serde_json::Value = serde_json::from_str(REAL_V3).unwrap();
+    value["lockfileVersion"] = serde_json::json!(2);
+    value["dependencies"] = serde_json::json!({
+        "left-pad": {
+            "version": "9.9.9",
+            "resolved": "https://example/legacy-left-pad-9.9.9.tgz",
+            "integrity": "sha512-LEGACY"
+        },
+        "@scope/bar": {
+            "version": "8.8.8"
+        }
+    });
+    serde_json::to_string(&value).unwrap()
+}
+
+#[test]
+fn v2_packages_table_is_authoritative_and_matches_v3_normalization() {
+    let v2 = real_v2_with_conflicting_legacy_dependencies();
+    let v2_report = import(&v2).unwrap();
+    let v3_report = import(REAL_V3).unwrap();
+    assert_eq!(v2_report.lockfile, v3_report.lockfile);
+    let left_pad = v2_report
+        .lockfile
+        .packages
+        .iter()
+        .find(|package| package.name == "left-pad")
+        .unwrap();
+    assert_eq!(left_pad.version, "1.3.0");
+    assert_eq!(left_pad.integrity.as_deref(), Some("sha512-AAAA"));
+}
+
 #[test]
 fn lockfile_output_is_byte_stable_across_runs() {
     // Parse twice from the same input; the serialized bpm.lock must be
@@ -130,6 +162,12 @@ fn unsupported_version_is_a_clear_error() {
     let err = import(&v1).unwrap_err();
     assert!(
         matches!(err, NpmLockError::UnsupportedVersion(1)),
+        "{err:?}"
+    );
+    let future = REAL_V3.replace("\"lockfileVersion\": 3", "\"lockfileVersion\": 4");
+    let err = import(&future).unwrap_err();
+    assert!(
+        matches!(err, NpmLockError::UnsupportedVersion(4)),
         "{err:?}"
     );
 }
@@ -239,6 +277,30 @@ fn cli_import_metadata_roundtrips_through_ci() {
         "ci rejected imported lock: {}",
         String::from_utf8_lossy(&ci.stderr)
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_import_accepts_v2_packages_table() {
+    let project = tempdir().unwrap();
+    let v2 = real_v2_with_conflicting_legacy_dependencies();
+    fs::write(project.path().join("package-lock.json"), v2).unwrap();
+
+    let import = Command::new(env!("CARGO_BIN_EXE_bpm"))
+        .args(["import", "package-lock.json"])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(
+        import.status.success(),
+        "v2 import failed: {}",
+        String::from_utf8_lossy(&import.stderr)
+    );
+    let imported = Lockfile::from_path(&project.path().join("bpm.lock")).unwrap();
+    assert!(imported
+        .packages
+        .iter()
+        .any(|package| package.name == "left-pad"));
 }
 
 #[test]

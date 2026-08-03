@@ -2,7 +2,7 @@
 //!
 //! This module selects the nearest supported project lock without mutating the
 //! source files. Directory-local precedence is `bpm.lock` first, then npm
-//! `package-lock.json` v3; only when neither exists in the current directory do
+//! `package-lock.json` v2/v3; only when neither exists in the current directory do
 //! we walk to the parent.
 
 use std::fs;
@@ -23,7 +23,7 @@ pub const NPM_PACKAGE_LOCK_FILE: &str = "package-lock.json";
 pub enum ProjectLockKind {
     /// Native BPM lockfile.
     Bpm,
-    /// npm `package-lock.json` with `lockfileVersion: 3`.
+    /// npm `package-lock.json` authority (v2/v3 input; canonical v3 output).
     NpmV3,
 }
 
@@ -63,7 +63,7 @@ pub enum ProjectLockError {
     Manifest { path: String, source: ManifestError },
 }
 
-/// Read and normalize an npm `package-lock.json` v3 from `path`, enriching it
+/// Read and normalize an npm `package-lock.json` v2/v3 from `path`, enriching it
 /// from the sibling `package.json` when present. The input lock is never
 /// modified and no `bpm.lock` is created.
 pub fn load_npm_package_lock(path: &Path) -> Result<ImportReport, ProjectLockError> {
@@ -232,6 +232,19 @@ mod tests {
     }
 
     #[test]
+    fn loads_npm_v2_lock_without_creating_bpm_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let npm_v2 = npm_v3().replace("\"lockfileVersion\":3", "\"lockfileVersion\":2");
+        fs::write(temp.path().join(NPM_PACKAGE_LOCK_FILE), npm_v2).unwrap();
+
+        let selected = find_project_lock(temp.path()).unwrap().unwrap();
+
+        assert_eq!(selected.kind, ProjectLockKind::NpmV3);
+        assert_eq!(selected.lockfile.packages.len(), 1);
+        assert!(!temp.path().join(BPM_LOCK_FILE).exists());
+    }
+
+    #[test]
     fn sibling_bpm_lock_wins_over_package_lock() {
         let temp = tempfile::tempdir().unwrap();
         fs::write(temp.path().join(NPM_PACKAGE_LOCK_FILE), npm_v3()).unwrap();
@@ -265,14 +278,14 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         fs::write(
             temp.path().join(NPM_PACKAGE_LOCK_FILE),
-            r#"{"lockfileVersion":2,"packages":{}}"#,
+            r#"{"lockfileVersion":1,"packages":{}}"#,
         )
         .unwrap();
 
         let error = find_project_lock(temp.path()).unwrap_err().to_string();
 
         assert!(error.contains("package-lock.json"), "{error}");
-        assert!(error.contains("unsupported lockfileVersion 2"), "{error}");
+        assert!(error.contains("unsupported lockfileVersion 1"), "{error}");
     }
 
     #[test]

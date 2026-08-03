@@ -163,6 +163,58 @@ fn postinstall_runs_in_volume_resolves_deps_and_persists_derived_content() {
 }
 
 #[test]
+fn omitted_dev_lifecycle_scripts_receive_production_node_env() {
+    let project = tempfile::tempdir().unwrap();
+    let store = tempfile::tempdir().unwrap();
+    let tgz = tempfile::tempdir().unwrap();
+    let host_bytes = build_tgz(|b| {
+        add_dir_pkg(b);
+        add_file(
+            b,
+            "package/package.json",
+            0o644,
+            br#"{"name":"host","version":"1.0.0","scripts":{"postinstall":"test \"$NODE_ENV\" = production && echo production > .node-env"}}"#,
+        );
+    });
+    let (host_path, host_int) = seed_tarball(tgz.path(), "host.tgz", &host_bytes);
+    fs::write(
+        project.path().join("package.json"),
+        r#"{"name":"app","version":"1.0.0","dependencies":{"host":"^1.0.0"}}"#,
+    )
+    .unwrap();
+    let mut lockfile = Lockfile::new("bpm-test");
+    lockfile.root = RootEntry {
+        name: Some("app".into()),
+        version: Some("1.0.0".into()),
+        dependencies: BTreeMap::from([("host".into(), "^1.0.0".into())]),
+    };
+    lockfile.packages.push(PackageEntry {
+        path: "node_modules/host".into(),
+        name: "host".into(),
+        version: "1.0.0".into(),
+        resolved: format!("file://{}", host_path.display()),
+        integrity: Some(host_int.to_npm_string()),
+        ..Default::default()
+    });
+    lockfile.write_to(&project.path().join("bpm.lock")).unwrap();
+
+    let out = Command::new(bpm_bin())
+        .args(["install", "--frozen", "--omit=dev", "--store"])
+        .arg(store.path())
+        .current_dir(project.path())
+        .output()
+        .expect("failed to run omitted-dev lifecycle install");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "omitted-dev install failed: {stderr}");
+    let marker = project.path().join("node_modules/host/.node-env");
+    assert_eq!(
+        fs::read_to_string(marker).unwrap().trim(),
+        "production",
+        "lifecycle script did not receive NODE_ENV=production"
+    );
+}
+
+#[test]
 fn second_install_hits_plan_cache_without_rerunning_lifecycle() {
     let (project, store, _tgz, _host_image_rel) = setup_project();
 

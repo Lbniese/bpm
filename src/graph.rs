@@ -59,6 +59,65 @@ impl GraphId {
     }
 }
 
+/// Install-time behavior that changes the materialized tree or lifecycle
+/// output without changing the authoritative lockfile.
+///
+/// The default profile is deliberately identity-free: all existing public
+/// graph helpers preserve their historical hashes. Non-default profiles append
+/// an explicit deterministic salt through the profile-aware helpers below.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InstallProfile {
+    omit_dev: bool,
+    lifecycle_production: bool,
+}
+
+impl InstallProfile {
+    /// Normal install behavior. Kept as an explicit constructor so callers do
+    /// not need to depend on the representation of this profile.
+    pub const fn default_profile() -> Self {
+        Self {
+            omit_dev: false,
+            lifecycle_production: false,
+        }
+    }
+
+    /// npm-compatible production projection: dev-only packages are omitted
+    /// and lifecycle scripts receive `NODE_ENV=production`.
+    pub const fn dev_omitted() -> Self {
+        Self {
+            omit_dev: true,
+            lifecycle_production: true,
+        }
+    }
+
+    /// Full dependency tree with npm-compatible production lifecycle mode.
+    ///
+    /// This is the `NODE_ENV=production --include=dev` profile: inclusion
+    /// overrides physical dev omission but must not allow a graph volume or
+    /// plan containing non-production lifecycle output to be reused.
+    pub const fn production_full_tree() -> Self {
+        Self {
+            omit_dev: false,
+            lifecycle_production: true,
+        }
+    }
+
+    /// Whether this profile omits dev-only packages.
+    pub const fn omits_dev(self) -> bool {
+        self.omit_dev
+    }
+
+    /// Whether dependency lifecycle and Git preparation receive an injected
+    /// `NODE_ENV=production`.
+    pub const fn lifecycle_is_production(self) -> bool {
+        self.lifecycle_production
+    }
+
+    const fn is_default(self) -> bool {
+        !self.omit_dev && !self.lifecycle_production
+    }
+}
+
 /// A single materialization operation recorded in a plan.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlanEntry {
@@ -285,6 +344,17 @@ pub fn graph_id(lockfile: &Lockfile) -> GraphId {
     GraphId(blake3::hash(&bytes))
 }
 
+/// Compute a graph id with an install-profile identity. The default profile is
+/// an exact wrapper around [`graph_id`], preserving normal-install identities.
+pub fn graph_id_with_profile(lockfile: &Lockfile, profile: InstallProfile) -> GraphId {
+    if profile.is_default() {
+        return graph_id(lockfile);
+    }
+    let mut bytes = canonical_graph_bytes(lockfile);
+    append_install_profile(&mut bytes, profile);
+    GraphId(blake3::hash(&bytes))
+}
+
 /// Compute a graph id with prepared-image identities but without workspace
 /// layout, matching the historical graph-volume identity.
 pub fn graph_id_with_prepared(
@@ -296,6 +366,28 @@ pub fn graph_id_with_prepared(
     }
     let mut bytes = canonical_graph_bytes(lockfile);
     append_prepared_images(&mut bytes, prepared);
+    GraphId(blake3::hash(&bytes))
+}
+
+/// Profile-aware counterpart of [`graph_id_with_prepared`].
+///
+/// Default-profile calls delegate to the historical helper byte-for-byte;
+/// every production-lifecycle profile gets a separate graph even when no
+/// package record was removed, because output can differ under
+/// `NODE_ENV=production`.
+pub fn graph_id_with_prepared_and_profile(
+    lockfile: &Lockfile,
+    prepared: &BTreeMap<String, [u8; 32]>,
+    profile: InstallProfile,
+) -> GraphId {
+    if profile.is_default() {
+        return graph_id_with_prepared(lockfile, prepared);
+    }
+    let mut bytes = canonical_graph_bytes(lockfile);
+    if !prepared.is_empty() {
+        append_prepared_images(&mut bytes, prepared);
+    }
+    append_install_profile(&mut bytes, profile);
     GraphId(blake3::hash(&bytes))
 }
 
@@ -321,6 +413,20 @@ pub fn graph_id_for_project(lockfile: &Lockfile, project_root: &Path) -> GraphId
     graph_id_for_project_with_prepared(lockfile, project_root, &BTreeMap::new())
 }
 
+/// Compute a project graph id with an install-profile identity.
+pub fn graph_id_for_project_with_profile(
+    lockfile: &Lockfile,
+    project_root: &Path,
+    profile: InstallProfile,
+) -> GraphId {
+    graph_id_for_project_with_prepared_and_profile(
+        lockfile,
+        project_root,
+        &BTreeMap::new(),
+        profile,
+    )
+}
+
 /// Compute the project graph id while including immutable prepared-image keys.
 ///
 /// Prepared Git images are not lockfile packages, so their identity must be
@@ -344,6 +450,28 @@ pub fn graph_id_for_project_with_prepared(
     GraphId(blake3::hash(&bytes))
 }
 
+/// Profile-aware counterpart of [`graph_id_for_project_with_prepared`].
+pub fn graph_id_for_project_with_prepared_and_profile(
+    lockfile: &Lockfile,
+    project_root: &Path,
+    prepared: &BTreeMap<String, [u8; 32]>,
+    profile: InstallProfile,
+) -> GraphId {
+    if profile.is_default() {
+        return graph_id_for_project_with_prepared(lockfile, project_root, prepared);
+    }
+    let ws = crate::workspace::discover(project_root);
+    let mut bytes = canonical_graph_bytes(lockfile);
+    if !ws.packages.is_empty() || !ws.patterns.is_empty() {
+        bytes.extend(crate::workspace::canonical_workspace_bytes(&ws));
+    }
+    if !prepared.is_empty() {
+        append_prepared_images(&mut bytes, prepared);
+    }
+    append_install_profile(&mut bytes, profile);
+    GraphId(blake3::hash(&bytes))
+}
+
 fn append_prepared_images(bytes: &mut Vec<u8>, prepared: &BTreeMap<String, [u8; 32]>) {
     bytes.extend_from_slice(b"prepared-images\n");
     write_u64(bytes, prepared.len() as u64);
@@ -351,6 +479,16 @@ fn append_prepared_images(bytes: &mut Vec<u8>, prepared: &BTreeMap<String, [u8; 
         write_field(bytes, path);
         bytes.extend_from_slice(key);
     }
+}
+
+fn append_install_profile(bytes: &mut Vec<u8>, profile: InstallProfile) {
+    debug_assert!(!profile.is_default());
+    bytes.extend_from_slice(b"install-profile-v2\n");
+    // Encode both independently meaningful facts even where current CLI
+    // policy makes one imply the other. This keeps a full production tree
+    // distinct from both a normal tree and an omitted-dev tree.
+    write_bool(bytes, profile.omits_dev());
+    write_bool(bytes, profile.lifecycle_is_production());
 }
 
 /// Compute a deterministic BLAKE3 digest of one package's resolved dependency
@@ -457,6 +595,25 @@ pub fn build_plan(
     lifecycle_paths: &[String],
     owned_entries: Vec<ManagedEntry>,
 ) -> InstallPlan {
+    build_plan_with_profile(
+        lockfile,
+        artifact_ids,
+        lifecycle_paths,
+        owned_entries,
+        InstallProfile::default_profile(),
+    )
+}
+
+/// Build a plan whose initial (non-workspace) graph identity includes the
+/// install profile. Callers that also fold workspace/prepared identities may
+/// replace `graph_id_hex` with the matching project-level helper afterwards.
+pub fn build_plan_with_profile(
+    lockfile: &Lockfile,
+    artifact_ids: &[Option<ArtifactId>],
+    lifecycle_paths: &[String],
+    owned_entries: Vec<ManagedEntry>,
+    profile: InstallProfile,
+) -> InstallPlan {
     let entries = lockfile
         .packages
         .iter()
@@ -480,7 +637,7 @@ pub fn build_plan(
     InstallPlan {
         plan_version: PLAN_VERSION,
         materializer_version: MATERIALIZER_VERSION,
-        graph_id_hex: graph_id(lockfile).to_hex(),
+        graph_id_hex: graph_id_with_profile(lockfile, profile).to_hex(),
         lifecycle_paths: lifecycle_paths.to_vec(),
         owned_entries,
         entries,
@@ -567,10 +724,29 @@ pub fn validate_plan(
     project_root: &Path,
     store: &ArtifactStore,
 ) -> Result<(), PlanInvalid> {
+    validate_plan_with_profile(
+        plan,
+        lockfile,
+        project_root,
+        store,
+        InstallProfile::default_profile(),
+    )
+}
+
+/// Validate a cached plan against the projected lockfile and its effective
+/// install profile. A profile mismatch is a graph change, forcing a rebuild
+/// and safe stale-entry reconciliation rather than reuse of a normal tree.
+pub fn validate_plan_with_profile(
+    plan: &InstallPlan,
+    lockfile: &Lockfile,
+    project_root: &Path,
+    store: &ArtifactStore,
+    profile: InstallProfile,
+) -> Result<(), PlanInvalid> {
     if plan.plan_version != PLAN_VERSION || plan.materializer_version != MATERIALIZER_VERSION {
         return Err(PlanInvalid::VersionMismatch);
     }
-    let current = graph_id_for_project(lockfile, project_root).to_hex();
+    let current = graph_id_for_project_with_profile(lockfile, project_root, profile).to_hex();
     if plan.graph_id_hex != current {
         return Err(PlanInvalid::GraphChanged);
     }
@@ -686,6 +862,60 @@ mod tests {
         a.packages[0].version = "1.3.1".into();
         let id1 = graph_id(&a).to_hex();
         assert_ne!(id0, id1, "version change must alter the graph id");
+    }
+
+    #[test]
+    fn default_install_profile_preserves_historical_graph_identity() {
+        let lockfile = lf();
+        let profile = InstallProfile::default_profile();
+
+        assert_eq!(
+            graph_id(&lockfile),
+            graph_id_with_profile(&lockfile, profile),
+            "the default profile must be an exact historical identity wrapper"
+        );
+        assert_eq!(
+            graph_id_with_prepared(&lockfile, &BTreeMap::new()),
+            graph_id_with_prepared_and_profile(&lockfile, &BTreeMap::new(), profile),
+            "default prepared-volume identity must remain stable"
+        );
+    }
+
+    #[test]
+    fn production_profiles_separate_graph_even_when_package_sets_match() {
+        // This lock deliberately has no dev package records: the projection is
+        // physically identical for the full-tree production profile, but
+        // lifecycle output still differs because it forces NODE_ENV=production.
+        let lockfile = lf();
+        let default = InstallProfile::default_profile();
+        let production_full_tree = InstallProfile::production_full_tree();
+        let omitted = InstallProfile::dev_omitted();
+
+        assert!(!production_full_tree.omits_dev());
+        assert!(production_full_tree.lifecycle_is_production());
+        assert!(omitted.omits_dev());
+        assert!(omitted.lifecycle_is_production());
+
+        assert_ne!(
+            graph_id_with_profile(&lockfile, default),
+            graph_id_with_profile(&lockfile, production_full_tree),
+        );
+        assert_ne!(
+            graph_id_with_profile(&lockfile, production_full_tree),
+            graph_id_with_profile(&lockfile, omitted),
+        );
+        assert_ne!(
+            graph_id_with_prepared_and_profile(&lockfile, &BTreeMap::new(), default,),
+            graph_id_with_prepared_and_profile(&lockfile, &BTreeMap::new(), production_full_tree,),
+        );
+        assert_ne!(
+            graph_id_with_prepared_and_profile(&lockfile, &BTreeMap::new(), production_full_tree,),
+            graph_id_with_prepared_and_profile(&lockfile, &BTreeMap::new(), omitted),
+        );
+        assert_ne!(
+            graph_id_for_project_with_profile(&lockfile, Path::new("."), default),
+            graph_id_for_project_with_profile(&lockfile, Path::new("."), production_full_tree,),
+        );
     }
 
     #[test]

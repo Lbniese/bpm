@@ -15,7 +15,7 @@ cold-vs-warm performance story with cited benchmark numbers, see
 
 1. **Manifest and lockfile reader** — `src/manifest.rs`, `src/lockfile.rs`,
    and `src/npm_lock.rs` parse `package.json`, import npm `package-lock.json`
-   v3, and write canonical `bpm.lock` v2 files. Imported locks are enriched
+   v2/v3 packages tables, and write canonical `bpm.lock` v2 files. Imported locks are enriched
    from the sibling manifest so `bpm ci` validates dev, optional, peer, and
    override declarations. `src/npm_lock.rs` also exports npm v3 lockfiles for
    package-lock-authority projects.
@@ -46,8 +46,11 @@ cold-vs-warm performance story with cited benchmark numbers, see
    [remote-cache-protocol.md](remote-cache-protocol.md).
 6. **Graph and plan cache** — `src/graph.rs` computes canonical graph IDs,
    records platform/workspace/override/peer inputs, and stores disposable
-   install plans beside the lockfile in `.bpm-state`. Plan validation checks
-   graph-volume integrity and the live project view.
+   install plans beside the lockfile in `.bpm-state`. Dev-tree omission and
+   production lifecycle mode are independent explicit install-profile facts,
+   so `NODE_ENV=production --include=dev` cannot reuse normal full-tree
+   lifecycle output even though its retained package records match. Plan
+   validation checks graph-volume integrity and the live project view.
 7. **Reusable graph volumes** — `src/volume.rs` builds a complete graph-keyed
    `node_modules` projection under `graphs/blake3/<id>/` is built in private
    staging and lifecycle-completed before atomic publication. Graph entries are
@@ -69,7 +72,7 @@ cold-vs-warm performance story with cited benchmark numbers, see
    isolated-copy fallback; no junction or hardlink exposes shared content.
    Published graph metadata stores canonical ownership identities so normal
    attachment does not rehash copied project file bodies.
-8. **Materializer** — `src/materializer.rs` supports compatible npm-v3 layout
+8. **Materializer** — `src/materializer.rs` supports compatible npm v2/v3 layout
    and strict declared-edge validation. Its isolated Reflink backend falls back
    directly to independent copying; explicit Hardlink/Symlink primitives are
    not selected for graph or project publication. On Windows, safe
@@ -80,10 +83,15 @@ cold-vs-warm performance story with cited benchmark numbers, see
    execution. The platform script command produces `sh -c` on Unix and
    `cmd.exe /D /S /C` on Windows, with `COMSPEC` fallback.
 10. **Lifecycle runner** — `src/lifecycle.rs` supplies npm-compatible script
-   environments and `--ignore-scripts`. Graph-volume installs execute scripts
-   against unpublished isolated staging, so derived output persists only after
-   successful lifecycle completion and dependencies resolve through the complete
-   volume tree. Malformed manifests fail with typed path-specific errors;
+   environments and `--ignore-scripts`. The production lifecycle profile
+   injects `NODE_ENV=production` for dependency scripts and Git build-context
+   `prepare`, including derived-artifact identity; it remains active when
+   `--include=dev` restores the full tree. Arbitrary non-production
+   `NODE_ENV` values are deliberately outside the bounded environment.
+   Graph-volume installs execute scripts against unpublished isolated staging,
+   so derived output persists only after successful lifecycle completion and
+   dependencies resolve through the complete volume tree. Malformed manifests
+   fail with typed path-specific errors;
    workspace/compatible installs retain the disposable sandbox. The separate
    derived-artifact store remains an explicit future optimization.
 11. **CLI and measurement** — `src/cli/` exposes install, ci, import, exec,
@@ -125,7 +133,9 @@ keys or diagnostics.
 - **Graph ID** — BLAKE3 of canonical lockfile graph fields plus target
   platform and workspace layout. Root overrides, peer mode/context, package
   sources, platform constraints, lifecycle-affecting metadata, and bin/edge
-  mappings participate in the canonical bytes.
+  mappings participate in the canonical bytes. The default install profile is
+  byte-compatible with historical identities; every non-default dev-omission
+  or production-lifecycle profile adds an explicit deterministic salt.
 - **Install plan** — a versioned plan containing graph identity, materialized
   entries, bins, and lifecycle-derived paths. It is disposable; `bpm.lock` is
   authoritative.
@@ -146,6 +156,11 @@ enumeration, task completion order, or network timing.
    both the graph volume and project view remain valid.
 5. Old volume/plan layouts are invalidated by explicit materializer/layout
    versions; stale deletion still hashes the live tree before removal.
+6. Dev omission is an in-memory install projection, not a lockfile rewrite:
+   the complete lock remains frozen-validation authority and only retained
+   records are fetched/materialized. It retains normal/optional runtime edges
+   and required peer providers; optional/peer omission is intentionally
+   deferred.
 
 ## Remaining architectural decisions
 

@@ -1,9 +1,10 @@
-//! Import of npm `package-lock.json` (lockfileVersion 3) into a BPM lockfile.
+//! Import of npm `package-lock.json` (lockfileVersion 2 or 3) into a BPM
+//! lockfile.
 //!
-//! npm v3 stores a *flat* package table keyed by the package's
+//! npm v2 and v3 store a *flat* package table keyed by the package's
 //! `node_modules/...` path. The layout of the tree (including hoisting and
 //! nested copies) is fully encoded by those path keys, so the importer is a
-//! normalization pass: it reads the v3 table, validates it, and emits a
+//! normalization pass: it reads the packages table, validates it, and emits a
 //! canonical [`crate::lockfile::Lockfile`] plus structured diagnostics for
 //! anything BPM does not yet honor. The source lockfile is never modified
 //! (§10).
@@ -21,7 +22,15 @@ use crate::path_safety::{validate_bin_name, validate_bin_target, validate_packag
 use crate::resolver::overrides::{OverrideOrigin, OverrideSet};
 
 /// The npm lockfile version this importer supports.
+///
+/// This remains the canonical export version. Input acceptance is tracked
+/// separately by [`ACCEPTED_IMPORT_LOCKFILE_VERSIONS`].
 pub const SUPPORTED_LOCKFILE_VERSION: u32 = 3;
+
+/// npm lockfile versions accepted by [`import`]. Both versions use the
+/// `packages` table as the authoritative representation; v2's legacy
+/// top-level `dependencies` tree is intentionally ignored.
+pub const ACCEPTED_IMPORT_LOCKFILE_VERSIONS: &[u32] = &[2, 3];
 
 /// Result of importing a package-lock.
 #[derive(Debug)]
@@ -37,9 +46,7 @@ pub struct ImportReport {
 pub enum NpmLockError {
     #[error("failed to parse package-lock.json: {0}")]
     Parse(#[from] serde_json::Error),
-    #[error(
-        "unsupported lockfileVersion {0}: only version {SUPPORTED_LOCKFILE_VERSION} is supported"
-    )]
+    #[error("unsupported lockfileVersion {0}: only versions 2 and 3 are supported")]
     UnsupportedVersion(u32),
     #[error("package-lock.json has no \"packages\" table")]
     NoPackages,
@@ -87,7 +94,7 @@ struct RawPkg {
     bin: serde_json::Value,
     #[serde(default)]
     dependencies: BTreeMap<String, String>,
-    /// Root-only: npm's package-lock v3 records the project's devDependencies
+    /// Root-only: npm's package-lock v2/v3 records the project's devDependencies
     /// under the root `""` entry. We merge these into the lockfile's root
     /// `dependencies` so the frozen installer can detect drift across both
     /// production and dev declarations.
@@ -197,7 +204,7 @@ fn info(code: &'static str, package: impl Into<String>, message: impl Into<Strin
 pub fn import(json: &str) -> Result<ImportReport, NpmLockError> {
     let raw: RawLock = serde_json::from_str(json)?;
     let version = raw.lockfile_version.unwrap_or(0);
-    if version != SUPPORTED_LOCKFILE_VERSION {
+    if !ACCEPTED_IMPORT_LOCKFILE_VERSIONS.contains(&version) {
         return Err(NpmLockError::UnsupportedVersion(version));
     }
     if raw.packages.is_empty() {
@@ -239,7 +246,7 @@ pub fn import(json: &str) -> Result<ImportReport, NpmLockError> {
         let version = pkg.version.clone().unwrap_or_default();
         let link = pkg.link.unwrap_or(false);
 
-        // npm v3 records workspace manifests under their project-relative
+        // npm v2/v3 records workspace manifests under their project-relative
         // paths as metadata entries in addition to the installable
         // node_modules/<name> link entries. The metadata is consumed through
         // the link entry and must not be treated as a materialized package
@@ -748,13 +755,70 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_versions() {
-        let v2 = minimal_v3().replace("\"lockfileVersion\": 3", "\"lockfileVersion\": 2");
-        let err = import(&v2).unwrap_err();
-        assert!(
-            matches!(err, NpmLockError::UnsupportedVersion(2)),
-            "{err:?}"
+    fn imports_v2_packages_and_ignores_legacy_dependencies() {
+        let v2 = r#"{
+          "name": "app",
+          "lockfileVersion": 2,
+          "requires": true,
+          "packages": {
+            "": { "version": "1.0.0", "dependencies": { "foo": "^1.0.0" } },
+            "node_modules/foo": {
+              "version": "1.2.3",
+              "resolved": "https://example/foo-1.2.3.tgz",
+              "integrity": "sha512-AAA"
+            }
+          },
+          "dependencies": {
+            "foo": {
+              "version": "9.9.9",
+              "resolved": "https://example/legacy-foo-9.9.9.tgz",
+              "integrity": "sha512-LEGACY"
+            }
+          }
+        }"#;
+        let report = import(v2).unwrap();
+        let foo = report
+            .lockfile
+            .packages
+            .iter()
+            .find(|package| package.name == "foo")
+            .unwrap();
+        assert_eq!(foo.version, "1.2.3");
+        assert_eq!(foo.resolved, "https://example/foo-1.2.3.tgz");
+        assert_eq!(
+            report
+                .lockfile
+                .root
+                .dependencies
+                .get("foo")
+                .map(String::as_str),
+            Some("^1.0.0")
         );
+    }
+
+    #[test]
+    fn v2_and_v3_packages_tables_normalize_identically() {
+        let v3 = minimal_v3();
+        let v2 = v3.replace("\"lockfileVersion\": 3", "\"lockfileVersion\": 2");
+        assert_eq!(import(&v2).unwrap().lockfile, import(v3).unwrap().lockfile);
+    }
+
+    #[test]
+    fn rejects_unsupported_versions() {
+        for version in [0, 1, 4] {
+            let json = minimal_v3().replace(
+                "\"lockfileVersion\": 3",
+                &format!("\"lockfileVersion\": {version}"),
+            );
+            let err = import(&json).unwrap_err();
+            assert!(
+                matches!(err, NpmLockError::UnsupportedVersion(v) if v == version),
+                "{err:?}"
+            );
+            assert!(err
+                .to_string()
+                .contains("only versions 2 and 3 are supported"));
+        }
     }
 
     #[test]

@@ -206,6 +206,8 @@ fn install_options(
         json_metrics: None,
         global: false,
         ignore_scripts: false,
+        omit_dev: false,
+        include_dev: false,
         derived_store: false,
         // Pass `false` so `install::run` applies its own env-based default
         // (on unless `BPM_GIT_PREPARE=0`), matching a plain `bpm install`.

@@ -574,42 +574,53 @@ fn add_resolves_a_transitive_dependency() {
 #[test]
 fn add_to_package_lock_project_exports_npm_v3() {
     let registry = MockRegistry::new(vec![one_package("lodash", "4.17.21", &BTreeMap::new())]);
-    let project = tempfile::tempdir().unwrap();
-    let store = tempfile::tempdir().unwrap();
-    write_manifest(project.path(), r#"{"name":"app","version":"1.0.0"}"#);
-    // A pre-existing package-lock.json v3 makes this an npm-authority project.
-    fs::write(
-        project.path().join("package-lock.json"),
-        r#"{"name":"app","lockfileVersion":3,"packages":{"":{"name":"app","version":"1.0.0"}}}"#,
-    )
-    .unwrap();
+    for version in [2, 3] {
+        let project = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        write_manifest(project.path(), r#"{"name":"app","version":"1.0.0"}"#);
+        // A pre-existing package-lock.json v2 or v3 makes this an
+        // npm-authority project. v2's legacy tree is deliberately conflicting
+        // and must not affect the packages-table import.
+        let legacy = if version == 2 {
+            r#", "dependencies": {"lodash": {"version": "9.9.9"}}"#
+        } else {
+            ""
+        };
+        let lock = format!(
+            r#"{{"name":"app","lockfileVersion":{version},"packages":{{"":{{"name":"app","version":"1.0.0"}}}}{legacy}}}"#
+        );
+        fs::write(project.path().join("package-lock.json"), lock).unwrap();
 
-    let (ok, stdout, stderr) = run_bpm(
-        &["add", "lodash", "--registry", registry.url()],
-        project.path(),
-        store.path(),
-    );
-    assert!(ok, "stderr: {stderr}\nstdout: {stdout}");
+        let (ok, stdout, stderr) = run_bpm(
+            &["add", "lodash", "--registry", registry.url()],
+            project.path(),
+            store.path(),
+        );
+        assert!(
+            ok,
+            "v{version} stderr: {stderr}\nv{version} stdout: {stdout}"
+        );
 
-    let lock_text = fs::read_to_string(project.path().join("package-lock.json")).unwrap();
-    let lock: serde_json::Value = serde_json::from_str(&lock_text).unwrap();
-    assert_eq!(lock["lockfileVersion"].as_u64(), Some(3));
-    assert_eq!(
-        lock["packages"][""]["dependencies"]["lodash"].as_str(),
-        Some("^4.17.21")
-    );
-    let lodash_pkg = &lock["packages"]["node_modules/lodash"];
-    assert_eq!(lodash_pkg["version"].as_str(), Some("4.17.21"));
-    assert!(lodash_pkg["resolved"]
-        .as_str()
-        .unwrap()
-        .contains("lodash-4.17.21.tgz"));
-    assert!(lodash_pkg["integrity"]
-        .as_str()
-        .unwrap()
-        .starts_with("sha512-"));
-    // No bpm.lock was introduced alongside the package-lock.
-    assert!(!project.path().join("bpm.lock").exists());
+        let lock_text = fs::read_to_string(project.path().join("package-lock.json")).unwrap();
+        let lock: serde_json::Value = serde_json::from_str(&lock_text).unwrap();
+        assert_eq!(lock["lockfileVersion"].as_u64(), Some(3));
+        assert_eq!(
+            lock["packages"][""]["dependencies"]["lodash"].as_str(),
+            Some("^4.17.21")
+        );
+        let lodash_pkg = &lock["packages"]["node_modules/lodash"];
+        assert_eq!(lodash_pkg["version"].as_str(), Some("4.17.21"));
+        assert!(lodash_pkg["resolved"]
+            .as_str()
+            .unwrap()
+            .contains("lodash-4.17.21.tgz"));
+        assert!(lodash_pkg["integrity"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha512-"));
+        // No bpm.lock was introduced alongside the package-lock.
+        assert!(!project.path().join("bpm.lock").exists());
+    }
 }
 
 #[test]

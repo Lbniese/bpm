@@ -25,7 +25,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::graph::{graph_id_with_prepared, ManagedEntry, IDENTITY_RELAY, IDENTITY_TREE};
+use crate::graph::{
+    graph_id_with_prepared_and_profile, InstallProfile, ManagedEntry, IDENTITY_RELAY, IDENTITY_TREE,
+};
 use crate::integrity::ArtifactId;
 use crate::lockfile::Lockfile;
 #[cfg(unix)]
@@ -297,12 +299,35 @@ pub fn ensure_graph_volume_with_prepared(
     prepared: &BTreeMap<String, crate::lifecycle::PreparedImage>,
     metrics: &mut Metrics,
 ) -> Result<EnsuredVolume, VolumeError> {
+    ensure_graph_volume_with_prepared_and_profile(
+        store,
+        lockfile,
+        artifact_ids,
+        prepared,
+        InstallProfile::default_profile(),
+        metrics,
+    )
+}
+
+/// Profile-aware counterpart of [`ensure_graph_volume_with_prepared`].
+///
+/// An omitted-dev profile gets a distinct durable volume even if its projected
+/// package set happens to equal the normal set, because lifecycle output may
+/// differ under `NODE_ENV=production`.
+pub fn ensure_graph_volume_with_prepared_and_profile(
+    store: &ArtifactStore,
+    lockfile: &Lockfile,
+    artifact_ids: &[Option<ArtifactId>],
+    prepared: &BTreeMap<String, crate::lifecycle::PreparedImage>,
+    profile: InstallProfile,
+    metrics: &mut Metrics,
+) -> Result<EnsuredVolume, VolumeError> {
     let build_start = std::time::Instant::now();
     let prepared_keys = prepared
         .iter()
         .map(|(path, image)| (path.clone(), *image.key.as_bytes()))
         .collect::<BTreeMap<_, _>>();
-    let gid = graph_id_with_prepared(lockfile, &prepared_keys);
+    let gid = graph_id_with_prepared_and_profile(lockfile, &prepared_keys, profile);
     let graph_hex = gid.to_hex();
     let volume_dir = store.graph_volume_path(&graph_hex);
 

@@ -8,7 +8,7 @@
 /// worker threads. Bounded to avoid overwhelming the registry connection pool.
 const ASYNC_RESOLVER_WORKERS: usize = 8;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -43,6 +43,12 @@ pub(super) struct Options {
     pub json_metrics: Option<PathBuf>,
     pub global: bool,
     pub ignore_scripts: bool,
+    /// Explicit `--omit=dev` request. `NODE_ENV=production` is evaluated at
+    /// install time so callers that construct these options internally retain
+    /// the same npm-compatible default.
+    pub omit_dev: bool,
+    /// Explicit `--include=dev` request, which wins over either omit source.
+    pub include_dev: bool,
     /// Experimental per-package lifecycle-derived image cache (`--derived-store` / `BPM_DERIVED_STORE`).
     pub derived_store: bool,
     /// Run Git package build-context prepare scripts and consume their images.
@@ -57,6 +63,36 @@ pub(super) struct Options {
     /// `bpm install -E` / `bpm add --save-exact`: save the resolved version as
     /// an exact `X.Y.Z` rather than the default `^X.Y.Z`.
     pub save_exact: bool,
+}
+
+impl Options {
+    /// `NODE_ENV` has one bounded compatibility meaning in this slice: only
+    /// the exact production value selects npm's production profile. Other
+    /// ambient values do not leak into lifecycle/cache identity.
+    fn ambient_production_mode() -> bool {
+        matches!(env::var("NODE_ENV").as_deref(), Ok("production"))
+    }
+
+    /// Effective npm-compatible dev omission. Explicit inclusion always wins
+    /// regardless of argv order.
+    fn effective_omit_dev(&self) -> bool {
+        self.install_profile().omits_dev()
+    }
+
+    fn install_profile(&self) -> graph::InstallProfile {
+        let ambient_production = Self::ambient_production_mode();
+        let omit_dev = (self.omit_dev || ambient_production) && !self.include_dev;
+        if omit_dev {
+            graph::InstallProfile::dev_omitted()
+        } else if ambient_production {
+            // `--include=dev` restores the physical tree but not the
+            // lifecycle environment inherited from production mode. Its
+            // distinct profile prevents reuse of normal lifecycle output.
+            graph::InstallProfile::production_full_tree()
+        } else {
+            graph::InstallProfile::default_profile()
+        }
+    }
 }
 
 pub(super) fn run(mut options: Options) -> anyhow::Result<()> {
@@ -124,7 +160,7 @@ pub(super) fn run(mut options: Options) -> anyhow::Result<()> {
             )
         }
         None if options.frozen => anyhow::bail!(
-            "frozen install requires bpm.lock or supported package-lock.json v3 in {} or an ancestor",
+            "frozen install requires bpm.lock or supported package-lock.json v2/v3 in {} or an ancestor",
             cwd.display()
         ),
         None => {
@@ -187,7 +223,11 @@ pub(super) fn run(mut options: Options) -> anyhow::Result<()> {
             //   non-streaming + blocking -> blocking resolver, then install
             //   pipeline. The two non-streaming rows share the lockfile write +
             //   install_resolved_lockfile handoff below.
-            if streaming_install_enabled() && async_resolve_enabled() {
+            // Omitted-dev installation must classify the complete resolved
+            // graph before any artifact is fetched. Keep normal installs on
+            // the established streaming path, but force this profile through
+            // the resolve -> authoritative-lock write -> projection handoff.
+            if !options.effective_omit_dev() && streaming_install_enabled() && async_resolve_enabled() {
                 return run_streaming_async_install(
                     &root,
                     &manifest,
@@ -202,7 +242,7 @@ pub(super) fn run(mut options: Options) -> anyhow::Result<()> {
                     &snapshot_key,
                 );
             }
-            if streaming_install_enabled() {
+            if !options.effective_omit_dev() && streaming_install_enabled() {
                 return run_streaming_install(
                     &root,
                     &manifest,
@@ -286,8 +326,16 @@ pub(super) fn install_resolved_lockfile(
     let store = ArtifactStore::open(store_root_path)?;
     let mut metrics = Metrics::new();
     if options.frozen {
+        // Drift truth is always the complete lock, never the install-only
+        // omitted-dev projection below.
         enforce_frozen(project_root, &lockfile, lock_kind.filename())?;
     }
+    let profile = options.install_profile();
+    let lockfile = if profile.omits_dev() {
+        project_lockfile_omitting_dev(&lockfile)
+    } else {
+        lockfile
+    };
 
     let config = effective_npm_config(project_root, options.registry.as_deref())?;
     let http = HttpClient::new(config.clone());
@@ -321,7 +369,8 @@ pub(super) fn install_resolved_lockfile(
             .any(|resolution| matches!(resolution.source, LockSource::Git { .. }));
     let plan_valid = !git_prepare_enabled
         && cached_plan.as_ref().is_some_and(|plan| {
-            graph::validate_plan(plan, &lockfile, project_root, &store).is_ok()
+            graph::validate_plan_with_profile(plan, &lockfile, project_root, &store, profile)
+                .is_ok()
         });
     if plan_valid {
         metrics.record("plan_cache_hit", std::time::Duration::ZERO);
@@ -344,7 +393,7 @@ pub(super) fn install_resolved_lockfile(
         // record access, and rewrite the durable project registration + SQLite
         // reference. A legacy/incomplete cached volume returns an error here so
         // the caller retries a full install to avoid a false no-op success.
-        let graph_id = graph::graph_id_for_project(&lockfile, project_root);
+        let graph_id = graph::graph_id_for_project_with_profile(&lockfile, project_root, profile);
         let graph_hex = graph_id.to_hex();
         let graph_hex_short = graph_id.to_hex_short();
         let graph_path = store.graph_volume_path(&graph_hex);
@@ -415,7 +464,173 @@ pub(super) fn install_resolved_lockfile(
         lockfile_path,
         &registry,
         cached_plan.as_ref(),
+        profile,
     )
+}
+
+/// Build the install-only projection used by effective `--omit=dev` installs.
+///
+/// The authoritative lock remains complete on disk. We begin with every
+/// package that is not marked dev-only, then retain the fixed-point runtime
+/// closure of their normal, optional, and required peer/provider edges. Native
+/// locks provide exact targets in `resolution.packages`; direct npm package
+/// tables do not, so their declared dependencies use a conservative Node-style
+/// placement lookup. Ambiguous legacy provenance retains rather than prunes.
+fn project_lockfile_omitting_dev(authoritative: &Lockfile) -> Lockfile {
+    let all_paths: BTreeSet<String> = authoritative
+        .packages
+        .iter()
+        .map(|package| package.path.clone())
+        .collect();
+    let package_by_path: HashMap<&str, &bpm::lockfile::PackageEntry> = authoritative
+        .packages
+        .iter()
+        .map(|package| (package.path.as_str(), package))
+        .collect();
+    let mut retained: BTreeSet<String> = authoritative
+        .packages
+        .iter()
+        .filter(|package| !package.dev)
+        .map(|package| package.path.clone())
+        .collect();
+    let mut pending: VecDeque<String> = retained.iter().cloned().collect();
+
+    while let Some(path) = pending.pop_front() {
+        let Some(package) = package_by_path.get(path.as_str()).copied() else {
+            // The authoritative input may already contain a dangling edge. Do
+            // not turn it into a different omission error by inventing a
+            // package record; only filter real records below.
+            continue;
+        };
+        for target in runtime_dependency_targets(authoritative, package, &all_paths) {
+            if all_paths.contains(&target) && retained.insert(target.clone()) {
+                pending.push_back(target);
+            }
+        }
+    }
+
+    let mut projected = authoritative.clone();
+    projected
+        .packages
+        .retain(|package| retained.contains(&package.path));
+    projected
+        .resolution
+        .packages
+        .retain(|path, _| retained.contains(path));
+    projected
+        .resolution
+        .registry_names
+        .retain(|path, _| retained.contains(path));
+    prune_omitted_optional_peer_metadata(&mut projected, &retained);
+    projected.sort_packages();
+    projected
+}
+
+/// Return every runtime target that must survive dev omission for a package.
+///
+/// Exact resolver metadata is authoritative when available. When an imported
+/// npm package table lacks it, only undeclared metadata entries fall back to a
+/// Node lookup through known physical placements; this can retain more than a
+/// fully annotated native lock, but never removes a required edge on guesswork.
+fn runtime_dependency_targets(
+    lockfile: &Lockfile,
+    package: &bpm::lockfile::PackageEntry,
+    all_paths: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let mut targets = BTreeSet::new();
+    let mut metadata_names = BTreeSet::new();
+    if let Some(metadata) = lockfile.resolution.packages.get(&package.path) {
+        for (name, dependency) in metadata
+            .dependencies
+            .iter()
+            .chain(metadata.optional_dependencies.iter())
+        {
+            metadata_names.insert(name.as_str());
+            targets.insert(dependency.target.clone());
+        }
+        for (name, dependency) in &metadata.peer_dependencies {
+            metadata_names.insert(name.as_str());
+            if !metadata.optional_peers.contains(name) {
+                targets.insert(dependency.target.clone());
+            }
+        }
+        for (name, provider) in &metadata.peer_context {
+            if !metadata.optional_peers.contains(name) {
+                targets.insert(provider.path.clone());
+            }
+        }
+    }
+
+    // Imported package-lock tables retain dependency specs but do not carry
+    // BPM's resolved target metadata. Fall back only for names not covered by
+    // metadata so a native explicit target is never second-guessed.
+    for name in package.dependencies.keys() {
+        if metadata_names.contains(name.as_str()) {
+            continue;
+        }
+        if let Some(target) = node_style_dependency_target(&package.path, name, all_paths) {
+            targets.insert(target);
+        }
+    }
+    targets
+}
+
+/// Resolve one legacy package-table dependency by the Node module lookup
+/// sequence, restricted to the complete lock's known physical placements.
+fn node_style_dependency_target(
+    package_path: &str,
+    dependency_name: &str,
+    all_paths: &BTreeSet<String>,
+) -> Option<String> {
+    let mut owner = Some(package_path);
+    while let Some(current) = owner {
+        let candidate = format!("{current}/node_modules/{dependency_name}");
+        if all_paths.contains(&candidate) {
+            return Some(candidate);
+        }
+        owner = parent_package_path(current);
+    }
+    let root_candidate = format!("node_modules/{dependency_name}");
+    all_paths
+        .contains(&root_candidate)
+        .then_some(root_candidate)
+}
+
+/// Package path of the containing physical package, if any. Root placements
+/// have no `/node_modules/` prefix before their own final placement segment.
+fn parent_package_path(path: &str) -> Option<&str> {
+    path.rsplit_once("/node_modules/").map(|(parent, _)| parent)
+}
+
+/// Optional peers are intentionally not retained solely for omission. If their
+/// target/provider was omitted, remove only that stale optional metadata while
+/// preserving every remaining declaration and all required/dangling edges.
+fn prune_omitted_optional_peer_metadata(lockfile: &mut Lockfile, retained: &BTreeSet<String>) {
+    for metadata in lockfile.resolution.packages.values_mut() {
+        let optional_peers: Vec<String> = metadata.optional_peers.iter().cloned().collect();
+        for name in optional_peers {
+            let peer_target_omitted = metadata
+                .peer_dependencies
+                .get(&name)
+                .is_some_and(|dependency| !retained.contains(&dependency.target));
+            let provider_omitted = metadata
+                .peer_context
+                .get(&name)
+                .is_some_and(|provider| !retained.contains(&provider.path));
+
+            if peer_target_omitted {
+                metadata.peer_dependencies.remove(&name);
+            }
+            if provider_omitted {
+                metadata.peer_context.remove(&name);
+            }
+            if !metadata.peer_dependencies.contains_key(&name)
+                && !metadata.peer_context.contains_key(&name)
+            {
+                metadata.optional_peers.remove(&name);
+            }
+        }
+    }
 }
 
 /// The project's `node_modules` attachment shape, resolved from
@@ -496,6 +711,11 @@ fn auto_local_project_view(lockfile: &Lockfile) -> bool {
     // a transitive placement, but Next still resolves its toolchain from the
     // project and requires those realpaths to remain project-local.
     let fragile = local_view_fragile_packages();
+    auto_local_project_view_with_fragile(lockfile, &fragile)
+}
+
+#[cfg(test)]
+fn auto_local_project_view_with_fragile(lockfile: &Lockfile, fragile: &[String]) -> bool {
     lockfile
         .packages
         .iter()
@@ -534,6 +754,7 @@ fn run_lifecycle_if_enabled(
     ignore_scripts: bool,
     skip_execution: bool,
     derived_store: bool,
+    profile: graph::InstallProfile,
     metrics: &mut Metrics,
 ) -> anyhow::Result<bpm::lifecycle::LifecycleStats> {
     if ignore_scripts {
@@ -545,13 +766,14 @@ fn run_lifecycle_if_enabled(
         skip_execution,
         use_derived_store: derived_store,
     };
-    let result = bpm::lifecycle::run_lifecycle(
+    let result = bpm::lifecycle::run_lifecycle_with_profile(
         project_root,
         store,
         lockfile,
         artifact_ids,
         volume_path,
         policy,
+        profile,
         metrics,
     )?;
     if result.skipped {
@@ -1543,6 +1765,7 @@ fn run_streaming_async_install(
         &path,
         &bpm::registry::RegistryClient::new(config),
         None,
+        options.install_profile(),
     )
 }
 
@@ -1694,6 +1917,7 @@ fn run_streaming_install(
         &path,
         client,
         None,
+        options.install_profile(),
     )
 }
 
@@ -1713,6 +1937,7 @@ fn finalize_install(
     lockfile_path: &Path,
     registry: &bpm::registry::RegistryClient,
     prior_plan: Option<&bpm::graph::InstallPlan>,
+    profile: graph::InstallProfile,
 ) -> anyhow::Result<()> {
     // Prior ownership for stale-entry reconciliation. A pre-fix (version-2)
     // plan persists `owned_entries` empty; in that one case conservatively
@@ -1747,12 +1972,13 @@ fn finalize_install(
         .any(|package| package.link && package.path.contains("/node_modules/"));
     let direct_materialization = has_workspace_links && !has_nested_links;
     let prepared = if git_prepare_enabled && !options.ignore_scripts && !direct_materialization {
-        bpm::lifecycle::prepare_git_packages(
+        bpm::lifecycle::prepare_git_packages_with_profile(
             project_root,
             store,
             lockfile,
             artifact_ids,
             registry,
+            profile,
             metrics,
         )?
     } else {
@@ -1819,15 +2045,17 @@ fn finalize_install(
                 options.ignore_scripts,
                 false,
                 options.derived_store,
+                profile,
                 metrics,
             )?,
         )
     } else {
-        let ensured = bpm::volume::ensure_graph_volume_with_prepared(
+        let ensured = bpm::volume::ensure_graph_volume_with_prepared_and_profile(
             store,
             lockfile,
             artifact_ids,
             &prepared,
+            profile,
             metrics,
         )?;
         let (volume, lifecycle) = match ensured {
@@ -1841,6 +2069,7 @@ fn finalize_install(
                     options.ignore_scripts,
                     true,
                     options.derived_store,
+                    profile,
                     metrics,
                 )?;
                 (volume, lifecycle)
@@ -1855,6 +2084,7 @@ fn finalize_install(
                     options.ignore_scripts,
                     false,
                     options.derived_store,
+                    profile,
                     metrics,
                 )?;
                 let volume = pending.publish()?;
@@ -1915,18 +2145,24 @@ fn finalize_install(
 
     let plan_start = Instant::now();
     let plan_path = graph::plan_path_for(lockfile_path);
-    let mut plan = graph::build_plan(
+    let mut plan = graph::build_plan_with_profile(
         lockfile,
         artifact_ids,
         &lifecycle.derived_paths,
         final_ownership.clone(),
+        profile,
     );
     let prepared_keys = prepared
         .iter()
         .map(|(path, image)| (path.clone(), *image.key.as_bytes()))
         .collect::<BTreeMap<_, _>>();
-    plan.graph_id_hex =
-        graph::graph_id_for_project_with_prepared(lockfile, project_root, &prepared_keys).to_hex();
+    plan.graph_id_hex = graph::graph_id_for_project_with_prepared_and_profile(
+        lockfile,
+        project_root,
+        &prepared_keys,
+        profile,
+    )
+    .to_hex();
     if let Err(error) = graph::write_plan(&plan, &plan_path) {
         eprintln!(
             "warning: failed to write plan {}: {error}",
@@ -2058,12 +2294,16 @@ impl std::error::Error for FetchFail {
 #[cfg(test)]
 mod tests {
     use super::{
-        assert_outcomes_complete, auto_local_project_view, resolve_project_view_with, FetchOutcome,
-        InstallWork, ProjectView, TryChannelSink,
+        assert_outcomes_complete, auto_local_project_view, auto_local_project_view_with_fragile,
+        project_lockfile_omitting_dev, resolve_project_view_with, FetchOutcome, InstallWork,
+        ProjectView, TryChannelSink,
     };
     use bpm::integrity::ArtifactId;
-    use bpm::lockfile::{Lockfile, PackageEntry};
+    use bpm::lockfile::{
+        LockDependency, LockSource, Lockfile, PackageEntry, PackageResolution, PeerProvider,
+    };
     use bpm::resolver::{ResolveSink, ResolvedDownloadUnit};
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::{mpsc::sync_channel, Arc, Mutex};
 
     fn unit(path: &str) -> ResolvedDownloadUnit {
@@ -2187,10 +2427,16 @@ mod tests {
     }
 
     #[test]
-    fn auto_view_detects_allowlisted_package_from_env() {
-        // The built-in `next` default must keep working even when the env list
-        // is set without it; the env list only extends the allowlist.
-        std::env::set_var("BPM_LOCAL_VIEW_PACKAGES", "turbopack,vite");
+    fn auto_view_detects_configured_fragile_package() {
+        // Exercise the configuration result without mutating a process-global
+        // environment variable: Rust's unit-test harness runs tests in
+        // parallel, so changing BPM_LOCAL_VIEW_PACKAGES here races unrelated
+        // view-selection tests.
+        let fragile = vec![
+            "next".to_string(),
+            "turbopack".to_string(),
+            "vite".to_string(),
+        ];
         let mut lockfile = Lockfile::new("test");
         lockfile.packages.push(PackageEntry {
             path: "node_modules/turbopack".into(),
@@ -2199,7 +2445,7 @@ mod tests {
             ..Default::default()
         });
         // Env-added package triggers the local view.
-        assert!(auto_local_project_view(&lockfile));
+        assert!(auto_local_project_view_with_fragile(&lockfile, &fragile));
 
         let mut lockfile = Lockfile::new("test");
         lockfile.packages.push(PackageEntry {
@@ -2209,7 +2455,7 @@ mod tests {
             ..Default::default()
         });
         // Built-in `next` still triggers even though the env list omitted it.
-        assert!(auto_local_project_view(&lockfile));
+        assert!(auto_local_project_view_with_fragile(&lockfile, &fragile));
 
         let mut lockfile = Lockfile::new("test");
         lockfile.packages.push(PackageEntry {
@@ -2219,9 +2465,7 @@ mod tests {
             ..Default::default()
         });
         // A package neither built-in nor env-listed does not trigger.
-        assert!(!auto_local_project_view(&lockfile));
-
-        std::env::remove_var("BPM_LOCAL_VIEW_PACKAGES");
+        assert!(!auto_local_project_view_with_fragile(&lockfile, &fragile));
     }
 
     #[test]
@@ -2250,5 +2494,170 @@ mod tests {
             resolve_project_view_with(&lockfile, project_root, Some("bogus")),
             ProjectView::Reflink
         );
+    }
+
+    fn projection_package(path: &str, dev: bool) -> PackageEntry {
+        PackageEntry {
+            path: path.to_owned(),
+            name: path.rsplit('/').next().unwrap_or(path).to_owned(),
+            version: "1.0.0".into(),
+            resolved: format!("https://example.test/{path}.tgz"),
+            integrity: Some("sha512-test".into()),
+            dev,
+            ..Default::default()
+        }
+    }
+
+    fn projection_resolution() -> PackageResolution {
+        PackageResolution {
+            source: LockSource::Registry {
+                registry: "https://registry.npmjs.org".into(),
+            },
+            dev_optional: false,
+            peer: false,
+            libc: Vec::new(),
+            dependencies: BTreeMap::new(),
+            optional_dependencies: BTreeMap::new(),
+            peer_dependencies: BTreeMap::new(),
+            optional_peers: BTreeSet::new(),
+            peer_context: BTreeMap::new(),
+            workspace_target: None,
+            has_install_script: false,
+        }
+    }
+
+    fn target(path: &str) -> LockDependency {
+        LockDependency {
+            spec: "^1.0.0".into(),
+            target: path.into(),
+        }
+    }
+
+    #[test]
+    fn omit_dev_projection_retains_runtime_closure_and_prunes_optional_peer_metadata() {
+        let mut full = Lockfile::new("test");
+        for (path, dev) in [
+            ("node_modules/runtime", false),
+            ("node_modules/runtime-child", true),
+            ("node_modules/optional-child", true),
+            ("node_modules/required-provider", true),
+            ("node_modules/optional-provider", true),
+            ("node_modules/dev-only", true),
+        ] {
+            full.packages.push(projection_package(path, dev));
+        }
+        let mut runtime = projection_resolution();
+        runtime
+            .dependencies
+            .insert("runtime-child".into(), target("node_modules/runtime-child"));
+        runtime.optional_dependencies.insert(
+            "optional-child".into(),
+            target("node_modules/optional-child"),
+        );
+        runtime.peer_dependencies.insert(
+            "required-provider".into(),
+            target("node_modules/required-provider"),
+        );
+        runtime.peer_context.insert(
+            "required-provider".into(),
+            PeerProvider {
+                name: "required-provider".into(),
+                version: "1.0.0".into(),
+                source: LockSource::Registry {
+                    registry: "https://registry.npmjs.org".into(),
+                },
+                path: "node_modules/required-provider".into(),
+            },
+        );
+        runtime.peer_dependencies.insert(
+            "optional-provider".into(),
+            target("node_modules/optional-provider"),
+        );
+        runtime.optional_peers.insert("optional-provider".into());
+        runtime.peer_context.insert(
+            "optional-provider".into(),
+            PeerProvider {
+                name: "optional-provider".into(),
+                version: "1.0.0".into(),
+                source: LockSource::Registry {
+                    registry: "https://registry.npmjs.org".into(),
+                },
+                path: "node_modules/optional-provider".into(),
+            },
+        );
+        full.resolution
+            .packages
+            .insert("node_modules/runtime".into(), runtime);
+        for path in [
+            "node_modules/runtime-child",
+            "node_modules/optional-child",
+            "node_modules/required-provider",
+            "node_modules/optional-provider",
+            "node_modules/dev-only",
+        ] {
+            full.resolution
+                .packages
+                .insert(path.into(), projection_resolution());
+        }
+        full.resolution
+            .registry_names
+            .insert("node_modules/dev-only".into(), "dev-only".into());
+        full.sort_packages();
+        let authoritative_before = full.clone();
+
+        let projected = project_lockfile_omitting_dev(&full);
+        let paths = projected
+            .packages
+            .iter()
+            .map(|package| package.path.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            paths,
+            BTreeSet::from([
+                "node_modules/runtime",
+                "node_modules/runtime-child",
+                "node_modules/optional-child",
+                "node_modules/required-provider",
+            ])
+        );
+        let runtime = &projected.resolution.packages["node_modules/runtime"];
+        assert!(runtime.peer_dependencies.contains_key("required-provider"));
+        assert!(runtime.peer_context.contains_key("required-provider"));
+        assert!(!runtime.peer_dependencies.contains_key("optional-provider"));
+        assert!(!runtime.peer_context.contains_key("optional-provider"));
+        assert!(!runtime.optional_peers.contains("optional-provider"));
+        assert!(!projected
+            .resolution
+            .registry_names
+            .contains_key("node_modules/dev-only"));
+        assert_eq!(
+            full, authoritative_before,
+            "the projection must never mutate authoritative lock truth"
+        );
+    }
+
+    #[test]
+    fn omit_dev_projection_uses_node_lookup_for_unannotated_package_locks() {
+        let mut full = Lockfile::new("test");
+        let mut host = projection_package("node_modules/host", false);
+        host.dependencies.insert("nested".into(), "^1.0.0".into());
+        full.packages.push(host);
+        full.packages.push(projection_package(
+            "node_modules/host/node_modules/nested",
+            true,
+        ));
+        full.packages
+            .push(projection_package("node_modules/dev-only", true));
+        full.sort_packages();
+
+        let projected = project_lockfile_omitting_dev(&full);
+        let paths = projected
+            .packages
+            .iter()
+            .map(|package| package.path.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(paths.contains("node_modules/host"));
+        assert!(paths.contains("node_modules/host/node_modules/nested"));
+        assert!(!paths.contains("node_modules/dev-only"));
     }
 }

@@ -6,7 +6,7 @@
 //! - `integrity`, `download`, `archive`, `store`, `metrics`: the immutable
 //!   artifact store.
 //! - `derived`: lifecycle output cache keyed by build-visible inputs.
-//! - `lockfile`, `npm_lock`, `project_lock`: package-lock v3 import,
+//! - `lockfile`, `npm_lock`, `project_lock`: package-lock v2/v3 import,
 //!   selected-lock discovery, and the canonical `bpm.lock`.
 //! - `materializer`: project-local `node_modules` materialization for the
 //!   frozen installer.
