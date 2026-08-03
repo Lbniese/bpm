@@ -2,7 +2,18 @@
 
 use std::{ffi::OsString, path::PathBuf};
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+
+/// Dependency classes accepted by the bounded install omit/include surface.
+///
+/// Keep this typed instead of accepting arbitrary strings: this compatibility
+/// slice deliberately supports only `dev`, and accepting `optional` or `peer`
+/// without implementing their semantics would silently produce an incorrect
+/// install tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum DependencyFilter {
+    Dev,
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -223,6 +234,14 @@ pub(crate) enum Commands {
         /// Do not run lifecycle scripts.
         #[arg(long)]
         ignore_scripts: bool,
+        /// Exclude a dependency class from the installed tree. Repeatable;
+        /// this slice supports only `dev`.
+        #[arg(long, value_enum)]
+        omit: Vec<DependencyFilter>,
+        /// Include a dependency class even when it is omitted by a flag or
+        /// NODE_ENV. Repeatable; this slice supports only `dev`.
+        #[arg(long, value_enum)]
+        include: Vec<DependencyFilter>,
         /// Cache lifecycle-derived package images per dependency closure, so a
         /// package's scripts never re-run when another graph shares its closure
         /// (experimental; default off).
@@ -428,6 +447,14 @@ pub(crate) enum Commands {
         /// Do not run lifecycle scripts.
         #[arg(long)]
         ignore_scripts: bool,
+        /// Exclude a dependency class from the installed tree. Repeatable;
+        /// this slice supports only `dev`.
+        #[arg(long, value_enum)]
+        omit: Vec<DependencyFilter>,
+        /// Include a dependency class even when it is omitted by a flag or
+        /// NODE_ENV. Repeatable; this slice supports only `dev`.
+        #[arg(long, value_enum)]
+        include: Vec<DependencyFilter>,
         /// Cache lifecycle-derived package images per dependency closure, so a
         /// package's scripts never re-run when another graph shares its closure
         /// (experimental; default off).
@@ -615,7 +642,7 @@ mod tests {
 
     use clap::{error::ErrorKind, CommandFactory, Parser};
 
-    use super::{Cli, Commands};
+    use super::{Cli, Commands, DependencyFilter};
 
     #[test]
     fn documented_command_inventory() {
@@ -786,6 +813,47 @@ mod tests {
         };
         assert!(targets.is_empty());
         assert!(frozen);
+    }
+
+    #[test]
+    fn install_and_ci_accept_repeatable_dev_omit_include_values() {
+        let cli = Cli::try_parse_from([
+            "bpm",
+            "install",
+            "--omit=dev",
+            "--omit",
+            "dev",
+            "--include=dev",
+        ])
+        .unwrap();
+        let Commands::Install { omit, include, .. } = cli.command else {
+            panic!("expected install command");
+        };
+        assert_eq!(omit, vec![DependencyFilter::Dev, DependencyFilter::Dev]);
+        assert_eq!(include, vec![DependencyFilter::Dev]);
+
+        let cli = Cli::try_parse_from(["bpm", "ci", "--include=dev", "--omit=dev"]).unwrap();
+        let Commands::Ci { omit, include, .. } = cli.command else {
+            panic!("expected ci command");
+        };
+        assert_eq!(omit, vec![DependencyFilter::Dev]);
+        assert_eq!(include, vec![DependencyFilter::Dev]);
+    }
+
+    #[test]
+    fn omit_and_include_reject_unimplemented_dependency_classes() {
+        for (flag, value) in [
+            ("--omit=optional", "optional"),
+            ("--omit=peer", "peer"),
+            ("--include=optional", "optional"),
+            ("--include=peer", "peer"),
+        ] {
+            let error = Cli::try_parse_from(["bpm", "install", flag]).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::InvalidValue, "{flag}");
+            let rendered = error.to_string();
+            assert!(rendered.contains(value), "{rendered}");
+            assert!(rendered.contains("dev"), "{rendered}");
+        }
     }
 
     #[test]

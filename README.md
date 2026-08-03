@@ -78,7 +78,7 @@ semantics without writable hardlink or relay aliases.
 | `bpm uninstall <pkg>...` (`bpm remove`, `bpm rm`, `bpm un`) | Remove dependencies transactionally and reinstall the resolved graph |
 | `bpm upgrade [<pkg>...]` | Select named dependency closures, or all dependencies when omitted, within declared ranges without editing manifest ranges |
 | `bpm dedupe` | Re-resolve to minimize duplicate versions and rewrite the selected lock |
-| `bpm ci` | Perform a reproducible frozen install from `bpm.lock` or supported npm v3 lock |
+| `bpm ci` | Perform a reproducible frozen install from `bpm.lock` or supported npm v2/v3 lock |
 | `bpm bin` | Print the user-level executable-shim directory |
 | `bpm root` | Print the project `node_modules` root or global store root |
 | `bpm prefix` | Print the project prefix or global BPM prefix |

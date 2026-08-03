@@ -204,6 +204,18 @@ fn setup_package_lock_project() -> (tempfile::TempDir, tempfile::TempDir, tempfi
     (project, store, tgz)
 }
 
+fn convert_package_lock_to_v2(project: &Path) {
+    let path = project.join("package-lock.json");
+    let lock = fs::read_to_string(&path).unwrap();
+    let lock = lock
+        .replace("\"lockfileVersion\": 3", "\"lockfileVersion\": 2")
+        .replace(
+            "  \"packages\": {",
+            "  \"dependencies\": {\"greet\": {\"version\": \"9.9.9\", \"resolved\": \"https://ignored.invalid/greet.tgz\"}},\n  \"packages\": {",
+        );
+    fs::write(path, lock).unwrap();
+}
+
 fn run_install(project: &Path, store: &Path) -> std::process::Output {
     Command::new(bpm_bin())
         .arg("install")
@@ -233,6 +245,330 @@ fn run_ci(project: &Path, store: &Path) -> std::process::Output {
         .current_dir(project)
         .output()
         .expect("failed to run bpm ci")
+}
+
+/// Project fixture for the bounded dev-omission compatibility surface. The
+/// runtime package's nested child is marked `dev` deliberately: retaining it
+/// proves the install projection follows runtime edges rather than blindly
+/// dropping every dev-marked physical record.
+fn setup_omit_dev_project() -> (
+    tempfile::TempDir,
+    tempfile::TempDir,
+    tempfile::TempDir,
+    String,
+) {
+    let project = tempdir().unwrap();
+    let store = tempdir().unwrap();
+    let tgz = tempdir().unwrap();
+
+    let runtime_bytes = build_tgz(&[(
+        "package/package.json",
+        br#"{"name":"runtime","version":"1.0.0","scripts":{"postinstall":"printf '%s' \"$NODE_ENV\" > .node-env"}}"#,
+        0o644,
+    )]);
+    let child_bytes = build_tgz(&[(
+        "package/package.json",
+        br#"{"name":"runtime-child","version":"1.0.0"}"#,
+        0o644,
+    )]);
+    let dev_bytes = build_tgz(&[(
+        "package/package.json",
+        br#"{"name":"dev-only","version":"1.0.0"}"#,
+        0o644,
+    )]);
+    let (runtime_path, runtime_int) = seed_tarball(tgz.path(), "runtime.tgz", &runtime_bytes);
+    let (child_path, child_int) = seed_tarball(tgz.path(), "runtime-child.tgz", &child_bytes);
+    let (dev_path, dev_int) = seed_tarball(tgz.path(), "dev-only.tgz", &dev_bytes);
+
+    fs::write(
+        project.path().join("package.json"),
+        r#"{"name":"app","version":"1.0.0","dependencies":{"runtime":"^1.0.0"},"devDependencies":{"dev-only":"^1.0.0"}}"#,
+    )
+    .unwrap();
+    let mut lockfile = Lockfile::new("bpm-test");
+    lockfile.root = RootEntry {
+        name: Some("app".into()),
+        version: Some("1.0.0".into()),
+        dependencies: BTreeMap::from([
+            ("runtime".into(), "^1.0.0".into()),
+            ("dev-only".into(), "^1.0.0".into()),
+        ]),
+    };
+    lockfile.resolution.root.dev_dependencies =
+        BTreeMap::from([("dev-only".into(), "^1.0.0".into())]);
+    lockfile.packages.push(PackageEntry {
+        path: "node_modules/runtime".into(),
+        name: "runtime".into(),
+        version: "1.0.0".into(),
+        resolved: format!("file://{}", runtime_path.display()),
+        integrity: Some(runtime_int.to_npm_string()),
+        dependencies: BTreeMap::from([("runtime-child".into(), "^1.0.0".into())]),
+        ..Default::default()
+    });
+    lockfile.packages.push(PackageEntry {
+        path: "node_modules/runtime/node_modules/runtime-child".into(),
+        name: "runtime-child".into(),
+        version: "1.0.0".into(),
+        resolved: format!("file://{}", child_path.display()),
+        integrity: Some(child_int.to_npm_string()),
+        // A legacy/package-lock-style dev marker cannot override a runtime
+        // edge; omit projection must retain this child.
+        dev: true,
+        ..Default::default()
+    });
+    lockfile.packages.push(PackageEntry {
+        path: "node_modules/dev-only".into(),
+        name: "dev-only".into(),
+        version: "1.0.0".into(),
+        resolved: format!("file://{}", dev_path.display()),
+        integrity: Some(dev_int.to_npm_string()),
+        dev: true,
+        ..Default::default()
+    });
+    lockfile.sort_packages();
+    lockfile.write_to(&project.path().join("bpm.lock")).unwrap();
+
+    (
+        project,
+        store,
+        tgz,
+        Sha512Digest::hash_bytes(&dev_bytes).to_hex(),
+    )
+}
+
+fn run_omit_install(project: &Path, store: &Path, args: &[&str]) -> std::process::Output {
+    run_omit_install_with_node_env(project, store, args, None)
+}
+
+fn run_omit_install_with_node_env(
+    project: &Path,
+    store: &Path,
+    args: &[&str],
+    node_env: Option<&str>,
+) -> std::process::Output {
+    let mut command = Command::new(bpm_bin());
+    command
+        .arg("install")
+        .arg("--frozen")
+        .args(args)
+        .arg("--store")
+        .arg(store)
+        .current_dir(project);
+    match node_env {
+        Some(value) => {
+            command.env("NODE_ENV", value);
+        }
+        None => {
+            command.env_remove("NODE_ENV");
+        }
+    }
+    command
+        .output()
+        .expect("failed to run bpm dev-omit install")
+}
+
+#[test]
+fn omit_dev_preserves_lock_avoids_dev_fetch_and_reconciles_profiles() {
+    let (project, store, _tgz, dev_digest) = setup_omit_dev_project();
+    let lock_path = project.path().join("bpm.lock");
+    let authoritative_before = fs::read(&lock_path).unwrap();
+
+    let omitted = run_omit_install(project.path(), store.path(), &["--omit=dev"]);
+    let stderr = String::from_utf8_lossy(&omitted.stderr);
+    assert!(omitted.status.success(), "omitted install failed: {stderr}");
+    assert!(project.path().join("node_modules/runtime").is_dir());
+    assert!(project
+        .path()
+        .join("node_modules/runtime/node_modules/runtime-child")
+        .is_dir());
+    assert!(
+        !project.path().join("node_modules/dev-only").exists(),
+        "dev-only package must not be materialized"
+    );
+    assert_eq!(fs::read(&lock_path).unwrap(), authoritative_before);
+    let dev_artifact = store
+        .path()
+        .join("artifacts/sha512")
+        .join(&dev_digest[..2])
+        .join(format!("{dev_digest}.tgz"));
+    assert!(
+        !dev_artifact.exists(),
+        "omitted dev artifact was fetched into the store: {}",
+        dev_artifact.display()
+    );
+
+    // Include always wins, even after omit appeared first. This transitions to
+    // the full graph and fetches/materializes the dev-only package.
+    let full = run_omit_install(
+        project.path(),
+        store.path(),
+        &["--omit=dev", "--include=dev"],
+    );
+    let stderr = String::from_utf8_lossy(&full.stderr);
+    assert!(full.status.success(), "include override failed: {stderr}");
+    assert!(project.path().join("node_modules/dev-only").is_dir());
+    assert!(
+        dev_artifact.exists(),
+        "include override must fetch dev artifact"
+    );
+    assert_eq!(
+        fs::read_to_string(project.path().join("node_modules/runtime/.node-env")).unwrap(),
+        "",
+        "explicit omit plus include without ambient production must retain normal lifecycle mode"
+    );
+
+    // Return to the omitted profile. A profile-specific cache must not leave
+    // the full tree attached or reuse its plan identity.
+    let omitted_again = run_omit_install(project.path(), store.path(), &["--omit=dev"]);
+    let stderr = String::from_utf8_lossy(&omitted_again.stderr);
+    assert!(
+        omitted_again.status.success(),
+        "second omitted install failed: {stderr}"
+    );
+    assert!(!project.path().join("node_modules/dev-only").exists());
+    assert_eq!(fs::read(&lock_path).unwrap(), authoritative_before);
+
+    // CI shares the same frozen/projection behavior and remains lock-read-only.
+    let ci = Command::new(bpm_bin())
+        .args(["ci", "--omit=dev", "--store"])
+        .arg(store.path())
+        .current_dir(project.path())
+        .output()
+        .expect("failed to run bpm ci --omit=dev");
+    let stderr = String::from_utf8_lossy(&ci.stderr);
+    assert!(ci.status.success(), "ci dev omission failed: {stderr}");
+    assert!(!project.path().join("node_modules/dev-only").exists());
+    assert_eq!(fs::read(&lock_path).unwrap(), authoritative_before);
+}
+
+#[test]
+fn production_node_env_omits_dev_unless_include_overrides_it() {
+    let (project, store, _tgz, _dev_digest) = setup_omit_dev_project();
+    let omitted = Command::new(bpm_bin())
+        .args(["install", "--frozen", "--store"])
+        .arg(store.path())
+        .env("NODE_ENV", "production")
+        .current_dir(project.path())
+        .output()
+        .expect("failed to run production install");
+    let stderr = String::from_utf8_lossy(&omitted.stderr);
+    assert!(
+        omitted.status.success(),
+        "production install failed: {stderr}"
+    );
+    assert!(!project.path().join("node_modules/dev-only").exists());
+
+    let included = Command::new(bpm_bin())
+        .args(["install", "--frozen", "--include=dev", "--store"])
+        .arg(store.path())
+        .env("NODE_ENV", "production")
+        .current_dir(project.path())
+        .output()
+        .expect("failed to run production install with include");
+    let stderr = String::from_utf8_lossy(&included.stderr);
+    assert!(
+        included.status.success(),
+        "production include override failed: {stderr}"
+    );
+    assert!(project.path().join("node_modules/dev-only").is_dir());
+}
+
+#[test]
+fn production_include_dev_uses_a_distinct_lifecycle_volume_and_plan_profile() {
+    let (project, store, _tgz, _dev_digest) = setup_omit_dev_project();
+    let marker = project.path().join("node_modules/runtime/.node-env");
+
+    // Build a normal full-tree volume first. The fixture script records the
+    // bounded NODE_ENV it receives, so an empty marker proves normal mode did
+    // not inherit arbitrary ambient NODE_ENV.
+    let normal =
+        run_omit_install_with_node_env(project.path(), store.path(), &["--include=dev"], None);
+    let stderr = String::from_utf8_lossy(&normal.stderr);
+    assert!(
+        normal.status.success(),
+        "normal full install failed: {stderr}"
+    );
+    assert!(project.path().join("node_modules/dev-only").is_dir());
+    assert_eq!(fs::read_to_string(&marker).unwrap(), "");
+
+    // `--include=dev` preserves the full physical tree under production, but
+    // lifecycle output changes. It must neither plan-cache-hit nor reuse the
+    // normal graph volume, and the script must see the injected production
+    // value.
+    let production = run_omit_install_with_node_env(
+        project.path(),
+        store.path(),
+        &["--include=dev"],
+        Some("production"),
+    );
+    let stdout = String::from_utf8_lossy(&production.stdout);
+    let stderr = String::from_utf8_lossy(&production.stderr);
+    assert!(
+        production.status.success(),
+        "production include install failed: {stderr}"
+    );
+    assert!(
+        !stdout.contains("nothing to install"),
+        "production profile must not plan-cache-hit normal lifecycle output: {stdout}"
+    );
+    assert!(
+        stdout.contains("graph volume built"),
+        "production profile must build a distinct graph volume: {stdout}"
+    );
+    assert!(project.path().join("node_modules/dev-only").is_dir());
+    assert_eq!(fs::read_to_string(&marker).unwrap(), "production");
+
+    // The reverse transition must restore the original normal-mode output,
+    // rather than plan-cache-hitting the production profile.
+    let normal_again =
+        run_omit_install_with_node_env(project.path(), store.path(), &["--include=dev"], None);
+    let stdout = String::from_utf8_lossy(&normal_again.stdout);
+    let stderr = String::from_utf8_lossy(&normal_again.stderr);
+    assert!(
+        normal_again.status.success(),
+        "normal reverse transition failed: {stderr}"
+    );
+    assert!(
+        !stdout.contains("nothing to install"),
+        "normal profile must not plan-cache-hit production lifecycle output: {stdout}"
+    );
+    assert!(project.path().join("node_modules/dev-only").is_dir());
+    assert_eq!(fs::read_to_string(&marker).unwrap(), "");
+}
+
+#[test]
+fn omit_dev_keeps_npm_package_lock_authoritative_without_creating_bpm_lock() {
+    let (project, store, _tgz) = setup_package_lock_project();
+    let lock_path = project.path().join("package-lock.json");
+    let before = fs::read(&lock_path).unwrap();
+
+    let install = Command::new(bpm_bin())
+        .args(["install", "--frozen", "--omit=dev", "--store"])
+        .arg(store.path())
+        .current_dir(project.path())
+        .output()
+        .expect("failed to run package-lock omitted-dev install");
+    let stderr = String::from_utf8_lossy(&install.stderr);
+    assert!(
+        install.status.success(),
+        "package-lock omitted-dev install failed: {stderr}"
+    );
+    assert!(!project.path().join("bpm.lock").exists());
+    assert_eq!(fs::read(&lock_path).unwrap(), before);
+
+    let ci = Command::new(bpm_bin())
+        .args(["ci", "--omit=dev", "--store"])
+        .arg(store.path())
+        .current_dir(project.path())
+        .output()
+        .expect("failed to run package-lock omitted-dev ci");
+    let stderr = String::from_utf8_lossy(&ci.stderr);
+    assert!(
+        ci.status.success(),
+        "package-lock omitted-dev ci failed: {stderr}"
+    );
+    assert!(!project.path().join("bpm.lock").exists());
+    assert_eq!(fs::read(&lock_path).unwrap(), before);
 }
 
 #[test]
@@ -308,6 +644,32 @@ fn installs_directly_from_package_lock_without_writing_bpm_lock() {
 }
 
 #[test]
+fn installs_and_runs_ci_directly_from_v2_package_lock_without_mutation() {
+    let (project, store, _tgz) = setup_package_lock_project();
+    convert_package_lock_to_v2(project.path());
+    let lock_path = project.path().join("package-lock.json");
+    let before = fs::read(&lock_path).unwrap();
+
+    let install = run_plain_install(project.path(), store.path());
+    assert!(
+        install.status.success(),
+        "v2 install failed: {}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    assert!(!project.path().join("bpm.lock").exists());
+    assert_eq!(fs::read(&lock_path).unwrap(), before);
+
+    let ci = run_ci(project.path(), store.path());
+    assert!(
+        ci.status.success(),
+        "v2 ci failed: {}",
+        String::from_utf8_lossy(&ci.stderr)
+    );
+    assert!(!project.path().join("bpm.lock").exists());
+    assert_eq!(fs::read(&lock_path).unwrap(), before);
+}
+
+#[test]
 fn ci_uses_package_lock_and_reports_package_lock_drift() {
     let (project, store, _tgz) = setup_package_lock_project();
 
@@ -332,8 +694,8 @@ fn ci_uses_package_lock_and_reports_package_lock_drift() {
 }
 
 #[test]
-fn package_lock_v1_v2_and_blocking_diagnostics_are_rejected() {
-    for version in [1, 2] {
+fn package_lock_v1_and_future_versions_are_rejected() {
+    for version in [1, 4] {
         let project = tempdir().unwrap();
         let store = tempdir().unwrap();
         fs::write(project.path().join("package.json"), r#"{"name":"app"}"#).unwrap();

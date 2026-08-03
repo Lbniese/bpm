@@ -24,7 +24,7 @@ use crate::derived::{
     self, DerivedInputs, DerivedMetadata, EnsureDerived, EnsureOptions, NullDerivedMetadata,
     RuntimeIdentity, SandboxFailure, TargetDescriptor,
 };
-use crate::graph::package_closure_digest;
+use crate::graph::{package_closure_digest, InstallProfile};
 use crate::integrity::{ArtifactId, Integrity};
 use crate::lockfile::{LockSource, Lockfile, PackageEntry};
 use crate::manifest::PackageManifest;
@@ -239,6 +239,33 @@ pub fn run_lifecycle(
     policy: LifecyclePolicy,
     metrics: &mut Metrics,
 ) -> Result<LifecycleStats, LifecycleError> {
+    run_lifecycle_with_profile(
+        project_root,
+        store,
+        lockfile,
+        artifact_ids,
+        volume_path,
+        policy,
+        InstallProfile::default_profile(),
+        metrics,
+    )
+}
+
+/// Profile-aware lifecycle execution. The default [`run_lifecycle`] wrapper
+/// preserves the normal profile; any production-lifecycle profile injects an
+/// exact `NODE_ENV=production` into the bounded script/derived-key
+/// environment.
+#[allow(clippy::too_many_arguments)]
+pub fn run_lifecycle_with_profile(
+    project_root: &Path,
+    store: &ArtifactStore,
+    lockfile: &Lockfile,
+    artifact_ids: &[Option<ArtifactId>],
+    volume_path: Option<&Path>,
+    policy: LifecyclePolicy,
+    profile: InstallProfile,
+    metrics: &mut Metrics,
+) -> Result<LifecycleStats, LifecycleError> {
     let mut stats = LifecycleStats {
         skipped: policy.ignore_scripts || policy.skip_execution,
         ..Default::default()
@@ -290,7 +317,7 @@ pub fn run_lifecycle(
     // runtime identity (probed from `node` once for the whole pass) and is only
     // meaningful against a graph volume; without one, scripts run in a sandbox
     // with no dependency resolution, so caching their output is unsound.
-    let bounded_env = bounded_environment();
+    let bounded_env = bounded_environment_for_profile(profile);
     let owned_runtime = if policy.use_derived_store && volume_path.is_some() {
         probe_runtime()
     } else {
@@ -555,9 +582,33 @@ pub fn prepare_git_packages(
     registry: &RegistryClient,
     metrics: &mut Metrics,
 ) -> Result<BTreeMap<String, PreparedImage>, LifecycleError> {
+    prepare_git_packages_with_profile(
+        _project_root,
+        store,
+        lockfile,
+        artifact_ids,
+        registry,
+        InstallProfile::default_profile(),
+        metrics,
+    )
+}
+
+/// Profile-aware Git build-context preparation. This remains a separate
+/// transient closure from the consumer install, but its scripts and derived
+/// key receive the same effective `NODE_ENV` as the final install profile.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_git_packages_with_profile(
+    _project_root: &Path,
+    store: &ArtifactStore,
+    lockfile: &Lockfile,
+    artifact_ids: &[Option<ArtifactId>],
+    registry: &RegistryClient,
+    profile: InstallProfile,
+    metrics: &mut Metrics,
+) -> Result<BTreeMap<String, PreparedImage>, LifecycleError> {
     let runtime = probe_runtime()
         .ok_or_else(|| LifecycleError::Prepare("could not probe the node runtime".into()))?;
-    let environment = bounded_environment();
+    let environment = bounded_environment_for_profile(profile);
     let metadata = open_derived_metadata(store.root());
     let derived_store = derived::DerivedStore::open(store.root(), &metadata)
         .map_err(|error| LifecycleError::Prepare(error.to_string()))?;
@@ -1069,6 +1120,18 @@ fn bounded_environment() -> BTreeMap<OsString, OsString> {
         .collect()
 }
 
+/// Apply the effective install profile after reading the bounded ambient
+/// inputs. `NODE_ENV` is deliberately absent from the generic allowlist: this
+/// compatibility slice injects only exact production mode, so arbitrary
+/// ambient values cannot leak into script execution or cache identity.
+fn bounded_environment_for_profile(profile: InstallProfile) -> BTreeMap<OsString, OsString> {
+    let mut environment = bounded_environment();
+    if profile.lifecycle_is_production() {
+        environment.insert(OsString::from("NODE_ENV"), OsString::from("production"));
+    }
+    environment
+}
+
 fn node_output(args: &[&str]) -> Option<String> {
     let output = Command::new("node").args(args).output().ok()?;
     if !output.status.success() {
@@ -1459,5 +1522,84 @@ mod tests {
                 "{noise} must stay out of the derived-key environment (host-specific noise)",
             );
         }
+        assert!(
+            !ENV_INPUT_VARS.contains(&"NODE_ENV"),
+            "NODE_ENV must enter only through an explicit production lifecycle profile"
+        );
+    }
+
+    #[test]
+    fn production_lifecycle_profile_injects_production_and_changes_derived_key_input() {
+        let regular = bounded_environment_for_profile(InstallProfile::default_profile());
+        assert!(
+            !regular.contains_key(std::ffi::OsStr::new("NODE_ENV")),
+            "arbitrary ambient NODE_ENV must not enter the bounded environment"
+        );
+
+        let production = bounded_environment_for_profile(InstallProfile::production_full_tree());
+        assert_eq!(
+            production.get(std::ffi::OsStr::new("NODE_ENV")),
+            Some(&OsString::from("production")),
+            "the production lifecycle profile must inject NODE_ENV=production"
+        );
+        assert_eq!(
+            production,
+            bounded_environment_for_profile(InstallProfile::dev_omitted()),
+            "both production profiles must give lifecycle scripts the same bounded environment"
+        );
+        let source = [7u8; 64];
+        let dependency_graph = [9u8; 32];
+        let scripts = BTreeMap::from([("install".to_string(), "node build.js".to_string())]);
+        let phases = ["install"];
+        let normal_inputs = DerivedInputs {
+            source_artifact: &source,
+            source_revision: None,
+            dependency_graph: &dependency_graph,
+            target: TargetDescriptor {
+                os: "linux",
+                architecture: "x86_64",
+                family: "unix",
+                abi: "gnu",
+            },
+            runtime: RuntimeIdentity {
+                executable: b"node",
+                version: "22",
+                modules_abi: "127",
+                napi_version: Some("10"),
+            },
+            phases: &phases,
+            scripts: &scripts,
+            environment: &regular,
+            runner_version: DERIVED_RUNNER_VERSION,
+            policy_version: DERIVED_POLICY_VERSION,
+        };
+        let production_inputs = DerivedInputs {
+            source_artifact: &source,
+            source_revision: None,
+            dependency_graph: &dependency_graph,
+            target: TargetDescriptor {
+                os: "linux",
+                architecture: "x86_64",
+                family: "unix",
+                abi: "gnu",
+            },
+            runtime: RuntimeIdentity {
+                executable: b"node",
+                version: "22",
+                modules_abi: "127",
+                napi_version: Some("10"),
+            },
+            phases: &phases,
+            scripts: &scripts,
+            environment: &production,
+            runner_version: DERIVED_RUNNER_VERSION,
+            policy_version: DERIVED_POLICY_VERSION,
+        };
+
+        assert_ne!(
+            crate::derived::derived_key(&normal_inputs),
+            crate::derived::derived_key(&production_inputs),
+            "the injected production mode must be part of the derived key"
+        );
     }
 }

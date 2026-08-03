@@ -174,6 +174,8 @@ pub(super) fn run_add(options: &install::Options) -> anyhow::Result<()> {
         json_metrics: options.json_metrics.clone(),
         global: false,
         ignore_scripts: options.ignore_scripts,
+        omit_dev: options.omit_dev,
+        include_dev: options.include_dev,
         derived_store: options.derived_store,
         git_prepare: options.git_prepare,
         legacy_peer_deps: options.legacy_peer_deps,
@@ -379,6 +381,8 @@ pub(super) fn run_uninstall(options: UninstallOptions) -> anyhow::Result<()> {
         json_metrics: options.json_metrics.clone(),
         global: false,
         ignore_scripts: options.ignore_scripts,
+        omit_dev: false,
+        include_dev: false,
         derived_store: options.derived_store,
         git_prepare: options.git_prepare,
         legacy_peer_deps: options.legacy_peer_deps,
@@ -429,7 +433,8 @@ fn project_root_and_lock_kind(cwd: &Path) -> anyhow::Result<(PathBuf, Option<Pro
 
 /// Serialize the resolved lockfile according to the project's lock authority.
 /// A `bpm.lock` project (or a project with no lock yet) gets canonical BPM
-/// bytes; a `package-lock.json` v3 project gets strict npm v3 export bytes.
+/// bytes; an npm-authority `package-lock.json` project (whether imported as v2
+/// or v3) gets strict npm v3 export bytes.
 fn serialize_lock(
     project_root: &Path,
     lock_kind: Option<ProjectLockKind>,
@@ -866,6 +871,8 @@ pub(super) fn run_upgrade(options: UpgradeOptions) -> anyhow::Result<()> {
         json_metrics: options.json_metrics.clone(),
         global: false,
         ignore_scripts: options.ignore_scripts,
+        omit_dev: false,
+        include_dev: false,
         derived_store: options.derived_store,
         git_prepare: options.git_prepare,
         legacy_peer_deps: options.legacy_peer_deps,
@@ -994,6 +1001,8 @@ pub(super) fn run_dedupe(options: DedupeOptions) -> anyhow::Result<()> {
         json_metrics: options.json_metrics.clone(),
         global: false,
         ignore_scripts: options.ignore_scripts,
+        omit_dev: false,
+        include_dev: false,
         derived_store: options.derived_store,
         git_prepare: options.git_prepare,
         legacy_peer_deps: options.legacy_peer_deps,

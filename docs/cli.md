@@ -72,7 +72,7 @@ BPM_OTP='<redacted>' bpm publish --provenance
 ## `bpm audit [flags]`
 
 Builds an advisory request from the exact versions in `bpm.lock` or a supported
-npm v3 lock and queries the registry's bulk advisory endpoint. It never treats
+npm v2/v3 lock and queries the registry's bulk advisory endpoint. It never treats
 manifest declarations as resolved inventory. Missing/malformed locks and
 malformed advisory responses fail closed.
 
@@ -135,7 +135,7 @@ Two modes:
 - **`bpm install` (no argument)** — installs the locked dependency graph from
   the nearest supported project lock into `node_modules` (see the frozen-installer
   docs). BPM checks each directory upward, preferring a sibling `bpm.lock` over
-  `package-lock.json`; a nested `package-lock.json` v3 wins over an ancestor
+  `package-lock.json`; a nested `package-lock.json` v2/v3 wins over an ancestor
   `bpm.lock`. If no lockfile exists, it resolves the nearest `package.json` and
   writes `bpm.lock` first; use `--frozen` to require an existing supported lock.
 - **`bpm install <target>`** — adds one or more registry targets to the local
@@ -171,14 +171,35 @@ Notes:
 | `<target>` | In local mutation mode, one or more registry package specs. With `-g`, one spec or exact URL/`file://`/path resolved like `bpm fetch`. Omit for lockfile install. |
 | `--registry <url>` | Registry base URL for package-spec resolution. |
 | `--store <dir>` | Store root. Defaults to `$BPM_STORE`, then `$HOME/.bpm`. |
-| `--frozen`, `--concurrency`, `--json-metrics`, `--ignore-scripts`, `--legacy-peer-deps` | Apply to the lockfile install mode (no `<target>`). `--frozen` accepts either `bpm.lock` or supported `package-lock.json` v3 and reports drift against the selected lock filename. |
+| `--frozen`, `--concurrency`, `--json-metrics`, `--ignore-scripts`, `--legacy-peer-deps` | Apply to the lockfile install mode (no `<target>`). `--frozen` accepts either `bpm.lock` or supported `package-lock.json` v2/v3 and reports drift against the selected lock filename. |
+| `--omit=dev` | Repeatable dev-only production projection. It omits packages marked dev-only after complete-lock validation; `NODE_ENV=production` enables the same behavior when this flag is absent. |
+| `--include=dev` | Repeatable override that wins over `--omit=dev` and the `NODE_ENV=production` default, regardless of flag order. |
 | `--git-prepare` | Run npm-compatible Git build-context `prepare` for Git dependencies using a transient regular+dev closure. **Enabled by default** for Git dependencies; disable with `--no-git-prepare` or `BPM_GIT_PREPARE=0`. |
 | `--derived-store` | Reuse lifecycle-derived package images across changed graphs. Explicitly opt-in; `BPM_DERIVED_STORE=1` is equivalent. |
+
+`omit`/`include` currently accept only the typed value `dev`; `optional` and
+`peer` are rejected rather than silently accepted. This is not an optional- or
+peer-omission feature. For effective dev omission, BPM keeps the complete
+authoritative lock unchanged and applies an install-only in-memory projection:
+it retains non-dev records plus normal dependencies, optional dependencies,
+required peer targets, and required peer-context providers. Frozen drift is
+checked against the complete lock before that projection. A fresh native
+resolution writes the complete `bpm.lock` first; direct npm package-lock
+installs remain read-only and do not create `bpm.lock`.
+
+An effective omitted-dev install receives its own graph-volume and plan-cache
+identity even if no physical record is removed. Dependency lifecycle scripts
+and Git build-context `prepare` receive `NODE_ENV=production`. When ambient
+`NODE_ENV` is exactly `production`, `--include=dev` disables only the omission
+projection: the full tree remains installed, but its production lifecycle mode
+gets a separate graph-volume and plan-cache identity. Other `NODE_ENV` values
+remain outside this bounded compatibility surface and are not exposed to or
+hashed for dependency lifecycle scripts.
 
 ### Direct `package-lock.json` use and `bpm ci`
 
 `bpm install`, `bpm install --frozen`, and `bpm ci` can consume a supported npm
-`package-lock.json` v3 directly when no nearer/sibling `bpm.lock` wins. The
+`package-lock.json` v2/v3 directly when no nearer/sibling `bpm.lock` wins. The
 package-lock input is read-only: BPM normalizes it in memory, writes install
 state in `.bpm-state`, and does not create `bpm.lock`. Native no-lock resolution
 still writes `bpm.lock`.
@@ -186,17 +207,18 @@ still writes `bpm.lock`.
 Precedence is deterministic: nearest directory wins, and within the same
 directory `bpm.lock` wins over `package-lock.json`. `bpm import` is optional for
 teams that want to migrate to BPM's native lock format; it is not required for
-install or CI. Package-lock versions 1 and 2 are rejected clearly. Link
+install or CI. Package-lock v1 and future versions are rejected clearly. Link
 entries with a resolved local target are supported; targetless links and
 non-link entries without `resolved` fail before fetching or materializing.
 
 ## `bpm ci [flags]`
 
 Performs the same install path as `bpm install --frozen`: it requires the
-manifest and selected `bpm.lock` or supported npm v3 lock to agree, performs no
+manifest and selected `bpm.lock` or supported npm v2/v3 lock to agree, performs no
 fresh dependency resolution, and leaves the authoritative lock format
 unchanged. Fetch/extract concurrency, lifecycle, cache-mode, metrics, and remote
-cache flags match lockfile install mode.
+cache flags match lockfile install mode, including the dev-only
+`--omit=dev`/`--include=dev` behavior above.
 
 ```bash
 bpm ci
@@ -206,7 +228,8 @@ bpm ci --offline --ignore-scripts
 Important flags include `--registry`, `--store`, `--concurrency`,
 `--json-metrics`, `--ignore-scripts`, `--legacy-peer-deps`, `--offline`,
 `--prefer-offline`, `--prefer-online`, `--remote-cache`, and the experimental
-`--derived-store` lifecycle cache.
+`--derived-store` lifecycle cache, plus dev-only `--omit=dev` and
+`--include=dev`.
 
 ## `bpm link [name] [flags]`
 
@@ -293,9 +316,9 @@ flags, and `--remote-cache`.
 
 ## `bpm import [path] [flags]`
 
-Imports an npm `package-lock.json` (`lockfileVersion` 3 only) into a
+Imports an npm `package-lock.json` (`lockfileVersion` 2 or 3) into a
 canonical `bpm.lock`. The source lockfile is never modified. This migration step
-is optional; direct install/CI can read a supported package-lock v3 without
+is optional; direct install/CI can read a supported package-lock v2/v3 without
 writing `bpm.lock`.
 
 | Argument/flag | Meaning |
@@ -668,7 +691,7 @@ output shows `<no parents>`.
 
 The command is lockfile-local and read-only — it never contacts the registry
 or modifies any files. A lockfile (`bpm.lock` or supported `package-lock.json`
-v3) must exist.
+v2/v3) must exist.
 
 ```bash
 bpm why lodash               # show why lodash is installed
@@ -853,7 +876,7 @@ bpm dedupe
 with no target is an error.
 
 Lock authority is deterministic: a `bpm.lock` project stays a `bpm.lock`
-project and a `package-lock.json` v3 project stays an npm v3 project.
+project and a `package-lock.json` v2/v3 project stays an npm-authority project.
 For npm-authority projects, BPM exports a strict `lockfileVersion: 3` document
 that `npm ci --ignore-scripts` accepts for the supported registry-only corpus.
 
@@ -874,6 +897,10 @@ By default, `bpm install` overlaps tarball downloads with resolution: as soon
 as the resolver places each registry package in the graph, its tarball download
 and extraction start on worker threads, so downloads make progress while the
 rest of the graph is resolved.
+
+Effective dev omission deliberately resolves the complete graph and writes its
+authoritative lock before applying the retained projection, so it does not use
+fresh streaming downloads; omitted packages are never scheduled for fetch.
 
 Set `BPM_STREAM_INSTALL=0` to resolve the whole graph before downloading
 anything — useful for benchmarking or isolating streaming-related regressions.
