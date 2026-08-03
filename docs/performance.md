@@ -54,48 +54,52 @@ build steps), `minimal` (tiny graph), and `monorepo` (workspace root).
 ## Current numbers from the reference baseline
 
 The checked-in baseline (`benchmarks/baselines/reference.json`) was recorded on
-**macOS 26.5, arm64** with **node v26.0.0, npm 11.12.1, pnpm 10.13.1,
-bpm 0.0.1**, over `number_of_runs: 7`. Median wall-clock milliseconds, with
+**macOS 26.5, arm64** with **node v26.5.0, npm 11.12.1, pnpm 10.13.1,
+bpm 0.2.1**, over `number_of_runs: 7`. Median wall-clock milliseconds, with
 p95 and standard deviation quoted for the headline cells:
 
 ### `large-frontend` — the representative graph
 
 | Scenario | npm (median) | pnpm (median) | bpm (median) | bpm p95 | bpm stddev |
 |---|---:|---:|---:|---:|---:|
-| `true_cold` | 11552 | 3819 | **25824** | 28853 | 1472 |
-| `resolved_cold` | 4180 | 4406 | 7350 | — | — |
-| `repeat_install` | 670 | 313 | **7** | 10 | 1.3 |
+| `true_cold` | 13230 | 1357 | **4982** | 9329 | 1571 |
+| `resolved_cold` | 4041 | 1300 | 2158 | 2211 | 77 |
+| `repeat_install` | 1728 | 290 | **241** | 249 | 4 |
 
-These are historical 0.0.1 measurements, not a current measurement of the
-isolated project-view implementation. The post-Plan-026 path still avoids
-network, extraction, resolution, and lifecycle work when reusing a graph, but
-project attachment performs isolated per-entry/file work. A same-version
-benchmark is required before claiming a current repeat-install time or speedup.
-On the historical `true_cold` run, bpm was **~6.8× slower than pnpm** (25824 ms
-vs 3819 ms): the cold resolver was the remaining bottleneck.
+This is now a same-version measurement at bpm 0.2.1. On the cold `true_cold` run,
+bpm is **~3.67× slower than pnpm** (4982 ms vs 1357 ms) — down from ~6.8× at
+the 0.0.1 baseline — after directory-level clonefile materialization (Plan 030)
+cut the `materialization` phase to ~1500 ms (from ~3925 ms) and
+`graph_volume_build` to ~101 ms (from ~1284 ms). The remaining cold gap is the
+resolver: `resolver_network_wait` dominates wall-clock. On `repeat_install`, bpm
+is 241 ms (vs 7 ms at 0.0.1) because project attachment now performs isolated
+per-entry/file work (Plan 026) rather than reflinking the whole `node_modules` —
+a deliberate safety/isolation tradeoff that is still faster than pnpm (0.83×).
 
 ### All fixtures (median wall-clock, bpm vs pnpm)
 
 | Fixture | Scenario | npm | pnpm | bpm | bpm/pnpm |
 |---|---|---:|---:|---:|---:|
-| large-frontend | repeat_install | 670 | 313 | 7 | **0.02×** |
-| large-frontend | resolved_cold | 4180 | 4406 | 7350 | 1.67× |
-| large-frontend | true_cold | 11552 | 3819 | 25824 | 6.76× |
-| many-small-files | repeat_install | 512 | 275 | 6 | **0.02×** |
-| many-small-files | resolved_cold | 518 | 430 | 160 | 0.37× |
-| many-small-files | true_cold | 540 | 443 | 198 | 0.45× |
-| minimal | repeat_install | 532 | 281 | 6 | **0.02×** |
-| monorepo | repeat_install | 545 | 239 | 11 | 0.05× |
-| monorepo | resolved_cold | 526 | 230 | 325 | 1.41× |
-| native-addon | repeat_install | 520 | 285 | 7 | **0.02×** |
-| native-addon | resolved_cold | 549 | 493 | 662 | 1.34× |
-| native-addon | true_cold | 955 | 507 | 3894 | 7.68× |
+| large-frontend | repeat_install | 1728 | 290 | 241 | **0.83×** |
+| large-frontend | resolved_cold | 4041 | 1300 | 2158 | 1.66× |
+| large-frontend | true_cold | 13230 | 1357 | 4982 | 3.67× |
+| many-small-files | repeat_install | 501 | 244 | 26 | **0.11×** |
+| many-small-files | resolved_cold | 1061 | 396 | 189 | 0.48× |
+| many-small-files | true_cold | 1237 | 399 | 293 | 0.73× |
+| minimal | repeat_install | 972 | 241 | 26 | **0.11×** |
+| monorepo | repeat_install | 1131 | 201 | 87 | 0.43× |
+| monorepo | resolved_cold | 1380 | 199 | 323 | 1.62× |
+| native-addon | repeat_install | 456 | 255 | 57 | **0.22×** |
+| native-addon | resolved_cold | 485 | 436 | 314 | 0.72× |
+| native-addon | true_cold | 888 | 436 | 1013 | 2.32× |
 
-Reading the table: these historical 0.0.1 results describe the former
-materialization behavior. They remain useful baseline evidence, but must not be
-generalized to current warm-install timings after the isolation change. The
-historical large cold graphs were several times slower than pnpm; refreshing the
-baseline is follow-up measurement rather than a shipped performance claim.
+Reading the table: bpm is faster than pnpm on the small fixtures even when cold
+(`many-small-files true_cold` 0.73×) and stays under pnpm on every
+`repeat_install`/`resolved_cold` cell. The large cold graphs are where the cold
+resolver still bites — `large-frontend true_cold` 3.67× and `native-addon
+true_cold` 2.32×. The warm-path ratios (`repeat_install`) reflect the isolated
+per-entry attachment work (Plan 026) rather than the former whole-tree reflink,
+so they are no longer near-zero but remain below pnpm.
 
 ## How to reproduce
 
@@ -130,10 +134,9 @@ request sharing during one-level graph expansion; metadata-cache writes are
 best-effort and asynchronous;
 `BPM_ASYNC_RESOLVE=0` remains the blocking kill-switch. Plan 036's shipped
 measurements reduced the `large-frontend` `true_cold` dependency-resolution
-phase from roughly 18.9 seconds to roughly 3.2–4.7 seconds. The checked-in
-benchmark table above remains the historical baseline and has not been
-regenerated, so these newer measurements are post-baseline observations rather
-than replacements for its numbers.
+phase from roughly 18.9 seconds to roughly 3.2–4.7 seconds; the regenerated
+baseline above now records that phase at a ~2.9 s median for the same cell
+(`dependency_resolution`), consistent with Plan 036's post-baseline observations.
 
 Repeated fresh resolves can reuse a validated resolution snapshot with
 `--prefer-offline` or `--offline`; normal installs continue registry validation
