@@ -177,7 +177,7 @@ fn windows_frozen_install_materializes_packages_and_bins() {
 #[test]
 fn windows_attach_with_reflink_backend_isolates_source() {
     use bpm::materializer::{MaterializeBackend, MaterializeStats};
-    use bpm::volume::{attach_project_local_with_backend, VolumeRef};
+    use bpm::volume::{attach_project_local_with_backend, write_test_meta_for_tests, VolumeRef};
 
     let store = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
@@ -185,6 +185,10 @@ fn windows_attach_with_reflink_backend_isolates_source() {
     fs::create_dir_all(volume.join("demo")).unwrap();
     let payload: &[u8] = br#"{"name":"demo","version":"1.0.0"}"#;
     fs::write(volume.join("demo/package.json"), payload).unwrap();
+    // `attach_project_local_with_backend` inherits published identities from
+    // the volume's metadata.json; publish a real manifest (computed tree-blake3
+    // identities) so attach resolves the demo entry.
+    write_test_meta_for_tests(store.path());
 
     let volume_ref = VolumeRef {
         path: store.path().to_path_buf(),

@@ -423,6 +423,7 @@ pub(crate) fn reflink_tree(source: &Path, target: &Path) -> Result<(), Materiali
 /// Junctions work at the directory level only — for individual files the
 /// callback naturally falls through to `hardlink_or_copy_file`.
 #[cfg(windows)]
+#[allow(dead_code)]
 pub(crate) fn junction_tree(source: &Path, target: &Path) -> Result<(), MaterializeError> {
     use std::os::windows::fs::symlink_dir;
 
@@ -553,9 +554,7 @@ fn reflink_or_fallback_file(from: &Path, to: &Path) -> Result<(), MaterializeErr
             copy_mode(from, to)?;
             Ok(())
         }
-        Err(error) if is_reflink_unsupported(&error) => fs::copy(from, to)
-            .map(|_| ())
-            .map_err(|source| io_err(to, source)),
+        Err(error) if is_reflink_unsupported(&error) => copy_file_preserving_mtime(from, to),
         Err(error) => Err(io_err(to, error)),
     }
 }
@@ -992,6 +991,32 @@ fn read_link_if_points_to(
     }
 }
 
+/// Copy `from` → `to` with `fs::copy`, then best-effort restore `from`'s
+/// modification time onto `to`. A materialized view must reflect the store
+/// image's timestamps the way a reflink/clone does; `fs::copy` alone stamps
+/// `to` with the current time, which breaks mtime-based reuse checks on
+/// filesystems where reflink is unavailable (e.g. CI runners on ext4/overlay).
+/// Mtime-transfer errors are intentionally ignored: the copy itself is the
+/// important outcome, and some filesystems reject `set_modified`.
+fn copy_file_preserving_mtime(from: &Path, to: &Path) -> Result<(), MaterializeError> {
+    fs::copy(from, to).map_err(|source| io_err(to, source))?;
+    transfer_mtime(from, to);
+    Ok(())
+}
+
+/// Best-effort copy of `from`'s mtime onto `to`. Silent on any failure.
+fn transfer_mtime(from: &Path, to: &Path) {
+    let Ok(metadata) = fs::symlink_metadata(from) else {
+        return;
+    };
+    let Ok(mtime) = metadata.modified() else {
+        return;
+    };
+    if let Ok(handle) = fs::OpenOptions::new().write(true).open(to) {
+        let _ = handle.set_modified(mtime);
+    }
+}
+
 /// Recursively copy a directory tree to independent inodes.
 /// Preserves executable bits and re-creates symlinks without following them.
 pub(crate) fn copy_tree(source: &Path, target: &Path) -> Result<(), MaterializeError> {
@@ -1025,7 +1050,7 @@ fn copy_tree_inner(source: &Path, target: &Path) -> Result<(), MaterializeError>
                 .map(|_| ())
                 .map_err(|source| io_err(&dst_path, source))?;
         } else {
-            fs::copy(&src_path, &dst_path).map_err(|source| io_err(&dst_path, source))?;
+            copy_file_preserving_mtime(&src_path, &dst_path)?;
             // Preserve executable bit.
             #[cfg(unix)]
             {

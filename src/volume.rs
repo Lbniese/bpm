@@ -556,6 +556,31 @@ fn read_entry_identities(volume: &Path) -> Result<BTreeMap<String, String>, Volu
     })
 }
 
+/// Write a canonical `metadata.json` manifest for a test volume rooted at
+/// `root`, computing real tree-blake3 entry identities from `<root>/node_modules`.
+/// Integration tests use this to publish a volume that
+/// [`attach_project_local_with_backend`] can read; production code publishes
+/// volumes via [`PendingVolume::publish`]. Panics on IO/serialization failure
+/// (test-only helper; mirrors the internal `write_test_meta`).
+pub fn write_test_meta_for_tests(root: &Path) {
+    let meta = VolumeMeta {
+        graph_id_hex: String::new(),
+        layout_version: VOLUME_LAYOUT_VERSION,
+        packages_materialized: 0,
+        bins_linked: 0,
+        inventory_version: INVENTORY_VERSION,
+        artifacts: Vec::new(),
+        derived: Vec::new(),
+        entry_identities: compute_entry_identities(&root.join("node_modules"))
+            .expect("test node_modules must be readable"),
+    };
+    fs::write(
+        root.join(META_FILE),
+        serde_json::to_vec(&meta).expect("volume meta must serialize"),
+    )
+    .expect("metadata.json must be writable");
+}
+
 impl PendingVolume {
     /// The staging path where lifecycle and materialization happen.
     pub fn path(&self) -> &Path {
@@ -1125,38 +1150,10 @@ pub fn attach_project_local(
     project_root: &Path,
     volume: &VolumeRef,
 ) -> Result<AttachOutcome, VolumeError> {
-    let vol_nm = volume.path.join("node_modules");
-    let proj_nm = project_root.join("node_modules");
-    fs::create_dir_all(&proj_nm).map_err(|source| io_err(&proj_nm, source))?;
-    let identities = read_entry_identities(&volume.path)?;
-    let mut entries = fs::read_dir(&vol_nm)
-        .map_err(|source| io_err(&vol_nm, source))?
-        .filter_map(Result::ok)
-        .collect::<Vec<_>>();
-    entries.sort_by_key(|entry| entry.file_name());
-    let mut stats = AttachStats::default();
-    let mut owned = Vec::new();
-    for entry in entries {
-        let name = entry.file_name();
-        let target = proj_nm.join(&name);
-        crate::materializer::copy_tree(&entry.path(), &target).map_err(VolumeError::Materialize)?;
-        stats.relays_created += 1;
-        let identity = identities.get(&name.to_string_lossy()).ok_or_else(|| {
-            io_err(
-                &entry.path(),
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "graph identity missing for entry",
-                ),
-            )
-        })?;
-        owned.push(ManagedEntry {
-            path: format!("node_modules/{name}"),
-            mode: "local".to_string(),
-            identity: identity.clone(),
-        });
-    }
-    Ok(AttachOutcome::new(stats, owned))
+    // Windows project views always copy (no reflink syscall); the backend is
+    // ignored, so delegate to the with-backend impl for API symmetry with the
+    // unix variant.
+    attach_project_local_with_backend(project_root, volume, MaterializeBackend::Auto)
 }
 
 /// Windows has no reflink syscall binding; the backend argument is accepted
@@ -1181,13 +1178,15 @@ pub fn attach_project_local_with_backend(
     let mut stats = AttachStats::default();
     let mut owned = Vec::new();
     for entry in entries {
+        let source = entry.path();
         let name = entry.file_name();
+        let name_str = name.to_string_lossy().into_owned();
         let target = proj_nm.join(&name);
-        crate::materializer::copy_tree(&entry.path(), &target).map_err(VolumeError::Materialize)?;
+        crate::materializer::copy_tree(&source, &target).map_err(VolumeError::Materialize)?;
         stats.relays_created += 1;
-        let identity = identities.get(&name.to_string_lossy()).ok_or_else(|| {
+        let identity = identities.get(&name_str).ok_or_else(|| {
             io_err(
-                &entry.path(),
+                &source,
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "graph identity missing for entry",
@@ -1195,7 +1194,7 @@ pub fn attach_project_local_with_backend(
             )
         })?;
         owned.push(ManagedEntry {
-            path: format!("node_modules/{name}"),
+            path: format!("node_modules/{name_str}"),
             mode: "local".to_string(),
             identity: identity.clone(),
         });

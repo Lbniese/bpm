@@ -327,6 +327,7 @@ fn materialize_windows_link(
     target: &Path,
     deferred: &[(PathBuf, PathBuf)],
     visiting: &mut HashSet<PathBuf>,
+    budget: &mut ExtractionBudget,
 ) -> Result<(), ExtractError> {
     let normalized_target = resolve_relative(link.parent().unwrap_or(Path::new("")), target)?;
     if !visiting.insert(link.to_path_buf()) {
@@ -341,7 +342,14 @@ fn materialize_windows_link(
             .iter()
             .find(|(candidate, _)| candidate == &normalized_target)
         {
-            materialize_windows_link(root, &normalized_target, next_target, deferred, visiting)?;
+            materialize_windows_link(
+                root,
+                &normalized_target,
+                next_target,
+                deferred,
+                visiting,
+                budget,
+            )?;
         }
     }
     if !source.exists() {
@@ -360,6 +368,7 @@ fn materialize_windows_link(
             root.join(link),
             deferred,
             visiting,
+            budget,
         )?;
     } else {
         fs::copy(&source, root.join(link)).map_err(|source| write_err(&root.join(link), source))?;
