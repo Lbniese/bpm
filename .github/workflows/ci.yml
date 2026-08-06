@@ -1,0 +1,240 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '17 3 * * 1'
+  workflow_dispatch:
+    inputs:
+      baseline_ref:
+        description: Git ref/commit to benchmark as the regression baseline (default HEAD^)
+        required: false
+        default: HEAD^
+        type: string
+      informational_baseline:
+        description: Report comparison rows without gating on environment mismatch or ratio excess
+        required: false
+        default: false
+        type: boolean
+      regression_envelope:
+        description: Maximum allowed current/baseline median ratio
+        required: false
+        default: '2.0'
+        type: string
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The integration suite relies on Unix filesystem semantics (symlinks,
+  # executable bits, /tmp paths) and ships release binaries for macOS and
+  # Linux only, so the full `cargo test` suite runs on those platforms.
+  # Windows is build-, lint-, and windows-gated-test-checked to keep the
+  # code cross-compilable and exercised there (see the `windows` job below).
+  test:
+    name: fmt, clippy, test, build
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      # Pinned toolchain — see rust-toolchain.toml. Keep the version here
+      # identical to the channel in that file.
+      - name: Install Rust (pinned)
+        uses: dtolnay/rust-toolchain@1.96.1
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace
+
+      - name: cargo build --release
+        run: cargo build --release --workspace
+
+  windows:
+    name: fmt, clippy, build, test (windows)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust (pinned)
+        uses: dtolnay/rust-toolchain@1.96.1
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: cargo build --release
+        run: cargo build --release --workspace
+
+      # Library and binary unit tests are portable and run on Windows. The
+      # Unix-oriented integration suites remain excluded because they rely on
+      # symlink/exec-bit/`/tmp` semantics. `tests/install_windows.rs` remains
+      # the dedicated Windows integration gate.
+      - name: cargo test (portable unit suites)
+        run: cargo test --workspace --lib --bins
+
+      - name: cargo test (windows-gated suite)
+        run: cargo test --test install_windows
+
+  benchmark-smoke:
+    name: benchmark harness smoke
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.96.1
+      - run: cargo run -- bench --list
+      - run: cargo test --test bench
+
+  benchmark-baseline:
+    name: benchmark baseline regression
+    runs-on: macos-14
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@1.96.1
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '26.0.0'
+      - name: Verify pinned tool versions
+        run: |
+          node --version
+          npm --version
+      - name: Resolve and validate baseline ref
+        id: baseline_ref
+        shell: bash
+        run: |
+          baseline_ref="${{ github.event.inputs.baseline_ref || 'HEAD^' }}"
+          # Validate the ref resolves to exactly one commit without evaluating
+          # it as shell text. `--end-of-options` stops option parsing so a
+          # ref beginning with '-' cannot change the command.
+          if ! baseline_sha="$(git rev-parse --verify --end-of-options "${baseline_ref}^{commit}")"; then
+            echo "::error::baseline_ref '${baseline_ref}' does not resolve to a commit"
+            exit 1
+          fi
+          echo "baseline_ref=${baseline_ref}" >> "$GITHUB_OUTPUT"
+          echo "baseline_sha=${baseline_sha}" >> "$GITHUB_OUTPUT"
+      - name: Build and benchmark baseline commit
+        shell: bash
+        env:
+          BASELINE_SHA: ${{ steps.baseline_ref.outputs.baseline_sha }}
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          worktree="${RUNNER_TEMP}/baseline-worktree"
+          git worktree add --detach "${worktree}" "${BASELINE_SHA}"
+          export CARGO_TARGET_DIR="${RUNNER_TEMP}/baseline-target"
+          # Build and run the BASELINE commit's harness with identical
+          # arguments to the current run below. BPM only (npm/pnpm are not
+          # part of the regression gate; the curated reference.json keeps the
+          # cross-tool historical narrative).
+          (cd "${worktree}" && cargo build --release)
+          "${RUNNER_TEMP}/baseline-target/release/bpm" bench \
+            --fixture minimal \
+            --scenario repeat_install \
+            --tools bpm \
+            --require-tools \
+            --runs 3 \
+            --json "${RUNNER_TEMP}/baseline.json"
+      - name: Build and benchmark current commit, compare against baseline
+        shell: bash
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR="${RUNNER_TEMP}/current-target"
+          cargo build --release
+          extra_flags=()
+          if [[ "${{ github.event.inputs.informational_baseline }}" == "true" ]]; then
+            extra_flags+=(--baseline-informational)
+          fi
+          ./target/release/bpm bench \
+            --fixture minimal \
+            --scenario repeat_install \
+            --tools bpm \
+            --require-tools \
+            --runs 3 \
+            --json "${RUNNER_TEMP}/current.json" \
+            --compare-baseline "${RUNNER_TEMP}/baseline.json" \
+            --regression-envelope "${{ github.event.inputs.regression_envelope || '2.0' }}" \
+            ${extra_flags[@]}
+      - name: Remove baseline worktree
+        if: always()
+        shell: bash
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          worktree="${RUNNER_TEMP}/baseline-worktree"
+          if [ -d "${worktree}" ]; then
+            git worktree remove --force "${worktree}" || true
+          fi
+      - name: Upload benchmark JSON artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: |
+            ${{ runner.temp }}/baseline.json
+            ${{ runner.temp }}/current.json
+          if-no-files-found: ignore
+
+  git-prepare-oracle:
+    name: git-prepare oracle (pinned npm)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.96.1
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '26.0.0'
+      - name: Verify pinned tool versions (npm must be 11.12.1)
+        run: |
+          node --version
+          npm --version
+          test "$(npm --version)" = "11.12.1"
+      - name: Run the ignored git-prepare oracle
+        run: cargo test --test git_prepare_characterization -- --ignored --nocapture --test-threads=1
+
+  advisory-scan:
+    name: cargo-deny advisories
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Install Rust (pinned)
+        uses: dtolnay/rust-toolchain@1.96.1
+      - name: Run cargo-deny (advisories)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command-arguments: advisories
