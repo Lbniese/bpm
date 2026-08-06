@@ -1,0 +1,32 @@
+services:
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      - HOME=/home/dev
+      - CARGO_HOME=/home/dev/.cargo
+      - PATH=/home/dev/.bun/bin:/home/dev/.cargo/bin:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    volumes:
+      # The repo is bind-mounted (dev-owned); `target/` therefore lives on the
+      # bind mount and needs no separate volume.
+      - .:/workspace
+      # Persistent registry/git cache. The mount point is dev-owned (chowned in
+      # the Dockerfile) so a fresh named volume inherits dev ownership.
+      - cargo-cache:/home/dev/.cargo/registry
+      - ${HOME}/.bun/bin:/home/dev/.bun/bin:ro
+      - ${HOME}/.bun/install:/home/dev/.bun/install:ro
+      - ${HOME}/.pi:/home/dev/.pi
+      - ${HOME}/.config/pi:/home/dev/.config/pi
+      - ${HOME}/.cache/pi:/home/dev/.cache/pi
+      - ${HOME}/.config/opencode:/home/dev/.config/opencode
+      - ${HOME}/.cache/opencode:/home/dev/.cache/opencode
+      - ${HOME}/.local/share/opencode:/home/dev/.local/share/opencode
+      - ${HOME}/.config/gh:/home/dev/.config/gh
+    working_dir: /workspace
+    tty: true
+    stdin_open: true
+    command: sleep infinity
+
+volumes:
+  cargo-cache:
