@@ -2,7 +2,10 @@
 
 use std::{fs, path::Path, path::PathBuf};
 
-use bpm::bench::{self, BenchmarkResult, CompareOptions, RunSuiteOptions, ScenarioKind, Tool};
+use bpm::bench::{
+    self, BenchmarkResult, CompareOptions, CrossToolGateOptions, RunSuiteOptions, ScenarioKind,
+    Tool,
+};
 
 pub(super) struct Options {
     pub fixture: String,
@@ -20,10 +23,13 @@ pub(super) struct Options {
     /// Run every tool install with `--ignore-scripts` (lifecycle
     /// parity sweep). Off by default: the headline baseline keeps lifecycle ON.
     pub ignore_scripts: bool,
-    /// Route all tools through the counting parity proxy and capture per-tool
+    /// Route all tools through the counting parity proxy and capture per-sample
     /// `NetworkShape`. Off by default: the proxy measures network
     /// *shape*, not production timing.
     pub profile_parity: bool,
+    pub require_faster_than: Option<String>,
+    pub max_median_ratio: Option<f64>,
+    pub max_p95_ratio: Option<f64>,
 }
 
 pub(super) fn run(options: Options) -> anyhow::Result<()> {
@@ -65,6 +71,7 @@ pub(super) fn run(options: Options) -> anyhow::Result<()> {
         })?;
     let scenarios = parse_scenarios(options.scenario.as_deref())?;
     let tools = parse_tools(&options.tools)?;
+    let cross_tool_gate = parse_cross_tool_gate(&options, &tools)?;
 
     eprintln!(
         "benchmark: fixture={}, scenarios={}, requested_tools={}, runs={}, require_tools={}",
@@ -150,6 +157,26 @@ pub(super) fn run(options: Options) -> anyhow::Result<()> {
         }
     }
 
+    if let Some(gate) = cross_tool_gate {
+        let rows = bench::compare_results_against_tool(&suite.results, &gate)?;
+        for row in rows {
+            println!(
+                "cross-tool fixture={} scenario={} bpm_median={:.3}ms target={} target_median={:.3}ms bpm_p95={:.3}ms target_p95={:.3}ms paired_median_ratio={:.6} paired_p95_ratio={:.6} protocol_version={} versions={:?}",
+                row.fixture,
+                row.scenario,
+                row.bpm_median_ms,
+                row.target_tool,
+                row.target_median_ms,
+                row.bpm_p95_ms,
+                row.target_p95_ms,
+                row.paired_median_ratio,
+                row.paired_p95_ratio,
+                row.protocol_version,
+                row.versions,
+            );
+        }
+    }
+
     Ok(())
 }
 
@@ -168,16 +195,86 @@ fn parse_scenarios(name: Option<&str>) -> anyhow::Result<Vec<ScenarioKind>> {
 }
 
 fn parse_tools(raw: &str) -> anyhow::Result<Vec<Tool>> {
-    raw.split(',')
-        .map(|value| match value.trim() {
-            "npm" => Ok(Tool::Npm),
-            "pnpm" => Ok(Tool::Pnpm),
-            "bpm" => Ok(Tool::Bpm),
-            "yarn" => Ok(Tool::Yarn),
-            "bun" => Ok(Tool::Bun),
-            other => Err(anyhow::anyhow!("unknown tool '{other}'")),
-        })
-        .collect()
+    let mut tools = Vec::new();
+    for value in raw.split(',') {
+        let tool = parse_tool(value)?;
+        if tools.contains(&tool) {
+            anyhow::bail!(
+                "duplicate tool '{}' in --tools; list each tool once",
+                tool.name()
+            );
+        }
+        tools.push(tool);
+    }
+    Ok(tools)
+}
+
+fn parse_tool(value: &str) -> anyhow::Result<Tool> {
+    match value.trim() {
+        "npm" => Ok(Tool::Npm),
+        "pnpm" => Ok(Tool::Pnpm),
+        "bpm" => Ok(Tool::Bpm),
+        "yarn" => Ok(Tool::Yarn),
+        "bun" => Ok(Tool::Bun),
+        other => Err(anyhow::anyhow!("unknown tool '{other}'")),
+    }
+}
+
+fn parse_cross_tool_gate(
+    options: &Options,
+    requested_tools: &[Tool],
+) -> anyhow::Result<Option<CrossToolGateOptions>> {
+    let Some(target_name) = options.require_faster_than.as_deref() else {
+        if options.max_median_ratio.is_some() || options.max_p95_ratio.is_some() {
+            anyhow::bail!("--max-median-ratio and --max-p95-ratio require --require-faster-than");
+        }
+        return Ok(None);
+    };
+
+    let target = parse_tool(target_name)?;
+    if target == Tool::Bpm {
+        anyhow::bail!("--require-faster-than cannot target bpm");
+    }
+    if !options.require_tools {
+        anyhow::bail!("--require-faster-than requires --require-tools");
+    }
+    if options.runs < 7 {
+        anyhow::bail!("--require-faster-than requires --runs >= 7");
+    }
+    if !options.ignore_scripts {
+        anyhow::bail!("--require-faster-than requires explicit --ignore-scripts");
+    }
+    if options.profile_parity {
+        anyhow::bail!("--require-faster-than cannot be combined with --profile-parity");
+    }
+    if !requested_tools.contains(&Tool::Bpm) {
+        anyhow::bail!("--require-faster-than requires bpm in --tools");
+    }
+    if !requested_tools.contains(&target) {
+        anyhow::bail!(
+            "--require-faster-than requires {} in --tools",
+            target.name()
+        );
+    }
+
+    let max_median_ratio = options.max_median_ratio.unwrap_or(1.0);
+    let max_p95_ratio = options.max_p95_ratio.unwrap_or(1.0);
+    if !(max_median_ratio.is_finite() && max_median_ratio > 0.0) {
+        anyhow::bail!("--max-median-ratio must be a positive finite number");
+    }
+    if !(max_p95_ratio.is_finite() && max_p95_ratio > 0.0) {
+        anyhow::bail!("--max-p95-ratio must be a positive finite number");
+    }
+
+    Ok(Some(CrossToolGateOptions {
+        target,
+        max_median_ratio,
+        max_p95_ratio,
+        require_tools: options.require_tools,
+        runs: options.runs,
+        ignore_scripts: options.ignore_scripts,
+        profile_parity: options.profile_parity,
+    }))
 }
 
 fn read_benchmark_results(path: &Path) -> anyhow::Result<Vec<BenchmarkResult>> {
@@ -225,4 +322,17 @@ fn slugify(value: &str) -> String {
         .collect::<String>()
         .trim_matches('-')
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_tools_rejects_duplicate_entries() {
+        let error = parse_tools("npm, pnpm, npm").unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("duplicate tool 'npm'"), "{message}");
+        assert!(message.contains("--tools"), "{message}");
+    }
 }
