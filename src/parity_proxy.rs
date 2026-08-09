@@ -11,8 +11,9 @@
 //! Design notes:
 //! - The proxy runs on its own multi-thread tokio runtime on a dedicated OS
 //!   thread (the harness is otherwise synchronous). [`ParityProxy::start`]
-//!   returns once the listener is bound; [`ParityProxy::drop`] signals shutdown
-//!   and joins the thread.
+//!   returns once the listener is bound. The harness creates one proxy per
+//!   sample and calls [`ParityProxy::finish`], which closes acceptance, joins
+//!   or cancels accepted connection tasks, and returns only finalized records.
 //! - The upstream fetch reuses `reqwest`'s async client (rustls), so TLS to the
 //!   registry is handled and the proxy only speaks HTTP/1.1 to the tools. This
 //!   normalizes transport and measures network *shape* (counts/bytes/concurrency),
@@ -28,9 +29,9 @@ use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::task::{Context, Poll};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures_util::TryStreamExt;
@@ -44,7 +45,8 @@ use serde::{Deserialize, Serialize};
 /// (`StreamBody` vs `Empty`).
 type BoxedCountingBody = Pin<Box<dyn Body<Data = Bytes, Error = std::convert::Infallible> + Send>>;
 use tokio::net::TcpListener;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
+use tokio::task::JoinSet;
 
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
@@ -64,8 +66,9 @@ pub struct NetRecord {
     pub end_ns: u128,
 }
 
-/// Aggregated network shape for one tool's run, derived from its [`NetRecord`]s.
-/// Serialized onto each `ToolResults` when `--profile-parity` is set.
+/// Aggregated network shape for a tool across all of its logical samples,
+/// derived from the raw [`NetRecord`]s. Serialized as the backward-compatible
+/// aggregate alongside per-sample shapes when `--profile-parity` is set.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NetworkShape {
     pub request_count: u64,
@@ -136,8 +139,14 @@ fn percentile(sorted: &[f64], q: f64) -> f64 {
     sorted[index]
 }
 
+/// The controlled public-registry `.npmrc` used by normal benchmark samples.
+/// It intentionally contains no credentials or operator-specific settings.
+pub fn public_registry_npmrc_content() -> &'static str {
+    "registry=https://registry.npmjs.org/\n"
+}
+
 /// The `.npmrc` body that redirects a tool's registry to the proxy. Written
-/// into each benchmark work dir so npm/pnpm/bpm all fetch through it.
+/// into each parity benchmark work dir so npm/pnpm/bpm all fetch through it.
 pub fn parity_npmrc_content(addr: SocketAddr) -> String {
     format!("registry=http://{addr}\n")
 }
@@ -146,17 +155,132 @@ pub fn parity_npmrc_content(addr: SocketAddr) -> String {
 // Proxy process
 // -----------------------------------------------------------------------
 
-/// Shared upstream client + per-tool request log. Cloned per connection/task.
+/// A request remains in flight until its response body is dropped and its
+/// finalized record has been appended. Accepted connections also hold a guard
+/// while hyper starts serving them. That connection-level tag closes the race
+/// where a snapshot could otherwise observe zero before a delayed request
+/// future begins.
+const IN_FLIGHT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+struct InFlight {
+    count: Mutex<usize>,
+    drained: Condvar,
+    accepting: AtomicBool,
+}
+
+impl Default for InFlight {
+    fn default() -> Self {
+        Self {
+            count: Mutex::new(0),
+            drained: Condvar::new(),
+            accepting: AtomicBool::new(true),
+        }
+    }
+}
+
+impl InFlight {
+    /// Tag an accepted connection. The acceptance check and count increment
+    /// are serialized with `close_acceptance`, making the sample boundary
+    /// linearizable: a connection is either in this sample or rejected.
+    fn accept(self: &Arc<Self>) -> Option<InFlightGuard> {
+        let mut count = self.count.lock().expect("in-flight mutex poisoned");
+        if !self.accepting.load(Ordering::SeqCst) {
+            return None;
+        }
+        *count += 1;
+        Some(InFlightGuard {
+            state: Arc::clone(self),
+        })
+    }
+
+    /// Tag a response body belonging to an already accepted connection. Body
+    /// work is allowed to begin after acceptance has closed.
+    fn begin(self: &Arc<Self>) -> InFlightGuard {
+        let mut count = self.count.lock().expect("in-flight mutex poisoned");
+        *count += 1;
+        InFlightGuard {
+            state: Arc::clone(self),
+        }
+    }
+
+    /// Close the acceptance gate before asking the listener to stop. Holding
+    /// the count lock prevents an accept/increment from racing this boundary.
+    fn close_acceptance(&self) {
+        let _count = self.count.lock().expect("in-flight mutex poisoned");
+        self.accepting.store(false, Ordering::SeqCst);
+    }
+
+    fn finish(&self) {
+        let mut count = self.count.lock().expect("in-flight mutex poisoned");
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            self.drained.notify_all();
+        }
+    }
+
+    fn wait_for_zero(&self) -> io::Result<()> {
+        self.wait_for_zero_with_hook(|| {})
+    }
+
+    fn wait_for_zero_with_hook<F>(&self, hook: F) -> io::Result<()>
+    where
+        F: FnOnce(),
+    {
+        let deadline = Instant::now() + IN_FLIGHT_DRAIN_TIMEOUT;
+        let mut count = self
+            .count
+            .lock()
+            .map_err(|_| io::Error::other("parity proxy in-flight state was poisoned"))?;
+        hook();
+        while *count != 0 {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "parity proxy did not drain in-flight response bodies",
+                ));
+            }
+            let (next_count, timeout) = self
+                .drained
+                .wait_timeout(count, remaining)
+                .map_err(|_| io::Error::other("parity proxy in-flight state was poisoned"))?;
+            count = next_count;
+            if timeout.timed_out() && *count != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "parity proxy did not drain in-flight response bodies",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+struct InFlightGuard {
+    state: Arc<InFlight>,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.state.finish();
+    }
+}
+
+/// Shared upstream client + one sample's request log. Cloned per connection/task.
 struct ProxyState {
     client: reqwest::Client,
     log: Arc<Mutex<Vec<NetRecord>>>,
+    in_flight: Arc<InFlight>,
 }
 
-/// Handle to a running parity proxy. Dropping it signals shutdown and joins the
-/// proxy thread.
+/// Handle to a running one-sample parity proxy. Dropping it signals shutdown
+/// and joins the proxy thread; benchmark attribution uses [`ParityProxy::finish`]
+/// so incomplete drains fail closed instead of returning partial records.
 pub struct ParityProxy {
     addr: SocketAddr,
     log: Arc<Mutex<Vec<NetRecord>>>,
+    in_flight: Arc<InFlight>,
+    drain_failed: Arc<AtomicBool>,
     shutdown: Option<oneshot::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -167,6 +291,10 @@ impl ParityProxy {
     pub fn start() -> io::Result<Self> {
         let log = Arc::new(Mutex::new(Vec::<NetRecord>::new()));
         let log_for_thread = log.clone();
+        let in_flight = Arc::new(InFlight::default());
+        let in_flight_for_thread = in_flight.clone();
+        let drain_failed = Arc::new(AtomicBool::new(false));
+        let drain_failed_for_thread = drain_failed.clone();
         let (addr_tx, addr_rx) = std::sync::mpsc::channel::<io::Result<SocketAddr>>();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
@@ -185,7 +313,13 @@ impl ParityProxy {
                         return;
                     }
                 };
-                runtime.block_on(proxy_main(addr_tx, log_for_thread, shutdown_rx));
+                runtime.block_on(proxy_main(
+                    addr_tx,
+                    log_for_thread,
+                    in_flight_for_thread,
+                    drain_failed_for_thread,
+                    shutdown_rx,
+                ));
             })?;
 
         let addr = addr_rx
@@ -195,6 +329,8 @@ impl ParityProxy {
         Ok(Self {
             addr,
             log,
+            in_flight,
+            drain_failed,
             shutdown: Some(shutdown_tx),
             thread: Some(thread),
         })
@@ -205,34 +341,78 @@ impl ParityProxy {
         self.addr
     }
 
+    /// Close this sample's acceptance boundary, stop accepting new
+    /// connections, join or cancel every accepted connection task, and return
+    /// only finalized records from this proxy instance. No record is returned
+    /// after an incomplete drain: callers must treat the sample as invalid.
+    pub fn finish(mut self) -> io::Result<Vec<NetRecord>> {
+        self.in_flight.close_acceptance();
+        if let Some(sender) = self.shutdown.take() {
+            let _ = sender.send(());
+        }
+        if let Some(handle) = self.thread.take() {
+            handle
+                .join()
+                .map_err(|_| io::Error::other("parity proxy thread panicked"))?;
+        }
+        if self.drain_failed.load(Ordering::SeqCst) {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "parity proxy did not drain accepted connection tasks",
+            ));
+        }
+        self.in_flight.wait_for_zero()?;
+        let mut log = self
+            .log
+            .lock()
+            .map_err(|_| io::Error::other("parity proxy record log was poisoned"))?;
+        Ok(std::mem::take(&mut *log))
+    }
+
     /// Snapshot the accumulated records WITHOUT clearing (used for inspection).
+    /// This is not a sample boundary; benchmark attribution uses [`Self::finish`].
     pub fn snapshot(&self) -> Vec<NetRecord> {
         self.log.lock().map(|log| log.clone()).unwrap_or_default()
     }
 
-    /// Snapshot the accumulated records and clear the log. Called between tools
-    /// so each tool's [`NetworkShape`] is attributed correctly.
+    /// Legacy diagnostic snapshot. It remains for callers that only inspect a
+    /// running proxy, but it does not close acceptance and must not delimit a
+    /// benchmark sample. Production sampling uses [`Self::finish`].
     pub fn snapshot_and_clear(&self) -> Vec<NetRecord> {
-        self.log
-            .lock()
-            .map(|mut log| {
-                let records = log.clone();
-                log.clear();
-                records
-            })
-            .unwrap_or_default()
+        self.try_snapshot_and_clear()
+            .expect("parity proxy response bodies did not drain")
     }
 
-    /// Drop the accumulated records without returning them.
+    pub fn try_snapshot_and_clear(&self) -> io::Result<Vec<NetRecord>> {
+        self.in_flight.wait_for_zero()?;
+        let mut log = self
+            .log
+            .lock()
+            .map_err(|_| io::Error::other("parity proxy record log was poisoned"))?;
+        let records = log.clone();
+        log.clear();
+        Ok(records)
+    }
+
+    /// Legacy diagnostic clear; it is intentionally not a sample boundary.
     pub fn clear(&self) {
-        if let Ok(mut log) = self.log.lock() {
-            log.clear();
-        }
+        self.try_clear()
+            .expect("parity proxy response bodies did not drain");
+    }
+
+    fn try_clear(&self) -> io::Result<()> {
+        self.in_flight.wait_for_zero()?;
+        self.log
+            .lock()
+            .map_err(|_| io::Error::other("parity proxy record log was poisoned"))?
+            .clear();
+        Ok(())
     }
 }
 
 impl Drop for ParityProxy {
     fn drop(&mut self) {
+        self.in_flight.close_acceptance();
         if let Some(sender) = self.shutdown.take() {
             let _ = sender.send(());
         }
@@ -252,10 +432,14 @@ impl fmt::Debug for ParityProxy {
 }
 
 /// Bind the listener, report the address, then accept connections until
-/// shutdown. Runs on the proxy's dedicated runtime.
+/// shutdown. Runs on the proxy's dedicated runtime. Each accepted connection
+/// is retained in a join set so finish can close the boundary and deterministically
+/// drain or cancel it before exposing the sample records.
 async fn proxy_main(
     addr_tx: std::sync::mpsc::Sender<io::Result<SocketAddr>>,
     log: Arc<Mutex<Vec<NetRecord>>>,
+    in_flight: Arc<InFlight>,
+    drain_failed: Arc<AtomicBool>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
     let listener = match TcpListener::bind("127.0.0.1:0").await {
@@ -284,26 +468,86 @@ async fn proxy_main(
         Ok(client) => client,
         Err(_) => return,
     };
-    let state = Arc::new(ProxyState { client, log });
+    let state = Arc::new(ProxyState {
+        client,
+        log,
+        in_flight: in_flight.clone(),
+    });
+    let (connection_shutdown, _) = watch::channel(false);
+    let mut connections = JoinSet::new();
 
     loop {
         tokio::select! {
             accepted = listener.accept() => {
                 let Ok((stream, _)) = accepted else { break };
+                let Some(connection_guard) = state.in_flight.accept() else {
+                    // finish closed the linearizable acceptance boundary while
+                    // this accept was being selected; do not admit the socket.
+                    break;
+                };
                 let io = TokioIo::new(stream);
                 let state = state.clone();
-                tokio::spawn(async move {
+                let mut connection_shutdown = connection_shutdown.subscribe();
+                connections.spawn(async move {
                     let service = service_fn(move |request: Request<Incoming>| {
                         let state = state.clone();
+                        // The accepted-connection guard remains live until this
+                        // task exits, so a delayed request start cannot race a
+                        // sample finish into an apparent zero-in-flight state.
+                        let in_flight = state.in_flight.begin();
                         async move {
-                            Ok::<_, std::convert::Infallible>(proxy_handle(request, state).await)
+                            Ok::<_, std::convert::Infallible>(
+                                proxy_handle(request, state, in_flight).await,
+                            )
                         }
                     });
-                    let _ = http1::Builder::new().serve_connection(io, service).await;
+                    let mut connection = Box::pin(
+                        http1::Builder::new().serve_connection(io, service),
+                    );
+                    tokio::select! {
+                        result = &mut connection => {
+                            let _ = result;
+                        }
+                        changed = connection_shutdown.changed() => {
+                            if changed.is_ok() {
+                                connection.as_mut().graceful_shutdown();
+                            }
+                            let _ = connection.await;
+                        }
+                    }
+                    drop(connection_guard);
                 });
             }
-            _ = &mut shutdown => break,
+            _ = &mut shutdown => {
+                in_flight.close_acceptance();
+                let _ = connection_shutdown.send(true);
+                break;
+            }
         }
+    }
+
+    // Also close the gate when the listener exits for an I/O reason. The
+    // shutdown notification makes idle keep-alive connections finish
+    // gracefully, while active requests are allowed to finalize their bodies.
+    in_flight.close_acceptance();
+    let _ = connection_shutdown.send(true);
+    let drained = tokio::time::timeout(IN_FLIGHT_DRAIN_TIMEOUT, async {
+        let mut ok = true;
+        while let Some(result) = connections.join_next().await {
+            if result.is_err() {
+                ok = false;
+            }
+        }
+        ok
+    })
+    .await;
+    if !matches!(drained, Ok(true)) {
+        drain_failed.store(true, Ordering::SeqCst);
+        connections.abort_all();
+        while connections.join_next().await.is_some() {}
+    }
+    if in_flight.wait_for_zero().is_err() {
+        drain_failed.store(true, Ordering::SeqCst);
     }
 }
 
@@ -358,6 +602,7 @@ fn forward_headers(headers: &http::HeaderMap, skip: &[&str]) -> http::HeaderMap 
 async fn proxy_handle(
     request: Request<Incoming>,
     state: Arc<ProxyState>,
+    in_flight: InFlightGuard,
 ) -> Response<BoxedCountingBody> {
     let method = request.method().clone();
     let path = request.uri().path().to_string();
@@ -386,6 +631,7 @@ async fn proxy_handle(
                 &method,
                 &path,
                 &state.log,
+                in_flight,
             )
         }
     };
@@ -401,6 +647,7 @@ async fn proxy_handle(
         },
         log: state.log.clone(),
         finalized: AtomicBool::new(false),
+        _in_flight: in_flight,
     };
 
     let mut response = Response::new(Box::pin(body) as BoxedCountingBody);
@@ -427,6 +674,7 @@ fn error_response(
     method: &Method,
     path: &str,
     log: &Arc<Mutex<Vec<NetRecord>>>,
+    in_flight: InFlightGuard,
 ) -> Response<BoxedCountingBody> {
     let body = CountingBody {
         inner: Box::pin(Empty::<Bytes>::new()),
@@ -439,6 +687,7 @@ fn error_response(
         },
         log: log.clone(),
         finalized: AtomicBool::new(false),
+        _in_flight: in_flight,
     };
     let mut response = Response::new(Box::pin(body) as BoxedCountingBody);
     *response.status_mut() = status;
@@ -466,6 +715,9 @@ struct CountingBody<S: Body<Data = Bytes>> {
     pending: PendingRecord,
     log: Arc<Mutex<Vec<NetRecord>>>,
     finalized: AtomicBool,
+    /// Dropped after `inner`, so snapshot draining observes the finalized log
+    /// record before this request leaves the in-flight set.
+    _in_flight: InFlightGuard,
 }
 
 struct PendingRecord {
@@ -659,6 +911,123 @@ mod tests {
         }
     }
 
+    #[test]
+    fn snapshot_and_clear_waits_for_delayed_body_finalization() {
+        struct DelayedDropBody {
+            release: Option<std::sync::mpsc::Receiver<()>>,
+        }
+
+        impl Body for DelayedDropBody {
+            type Data = Bytes;
+            type Error = std::convert::Infallible;
+
+            fn poll_frame(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+                Poll::Ready(None)
+            }
+        }
+
+        impl Drop for DelayedDropBody {
+            fn drop(&mut self) {
+                self.release
+                    .take()
+                    .expect("delayed body release")
+                    .recv()
+                    .expect("release delayed body");
+            }
+        }
+
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let in_flight = Arc::new(InFlight::default());
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let body = CountingBody {
+            inner: Box::pin(DelayedDropBody {
+                release: Some(release_rx),
+            }),
+            bytes: 7,
+            pending: PendingRecord {
+                method: "GET".into(),
+                path: "/delayed".into(),
+                status: 200,
+                start_ns: 1,
+            },
+            log: log.clone(),
+            finalized: AtomicBool::new(false),
+            _in_flight: in_flight.begin(),
+        };
+        let proxy = ParityProxy {
+            addr: "127.0.0.1:1".parse().unwrap(),
+            log,
+            in_flight,
+            drain_failed: Arc::new(AtomicBool::new(false)),
+            shutdown: None,
+            thread: None,
+        };
+
+        let (snapshot_tx, snapshot_rx) = std::sync::mpsc::channel();
+        let snapshot_thread = std::thread::spawn(move || {
+            snapshot_tx
+                .send(proxy.try_snapshot_and_clear())
+                .expect("send snapshot result");
+        });
+        let (drop_done_tx, drop_done_rx) = std::sync::mpsc::channel();
+        let drop_thread = std::thread::spawn(move || {
+            drop(body);
+            drop_done_tx.send(()).expect("send body drop result");
+        });
+
+        // The response body is held in its delayed destructor, so the drain
+        // cannot return a snapshot while its in-flight guard is still live.
+        assert!(snapshot_rx.try_recv().is_err());
+        release_tx.send(()).expect("release delayed body");
+        drop_done_rx.recv().expect("body drop completed");
+        let records = snapshot_rx
+            .recv()
+            .expect("snapshot completed")
+            .expect("snapshot succeeded");
+        drop_thread.join().expect("join body thread");
+        snapshot_thread.join().expect("join snapshot thread");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].path, "/delayed");
+        assert_eq!(records[0].bytes, 7);
+    }
+
+    #[test]
+    fn closed_boundary_waits_for_delayed_request_start() {
+        let in_flight = Arc::new(InFlight::default());
+        let connection_guard = in_flight.accept().expect("connection accepted");
+        let (start_tx, start_rx) = std::sync::mpsc::channel();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let request_state = in_flight.clone();
+        let request_thread = std::thread::spawn(move || {
+            start_rx.recv().expect("release delayed request start");
+            let request_guard = request_state.begin();
+            started_tx.send(()).expect("request started");
+            drop(request_guard);
+            drop(connection_guard);
+        });
+
+        // Closing acceptance rejects genuinely late connections, while the
+        // already accepted connection keeps the drain from observing zero
+        // before its delayed request future begins.
+        in_flight.close_acceptance();
+        assert!(in_flight.accept().is_none());
+
+        let wait_state = in_flight.clone();
+        let (wait_ready_tx, wait_ready_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            wait_state
+                .wait_for_zero_with_hook(|| wait_ready_tx.send(()).expect("drain waiter started"))
+        });
+        wait_ready_rx.recv().expect("drain waiter ready");
+        start_tx.send(()).expect("start delayed request");
+        started_rx.recv().expect("delayed request started");
+        assert!(waiter.join().expect("join drain waiter").is_ok());
+        request_thread.join().expect("join delayed request");
+    }
+
     /// Network-dependent accuracy check: every request the proxy forwards must
     /// be recorded exactly once, including sequential requests on one keep-alive
     /// connection and concurrent requests. Ignored by default (hits the live
@@ -701,7 +1070,7 @@ mod tests {
             futures_util::future::join_all(futures).await;
         });
 
-        let records = proxy.snapshot();
+        let records = proxy.finish().expect("finish parity proxy");
         let expected = paths.len() + 3;
         assert_eq!(
             records.len(),
