@@ -131,10 +131,20 @@ pub(crate) enum Commands {
         /// Run every tool install with `--ignore-scripts` (lifecycle parity sweep).
         #[arg(long = "ignore-scripts")]
         ignore_scripts: bool,
-        /// Route all tools through a counting proxy and capture per-tool network
-        /// shape. Measures network shape, not production timing.
+        /// Route all tools through a counting proxy and capture per-sample
+        /// network shape. Measures network shape, not production timing.
         #[arg(long = "profile-parity")]
         profile_parity: bool,
+        /// Require BPM to be faster than the named competitive tool in the
+        /// same paired benchmark run (for example, `pnpm`).
+        #[arg(long = "require-faster-than")]
+        require_faster_than: Option<String>,
+        /// Maximum paired median BPM/target ratio (default: 1.0 when gated).
+        #[arg(long = "max-median-ratio")]
+        max_median_ratio: Option<f64>,
+        /// Maximum paired p95 BPM/target ratio (default: 1.0 when gated).
+        #[arg(long = "max-p95-ratio")]
+        max_p95_ratio: Option<f64>,
     },
     /// Import an npm `package-lock.json` and emit a canonical `bpm.lock`.
     Import {
@@ -754,6 +764,12 @@ mod tests {
             "/tmp/profile",
             "--compare-baseline",
             "/tmp/baseline.json",
+            "--require-faster-than",
+            "pnpm",
+            "--max-median-ratio",
+            "0.95",
+            "--max-p95-ratio",
+            "1.0",
         ])
         .unwrap();
 
@@ -761,6 +777,9 @@ mod tests {
             require_tools,
             profile_bpm,
             compare_baseline,
+            require_faster_than,
+            max_median_ratio,
+            max_p95_ratio,
             ..
         } = cli.command
         else {
@@ -769,6 +788,9 @@ mod tests {
         assert!(require_tools);
         assert_eq!(profile_bpm, Some(PathBuf::from("/tmp/profile")));
         assert_eq!(compare_baseline, Some(PathBuf::from("/tmp/baseline.json")));
+        assert_eq!(require_faster_than.as_deref(), Some("pnpm"));
+        assert_eq!(max_median_ratio, Some(0.95));
+        assert_eq!(max_p95_ratio, Some(1.0));
     }
 
     #[cfg(unix)]
