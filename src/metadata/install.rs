@@ -65,29 +65,46 @@ impl InstallSession {
         derived: &[String],
     ) -> Result<(), MetadataError> {
         let now = Timestamp::now()?;
-        let mut keys: Vec<ObjectKey> = Vec::new();
+        let mut keys: Vec<ObjectKey> = Vec::with_capacity(artifacts.len() * 2 + derived.len());
         for id in artifacts {
             let hex = id.to_hex();
             let artifact = ObjectKey::artifact(hex.clone())?;
-            self.repository.record_published_object(&artifact)?;
             keys.push(artifact);
             // Every fetched artifact is extracted into a store image.
-            let image = ObjectKey::image(hex)?;
-            self.repository.record_published_object(&image)?;
-            keys.push(image);
+            keys.push(ObjectKey::image(hex)?);
         }
         for derived_id in derived {
-            let key = ObjectKey::derived(derived_id.clone())?;
-            self.repository.record_published_object(&key)?;
-            keys.push(key);
+            keys.push(ObjectKey::derived(derived_id.clone())?);
         }
-        if !keys.is_empty() {
-            self.repository.record_access(&keys, now)?;
-            self.lease = Some(
-                self.repository
-                    .acquire_lease(&keys, LeaseOptions::default())?,
-            );
+        if keys.is_empty() {
+            return Ok(());
         }
+        // Record publication of every artifact/image/derived key in ONE
+        // transaction (one connection, one fsync) instead of 2N+D serial
+        // per-key transactions. Semantics are byte-for-byte identical: every
+        // key is still verified as published on the filesystem and its
+        // size/timestamp still derived from the filesystem.
+        self.repository.record_published_objects_batch(&keys, now)?;
+        // Access is already batched in a single transaction internally.
+        self.repository.record_access(&keys, now)?;
+        self.lease = Some(
+            self.repository
+                .acquire_lease(&keys, LeaseOptions::default())?,
+        );
+        Ok(())
+    }
+
+    /// Lease only the immutable graph volume for an install that exclusively
+    /// reads that volume (a volume-reuse attach). Store artifacts and images
+    /// are not read, and the volume's hardlinks keep their inodes alive even
+    /// if a concurrent collector unlinks the store copies, so the graph lease
+    /// alone covers the read window.
+    pub fn lease_graph_object(&mut self, graph_hex: &str) -> Result<(), MetadataError> {
+        let key = ObjectKey::graph(graph_hex.to_owned())?;
+        self.lease = Some(
+            self.repository
+                .acquire_lease(std::slice::from_ref(&key), LeaseOptions::default())?,
+        );
         Ok(())
     }
 
@@ -103,11 +120,26 @@ impl InstallSession {
         graph_hex: &str,
         inventory: Option<&crate::volume::GraphInventory>,
     ) -> Result<(), MetadataError> {
+        self.record_graph_with_size_hint(graph_hex, inventory, None)
+    }
+
+    /// Record a graph with an optional precomputed logical size for its
+    /// contents (excluding the durable graph marker). The repository falls
+    /// back to its recursive walk when the hint is unavailable.
+    pub fn record_graph_with_size_hint(
+        &mut self,
+        graph_hex: &str,
+        inventory: Option<&crate::volume::GraphInventory>,
+        contents_size_hint: Option<u64>,
+    ) -> Result<(), MetadataError> {
         let graph_key = ObjectKey::graph(graph_hex)?;
         match inventory {
             Some(inventory) => {
-                self.repository
-                    .record_graph_with_inventory(graph_hex, inventory)?;
+                self.repository.record_graph_with_inventory_and_size(
+                    graph_hex,
+                    inventory,
+                    contents_size_hint,
+                )?;
             }
             None => {
                 // Legacy/incomplete volume: record the object only so it is
@@ -132,6 +164,20 @@ impl InstallSession {
         Ok(())
     }
 
+    /// Sum the indexed logical sizes of extracted images for `artifacts`.
+    /// Duplicate artifact ids remain duplicated because npm-compatible graph
+    /// placement may materialize the same image at multiple paths.
+    pub fn recorded_image_size_sum(
+        &self,
+        artifacts: &[ArtifactId],
+    ) -> Result<Option<u64>, MetadataError> {
+        let keys = artifacts
+            .iter()
+            .map(|id| ObjectKey::image(id.to_hex()))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.repository.recorded_logical_size_sum(&keys)
+    }
+
     /// Verify the install lease is still held (heartbeat alive, token valid).
     pub fn check(&self) -> Result<(), MetadataError> {
         match &self.lease {
@@ -144,12 +190,23 @@ impl InstallSession {
     /// `.bpm-state` written: checks the lease is still valid, writes the
     /// durable registration file, and atomically replaces the SQLite project
     /// graph reference. A failure here must fail the install rather than leave
-    /// an unprotected graph reported as installed.
+    /// an unprotected graph reported as installed. Short-circuits without
+    /// writes when the index already records this complete graph, the project
+    /// reference, and a matching durable registration — the same redundancy
+    /// predicate as [`Self::refresh_cached_graph`], applied to installs that
+    /// re-materialized an unchanged graph (volume reuse) rather than hitting
+    /// the plan cache.
     pub fn finalize_project(
         &self,
         project_root: &Path,
         graph_hex: &str,
     ) -> Result<(), MetadataError> {
+        if self
+            .repository
+            .cached_graph_protection_current(project_root, graph_hex)?
+        {
+            return Ok(());
+        }
         self.check()?;
         self.repository
             .write_durable_registration(project_root, graph_hex)?;
@@ -167,7 +224,14 @@ impl InstallSession {
     /// Refresh ownership for a plan-cache-hit install (no fetch/materialization
     /// performed): read the graph's durable inventory, lease the objects the
     /// cached graph depends on, record access, and refresh the durable project
-    /// registration + SQLite reference.
+    /// registration + SQLite reference. Short-circuits without writes when the
+    /// volume's durable inventory is current and the index already records the
+    /// complete graph, the project reference, and a matching durable
+    /// registration — at that point every remaining write is semantically
+    /// redundant (see
+    /// [`MetadataRepository::cached_graph_protection_current`]). A legacy or
+    /// missing inventory still fails so the caller rebuilds the volume rather
+    /// than trusting an unprotected cache hit.
     pub fn refresh_cached_graph(
         &mut self,
         project_root: &Path,
@@ -187,6 +251,12 @@ impl InstallSession {
                 id: graph_hex.to_owned(),
             });
         };
+        if self
+            .repository
+            .cached_graph_protection_current(project_root, graph_hex)?
+        {
+            return Ok(());
+        }
         let artifact_ids: Vec<ArtifactId> = inventory
             .artifacts
             .iter()
@@ -230,5 +300,92 @@ mod tests {
         session.check().unwrap();
         // Dropping releases the lease without error.
         drop(session);
+    }
+
+    #[test]
+    fn refresh_cached_graph_short_circuits_when_protection_is_current() {
+        let temp = tempfile::tempdir().unwrap();
+        let store_root = temp.path();
+        let project = store_root.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        // Publish one artifact + its image by hand.
+        let id = ArtifactId::from_bytes([7; 64]);
+        let hex = id.to_hex();
+        let artifact_path = store_root
+            .join("artifacts/sha512")
+            .join(&hex[..2])
+            .join(format!("{hex}.tgz"));
+        std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
+        std::fs::write(&artifact_path, b"tarball").unwrap();
+        let image_path = store_root.join("images/sha512").join(&hex[..2]).join(&hex);
+        std::fs::create_dir_all(&image_path).unwrap();
+        std::fs::write(image_path.join("package.json"), b"{}").unwrap();
+
+        // Publish a complete graph volume with a durable inventory.
+        let graph_hex = "ab".repeat(32);
+        let volume = store_root
+            .join("graphs/blake3")
+            .join(&graph_hex[..2])
+            .join(&graph_hex);
+        std::fs::create_dir_all(volume.join("node_modules")).unwrap();
+        std::fs::write(
+            volume.join("metadata.json"),
+            serde_json::json!({
+                "graph_id_hex": graph_hex,
+                "layout_version": 9,
+                "packages_materialized": 1,
+                "bins_linked": 0,
+                "inventory_version": 1,
+                "artifacts": [{ "id": hex, "requires_image": true }],
+                "derived": [],
+                "entry_identities": [],
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        // One full refresh records the complete graph, the project reference,
+        // and the durable registration.
+        let mut session = InstallSession::open(store_root).unwrap();
+        session.refresh_cached_graph(&project, &graph_hex).unwrap();
+        drop(session);
+
+        let repository = MetadataRepository::open(store_root).unwrap();
+        assert!(repository
+            .cached_graph_protection_current(&project, &graph_hex)
+            .unwrap());
+        // A refresh against current protection performs no writes and still
+        // succeeds.
+        let mut session = InstallSession::open(store_root).unwrap();
+        session.refresh_cached_graph(&project, &graph_hex).unwrap();
+        drop(session);
+
+        // Removing the SQLite reference flips the check back to false so the
+        // next refresh self-heals instead of skipping.
+        let connection = rusqlite::Connection::open(store_root.join("store.db")).unwrap();
+        connection
+            .execute("DELETE FROM project_graph_refs", [])
+            .unwrap();
+        drop(connection);
+        assert!(!repository
+            .cached_graph_protection_current(&project, &graph_hex)
+            .unwrap());
+        let mut session = InstallSession::open(store_root).unwrap();
+        session.refresh_cached_graph(&project, &graph_hex).unwrap();
+        drop(session);
+        assert!(repository
+            .cached_graph_protection_current(&project, &graph_hex)
+            .unwrap());
+
+        // An incomplete graph also forces the full refresh path.
+        let connection = rusqlite::Connection::open(store_root.join("store.db")).unwrap();
+        connection
+            .execute("UPDATE graphs SET complete=0", [])
+            .unwrap();
+        drop(connection);
+        assert!(!repository
+            .cached_graph_protection_current(&project, &graph_hex)
+            .unwrap());
     }
 }
