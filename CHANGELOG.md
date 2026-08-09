@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- **Skip redundant index work on the warm path.** The plan-cache fast path
+  refreshes the metadata lease on every `repeat_install`. Three sources of
+  redundant work on already-indexed immutable objects were eliminated: the
+  batched lease reuses stored `(size_bytes, published_at)` from the SQLite
+  index instead of re-walking directories with `logical_size` and re-statting
+  every file; graph re-publication is skipped entirely for graphs already
+  recorded complete (avoiding a full `node_modules` tree walk and redundant
+  edge-row rewrites). On `large-frontend` `repeat_install` (7 runs) this cut
+  bpm from 76.4 ms to 36.1 ms (-53%), making bpm ~8.9× faster than pnpm on
+  that cell (0.11× ratio). stddev also dropped (5.0 → 2.3 ms).
+
+- **Decoupled download concurrency from extract concurrency.** The
+  download→extract pipeline previously shared one fs-derived worker count
+  (capped at 8 where atomic directory rename is supported). Downloads are
+  network-bound, so the download pool is now sized independently
+  (`download_worker_count`, bounded by the resolver HTTP ceiling; override with
+  `BPM_DOWNLOAD_CONCURRENCY`). On `large-frontend` `true_cold` this cut the bpm
+  median from ~4259 ms to ~3985 ms (-6.4%).
+
+- **Batched metadata lease.** The install lease phase now records every artifact,
+  image, and derived object in a single SQLite transaction
+  (`record_published_objects_batch`) instead of one transaction per object. This
+  replaces 2N+D serial `BEGIN IMMEDIATE` + `COMMIT`/fsync round-trips (each
+  reopening the connection) with one connection and one fsync, dropping the
+  `metadata_lease` phase from ~192–433 ms to ~35 ms. The warm-path headline
+  `large-frontend` `repeat_install` fell from ~241 ms (0.2.1) to ~75 ms median —
+  about 3.5× faster than pnpm on that cell. Resulting rows are byte-for-byte
+  identical to the per-key path; access timestamps now use a single caller-supplied
+  `now` for monotonicity.
+
+- **Buffered gzip decode and widened copy buffer for extraction.** Both
+  extraction passes now buffer the compressed stream in a 64 KiB `BufReader`,
+  and per-file writes use a `BufWriter` plus a 64 KiB copy buffer. The
+  `artifact_extract` phase is consistently ~600 ms median, down from ~653 ms
+  (~8% on that phase).
+
+### Changed
+
+- **Serial graph-volume materialization.** The graph-volume staging build now
+  materializes Pass A on a single thread
+  (`materialize_with_backend_serial`). Graph volumes contain nested
+  ancestor/descendant package paths that race under parallel
+  `create_dir_all` / `clonefile_directory` (EEXIST on the ancestor target); a
+  measured parallel build with EEXIST-retries was both slower (macOS `clonefile`
+  is kernel-serialized) and higher-variance than serial. The staging tree is
+  private and atomically renamed on publish, so Pass-A order does not affect the
+  published `node_modules` byte-identity.
+
 ## [0.3.0] - 2026-08-03
 
 npm-compatible developer and registry-management commands, dev-only install

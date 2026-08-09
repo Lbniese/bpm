@@ -32,11 +32,11 @@ pub const PLAN_FILE: &str = ".bpm-state";
 /// Bumped when the plan encoding or materialization semantics change. A plan
 /// with a different version is treated as invalid and regenerated.
 ///
-/// Version 3 makes `ManagedEntry` ownership enforceable: paths are validated
-/// as project-relative `node_modules/...` entries and identities carry a
-/// versioned encoding (`relay:<target>` or `tree-blake3-v1:<hex>`). Existing
-/// version-2 plans remain readable but never cache-hit.
-pub const PLAN_VERSION: u32 = 4;
+/// Version 5 records graph-backed tree identities as immutable source-entry
+/// references. Stale deletion verifies the live project tree against that
+/// prior graph entry on demand, avoiding a full byte hash during publication.
+/// Older plans remain readable for conservative migration but never cache-hit.
+pub const PLAN_VERSION: u32 = 5;
 
 /// Bumped when the materializer's output semantics change (e.g. bin linking
 /// strategy, symlink vs hardlink volume layout). Incompatible materializer
@@ -152,6 +152,13 @@ pub const IDENTITY_RELAY: &str = "relay:";
 /// when the live fingerprint still matches.
 pub const IDENTITY_TREE: &str = "tree-blake3-v1:";
 
+/// Identity prefix for graph-backed local/reflink views. The validated direct
+/// entry name follows as `tree-volume-v1:<name>`; stale deletion resolves it
+/// inside the prior plan's immutable graph volume and compares both trees on
+/// demand. This moves deep I/O off the cold install path without weakening the
+/// deletion preflight.
+pub const IDENTITY_TREE_VOLUME: &str = "tree-volume-v1:";
+
 /// A project-view entry that BPM created and therefore may safely remove.
 ///
 /// `path` is unambiguously **project-relative** (`node_modules/foo`,
@@ -170,8 +177,8 @@ pub struct ManagedEntry {
     /// "direct" (workspace symlink).
     pub mode: String,
     /// Versioned identity for removal preflight: `relay:<read_link target>` for
-    /// symlink/junction relays, or `tree-blake3-v1:<hex>` for local/reflink
-    /// directory views.
+    /// symlink/junction relays, `tree-volume-v1:<entry>` for graph-backed
+    /// local/reflink views, or the legacy `tree-blake3-v1:<hex>` form.
     pub identity: String,
 }
 

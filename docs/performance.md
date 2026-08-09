@@ -101,6 +101,86 @@ true_cold` 2.32×. The warm-path ratios (`repeat_install`) reflect the isolated
 per-entry attachment work rather than the former whole-tree reflink,
 so they are no longer near-zero but remain below pnpm.
 
+## 0.3.0 progress (batched metadata lease)
+
+The `metadata_lease` phase — which holds one renewable SQLite lease over every
+artifact and image an install reads — previously issued one transaction per
+object (2N+D serial `BEGIN IMMEDIATE` + `COMMIT`/fsync calls, each reopening the
+connection). It now records all objects in a single transaction
+(`record_published_objects_batch`), dropping the phase from ~192–433 ms to ~35 ms
+(measured via `bpm install --json-metrics`).
+
+The win is largest on the warm path, where `metadata_lease` is a bigger share of
+total wall-clock: `large-frontend` `repeat_install` fell from ~241 ms (0.2.1
+reference) to ~75 ms median over 7 runs — about **3.5× faster than pnpm** on that
+cell. `resolved_cold` improved more modestly (~1554 → ~1482 ms) because
+materialization dominates there. `true_cold` remains network-bound
+(`resolver_network_wait` is the dominant phase); the cold resolver's observed
+peak HTTP concurrency (~27) sits below its configured cap (32), so the remaining
+cold gap is registry latency and graph shape, not a local concurrency ceiling.
+
+A machine-stamped 0.3.0 snapshot is checked in at
+`benchmarks/baselines/arm64-20260806.json`; the 0.2.1 `reference.json` is
+preserved as the historical comparison point.
+
+## Warm-path progress (skip redundant index work)
+
+The plan-cache fast path (the `repeat_install` scenario) refreshes the
+metadata lease on every warm install. Three sources of redundant work on
+already-indexed immutable objects were identified and eliminated:
+
+1. **Recursive size walks.** `record_published_objects_batch` called
+   `logical_size` — a recursive directory walk — for every artifact, image,
+   and derived object, even though the store is content-addressed and
+   immutable. The batch now queries existing `(size_bytes, published_at)` from
+   the SQLite index (`existing_object_records`) and reuses them for keys
+   already present, skipping both the directory walk and the per-key
+   `symlink_metadata` stat. Only keys new to the index touch the filesystem.
+
+2. **Graph re-publication.** `record_graph_with_inventory` re-walked the entire
+   graph volume's `node_modules` tree with `logical_size` and re-`DELETE`d +
+   re-`INSERT`ed every `graph_artifacts`/`graph_derived` row on every warm
+   install, even though a complete graph's membership is immutable. It now
+   checks `graph_already_complete` first and returns immediately if the graph
+   is already recorded complete.
+
+3. **Cold-path download concurrency.** (See below.)
+
+Measured on `large-frontend` `repeat_install` (7 runs, macOS arm64, node
+v26.5.0, pnpm 11.14.0):
+
+| | bpm median | bpm stddev | bpm/pnpm |
+|---|---:|---:|---:|
+| Before (0.3.0 batched lease) | 76.4 ms | 5.0 ms | 0.24× |
+| After (skip indexed size walks) | 53.8 ms | 2.6 ms | 0.17× |
+| After (skip graph re-publication) | 39.5 ms | 2.4 ms | 0.12× |
+| After (fetch size+timestamp, no per-key stat) | 36.1 ms | 2.3 ms | **0.11×** |
+
+bpm is now ~8.9× faster than pnpm on the warm path for this graph (pnpm
+unchanged at ~318 ms). The improvement holds across fixtures: `minimal` 0.08×,
+`many-small-files` 0.08×.
+
+Two further cold-path changes shipped alongside:
+
+- **Decoupled download concurrency from extract concurrency.** The
+  download→extract pipeline previously shared one fs-derived worker count
+  (capped at 8 on filesystems supporting atomic directory rename). Downloads
+  are network-bound, so the download pool is now sized independently
+  (`download_worker_count`, bounded by the resolver HTTP ceiling, default 32;
+  override with `BPM_DOWNLOAD_CONCURRENCY`). On `large-frontend` `true_cold`
+  this cut the bpm median from ~4259 ms to ~3985 ms (-6.4%, ratio 2.57× →
+  ~2.3×). Profiling shows the download pool is not the binding constraint on
+  this graph — the serial resolver placement rate feeds downloaders at ~8
+  concurrent downloads regardless of pool size — so further cold gains require
+  faster placement or earlier download start, not a larger pool.
+
+- **Buffered gzip decode and widened copy buffer for extraction.** Both the
+  main extraction pass and the prefix-detection scan now buffer the compressed
+  stream in a 64 KiB `BufReader`, and per-file writes use a `BufWriter` plus a
+  64 KiB copy buffer instead of `io::copy`'s 8 KiB default. The
+  `artifact_extract` phase is consistently ~600 ms median across 14 runs, down
+  from ~653 ms (~8% on that phase).
+
 ## How to reproduce
 
 Regenerate a single cell (prepending the fresh release dir so the recorded

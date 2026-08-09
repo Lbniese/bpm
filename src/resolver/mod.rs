@@ -84,6 +84,17 @@ pub struct ResolvedDownloadUnit {
     pub integrity: Option<Integrity>,
 }
 
+/// A best-effort artifact warmup discovered before deterministic graph
+/// placement reaches the package. It deliberately has no install path:
+/// placement still emits a [`ResolvedDownloadUnit`] and remains the sole
+/// authority for lockfile and materialization outcomes.
+#[derive(Clone, Debug)]
+pub struct ResolvedDownloadHint {
+    pub name: String,
+    pub url: String,
+    pub integrity: Option<Integrity>,
+}
+
 /// Receives each resolved registry-typed package as it is placed during graph
 /// expansion, so a caller can overlap downloads with the rest of resolution.
 ///
@@ -94,6 +105,11 @@ pub struct ResolvedDownloadUnit {
 /// own errors.
 pub trait ResolveSink {
     fn emit(&self, unit: ResolvedDownloadUnit);
+
+    /// Warm an immutable artifact selected during resolver lookahead. The
+    /// default is a no-op so non-streaming and diagnostic sinks retain their
+    /// existing behavior.
+    fn prefetch(&self, _hint: ResolvedDownloadHint) {}
 }
 
 /// Resolve a manifest into the canonical BPM lockfile.
