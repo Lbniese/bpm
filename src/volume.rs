@@ -33,7 +33,7 @@ use crate::lockfile::Lockfile;
 #[cfg(unix)]
 use crate::materializer::reflink_tree;
 use crate::materializer::{
-    materialize_with_backend, MaterializeBackend, MaterializeError, MaterializeStats,
+    materialize_with_backend_serial, MaterializeBackend, MaterializeError, MaterializeStats,
 };
 use crate::metrics::Metrics;
 use crate::store::ArtifactStore;
@@ -403,7 +403,18 @@ pub fn ensure_graph_volume_with_prepared_and_profile(
     // symlinked package image is not safe here. Hardlinks also let the plan
     // validator prove that pristine package files still match their immutable
     // store images using device/inode identity.
-    let stats = materialize_with_backend(
+    // Serial materialization: graph volumes contain nested ancestor/descendant
+    // package paths (e.g. `node_modules/@scope/pkg` and a transitive
+    // `node_modules/@scope/pkg/node_modules/<dep>`) that race under parallel
+    // `create_dir_all` / `clonefile_directory` (EEXIST on the ancestor target).
+    // Empirically (measured 2026-08-06) a parallel build with EEXIST-retries is
+    // both slower (macOS `clonefile` is kernel-serialized — volume.rs:487) and
+    // higher-variance than serial, so the serial Pass A is the correct choice
+    // for the graph-volume staging build. The graph volume is a private staging
+    // tree atomically renamed on publish, so Pass-A order does not affect the
+    // published node_modules byte-identity (entry identities are
+    // blake3-fingerprinted post-build). See [`materialize_with_backend_serial`].
+    let stats = materialize_with_backend_serial(
         staging.as_path(),
         store,
         &resolved,

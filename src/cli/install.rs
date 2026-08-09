@@ -431,11 +431,20 @@ pub(super) fn install_resolved_lockfile(
 
     let work = build_install_work(&lockfile, options.frozen, lock_kind.filename())?;
     let workers = adaptive_workers(options.concurrency, work.len(), project_root);
+    let download_workers = download_worker_count(workers);
     let outcomes = std::thread::scope(|scope| -> anyhow::Result<Vec<FetchOutcome>> {
-        let (unit_tx, unit_rx) = std::sync::mpsc::sync_channel::<InstallWork>(workers.max(1) * 2);
+        let (unit_tx, unit_rx) =
+            std::sync::mpsc::sync_channel::<InstallWork>(download_workers.max(1) * 2);
         let unit_rx = std::sync::Arc::new(std::sync::Mutex::new(unit_rx));
-        let (downloaders, extractors, clock) =
-            spawn_fetch_pipeline(scope, &store, &http, remote.as_ref(), unit_rx, workers);
+        let (downloaders, extractors, clock) = spawn_fetch_pipeline(
+            scope,
+            &store,
+            &http,
+            remote.as_ref(),
+            unit_rx,
+            download_workers,
+            workers,
+        );
         for item in work {
             if unit_tx.send(item).is_err() {
                 break;
@@ -742,6 +751,38 @@ fn adaptive_workers(requested: usize, work_items: usize, project_root: &Path) ->
     cpu.saturating_mul(2)
         .clamp(1, fs_limit)
         .min(work_items.max(1))
+}
+
+/// Choose the download-pool size. Downloads are network-bound — a worker
+/// spends most of its time waiting on registry I/O and holding a socket, not
+/// doing local CPU or filesystem work — so it is safe and beneficial to run
+/// more concurrent downloads than the filesystem-derived extract cap allows.
+///
+/// The ceiling is the resolver's HTTP concurrency (`async_resolver_max_in_flight`,
+/// default 32), because there is no point having more download workers than the
+/// shared HTTP client permits in flight at once. The floor is the extract worker
+/// count, so the download pool is never smaller than the extract pool (which
+/// would needlessly starve extraction). Override with
+/// `BPM_DOWNLOAD_CONCURRENCY`.
+fn download_worker_count(extract_workers: usize) -> usize {
+    if let Ok(value) = env::var("BPM_DOWNLOAD_CONCURRENCY") {
+        if let Ok(parsed) = value.parse::<usize>() {
+            if parsed > 0 {
+                return parsed;
+            }
+        }
+    }
+    let cpu = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1);
+    // Bound by the HTTP in-flight ceiling (no value in exceeding it) and by a
+    // sane multiple of the CPU count (downloads still do SHA-512 + buffer
+    // copies). Never below the extract pool.
+    let ceiling = async_resolver_max_in_flight() as usize;
+    cpu.saturating_mul(2)
+        .min(ceiling)
+        .max(extract_workers)
+        .max(1)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1218,19 +1259,25 @@ fn spawn_fetch_pipeline<'scope, 'env>(
     http: &'env HttpClient,
     remote: Option<&'env bpm::remote_cache::RemoteCacheClient>,
     unit_rx: std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<InstallWork>>>,
-    workers: usize,
+    download_workers: usize,
+    extract_workers: usize,
 ) -> (
     Vec<DownloaderHandle<'scope>>,
     Vec<ExtractorHandle<'scope>>,
     Arc<PipelineClock>,
 ) {
     use std::sync::mpsc::sync_channel;
-    let workers = workers.max(1);
+    let download_workers = download_workers.max(1);
+    let extract_workers = extract_workers.max(1);
     let clock = Arc::new(PipelineClock::new());
-    let (send, receive) = sync_channel::<Result<PendingArtifact, FetchFail>>(workers * 2);
+    // The download→extract handoff channel is sized by the *extract* pool: a
+    // download only blocks here once extract has `extract_workers * 2` pending
+    // artifacts queued, which is the natural backpressure point (extraction is
+    // the fs-bound stage).
+    let (send, receive) = sync_channel::<Result<PendingArtifact, FetchFail>>(extract_workers * 2);
     let receive = std::sync::Arc::new(std::sync::Mutex::new(receive));
-    let mut downloaders = Vec::with_capacity(workers);
-    for _ in 0..workers {
+    let mut downloaders = Vec::with_capacity(download_workers);
+    for _ in 0..download_workers {
         let unit_rx = unit_rx.clone();
         let send = send.clone();
         let http = http.clone();
@@ -1293,8 +1340,8 @@ fn spawn_fetch_pipeline<'scope, 'env>(
         }));
     }
     drop(send);
-    let mut extractors = Vec::with_capacity(workers);
-    for _ in 0..workers {
+    let mut extractors = Vec::with_capacity(extract_workers);
+    for _ in 0..extract_workers {
         let receive = receive.clone();
         let clock = Arc::clone(&clock);
         extractors.push(
@@ -1639,14 +1686,22 @@ fn run_streaming_async_install(
         None
     };
     let workers = adaptive_workers(concurrency, usize::MAX, root);
+    let download_workers = download_worker_count(workers);
     let overflow = std::sync::Arc::new(std::sync::Mutex::new(Vec::<InstallWork>::new()));
     let (lockfile, outcomes) = std::thread::scope(
         |scope| -> anyhow::Result<(Lockfile, Vec<FetchOutcome>)> {
             let (unit_tx, unit_rx) =
-                std::sync::mpsc::sync_channel::<InstallWork>(workers.max(1) * 2);
+                std::sync::mpsc::sync_channel::<InstallWork>(download_workers.max(1) * 2);
             let unit_rx = std::sync::Arc::new(std::sync::Mutex::new(unit_rx));
-            let (downloaders, extractors, clock) =
-                spawn_fetch_pipeline(scope, store, http, remote.as_ref(), unit_rx, workers);
+            let (downloaders, extractors, clock) = spawn_fetch_pipeline(
+                scope,
+                store,
+                http,
+                remote.as_ref(),
+                unit_rx,
+                download_workers,
+                workers,
+            );
             // Run async resolution on a tokio runtime, emitting placed nodes
             // to the non-blocking TryChannelSink. Units that overflow the live
             // channel are retained in `overflow` rather than dropped.
@@ -1835,13 +1890,21 @@ fn run_streaming_install(
     // Work count is unknown until resolution completes, so do not clamp the
     // worker count to it (usize::MAX makes adaptive_workers' clamp a no-op).
     let workers = adaptive_workers(concurrency, usize::MAX, root);
+    let download_workers = download_worker_count(workers);
     let (lockfile, outcomes) =
         std::thread::scope(|scope| -> anyhow::Result<(Lockfile, Vec<FetchOutcome>)> {
             let (unit_tx, unit_rx) =
-                std::sync::mpsc::sync_channel::<InstallWork>(workers.max(1) * 2);
+                std::sync::mpsc::sync_channel::<InstallWork>(download_workers.max(1) * 2);
             let unit_rx = std::sync::Arc::new(std::sync::Mutex::new(unit_rx));
-            let (downloaders, extractors, clock) =
-                spawn_fetch_pipeline(scope, store, http, remote.as_ref(), unit_rx, workers);
+            let (downloaders, extractors, clock) = spawn_fetch_pipeline(
+                scope,
+                store,
+                http,
+                remote.as_ref(),
+                unit_rx,
+                download_workers,
+                workers,
+            );
             // Run resolution on this thread, emitting each placed node to the
             // sink; dropping `sink` closes the unit channel so downloaders (and
             // then extractors) drain and finish before we join them below.

@@ -430,6 +430,139 @@ impl MetadataRepository {
         Ok(())
     }
 
+    /// Batched equivalent of [`record_published_object`]: records publication
+    /// of every key in `keys` using a SINGLE SQLite connection and a SINGLE
+    /// transaction (one `BEGIN IMMEDIATE` + one `COMMIT`/fsync), instead of
+    /// one connection + one transaction per key. This is the fast path for the
+    /// install lease phase, which previously issued 2N+D serial transactions
+    /// (one per artifact, one per image, one per derived object) — each
+    /// opening a fresh connection, re-running schema checks, and fsync-ing.
+    ///
+    /// Every key is still verified as published on the filesystem first (one
+    /// `stat` pass), and each object's size/timestamp is still derived from the
+    /// filesystem exactly as in the per-key path, so the resulting rows are
+    /// byte-for-byte identical to N individual `record_published_object` calls.
+    /// Access timestamps all use `now` (the caller's timestamp) so they are
+    /// monotonic and deterministic regardless of intra-batch ordering.
+    pub fn record_published_objects_batch(
+        &self,
+        keys: &[ObjectKey],
+        now: Timestamp,
+    ) -> Result<(), MetadataError> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        // One filesystem verification pass (dedup first to avoid double work).
+        let keys = canonical_keys(keys);
+        for key in &keys {
+            self.ensure_published(key)?;
+        }
+        // The store is content-addressed and immutable: an object that is
+        // already recorded in the index has a size_bytes and published_at that
+        // will never change. On the common warm-install path every key is
+        // already indexed, so batch-query the existing (size, published_at)
+        // and reuse them, skipping both the recursive `logical_size` directory
+        // walk and the per-key `symlink_metadata` stat for indexed objects.
+        let existing = self.existing_object_records(&keys)?;
+        // Pre-compute (key, size, published_at) from the filesystem outside the
+        // transaction so the write lock is held only for the upserts, not for
+        // the (potentially recursive) `logical_size` directory walks.
+        let mut records: Vec<ObjectRecord> = Vec::with_capacity(keys.len());
+        for key in &keys {
+            if let Some(cached) = existing.get(key) {
+                records.push(cached.clone());
+                continue;
+            }
+            let path = self.store_root.join(key.relative_path());
+            let size_bytes = logical_size(&path)?;
+            let metadata = fs::symlink_metadata(&path).map_err(|source| io_error(&path, source))?;
+            let published_at = modified_timestamp(&metadata)?;
+            records.push(ObjectRecord {
+                key: key.clone(),
+                size_bytes,
+                published_at,
+            });
+        }
+        // One connection, one transaction, one fsync for the whole batch.
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for record in &records {
+            upsert_object(&transaction, record, None, None)?;
+            upsert_access(&transaction, &record.key, now)?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Batch-query the `size_bytes` already stored for the given keys, keyed by
+    /// Batch-query the `(size_bytes, published_at)` already stored for the
+    /// given keys, keyed by `ObjectKey`. Keys absent from the index are omitted
+    /// from the map. Used by [`record_published_objects_batch`] to skip both
+    /// the O(total-files) `logical_size` directory walk and the per-key
+    /// `symlink_metadata` stat for immutable objects that are already indexed —
+    /// the dominant cost on the warm-install plan-cache path.
+    ///
+    /// Artifacts, images, derived objects, and graphs are queried; plans are
+    /// skipped (they are not recorded on the lease path).
+    fn existing_object_records(
+        &self,
+        keys: &[ObjectKey],
+    ) -> Result<std::collections::HashMap<ObjectKey, ObjectRecord>, MetadataError> {
+        if keys.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let ids_by_kind: std::collections::BTreeMap<ObjectKind, Vec<&str>> = {
+            let mut map: std::collections::BTreeMap<ObjectKind, Vec<&str>> =
+                std::collections::BTreeMap::new();
+            for key in keys {
+                map.entry(key.kind()).or_default().push(key.id());
+            }
+            map
+        };
+        let mut out: std::collections::HashMap<ObjectKey, ObjectRecord> =
+            std::collections::HashMap::with_capacity(keys.len());
+        let connection = self.connection()?;
+        for (kind, ids) in &ids_by_kind {
+            let table = match kind {
+                ObjectKind::Artifact => "artifacts",
+                ObjectKind::Image => "images",
+                ObjectKind::Derived => "derived_artifacts",
+                ObjectKind::Graph => "graphs",
+                // Plans are not recorded on the lease path.
+                ObjectKind::Plan => continue,
+            };
+            let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT id, size_bytes, published_at_ms FROM {table} WHERE id IN ({placeholders})"
+            );
+            let mut params_vec: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(ids.len());
+            for id in ids {
+                params_vec.push(id);
+            }
+            let mut statement = connection.prepare(&sql)?;
+            let rows = statement.query_map(params_vec.as_slice(), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (id, size, published) = row?;
+                let key = ObjectKey::new(*kind, id)?;
+                out.insert(
+                    key.clone(),
+                    ObjectRecord {
+                        key,
+                        size_bytes: size as u64,
+                        published_at: Timestamp(published as u64),
+                    },
+                );
+            }
+        }
+        Ok(out)
+    }
+
     /// Atomically publish a durable project registration under
     /// `<store>/projects/<hh>/<blake3>`, keyed by BLAKE3 of the canonical
     /// project root. Written after graph attachment succeeds so a failed
@@ -457,6 +590,18 @@ impl MetadataRepository {
         let graph_key = ObjectKey::graph(graph_hex)?;
         self.ensure_published(&graph_key)?;
         let graph_path = self.store_root.join(graph_key.relative_path());
+
+        // The graph volume is content-addressed and immutable: if it is already
+        // recorded as complete in the index, its size and its artifact/derived
+        // membership are final. Re-walking the full node_modules tree with
+        // `logical_size` and re-inserting every graph_artifacts/graph_derived
+        // row is pure redundant work on the warm path. Check completeness first;
+        // only a new or incomplete graph pays the full publication cost.
+        if self.graph_already_complete(graph_hex)? {
+            return Ok(());
+        }
+
+        // New/incomplete graph: walk the filesystem for size and timestamp.
         let metadata =
             fs::symlink_metadata(&graph_path).map_err(|source| io_error(&graph_path, source))?;
         let graph_record = ObjectRecord {
@@ -470,6 +615,21 @@ impl MetadataRepository {
             derived: inventory.derived.clone(),
         })?;
         Ok(())
+    }
+
+    /// Whether the graph is already recorded in the index as complete. A
+    /// complete graph's size, artifact edges, and derived edges are immutable,
+    /// so callers on the warm path can skip re-publication entirely.
+    fn graph_already_complete(&self, graph_hex: &str) -> Result<bool, MetadataError> {
+        let connection = self.connection()?;
+        let complete: Option<i64> = connection
+            .query_row(
+                "SELECT complete FROM graphs WHERE id=?1",
+                [graph_hex],
+                |row| row.get(0),
+            )
+            .ok();
+        Ok(complete == Some(1))
     }
 
     /// Acquire one renewable lease covering a sorted, deduplicated object set.

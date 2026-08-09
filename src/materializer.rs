@@ -264,6 +264,36 @@ pub fn materialize_with_backend(
     resolved: &[(&PackageEntry, ArtifactId)],
     backend: MaterializeBackend,
 ) -> Result<MaterializeStats, MaterializeError> {
+    materialize_with_backend_impl(project_root, store, resolved, backend, true)
+}
+
+/// Serial variant of [`materialize_with_backend`]: processes Pass A on a
+/// single thread. Required for the graph-volume staging build, where nested
+/// ancestor/descendant package paths (e.g. `node_modules/@scope/pkg` and
+/// `node_modules/@scope/pkg/node_modules/<dep>`) race under parallel
+/// `create_dir_all` / `clonefile_directory` — the ancestor clone can observe
+/// a target recreated by a sibling worker's parent-dir creation and fail with
+/// `EEXIST`. The graph volume is a private staging tree atomically renamed on
+/// publish, so its Pass-A order does not affect the published node_modules
+/// byte-identity (entry identities are blake3-fingerprinted post-build). Use
+/// the parallel variant for direct project materialization, where targets are
+/// disjoint top-level node_modules entries.
+pub fn materialize_with_backend_serial(
+    project_root: &Path,
+    store: &ArtifactStore,
+    resolved: &[(&PackageEntry, ArtifactId)],
+    backend: MaterializeBackend,
+) -> Result<MaterializeStats, MaterializeError> {
+    materialize_with_backend_impl(project_root, store, resolved, backend, false)
+}
+
+fn materialize_with_backend_impl(
+    project_root: &Path,
+    store: &ArtifactStore,
+    resolved: &[(&PackageEntry, ArtifactId)],
+    backend: MaterializeBackend,
+    parallel: bool,
+) -> Result<MaterializeStats, MaterializeError> {
     preflight_resolved(resolved)?;
     let mut stats = MaterializeStats::default();
     // Names already linked into node_modules/.bin, for deterministic collision
@@ -284,9 +314,16 @@ pub fn materialize_with_backend(
     // Count skipped entries into stats up front.
     stats.links_skipped = resolved.len() - work.len();
 
-    // Pass A — parallel tree linking. Each scoped thread returns its
-    // original index so Pass B can iterate in the original `resolved` order.
-    let workers = worker_count(work.len());
+    // Pass A — tree linking. Parallel by default (each scoped thread returns
+    // its original index so Pass B can iterate in the original `resolved`
+    // order); serial when the caller opts out via `parallel = false` to avoid
+    // nested ancestor/descendant path races (see
+    // [`materialize_with_backend_serial`]).
+    let workers = if parallel {
+        worker_count(work.len())
+    } else {
+        1
+    };
     let mut symlink_bins_flags = vec![false; work.len()];
     if workers <= 1 {
         for (i, (_, entry, id)) in work.iter().enumerate() {

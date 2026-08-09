@@ -65,29 +65,32 @@ impl InstallSession {
         derived: &[String],
     ) -> Result<(), MetadataError> {
         let now = Timestamp::now()?;
-        let mut keys: Vec<ObjectKey> = Vec::new();
+        let mut keys: Vec<ObjectKey> = Vec::with_capacity(artifacts.len() * 2 + derived.len());
         for id in artifacts {
             let hex = id.to_hex();
             let artifact = ObjectKey::artifact(hex.clone())?;
-            self.repository.record_published_object(&artifact)?;
             keys.push(artifact);
             // Every fetched artifact is extracted into a store image.
-            let image = ObjectKey::image(hex)?;
-            self.repository.record_published_object(&image)?;
-            keys.push(image);
+            keys.push(ObjectKey::image(hex)?);
         }
         for derived_id in derived {
-            let key = ObjectKey::derived(derived_id.clone())?;
-            self.repository.record_published_object(&key)?;
-            keys.push(key);
+            keys.push(ObjectKey::derived(derived_id.clone())?);
         }
-        if !keys.is_empty() {
-            self.repository.record_access(&keys, now)?;
-            self.lease = Some(
-                self.repository
-                    .acquire_lease(&keys, LeaseOptions::default())?,
-            );
+        if keys.is_empty() {
+            return Ok(());
         }
+        // Record publication of every artifact/image/derived key in ONE
+        // transaction (one connection, one fsync) instead of 2N+D serial
+        // per-key transactions. Semantics are byte-for-byte identical: every
+        // key is still verified as published on the filesystem and its
+        // size/timestamp still derived from the filesystem.
+        self.repository.record_published_objects_batch(&keys, now)?;
+        // Access is already batched in a single transaction internally.
+        self.repository.record_access(&keys, now)?;
+        self.lease = Some(
+            self.repository
+                .acquire_lease(&keys, LeaseOptions::default())?,
+        );
         Ok(())
     }
 

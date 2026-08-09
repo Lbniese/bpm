@@ -929,3 +929,10 @@ high-latency HTTP/1.1 environments; lockfile placement remains deterministic.
 Artifact downloads use HTTP/2 via ALPN by default so concurrent response bodies
 can share a connection. Set `BPM_HTTP2=0` to force HTTP/1.1 when diagnosing a
 registry or transport compatibility issue.
+
+The download→extract pipeline uses two independently sized worker pools.
+Extraction workers are bounded by a filesystem-capability probe (8 where
+atomic directory rename is supported, 2 otherwise); downloads are
+network-bound, so the download pool is sized separately by CPU count up to the
+resolver HTTP ceiling (`BPM_RESOLVER_MAX_IN_FLIGHT`). Set
+`BPM_DOWNLOAD_CONCURRENCY` to override the download pool size explicitly.
