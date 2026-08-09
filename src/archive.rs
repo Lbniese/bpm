@@ -19,7 +19,7 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::io;
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 use flate2::read::GzDecoder;
@@ -27,6 +27,13 @@ use thiserror::Error;
 
 /// Leading component of npm-packed tarball entries, stripped on extraction.
 const PACKAGE_PREFIX: &str = "package";
+
+/// Buffer size for the decompression read path and the per-file copy loop.
+/// npm package tarballs are gzip streams of many small files; the default
+/// 8 KiB `io::copy` buffer underutilizes both the decompressor and the write
+/// path. A larger buffer amortizes syscall and decompression-call overhead
+/// across the (often thousands of) entries in a frontend dependency graph.
+const EXTRACT_BUFFER_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Error)]
 pub enum ExtractError {
@@ -196,13 +203,23 @@ fn extract_with_limits(
         path: archive_path.display().to_string(),
         source,
     })?;
-    let gz = GzDecoder::new(file);
+    // Buffer the compressed stream so the gzip decoder pulls large chunks from
+    // the OS instead of issuing a read syscall per internal decode step.
+    let gz = GzDecoder::new(BufReader::with_capacity(EXTRACT_BUFFER_BYTES, file));
     let mut archive = tar::Archive::new(gz);
     let entries = archive
         .entries()
         .map_err(|e| ExtractError::InvalidArchive(format!("cannot enumerate tar entries: {e}")))?;
 
     let mut seen: HashSet<PathBuf> = HashSet::new();
+    // The mode `File::create` actually produces for a fresh file under this
+    // process's umask, learned once from the first extracted file. npm
+    // tarballs are almost entirely mode 0o644, which equals that created mode
+    // under the usual umask, so the follow-up chmod is provably a no-op and
+    // is skipped — one syscall per file saved on entry-heavy packages
+    // (~20k entries for caniuse-lite). Non-default tar modes still chmod.
+    #[cfg(unix)]
+    let mut created_file_mode: Option<u32> = None;
     #[cfg(windows)]
     let mut deferred_links: Vec<(PathBuf, PathBuf)> = Vec::new();
     for entry_result in entries {
@@ -239,8 +256,13 @@ fn extract_with_limits(
                 if let Some(parent) = dest.parent() {
                     fs::create_dir_all(parent).map_err(|source| write_err(parent, source))?;
                 }
-                let mut out = fs::File::create(&dest).map_err(|source| write_err(&dest, source))?;
-                io::copy(&mut entry, &mut out).map_err(|source| write_err(&dest, source))?;
+                let out = fs::File::create(&dest).map_err(|source| write_err(&dest, source))?;
+                // Buffer writes and use a larger copy buffer than `io::copy`'s
+                // 8 KiB default to amortize syscall overhead across the entry.
+                let mut out = BufWriter::with_capacity(EXTRACT_BUFFER_BYTES, out);
+                copy_buf_with_capacity(&mut entry, &mut out, EXTRACT_BUFFER_BYTES)
+                    .map_err(|source| write_err(&dest, source))?;
+                out.flush().map_err(|source| write_err(&dest, source))?;
                 // The image is built in a private temporary directory and
                 // published with one atomic rename by `ArtifactStore`.
                 // Fsyncing every file here serialized extraction on large
@@ -248,6 +270,21 @@ fn extract_with_limits(
                 // guarantee; callers can safely retry an unpublished temp
                 // image after a crash.
                 let mode = entry.header().mode().unwrap_or(0o644);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let masked = (mode & 0o777) & !0o002;
+                    let default_mode = *created_file_mode.get_or_insert_with(|| {
+                        out.get_ref()
+                            .metadata()
+                            .map(|m| m.permissions().mode() & 0o777)
+                            .unwrap_or(u32::MAX)
+                    });
+                    if default_mode != masked {
+                        apply_mode(&dest, mode).map_err(|source| write_err(&dest, source))?;
+                    }
+                }
+                #[cfg(not(unix))]
                 apply_mode(&dest, mode).map_err(|source| write_err(&dest, source))?;
             }
             tar::EntryType::Directory => {
@@ -450,7 +487,7 @@ fn detect_archive_root_prefix(archive_path: &Path) -> Result<Option<PathBuf>, Ex
         path: archive_path.display().to_string(),
         source,
     })?;
-    let gz = GzDecoder::new(file);
+    let gz = GzDecoder::new(BufReader::with_capacity(EXTRACT_BUFFER_BYTES, file));
     let mut archive = tar::Archive::new(gz);
     let entries = archive
         .entries()
@@ -581,6 +618,27 @@ fn write_err(path: &Path, source: io::Error) -> ExtractError {
         path: path.display().to_string(),
         source,
     }
+}
+
+/// Copy `reader` to `writer` using a buffer of `capacity` bytes. This is
+/// `io::copy` with a caller-chosen buffer size (the std default is 8 KiB),
+/// reducing the number of read/write syscall pairs for larger entries.
+fn copy_buf_with_capacity<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    capacity: usize,
+) -> io::Result<u64> {
+    let mut buf = vec![0u8; capacity];
+    let mut total: u64 = 0;
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        writer.write_all(&buf[..n])?;
+        total += n as u64;
+    }
+    Ok(total)
 }
 
 #[cfg(test)]
