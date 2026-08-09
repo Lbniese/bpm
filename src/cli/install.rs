@@ -8,7 +8,7 @@
 /// worker threads. Bounded to avoid overwhelming the registry connection pool.
 const ASYNC_RESOLVER_WORKERS: usize = 8;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -338,26 +338,6 @@ pub(super) fn install_resolved_lockfile(
     };
 
     let config = effective_npm_config(project_root, options.registry.as_deref())?;
-    let http = HttpClient::new(config.clone());
-    let registry = open_registry_client(store_root_path, config, http.clone(), options.cache_mode)?;
-    let remote = if options.cache_mode.allows_network() {
-        options
-            .remote_cache
-            .as_deref()
-            .map(|base| {
-                let token = env::var("BPM_REMOTE_CACHE_TOKEN").ok();
-                bpm::remote_cache::RemoteCacheConfig::new(base, token)
-                    .map_err(|error| anyhow::anyhow!("invalid remote cache configuration: {error}"))
-                    .and_then(|config| {
-                        bpm::remote_cache::RemoteCacheClient::new(config).map_err(|error| {
-                            anyhow::anyhow!("invalid remote cache configuration: {error}")
-                        })
-                    })
-            })
-            .transpose()?
-    } else {
-        None
-    };
 
     let plan_path = graph::plan_path_for(lockfile_path);
     let cached_plan = graph::read_plan(&plan_path)?;
@@ -369,8 +349,11 @@ pub(super) fn install_resolved_lockfile(
             .any(|resolution| matches!(resolution.source, LockSource::Git { .. }));
     let plan_valid = !git_prepare_enabled
         && cached_plan.as_ref().is_some_and(|plan| {
-            graph::validate_plan_with_profile(plan, &lockfile, project_root, &store, profile)
-                .is_ok()
+            let started = std::time::Instant::now();
+            let outcome =
+                graph::validate_plan_with_profile(plan, &lockfile, project_root, &store, profile);
+            metrics.record("plan_validate", started.elapsed());
+            outcome.is_ok()
         });
     if plan_valid {
         metrics.record("plan_cache_hit", std::time::Duration::ZERO);
@@ -391,14 +374,18 @@ pub(super) fn install_resolved_lockfile(
         // refresh ownership so a concurrent `bpm gc` cannot age out the cached
         // graph or its dependencies: re-lease the graph's durable inventory,
         // record access, and rewrite the durable project registration + SQLite
-        // reference. A legacy/incomplete cached volume returns an error here so
-        // the caller retries a full install to avoid a false no-op success.
+        // reference. When that protection is already durably recorded the
+        // refresh short-circuits without writes. A legacy/incomplete cached
+        // volume returns an error here so the caller retries a full install to
+        // avoid a false no-op success.
         let graph_id = graph::graph_id_for_project_with_profile(&lockfile, project_root, profile);
         let graph_hex = graph_id.to_hex();
         let graph_hex_short = graph_id.to_hex_short();
         let graph_path = store.graph_volume_path(&graph_hex);
+        let refresh_started = std::time::Instant::now();
         let refreshed = bpm::metadata::InstallSession::open(store.root())
             .and_then(|mut session| session.refresh_cached_graph(project_root, &graph_hex));
+        metrics.record("ownership_refresh", refresh_started.elapsed());
         match refreshed {
             Ok(()) => {
                 println!(
@@ -407,7 +394,6 @@ pub(super) fn install_resolved_lockfile(
                     materialized,
                     bins
                 );
-                metrics.add_requests(http.request_count());
                 return write_metrics(&metrics, options.json_metrics.clone());
             }
             Err(error) => {
@@ -429,13 +415,46 @@ pub(super) fn install_resolved_lockfile(
     }
     metrics.record("plan_cache_miss", std::time::Duration::ZERO);
 
+    // A cache hit performs zero outbound requests, so the HTTP client,
+    // registry client, and remote cache are constructed only now that a
+    // fetch/rebuild path is actually reachable.
+    let http = HttpClient::new(config.clone());
+    let registry = open_registry_client(store_root_path, config, http.clone(), options.cache_mode)?;
+    let remote = if options.cache_mode.allows_network() {
+        options
+            .remote_cache
+            .as_deref()
+            .map(|base| {
+                let token = env::var("BPM_REMOTE_CACHE_TOKEN").ok();
+                bpm::remote_cache::RemoteCacheConfig::new(base, token)
+                    .map_err(|error| anyhow::anyhow!("invalid remote cache configuration: {error}"))
+                    .and_then(|config| {
+                        bpm::remote_cache::RemoteCacheClient::new(config).map_err(|error| {
+                            anyhow::anyhow!("invalid remote cache configuration: {error}")
+                        })
+                    })
+            })
+            .transpose()?
+    } else {
+        None
+    };
+
     let work = build_install_work(&lockfile, options.frozen, lock_kind.filename())?;
     let workers = adaptive_workers(options.concurrency, work.len(), project_root);
+    let download_workers = download_worker_count(workers);
     let outcomes = std::thread::scope(|scope| -> anyhow::Result<Vec<FetchOutcome>> {
-        let (unit_tx, unit_rx) = std::sync::mpsc::sync_channel::<InstallWork>(workers.max(1) * 2);
+        let (unit_tx, unit_rx) =
+            std::sync::mpsc::sync_channel::<InstallWork>(download_workers.max(1) * 2);
         let unit_rx = std::sync::Arc::new(std::sync::Mutex::new(unit_rx));
-        let (downloaders, extractors, clock) =
-            spawn_fetch_pipeline(scope, &store, &http, remote.as_ref(), unit_rx, workers);
+        let (downloaders, extractors, clock) = spawn_fetch_pipeline(
+            scope,
+            &store,
+            &http,
+            remote.as_ref(),
+            unit_rx,
+            download_workers,
+            workers,
+        );
         for item in work {
             if unit_tx.send(item).is_err() {
                 break;
@@ -742,6 +761,38 @@ fn adaptive_workers(requested: usize, work_items: usize, project_root: &Path) ->
     cpu.saturating_mul(2)
         .clamp(1, fs_limit)
         .min(work_items.max(1))
+}
+
+/// Choose the download-pool size. Downloads are network-bound — a worker
+/// spends most of its time waiting on registry I/O and holding a socket, not
+/// doing local CPU or filesystem work — so it is safe and beneficial to run
+/// more concurrent downloads than the filesystem-derived extract cap allows.
+///
+/// The ceiling is the resolver's HTTP concurrency (`async_resolver_max_in_flight`,
+/// default 32), because there is no point having more download workers than the
+/// shared HTTP client permits in flight at once. The floor is the extract worker
+/// count, so the download pool is never smaller than the extract pool (which
+/// would needlessly starve extraction). Override with
+/// `BPM_DOWNLOAD_CONCURRENCY`.
+fn download_worker_count(extract_workers: usize) -> usize {
+    if let Ok(value) = env::var("BPM_DOWNLOAD_CONCURRENCY") {
+        if let Ok(parsed) = value.parse::<usize>() {
+            if parsed > 0 {
+                return parsed;
+            }
+        }
+    }
+    let cpu = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1);
+    // Bound by the HTTP in-flight ceiling (no value in exceeding it) and by a
+    // sane multiple of the CPU count (downloads still do SHA-512 + buffer
+    // copies). Never below the extract pool.
+    let ceiling = async_resolver_max_in_flight() as usize;
+    cpu.saturating_mul(2)
+        .min(ceiling)
+        .max(extract_workers)
+        .max(1)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1119,7 +1170,9 @@ fn enforce_frozen(
 }
 
 struct InstallWork {
-    path: String,
+    /// `None` marks a best-effort lookahead warmup. A placed resolver unit
+    /// always has a path and is the only kind that produces a fetch outcome.
+    path: Option<String>,
     name: String,
     url: String,
     integrity: Option<Integrity>,
@@ -1133,7 +1186,7 @@ struct FetchOutcome {
 }
 
 struct PendingArtifact {
-    path: String,
+    path: Option<String>,
     name: String,
     url: String,
     artifact: bpm::store::ArtifactRef,
@@ -1155,7 +1208,7 @@ struct ChannelSink(std::sync::mpsc::SyncSender<InstallWork>);
 impl resolver::ResolveSink for ChannelSink {
     fn emit(&self, unit: resolver::ResolvedDownloadUnit) {
         let _ = self.0.send(InstallWork {
-            path: unit.path,
+            path: Some(unit.path),
             name: unit.name,
             url: unit.url,
             integrity: unit.integrity,
@@ -1218,19 +1271,25 @@ fn spawn_fetch_pipeline<'scope, 'env>(
     http: &'env HttpClient,
     remote: Option<&'env bpm::remote_cache::RemoteCacheClient>,
     unit_rx: std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<InstallWork>>>,
-    workers: usize,
+    download_workers: usize,
+    extract_workers: usize,
 ) -> (
     Vec<DownloaderHandle<'scope>>,
     Vec<ExtractorHandle<'scope>>,
     Arc<PipelineClock>,
 ) {
     use std::sync::mpsc::sync_channel;
-    let workers = workers.max(1);
+    let download_workers = download_workers.max(1);
+    let extract_workers = extract_workers.max(1);
     let clock = Arc::new(PipelineClock::new());
-    let (send, receive) = sync_channel::<Result<PendingArtifact, FetchFail>>(workers * 2);
+    // The download→extract handoff channel is sized by the *extract* pool: a
+    // download only blocks here once extract has `extract_workers * 2` pending
+    // artifacts queued, which is the natural backpressure point (extraction is
+    // the fs-bound stage).
+    let (send, receive) = sync_channel::<Result<PendingArtifact, FetchFail>>(extract_workers * 2);
     let receive = std::sync::Arc::new(std::sync::Mutex::new(receive));
-    let mut downloaders = Vec::with_capacity(workers);
-    for _ in 0..workers {
+    let mut downloaders = Vec::with_capacity(download_workers);
+    for _ in 0..download_workers {
         let unit_rx = unit_rx.clone();
         let send = send.clone();
         let http = http.clone();
@@ -1252,6 +1311,7 @@ fn spawn_fetch_pipeline<'scope, 'env>(
                 if extraction_gone {
                     continue;
                 }
+                let speculative = item.path.is_none();
                 let result = if let Some(remote) = remote.as_ref() {
                     store
                         .ensure_artifact_with_remote(
@@ -1281,6 +1341,13 @@ fn spawn_fetch_pipeline<'scope, 'env>(
                     url: item.url.clone(),
                     source: Box::new(source),
                 });
+                // Lookahead hints are deliberately best-effort. If metadata
+                // selected an artifact that placement later rejects (or the
+                // speculative fetch itself fails), only an authoritative
+                // placed unit may fail the install.
+                if speculative && result.is_err() {
+                    continue;
+                }
                 if send.send(result).is_err() {
                     // Extractors all exited (fatal error). Keep draining unit_rx
                     // so a streaming producer never blocks on a full channel;
@@ -1293,8 +1360,8 @@ fn spawn_fetch_pipeline<'scope, 'env>(
         }));
     }
     drop(send);
-    let mut extractors = Vec::with_capacity(workers);
-    for _ in 0..workers {
+    let mut extractors = Vec::with_capacity(extract_workers);
+    for _ in 0..extract_workers {
         let receive = receive.clone();
         let clock = Arc::clone(&clock);
         extractors.push(
@@ -1321,12 +1388,20 @@ fn spawn_fetch_pipeline<'scope, 'env>(
                         continue;
                     }
                     match store.ensure_image(&pending.artifact.id, &mut local) {
-                        Ok(image) => outcomes.push(FetchOutcome {
-                            path: pending.path.clone(),
-                            id: pending.artifact.id,
-                            artifact_cached: pending.artifact.cached,
-                            image_cached: image.cached,
-                        }),
+                        Ok(image) => {
+                            if let Some(path) = pending.path.clone() {
+                                outcomes.push(FetchOutcome {
+                                    path,
+                                    id: pending.artifact.id,
+                                    artifact_cached: pending.artifact.cached,
+                                    image_cached: image.cached,
+                                });
+                            }
+                        }
+                        Err(_) if pending.path.is_none() => {
+                            // Best-effort warmup failure: the eventual placed
+                            // unit retries through the authoritative path.
+                        }
                         Err(source) => {
                             first_error = Some(FetchFail {
                                 name: pending.name,
@@ -1573,12 +1648,13 @@ fn resolve_fresh_manifest_blocking(
 struct TryChannelSink {
     tx: std::sync::mpsc::SyncSender<InstallWork>,
     overflow: std::sync::Arc<std::sync::Mutex<Vec<InstallWork>>>,
+    prefetched: std::sync::Arc<std::sync::Mutex<HashSet<String>>>,
 }
 
 impl resolver::ResolveSink for TryChannelSink {
     fn emit(&self, unit: resolver::ResolvedDownloadUnit) {
         let work = InstallWork {
-            path: unit.path,
+            path: Some(unit.path),
             name: unit.name,
             url: unit.url,
             integrity: unit.integrity,
@@ -1595,6 +1671,39 @@ impl resolver::ResolveSink for TryChannelSink {
             };
             if let Ok(mut buffer) = self.overflow.lock() {
                 buffer.push(work);
+            }
+        }
+    }
+
+    fn prefetch(&self, hint: resolver::ResolvedDownloadHint) {
+        // Integrity is the stable identity; URL is a safe fallback for old
+        // registry entries without sha512 metadata. Claim before enqueueing so
+        // repeated ranges/placements do not flood the bounded live channel.
+        let key = hint
+            .integrity
+            .as_ref()
+            .map(|value| value.digest().to_hex())
+            .unwrap_or_else(|| hint.url.clone());
+        let claimed = self
+            .prefetched
+            .lock()
+            .map(|mut values| values.insert(key.clone()))
+            .unwrap_or(false);
+        if !claimed {
+            return;
+        }
+        let work = InstallWork {
+            path: None,
+            name: hint.name,
+            url: hint.url,
+            integrity: hint.integrity,
+        };
+        // Speculation must never create post-resolution overflow or block the
+        // tokio worker. If the pipeline is busy, drop the hint; placement will
+        // still emit the authoritative unit.
+        if self.tx.try_send(work).is_err() {
+            if let Ok(mut values) = self.prefetched.lock() {
+                values.remove(&key);
             }
         }
     }
@@ -1639,14 +1748,22 @@ fn run_streaming_async_install(
         None
     };
     let workers = adaptive_workers(concurrency, usize::MAX, root);
+    let download_workers = download_worker_count(workers);
     let overflow = std::sync::Arc::new(std::sync::Mutex::new(Vec::<InstallWork>::new()));
     let (lockfile, outcomes) = std::thread::scope(
         |scope| -> anyhow::Result<(Lockfile, Vec<FetchOutcome>)> {
             let (unit_tx, unit_rx) =
-                std::sync::mpsc::sync_channel::<InstallWork>(workers.max(1) * 2);
+                std::sync::mpsc::sync_channel::<InstallWork>(download_workers.max(1) * 2);
             let unit_rx = std::sync::Arc::new(std::sync::Mutex::new(unit_rx));
-            let (downloaders, extractors, clock) =
-                spawn_fetch_pipeline(scope, store, http, remote.as_ref(), unit_rx, workers);
+            let (downloaders, extractors, clock) = spawn_fetch_pipeline(
+                scope,
+                store,
+                http,
+                remote.as_ref(),
+                unit_rx,
+                download_workers,
+                workers,
+            );
             // Run async resolution on a tokio runtime, emitting placed nodes
             // to the non-blocking TryChannelSink. Units that overflow the live
             // channel are retained in `overflow` rather than dropped.
@@ -1661,15 +1778,17 @@ fn run_streaming_async_install(
                         .build()
                         .expect("failed to build tokio runtime")
                         .block_on(async {
-                            let sink = TryChannelSink {
+                            let sink = Arc::new(TryChannelSink {
                                 tx: unit_tx.clone(),
                                 overflow: std::sync::Arc::clone(&overflow),
-                            };
+                                prefetched: Arc::new(std::sync::Mutex::new(HashSet::new())),
+                            });
                             let async_cache = open_metadata_cache(store.root(), options.cache_mode)?;
                             let mut registry = bpm::async_resolver::AsyncRegistryClient::new(
                                 config_clone,
                             )
-                            .with_max_in_flight(async_resolver_max_in_flight());
+                            .with_max_in_flight(async_resolver_max_in_flight())
+                            .with_download_prefetch_sink(sink.clone());
                             if let Some(cache) = async_cache {
                                 registry = registry.with_metadata_cache(cache, options.cache_mode);
                             }
@@ -1681,7 +1800,7 @@ fn run_streaming_async_install(
                                     Some(workspace_index),
                                     peer_mode,
                                     bpm::resolver::current_target_platform(),
-                                    Some(&sink as &dyn resolver::ResolveSink),
+                                    Some(sink.as_ref() as &dyn resolver::ResolveSink),
                                 )
                                 .await?;
                             let diag = registry.take_diagnostics();
@@ -1835,13 +1954,21 @@ fn run_streaming_install(
     // Work count is unknown until resolution completes, so do not clamp the
     // worker count to it (usize::MAX makes adaptive_workers' clamp a no-op).
     let workers = adaptive_workers(concurrency, usize::MAX, root);
+    let download_workers = download_worker_count(workers);
     let (lockfile, outcomes) =
         std::thread::scope(|scope| -> anyhow::Result<(Lockfile, Vec<FetchOutcome>)> {
             let (unit_tx, unit_rx) =
-                std::sync::mpsc::sync_channel::<InstallWork>(workers.max(1) * 2);
+                std::sync::mpsc::sync_channel::<InstallWork>(download_workers.max(1) * 2);
             let unit_rx = std::sync::Arc::new(std::sync::Mutex::new(unit_rx));
-            let (downloaders, extractors, clock) =
-                spawn_fetch_pipeline(scope, store, http, remote.as_ref(), unit_rx, workers);
+            let (downloaders, extractors, clock) = spawn_fetch_pipeline(
+                scope,
+                store,
+                http,
+                remote.as_ref(),
+                unit_rx,
+                download_workers,
+                workers,
+            );
             // Run resolution on this thread, emitting each placed node to the
             // sink; dropping `sink` closes the unit channel so downloaders (and
             // then extractors) drain and finish before we join them below.
@@ -1945,6 +2072,7 @@ fn finalize_install(
     // of stale entries still clears, claiming only entries whose live state
     // exactly matches the prior volume.
     let ownership_start = Instant::now();
+    let prior_volume_path = prior_plan.map(|plan| store.graph_volume_path(&plan.graph_id_hex));
     let prior_owned_vec: Vec<bpm::graph::ManagedEntry> = match prior_plan {
         Some(plan) if plan.owned_entries.is_empty() => bpm::volume::infer_prior_ownership(
             project_root,
@@ -2000,11 +2128,17 @@ fn finalize_install(
         .filter_map(|(maybe_id, pkg)| if pkg.link { None } else { *maybe_id })
         .collect();
     let prepared_derived: Vec<String> = prepared.values().map(|image| image.key.to_hex()).collect();
-    let metadata_lease_start = Instant::now();
-    session
-        .lease_objects(&lease_artifacts, &prepared_derived)
-        .map_err(|error| anyhow::anyhow!("lease store objects failed: {error}"))?;
-    metrics.record("metadata_lease", metadata_lease_start.elapsed());
+    // Volume-reuse installs read only the immutable graph volume from the
+    // store: its hardlinks keep every artifact/image inode alive even if a
+    // concurrent collector unlinks the store copies, so leasing the graph
+    // object alone covers the read window and skips the 2N+D publication,
+    // access, and lease-row writes. Any install that will (re)build the
+    // volume reads store images directly and takes the full object lease.
+    let volume_reuse_hex = if direct_materialization {
+        None
+    } else {
+        bpm::volume::graph_volume_reuse_expected(store, lockfile, &prepared, profile)
+    };
     // Turbopack and similar bundlers enforce that dependency realpaths remain
     // inside the project. Keep the O(top-level) relay fast path for ordinary
     // projects, but use a local hardlink view automatically for Next projects;
@@ -2020,19 +2154,49 @@ fn finalize_install(
     // graph-volume ownership.
     let mut final_ownership: Vec<bpm::graph::ManagedEntry> = Vec::new();
     let mut graph_hex: Option<String> = None;
+    let mut graph_record_elapsed = std::time::Duration::ZERO;
+    // Acquire the install lease CONCURRENTLY with materialization, joining it
+    // in each branch once the fs-heavy work has hidden it. Ordering rationale:
+    // freshly extracted store objects are categorically protected by GC's
+    // default 30-day grace period, so materialization may safely read them
+    // before the durable lease rows exist; the lease still completes (and is
+    // joined) before the graph is recorded, ownership is finalized, or the
+    // install reports success, so no install ever succeeds with an
+    // unprotected graph.
+    let run_lease = |session: &mut bpm::metadata::InstallSession| {
+        let metadata_lease_start = Instant::now();
+        let result = match &volume_reuse_hex {
+            Some(graph_hex) => session
+                .lease_graph_object(graph_hex)
+                .map_err(|error| anyhow::anyhow!("lease graph volume failed: {error}")),
+            None => session
+                .lease_objects(&lease_artifacts, &prepared_derived)
+                .map_err(|error| anyhow::anyhow!("lease store objects failed: {error}")),
+        };
+        let elapsed = metadata_lease_start.elapsed();
+        (result, elapsed)
+    };
     let materialization_start = Instant::now();
     let (volume, view_entry_count, lifecycle) = if direct_materialization {
-        bpm::materializer::materialize_lockfile_with_backend(
-            project_root,
-            store,
-            lockfile,
-            artifact_ids,
-            bpm::materializer::MaterializeMode::Compatible,
-            match project_view {
-                ProjectView::Reflink => bpm::materializer::MaterializeBackend::Reflink,
-                ProjectView::Local => bpm::materializer::MaterializeBackend::IsolatedCopy,
-            },
-        )?;
+        let (materialized, lease) = std::thread::scope(|lease_scope| {
+            let lease_handle = lease_scope.spawn(|| run_lease(&mut session));
+            let materialized = bpm::materializer::materialize_lockfile_with_backend(
+                project_root,
+                store,
+                lockfile,
+                artifact_ids,
+                bpm::materializer::MaterializeMode::Compatible,
+                match project_view {
+                    ProjectView::Reflink => bpm::materializer::MaterializeBackend::Reflink,
+                    ProjectView::Local => bpm::materializer::MaterializeBackend::IsolatedCopy,
+                },
+            );
+            let lease = lease_handle.join().expect("lease thread panicked");
+            (materialized, lease)
+        });
+        metrics.record("metadata_lease", lease.1);
+        lease.0?;
+        materialized?;
         (
             None,
             0usize,
@@ -2050,14 +2214,22 @@ fn finalize_install(
             )?,
         )
     } else {
-        let ensured = bpm::volume::ensure_graph_volume_with_prepared_and_profile(
-            store,
-            lockfile,
-            artifact_ids,
-            &prepared,
-            profile,
-            metrics,
-        )?;
+        let (ensured, lease) = std::thread::scope(|lease_scope| {
+            let lease_handle = lease_scope.spawn(|| run_lease(&mut session));
+            let ensured = bpm::volume::ensure_graph_volume_with_prepared_and_profile(
+                store,
+                lockfile,
+                artifact_ids,
+                &prepared,
+                profile,
+                metrics,
+            );
+            let lease = lease_handle.join().expect("lease thread panicked");
+            (ensured, lease)
+        });
+        metrics.record("metadata_lease", lease.1);
+        lease.0?;
+        let ensured = ensured?;
         let (volume, lifecycle) = match ensured {
             bpm::volume::EnsuredVolume::Ready(volume) => {
                 let lifecycle = run_lifecycle_if_enabled(
@@ -2087,18 +2259,58 @@ fn finalize_install(
                     profile,
                     metrics,
                 )?;
+                let publish_start = Instant::now();
                 let volume = pending.publish()?;
+                metrics.record("graph_volume_publish", publish_start.elapsed());
                 (volume, lifecycle)
             }
         };
-        let attach = bpm::volume::attach_project(project_root, &volume)?;
-        final_ownership.clone_from(&attach.owned);
+        // On Unix, an ignore-scripts graph without workspace/prepared
+        // overlays is exactly the sum of its immutable image sizes per
+        // placement; directories and `.bin` symlinks contribute zero
+        // under metadata's logical-size rules. The lease phase has
+        // already measured and indexed those images, so reuse that
+        // work. Every other shape conservatively falls back to a graph
+        // walk.
+        let graph_size_hint = if cfg!(unix)
+            && options.ignore_scripts
+            && !has_workspace_links
+            && prepared.is_empty()
+        {
+            session
+                .recorded_image_size_sum(&lease_artifacts)
+                .map_err(|error| anyhow::anyhow!("read indexed image sizes failed: {error}"))?
+        } else {
+            None
+        };
         let hex = volume
             .path
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("")
             .to_string();
+        let inventory = bpm::volume::read_graph_inventory(&store.graph_volume_path(&hex));
+        let attachment_start = Instant::now();
+        let (attach_result, graph_record_result, record_elapsed) = std::thread::scope(|scope| {
+            // The published graph is immutable, so its durable metadata walk
+            // and project attachment may safely read it concurrently. Both
+            // complete before project ownership is finalized below.
+            let record = scope.spawn(|| {
+                let start = Instant::now();
+                let result =
+                    session.record_graph_with_size_hint(&hex, inventory.as_ref(), graph_size_hint);
+                (result, start.elapsed())
+            });
+            let attach = bpm::volume::attach_project(project_root, &volume);
+            let (record_result, elapsed) = record.join().unwrap();
+            (attach, record_result, elapsed)
+        });
+        metrics.record("project_attachment", attachment_start.elapsed());
+        graph_record_elapsed = record_elapsed;
+        let attach = attach_result?;
+        graph_record_result
+            .map_err(|error| anyhow::anyhow!("record graph ownership failed: {error}"))?;
+        final_ownership.clone_from(&attach.owned);
         graph_hex = Some(hex);
         (
             Some(volume),
@@ -2107,13 +2319,13 @@ fn finalize_install(
         )
     };
     metrics.record("materialization", materialization_start.elapsed());
+    metrics.record("metadata_graph_record", graph_record_elapsed);
     let local_view_start = Instant::now();
     metrics.record("project_local_view", local_view_start.elapsed());
 
     // Overlap the independent post-materialization work:
-    // project-view reconciliation and plan writing run concurrently,
-    // while record_graph runs in the main thread. This overlaps
-    // the serial tail with itself, reducing wall-clock time.
+    // project-view reconciliation and plan writing run concurrently. This
+    // overlaps the serial tail with itself, reducing wall-clock time.
     let overlap_start = Instant::now();
     let has_volume = volume.is_some();
 
@@ -2134,8 +2346,13 @@ fn finalize_install(
     let (reconciliation_outcome, plan_result) = std::thread::scope(|scope| {
         let r = scope.spawn(move || {
             if !prior_owned.is_empty() && has_volume {
-                bpm::volume::reconcile_project_view(project_root, prior_owned, &new_desired)
-                    .map_err(|error| anyhow::anyhow!("project-view reconciliation failed: {error}"))
+                bpm::volume::reconcile_project_view_with_prior_volume(
+                    project_root,
+                    prior_owned,
+                    &new_desired,
+                    prior_volume_path.as_deref(),
+                )
+                .map_err(|error| anyhow::anyhow!("project-view reconciliation failed: {error}"))
             } else {
                 Ok(bpm::volume::ReconcileOutcome::default())
             }
@@ -2182,17 +2399,6 @@ fn finalize_install(
         }
     }
     metrics.record("project_reconciliation", reconciliation_start.elapsed());
-
-    let graph_record_start = Instant::now();
-    if let Some(hex) = &graph_hex {
-        session
-            .record_graph(
-                hex,
-                bpm::volume::read_graph_inventory(&store.graph_volume_path(hex)).as_ref(),
-            )
-            .map_err(|error| anyhow::anyhow!("record graph ownership failed: {error}"))?;
-    }
-    metrics.record("metadata_graph_record", graph_record_start.elapsed());
 
     let plan_start = Instant::now();
     if let Err(error) = plan_result {
@@ -2297,7 +2503,7 @@ fn build_install_work(
             None => None,
         };
         work.push(InstallWork {
-            path: package.path.clone(),
+            path: Some(package.path.clone()),
             name: package.name.clone(),
             url: package.resolved.clone(),
             integrity,
@@ -2335,8 +2541,8 @@ mod tests {
     use bpm::lockfile::{
         LockDependency, LockSource, Lockfile, PackageEntry, PackageResolution, PeerProvider,
     };
-    use bpm::resolver::{ResolveSink, ResolvedDownloadUnit};
-    use std::collections::{BTreeMap, BTreeSet};
+    use bpm::resolver::{ResolveSink, ResolvedDownloadHint, ResolvedDownloadUnit};
+    use std::collections::{BTreeMap, BTreeSet, HashSet};
     use std::sync::{mpsc::sync_channel, Arc, Mutex};
 
     fn unit(path: &str) -> ResolvedDownloadUnit {
@@ -2357,6 +2563,7 @@ mod tests {
         let sink = TryChannelSink {
             tx: tx.clone(),
             overflow: Arc::clone(&overflow),
+            prefetched: Arc::new(Mutex::new(HashSet::new())),
         };
         sink.emit(unit("node_modules/p0"));
         sink.emit(unit("node_modules/p1"));
@@ -2368,8 +2575,8 @@ mod tests {
                 2,
                 "two units must overflow a capacity-1 channel"
             );
-            assert_eq!(buffered[0].path, "node_modules/p1");
-            assert_eq!(buffered[1].path, "node_modules/p2");
+            assert_eq!(buffered[0].path.as_deref(), Some("node_modules/p1"));
+            assert_eq!(buffered[1].path.as_deref(), Some("node_modules/p2"));
             // No URL/name/path field is lost in ResolvedDownloadUnit -> InstallWork.
             assert_eq!(buffered[0].url, "https://example.test/node_modules/p1.tgz");
             assert_eq!(buffered[0].name, "node_modules/p1");
@@ -2379,6 +2586,44 @@ mod tests {
         drop(rx);
         sink.emit(unit("node_modules/p3"));
         assert_eq!(overflow.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn try_channel_sink_deduplicates_best_effort_prefetch_without_overflow() {
+        let (tx, rx) = sync_channel::<InstallWork>(1);
+        let overflow = Arc::new(Mutex::new(Vec::new()));
+        let sink = TryChannelSink {
+            tx,
+            overflow: Arc::clone(&overflow),
+            prefetched: Arc::new(Mutex::new(HashSet::new())),
+        };
+        let hint = ResolvedDownloadHint {
+            name: "pkg".to_owned(),
+            url: "https://example.test/pkg.tgz".to_owned(),
+            integrity: None,
+        };
+
+        sink.prefetch(hint.clone());
+        sink.prefetch(hint);
+
+        let queued = rx.try_recv().expect("first hint should be queued");
+        assert!(queued.path.is_none());
+        assert!(rx.try_recv().is_err(), "duplicate hint must be suppressed");
+        assert!(overflow.lock().unwrap().is_empty());
+
+        // An authoritative unit owns the only channel slot. A different hint
+        // must be dropped rather than displacing it into post-resolution
+        // overflow.
+        sink.emit(unit("node_modules/placed"));
+        sink.prefetch(ResolvedDownloadHint {
+            name: "other".to_owned(),
+            url: "https://example.test/other.tgz".to_owned(),
+            integrity: None,
+        });
+        let placed = rx.try_recv().expect("placed unit must retain priority");
+        assert_eq!(placed.path.as_deref(), Some("node_modules/placed"));
+        assert!(rx.try_recv().is_err(), "full-channel hint must be dropped");
+        assert!(overflow.lock().unwrap().is_empty());
     }
 
     fn outcome(path: &str) -> FetchOutcome {

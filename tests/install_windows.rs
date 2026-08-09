@@ -186,8 +186,8 @@ fn windows_attach_with_reflink_backend_isolates_source() {
     let payload: &[u8] = br#"{"name":"demo","version":"1.0.0"}"#;
     fs::write(volume.join("demo/package.json"), payload).unwrap();
     // `attach_project_local_with_backend` inherits published identities from
-    // the volume's metadata.json; publish a real manifest (computed tree-blake3
-    // identities) so attach resolves the demo entry.
+    // the volume's metadata.json; publish a real manifest with validated
+    // immutable-entry identities so attach resolves the demo entry.
     write_test_meta_for_tests(store.path());
 
     let volume_ref = VolumeRef {
@@ -203,8 +203,8 @@ fn windows_attach_with_reflink_backend_isolates_source() {
         stats.stats.relays_created, 1,
         "one package should be attached"
     );
-    // Attachment records the isolated real directory with a versioned tree
-    // fingerprint.
+    // Attachment records the isolated real directory with a versioned
+    // immutable-volume entry reference.
     assert_eq!(
         stats.owned.len(),
         1,
@@ -217,7 +217,7 @@ fn windows_attach_with_reflink_backend_isolates_source() {
         "owned entry must carry an identity"
     );
     assert_eq!(owned.mode, "local", "copy fallback records local mode");
-    assert!(owned.identity.starts_with("tree-blake3-v1:"));
+    assert_eq!(owned.identity, "tree-volume-v1:demo");
 
     let pkg = project.path().join("node_modules/demo/package.json");
     assert!(
