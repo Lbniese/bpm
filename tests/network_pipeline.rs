@@ -6,6 +6,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -13,6 +14,8 @@ use std::time::Duration;
 #[cfg(unix)]
 use bpm::lockfile::{Lockfile, PackageEntry, RootEntry};
 use common::{build_tgz, integrity_of, CapturedRequest, MiniServer, RouteBody};
+use flate2::write::GzEncoder;
+use flate2::Compression;
 
 /// (name, version, tarball url, tarball body, extra response headers)
 type PkgFixture<'a> = (&'a str, &'a str, &'a str, Vec<u8>, BTreeMap<String, String>);
@@ -218,6 +221,218 @@ fn read_request(
         path,
         headers,
     })
+}
+
+fn gzip_bytes(body: &[u8]) -> Vec<u8> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(body).expect("gzip metadata");
+    encoder.finish().expect("finish gzip metadata")
+}
+
+struct InstallRegistry {
+    registry: String,
+    metadata_requests: Arc<AtomicUsize>,
+    compressed_metadata_requests: Arc<AtomicUsize>,
+    tarball_requests: Arc<AtomicUsize>,
+    saw_compression_advertisement: Arc<AtomicBool>,
+    _handle: thread::JoinHandle<()>,
+}
+
+impl InstallRegistry {
+    fn gzip_then_identity(name: &str, version: &str, tgz: Vec<u8>, gzip_responses: usize) -> Self {
+        Self::new(name, version, tgz, gzip_responses)
+    }
+
+    fn new(name: &str, version: &str, tgz: Vec<u8>, gzip_responses: usize) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind install registry");
+        let registry = format!(
+            "http://{}",
+            listener.local_addr().expect("registry address")
+        );
+        let metadata_path = format!("/{}", name.replace('/', "%2F"));
+        let tarball_path = format!("/tarballs/{name}-{version}.tgz");
+        let identity_metadata = serde_json::to_vec(&packument(
+            version,
+            format!("{registry}{tarball_path}"),
+            integrity_of(&tgz),
+        ))
+        .expect("serialize packument");
+        let compressed_metadata = Arc::new(gzip_bytes(&identity_metadata));
+        let identity_metadata = Arc::new(identity_metadata);
+        let tarball = Arc::new(tgz);
+        let metadata_requests = Arc::new(AtomicUsize::new(0));
+        let compressed_metadata_requests = Arc::new(AtomicUsize::new(0));
+        let tarball_requests = Arc::new(AtomicUsize::new(0));
+        let saw_compression_advertisement = Arc::new(AtomicBool::new(false));
+
+        let metadata_requests_thread = Arc::clone(&metadata_requests);
+        let compressed_metadata_thread = Arc::clone(&compressed_metadata_requests);
+        let tarball_requests_thread = Arc::clone(&tarball_requests);
+        let compression_thread = Arc::clone(&saw_compression_advertisement);
+        let compressed_metadata_thread_body = Arc::clone(&compressed_metadata);
+        let identity_metadata_thread = Arc::clone(&identity_metadata);
+        let tarball_thread = Arc::clone(&tarball);
+        let handle = thread::spawn(move || {
+            for incoming in listener.incoming() {
+                let Ok(mut stream) = incoming else { break };
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+                let Some(request) = read_request(&mut stream, 0, 0) else {
+                    continue;
+                };
+                let accepts_compression = request
+                    .header("accept-encoding")
+                    .map(|value| {
+                        let lower = value.to_ascii_lowercase();
+                        lower.contains("gzip") && lower.contains("br")
+                    })
+                    .unwrap_or(false);
+                if accepts_compression {
+                    compression_thread.store(true, Ordering::SeqCst);
+                }
+                if request.path == metadata_path {
+                    let request_number =
+                        metadata_requests_thread.fetch_add(1, Ordering::SeqCst) + 1;
+                    let (body, content_encoding) = if request_number <= gzip_responses {
+                        compressed_metadata_thread.fetch_add(1, Ordering::SeqCst);
+                        (
+                            compressed_metadata_thread_body.as_slice(),
+                            "Content-Encoding: gzip\r\n",
+                        )
+                    } else {
+                        (identity_metadata_thread.as_slice(), "")
+                    };
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\n{content_encoding}Connection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes());
+                    let _ = stream.write_all(body);
+                } else if request.path == tarball_path {
+                    tarball_requests_thread.fetch_add(1, Ordering::SeqCst);
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/gzip\r\nConnection: close\r\n\r\n",
+                        tarball_thread.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes());
+                    let _ = stream.write_all(&tarball_thread);
+                } else {
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                }
+            }
+        });
+
+        Self {
+            registry,
+            metadata_requests,
+            compressed_metadata_requests,
+            tarball_requests,
+            saw_compression_advertisement,
+            _handle: handle,
+        }
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!(
+            "{}/{path}",
+            self.registry,
+            path = path.trim_start_matches('/')
+        )
+    }
+
+    fn metadata_requests(&self) -> usize {
+        self.metadata_requests.load(Ordering::SeqCst)
+    }
+
+    fn compressed_metadata_requests(&self) -> usize {
+        self.compressed_metadata_requests.load(Ordering::SeqCst)
+    }
+
+    fn tarball_requests(&self) -> usize {
+        self.tarball_requests.load(Ordering::SeqCst)
+    }
+
+    fn saw_compression_advertisement(&self) -> bool {
+        self.saw_compression_advertisement.load(Ordering::SeqCst)
+    }
+}
+
+fn executable_package_tgz(name: &str, version: &str) -> Vec<u8> {
+    build_tgz(|builder| {
+        let package = serde_json::json!({
+            "name": name,
+            "version": version,
+            "main": "index.js",
+            "bin": { "gzip-installed": "./cli.js" }
+        });
+        let package_json = serde_json::to_vec(&package).expect("serialize executable package");
+        common::add_file(builder, "package.json", 0o644, &package_json);
+        common::add_file(
+            builder,
+            "index.js",
+            0o644,
+            br#"module.exports = { value: "gzip-metadata-ok" };"#,
+        );
+        common::add_file(
+            builder,
+            "cli.js",
+            0o755,
+            b"#!/usr/bin/env node\nprocess.stdout.write('gzip-exec-ok\\n');\n",
+        );
+    })
+}
+
+fn assert_package_can_run(project: &Path, package_name: &str) {
+    let source = format!(
+        "const package = require({package_name:?}); if (package.value !== 'gzip-metadata-ok') process.exit(1);"
+    );
+    let output = Command::new("node")
+        .args(["-e", &source])
+        .current_dir(project)
+        .output()
+        .expect("run node require after install");
+    assert!(
+        output.status.success(),
+        "installed package require failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let cli = project
+        .join("node_modules")
+        .join(package_name)
+        .join("cli.js");
+    let output = Command::new("node")
+        .arg(cli)
+        .current_dir(project)
+        .output()
+        .expect("execute installed package after install");
+    assert!(
+        output.status.success(),
+        "installed package execution failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "gzip-exec-ok\n");
+}
+
+fn run_bpm_with_default_resolver_modes(
+    args: &[&str],
+    cwd: &Path,
+    store: &Path,
+) -> (bool, String, String) {
+    let mut cmd = Command::new(bin());
+    cmd.args(args)
+        .current_dir(cwd)
+        .env("BPM_STORE", store)
+        .env_remove("BPM_ASYNC_RESOLVE")
+        .env_remove("BPM_STREAM_INSTALL");
+    let out = cmd.output().expect("run bpm with default resolver modes");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
 }
 
 fn same_host_registry_mock(
@@ -842,6 +1057,136 @@ fn async_streaming_resolve_produces_byte_identical_lockfile() {
         blocking_lock, combined_lock,
         "blocking and streaming+async resolve must produce byte-identical bpm.lock"
     );
+}
+
+#[test]
+fn gzip_registry_metadata_preserves_lock_and_runtime_semantics() {
+    let package_name = "gzip-install-pkg";
+    let version = "1.0.0";
+    let tgz = executable_package_tgz(package_name, version);
+    // The first three resolver-mode installs receive gzip metadata; the fourth
+    // receives the byte-equivalent identity JSON from the same registry URL.
+    let registry = InstallRegistry::gzip_then_identity(package_name, version, tgz, 3);
+    let project = tempfile::tempdir().unwrap();
+    let mut dependencies = serde_json::Map::new();
+    dependencies.insert(package_name.to_string(), serde_json::json!("^1.0.0"));
+    let manifest = serde_json::json!({
+        "name": "gzip-app",
+        "version": "1.0.0",
+        "dependencies": dependencies
+    });
+    fs::write(
+        project.path().join("package.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    write_npmrc(project.path(), &[format!("registry={}", registry.url(""))]);
+
+    let mut locks = Vec::new();
+
+    let store_blocking = tempfile::tempdir().unwrap();
+    let store_path = store_blocking.path().to_str().unwrap();
+    let registry_url = registry.url("");
+    let args = [
+        "install",
+        "--registry",
+        registry_url.as_str(),
+        "--store",
+        store_path,
+    ];
+    let (ok, stdout, stderr) = run_bpm_with_env(
+        &args,
+        project.path(),
+        store_blocking.path(),
+        None,
+        RESOLVE_BLOCKING,
+    );
+    assert!(
+        ok,
+        "blocking compressed install failed\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    locks.push(fs::read(project.path().join("bpm.lock")).unwrap());
+    assert_package_can_run(project.path(), package_name);
+
+    let _ = fs::remove_file(project.path().join("bpm.lock"));
+    let _ = fs::remove_dir_all(project.path().join("node_modules"));
+    let store_async = tempfile::tempdir().unwrap();
+    let store_path = store_async.path().to_str().unwrap();
+    let registry_url = registry.url("");
+    let args = [
+        "install",
+        "--registry",
+        registry_url.as_str(),
+        "--store",
+        store_path,
+    ];
+    let (ok, stdout, stderr) = run_bpm_with_env(
+        &args,
+        project.path(),
+        store_async.path(),
+        None,
+        &[("BPM_ASYNC_RESOLVE", "1"), ("BPM_STREAM_INSTALL", "0")],
+    );
+    assert!(
+        ok,
+        "async non-streaming compressed install failed\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    locks.push(fs::read(project.path().join("bpm.lock")).unwrap());
+    assert_package_can_run(project.path(), package_name);
+
+    let _ = fs::remove_file(project.path().join("bpm.lock"));
+    let _ = fs::remove_dir_all(project.path().join("node_modules"));
+    let store_default = tempfile::tempdir().unwrap();
+    let store_path = store_default.path().to_str().unwrap();
+    let registry_url = registry.url("");
+    let args = [
+        "install",
+        "--registry",
+        registry_url.as_str(),
+        "--store",
+        store_path,
+    ];
+    let (ok, stdout, stderr) =
+        run_bpm_with_default_resolver_modes(&args, project.path(), store_default.path());
+    assert!(
+        ok,
+        "default async+streaming compressed install failed\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    locks.push(fs::read(project.path().join("bpm.lock")).unwrap());
+    assert_package_can_run(project.path(), package_name);
+
+    let _ = fs::remove_file(project.path().join("bpm.lock"));
+    let _ = fs::remove_dir_all(project.path().join("node_modules"));
+    let store_identity = tempfile::tempdir().unwrap();
+    let store_path = store_identity.path().to_str().unwrap();
+    let registry_url = registry.url("");
+    let args = [
+        "install",
+        "--registry",
+        registry_url.as_str(),
+        "--store",
+        store_path,
+    ];
+    let (ok, stdout, stderr) =
+        run_bpm_with_default_resolver_modes(&args, project.path(), store_identity.path());
+    assert!(
+        ok,
+        "identity metadata install failed\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    locks.push(fs::read(project.path().join("bpm.lock")).unwrap());
+    assert_package_can_run(project.path(), package_name);
+
+    assert_eq!(locks.len(), 4);
+    assert_eq!(locks[0], locks[1], "blocking and async lockfiles differ");
+    assert_eq!(locks[0], locks[2], "blocking and default lockfiles differ");
+    assert_eq!(
+        locks[0], locks[3],
+        "gzip and identity metadata produced different lockfiles"
+    );
+    assert_eq!(registry.metadata_requests(), 4);
+    assert_eq!(registry.compressed_metadata_requests(), 3);
+    assert_eq!(registry.tarball_requests(), 4);
+    assert!(registry.saw_compression_advertisement());
 }
 
 /// Helper that starts a registry mock returning a packument with an arbitrary
