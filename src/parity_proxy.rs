@@ -16,11 +16,13 @@
 //!   or cancels accepted connection tasks, and returns only finalized records.
 //! - The upstream fetch reuses `reqwest`'s async client (rustls), so TLS to the
 //!   registry is handled and the proxy only speaks HTTP/1.1 to the tools. This
-//!   normalizes transport and measures network *shape* (counts/bytes/concurrency),
-//!   not production wall-clock; production timing stays in `reference.json`.
+//!   normalizes transport and measures network *shape* (counts/raw wire
+//!   bytes/concurrency), not production wall-clock; production timing stays in
+//!   `reference.json`. Automatic content decoding is disabled on this client so
+//!   enabling compression in bpm cannot silently change the byte metric.
 //! - Response bodies are streamed back through a [`CountingBody`] whose `Drop`
-//!   records the finalized byte count and end timestamp, so large tarballs are
-//!   never buffered in memory.
+//!   records the finalized raw upstream byte count and end timestamp, so large
+//!   tarballs are never buffered in memory.
 //! - `peak_concurrent` is computed from the recorded `(start, end)` intervals
 //!   by [`compute_network_shape`], which is pure and unit-testable.
 
@@ -461,10 +463,7 @@ async fn proxy_main(
         return;
     }
 
-    let client = match reqwest::Client::builder()
-        .pool_max_idle_per_host(64)
-        .build()
-    {
+    let client = match build_upstream_client() {
         Ok(client) => client,
         Err(_) => return,
     };
@@ -549,6 +548,22 @@ async fn proxy_main(
     if in_flight.wait_for_zero().is_err() {
         drain_failed.store(true, Ordering::SeqCst);
     }
+}
+
+/// Build the proxy's upstream client without transparent content decoding.
+///
+/// The proxy forwards each tool's `Accept-Encoding` header verbatim. Disabling
+/// reqwest's automatic gzip/brotli decoding therefore preserves both the raw
+/// response octets and `Content-Encoding` header on the registry-to-tool hop.
+/// This must remain explicit because reqwest features are unified crate-wide:
+/// enabling decoding for bpm's registry client otherwise changes parity-proxy
+/// measurement semantics as a side effect.
+fn build_upstream_client() -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .no_gzip()
+        .no_brotli()
+        .pool_max_idle_per_host(64)
+        .build()
 }
 
 /// Headers forwarded tool -> registry (everything but hop-by-hop / host).
@@ -783,6 +798,64 @@ fn mono_now_ns() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upstream_client_preserves_compressed_wire_bytes() {
+        use std::io::{Read as _, Write as _};
+
+        let plain = vec![b'x'; 32 * 1024];
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&plain).unwrap();
+        let compressed = encoder.finish().unwrap();
+        assert!(compressed.len() < plain.len());
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_body = compressed.clone();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = stream.read(&mut chunk).unwrap();
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..count]);
+            }
+            let request = String::from_utf8_lossy(&request).to_ascii_lowercase();
+            assert!(request.contains("accept-encoding: gzip"));
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                server_body.len()
+            )
+            .unwrap();
+            stream.write_all(&server_body).unwrap();
+        });
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (encoding, received) = runtime.block_on(async {
+            let response = build_upstream_client()
+                .unwrap()
+                .get(format!("http://{address}/packument"))
+                .header(reqwest::header::ACCEPT_ENCODING, "gzip")
+                .send()
+                .await
+                .unwrap();
+            let encoding = response
+                .headers()
+                .get(reqwest::header::CONTENT_ENCODING)
+                .cloned();
+            let body = response.bytes().await.unwrap();
+            (encoding, body)
+        });
+        server.join().unwrap();
+
+        assert_eq!(encoding.unwrap(), "gzip");
+        assert_eq!(received.as_ref(), compressed.as_slice());
+        assert_ne!(received.as_ref(), plain.as_slice());
+    }
 
     #[test]
     fn empty_records_yield_default_shape() {
