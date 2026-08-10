@@ -6,12 +6,18 @@
 //! These drive `AsyncRegistryClient` directly against a `MiniServer` mock
 //! registry so the assertions are deterministic and network-free.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::thread;
 
 use bpm::async_resolver::AsyncRegistryClient;
 use bpm::config::NpmConfig;
-use bpm::registry::{PackageSpec, VersionRequest};
+use bpm::metadata_cache::{CacheMode, MetadataCache};
+use bpm::registry::{parse_spec, PackageSpec, VersionRequest};
+use flate2::write::GzEncoder;
+use flate2::Compression;
 
 mod common;
 use common::{MiniServer, RouteBody};
@@ -97,7 +103,10 @@ fn full_packument_body(name: &str, version: &str) -> Vec<u8> {
         "tarball".into(),
         serde_json::json!(format!("http://example.test/{name}-{version}.tgz")),
     );
-    dist.insert("integrity".into(), serde_json::json!("sha512-AAAA"));
+    dist.insert(
+        "integrity".into(),
+        serde_json::json!("sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="),
+    );
     let mut entry = serde_json::Map::new();
     entry.insert("name".into(), serde_json::json!(name));
     entry.insert("version".into(), serde_json::json!(version));
@@ -118,7 +127,10 @@ fn abbreviated_version_body(name: &str, version: &str) -> Vec<u8> {
         "tarball".into(),
         serde_json::json!(format!("http://example.test/{name}-{version}.tgz")),
     );
-    dist.insert("integrity".into(), serde_json::json!("sha512-AAAA"));
+    dist.insert(
+        "integrity".into(),
+        serde_json::json!("sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="),
+    );
     let mut root = serde_json::Map::new();
     root.insert("name".into(), serde_json::json!(name));
     root.insert("version".into(), serde_json::json!(version));
@@ -131,6 +143,271 @@ fn client_for(server: &MiniServer) -> AsyncRegistryClient {
         .with_registry_override(&server.url(""))
         .expect("valid registry override");
     AsyncRegistryClient::new(config)
+}
+
+fn gzip_encode(body: &[u8]) -> Vec<u8> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(body).expect("gzip body");
+    encoder.finish().expect("finish gzip body")
+}
+
+/// Loopback registry that emits decoded JSON through HTTP gzip content
+/// encoding. It also returns 304 for conditional requests so cache tests prove
+/// the persistent cache stores decoded JSON rather than compressed bytes.
+struct GzipPackumentServer {
+    registry: String,
+    requests: Arc<AtomicUsize>,
+    unconditional_requests: Arc<AtomicUsize>,
+    conditional_requests: Arc<AtomicUsize>,
+    full_requests: Arc<AtomicUsize>,
+    exact_requests: Arc<AtomicUsize>,
+    saw_compression_advertisement: Arc<AtomicBool>,
+    _handle: thread::JoinHandle<()>,
+}
+
+impl GzipPackumentServer {
+    fn new(name: &str, version: &str, full_body: Vec<u8>, exact_body: Vec<u8>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind gzip registry");
+        let registry = format!(
+            "http://{}",
+            listener.local_addr().expect("registry address")
+        );
+        let full_path = format!("/{}", name.replace('/', "%2F"));
+        let exact_path = format!("{full_path}/{version}");
+        let full_body = Arc::new(gzip_encode(&full_body));
+        let exact_body = Arc::new(gzip_encode(&exact_body));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let unconditional_requests = Arc::new(AtomicUsize::new(0));
+        let conditional_requests = Arc::new(AtomicUsize::new(0));
+        let full_requests = Arc::new(AtomicUsize::new(0));
+        let exact_requests = Arc::new(AtomicUsize::new(0));
+        let saw_compression_advertisement = Arc::new(AtomicBool::new(false));
+
+        let requests_thread = Arc::clone(&requests);
+        let unconditional_thread = Arc::clone(&unconditional_requests);
+        let conditional_thread = Arc::clone(&conditional_requests);
+        let full_thread = Arc::clone(&full_requests);
+        let exact_thread = Arc::clone(&exact_requests);
+        let compression_thread = Arc::clone(&saw_compression_advertisement);
+        let handle = thread::spawn(move || {
+            for incoming in listener.incoming() {
+                let Ok(mut stream) = incoming else { break };
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(5)));
+                let Some(request) = read_http_headers(&mut stream) else {
+                    continue;
+                };
+                requests_thread.fetch_add(1, Ordering::SeqCst);
+                let lower = request.to_ascii_lowercase();
+                if lower.contains("accept-encoding:")
+                    && lower.contains("gzip")
+                    && lower.contains("br")
+                {
+                    compression_thread.store(true, Ordering::SeqCst);
+                }
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or_default();
+                let body = if path == full_path {
+                    full_thread.fetch_add(1, Ordering::SeqCst);
+                    Some(Arc::clone(&full_body))
+                } else if path == exact_path {
+                    exact_thread.fetch_add(1, Ordering::SeqCst);
+                    Some(Arc::clone(&exact_body))
+                } else {
+                    None
+                };
+                let Some(body) = body else {
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                    continue;
+                };
+                if lower.contains("if-none-match:") {
+                    conditional_thread.fetch_add(1, Ordering::SeqCst);
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\nETag: \"gzip-v1\"\r\nConnection: close\r\n\r\n",
+                    );
+                } else {
+                    unconditional_thread.fetch_add(1, Ordering::SeqCst);
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nETag: \"gzip-v1\"\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes());
+                    let _ = stream.write_all(&body);
+                }
+            }
+        });
+
+        Self {
+            registry,
+            requests,
+            unconditional_requests,
+            conditional_requests,
+            full_requests,
+            exact_requests,
+            saw_compression_advertisement,
+            _handle: handle,
+        }
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!(
+            "{}/{path}",
+            self.registry,
+            path = path.trim_start_matches('/')
+        )
+    }
+
+    fn unconditional_requests(&self) -> usize {
+        self.unconditional_requests.load(Ordering::SeqCst)
+    }
+
+    fn conditional_requests(&self) -> usize {
+        self.conditional_requests.load(Ordering::SeqCst)
+    }
+
+    fn full_requests(&self) -> usize {
+        self.full_requests.load(Ordering::SeqCst)
+    }
+
+    fn exact_requests(&self) -> usize {
+        self.exact_requests.load(Ordering::SeqCst)
+    }
+
+    fn requests(&self) -> usize {
+        self.requests.load(Ordering::SeqCst)
+    }
+
+    fn saw_compression_advertisement(&self) -> bool {
+        self.saw_compression_advertisement.load(Ordering::SeqCst)
+    }
+}
+
+fn read_http_headers(stream: &mut TcpStream) -> Option<String> {
+    let mut bytes = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    while bytes.len() < 64 * 1024 {
+        let read = stream.read(&mut chunk).ok()?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+        if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+    }
+    (!bytes.is_empty()).then(|| String::from_utf8_lossy(&bytes).into_owned())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gzip_packuments_decode_for_exact_and_range_requests() {
+    let server = GzipPackumentServer::new(
+        "gzip-pkg",
+        "1.0.0",
+        full_packument_body("gzip-pkg", "1.0.0"),
+        abbreviated_version_body("gzip-pkg", "1.0.0"),
+    );
+    let client = AsyncRegistryClient::new(
+        NpmConfig::default()
+            .with_registry_override(&server.url(""))
+            .expect("valid registry override"),
+    );
+
+    let exact = client
+        .resolve(&PackageSpec {
+            name: "gzip-pkg".to_string(),
+            req: VersionRequest::Exact(semver::Version::new(1, 0, 0)),
+        })
+        .await
+        .expect("compressed exact metadata resolves");
+    let range = client
+        .resolve(&parse_spec("gzip-pkg@^1.0.0").expect("valid range spec"))
+        .await
+        .expect("compressed range metadata resolves");
+
+    assert_eq!(exact.version, semver::Version::new(1, 0, 0));
+    assert_eq!(range.version, semver::Version::new(1, 0, 0));
+    assert_eq!(server.exact_requests(), 1);
+    assert_eq!(server.full_requests(), 1);
+    assert!(server.saw_compression_advertisement());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gzip_packument_cache_reuses_decoded_body_on_304() {
+    let full_body = full_packument_body("cached-gzip", "1.0.0");
+    let server = GzipPackumentServer::new(
+        "cached-gzip",
+        "1.0.0",
+        full_body.clone(),
+        abbreviated_version_body("cached-gzip", "1.0.0"),
+    );
+    let cache = Arc::new(MetadataCache::open_in_memory().expect("in-memory metadata cache"));
+    let config = NpmConfig::default()
+        .with_registry_override(&server.url(""))
+        .expect("valid registry override");
+
+    let first = AsyncRegistryClient::new(config.clone())
+        .with_metadata_cache(Arc::clone(&cache), CacheMode::Default)
+        .resolve(&parse_spec("cached-gzip").expect("valid package spec"))
+        .await
+        .expect("initial compressed fetch");
+
+    let cache_url = server.url("cached-gzip");
+    let mut cached = None;
+    for _ in 0..100 {
+        if let Some(entry) = cache.get(&cache_url).expect("cache read") {
+            cached = Some(entry);
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let cached = cached.expect("decoded metadata should be persisted");
+    assert_eq!(cached.body, full_body);
+    assert_ne!(cached.body, gzip_encode(&full_body));
+
+    let second = AsyncRegistryClient::new(config)
+        .with_metadata_cache(Arc::clone(&cache), CacheMode::Default)
+        .resolve(&parse_spec("cached-gzip").expect("valid package spec"))
+        .await
+        .expect("conditional compressed fetch");
+
+    assert_eq!(first.version, second.version);
+    assert_eq!(first.tarball_url, second.tarball_url);
+    assert_eq!(server.requests(), 2);
+    assert_eq!(server.unconditional_requests(), 1);
+    assert_eq!(server.conditional_requests(), 1);
+    assert!(server.saw_compression_advertisement());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gzip_packument_expansion_still_hits_decoded_response_limit() {
+    const MAX_CONTROL_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+    let server = GzipPackumentServer::new(
+        "oversized-gzip",
+        "1.0.0",
+        vec![b'x'; MAX_CONTROL_RESPONSE_BYTES + 1],
+        b"{}".to_vec(),
+    );
+    let client = AsyncRegistryClient::new(
+        NpmConfig::default()
+            .with_registry_override(&server.url(""))
+            .expect("valid registry override"),
+    );
+
+    let error = client
+        .packument("oversized-gzip")
+        .await
+        .expect_err("decoded compressed body over the limit must fail");
+    let message = error.to_string();
+    assert!(
+        message.contains("response body exceeds 67108864 byte limit"),
+        "unexpected bounded-response error: {message}"
+    );
+    assert_eq!(server.unconditional_requests(), 1);
 }
 
 /// a prefetch that completes between two inline calls must
