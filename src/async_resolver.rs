@@ -123,7 +123,9 @@ const DEFAULT_MAX_IN_FLIGHT: usize = 32;
 /// Maximum number of transitive packuments speculatively fetched from the
 /// root warmup. The resolver still fetches every required package through its
 /// normal inline path; this budget only bounds latency-hiding lookahead.
-const ROOT_LOOKAHEAD_BUDGET: u64 = 64;
+/// Raised from 64 to 256 so DFS-time single-level lookahead (see
+/// [`Self::prefetch_packument`]) does not starve root warmup on medium graphs.
+const ROOT_LOOKAHEAD_BUDGET: u64 = 256;
 
 /// Number of dependency waves below each completed root packument that may be
 /// prefetched. Selection happens from the fetched version metadata, so this is
@@ -871,14 +873,29 @@ impl AsyncRegistryClient {
         let Ok(spec) = parse_spec(&format!("{name}@{requested}")) else {
             return;
         };
-        self.prefetch_parsed_packument(spec, 0);
+        // Lookahead depth 1 (not 0): after fetching this packument, also
+        // prefetch its registry children's packuments. This closes the serial
+        // "discover → fetch → parse → discover" chain on deep transitive paths
+        // (e.g. @babel/compat-data → browserslist → caniuse-lite), where root
+        // warmup can't reach. Metadata-only — artifact download hints stay
+        // gated to the placed node, not these speculative grandchildren.
+        self.prefetch_parsed_packument(spec, 1, false);
     }
 
     /// Prefetch one parsed registry request and, after it completes, schedule
     /// up to `lookahead_levels` additional dependency waves. Callers claim the
     /// shared root-lookahead budget before entering this method, so recursive
     /// fan-out stays globally bounded for the install.
-    fn prefetch_parsed_packument(&self, spec: PackageSpec, lookahead_levels: u8) {
+    ///
+    /// `emit_artifact_hint` is `true` only for the direct root children emitted
+    /// by root warmup; recursive descendants pass `false` so speculative
+    /// metadata prefetch never floods the artifact download pipeline.
+    fn prefetch_parsed_packument(
+        &self,
+        spec: PackageSpec,
+        lookahead_levels: u8,
+        emit_artifact_hint: bool,
+    ) {
         // Route exact-version specs to the single-version endpoint so the
         // prefetch fills the same version-scoped cache key that `packument_for`
         // reads. Range/latest specs fetch the full packument.
@@ -906,7 +923,12 @@ impl AsyncRegistryClient {
                 cache.get(&key).cloned()
             };
             if let Some(packument) = cached {
-                this.prefetch_selected_children(&spec, &packument, lookahead_levels);
+                this.prefetch_selected_children(
+                    &spec,
+                    &packument,
+                    lookahead_levels,
+                    emit_artifact_hint,
+                );
                 return;
             }
             this.prefetch_fetches.fetch_add(1, Ordering::Relaxed);
@@ -927,7 +949,12 @@ impl AsyncRegistryClient {
                 }
             };
             if let Ok(packument) = result {
-                this.prefetch_selected_children(&spec, &packument, lookahead_levels);
+                this.prefetch_selected_children(
+                    &spec,
+                    &packument,
+                    lookahead_levels,
+                    emit_artifact_hint,
+                );
             }
         });
     }
@@ -936,11 +963,18 @@ impl AsyncRegistryClient {
     /// prefetch its registry dependencies. Each scheduled child consumes one
     /// slot from a client-wide budget; cache and singleflight deduplication
     /// make repeated names or cycles no-ops.
+    ///
+    /// `emit_artifact_hint` gates the streaming-install artifact prefetch:
+    /// `true` for direct root children (where the artifact will certainly be
+    /// needed), `false` for deeper speculative descendants (where pushing the
+    /// artifact hint floods the download pipeline without enough overlap to
+    /// repay — see the streaming DFS lookahead change).
     fn prefetch_selected_children(
         &self,
         parent: &PackageSpec,
         packument: &Packument,
         lookahead_levels: u8,
+        emit_artifact_hint: bool,
     ) {
         if lookahead_levels == 0 {
             return;
@@ -949,15 +983,16 @@ impl AsyncRegistryClient {
         // URL and integrity. Let streaming installs warm that artifact while
         // metadata lookahead and deterministic placement continue. The final
         // placed unit will re-enter the integrity-keyed store path and reuse
-        // the result; speculative failures are ignored by the sink. Restrict
-        // artifact hints to the root lookahead frontier: level-zero calls also
-        // arise from ordinary DFS child prefetch and are too broad to be a
-        // useful download predictor.
-        if let (Some(sink), Some(hint)) = (
-            self.download_prefetch_sink.as_ref(),
-            selected_download_hint(parent, packument),
-        ) {
-            sink.prefetch(hint);
+        // the result; speculative failures are ignored by the sink. Gated to
+        // the root frontier so speculative metadata lookahead never floods the
+        // artifact pipeline.
+        if emit_artifact_hint {
+            if let (Some(sink), Some(hint)) = (
+                self.download_prefetch_sink.as_ref(),
+                selected_download_hint(parent, packument),
+            ) {
+                sink.prefetch(hint);
+            }
         }
         for parsed in selected_registry_children(parent, packument) {
             if self
@@ -969,7 +1004,10 @@ impl AsyncRegistryClient {
             {
                 break;
             }
-            self.prefetch_parsed_packument(parsed, lookahead_levels - 1);
+            // Recursive descendants are metadata-only prefetch: they close the
+            // serial resolution spine without speculatively downloading their
+            // artifacts.
+            self.prefetch_parsed_packument(parsed, lookahead_levels - 1, false);
         }
     }
 
@@ -1962,10 +2000,13 @@ pub async fn resolve_manifest_with_options_and_target_async_sink(
         // singleflight/cache and range/latest to the full packument.
         warmup.spawn(async move {
             if let Ok(packument) = registry_clone.packument_for_shared(&parsed).await {
+                // Root children: emit artifact hints (streaming installs warm
+                // the certainly-needed root artifact while resolution proceeds).
                 registry_clone.prefetch_selected_children(
                     &parsed,
                     &packument,
                     ROOT_LOOKAHEAD_LEVELS,
+                    true,
                 );
             }
         });
