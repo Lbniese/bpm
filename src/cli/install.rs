@@ -1571,8 +1571,8 @@ fn async_resolver_max_in_flight() -> u32 {
     env::var("BPM_RESOLVER_MAX_IN_FLIGHT")
         .ok()
         .and_then(|value| value.parse::<u32>().ok())
-        .map(|value| value.clamp(1, 64))
-        .unwrap_or(32)
+        .map(|value| value.clamp(1, 128))
+        .unwrap_or(64)
 }
 
 /// Diagnostic counters threaded back from the async resolve runtime.
