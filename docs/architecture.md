@@ -70,8 +70,11 @@ cold-vs-warm performance story with cited benchmark numbers, see
    filesystems (ext4, HFS+, cross-device) the backend transparently degrades
    to an independent deep copy. Windows uses the same correctness-first
    isolated-copy fallback; no junction or hardlink exposes shared content.
-   Published graph metadata stores canonical ownership identities so normal
-   attachment does not rehash copied project file bodies.
+   Published graph metadata stores validated references to immutable top-level
+   graph entries, so cold publication and normal attachment do not rehash
+   package file bodies. Stale deletion compares a project tree with its prior
+   graph source on demand and preserves the entry when that source is missing
+   or different.
 8. **Materializer** — `src/materializer.rs` supports compatible npm v2/v3 layout
    and strict declared-edge validation. Its isolated Reflink backend falls back
    directly to independent copying; explicit Hardlink/Symlink primitives are
@@ -151,11 +154,13 @@ enumeration, task completion order, or network timing.
 2. Graphs are isolated and lifecycle-complete before their marker is published;
    `.bin` scripts retain package-relative symlink semantics.
 3. Project attachment is an isolated Reflink-or-Copy view and records validated
-   graph-entry ownership identities without rereading copied file bodies.
+   graph-entry ownership references without rereading copied file bodies;
+   destructive reconciliation verifies referenced trees on demand.
 4. A plan-cache hit skips resolution, fetching, extraction, and lifecycle when
    both the graph volume and project view remain valid.
 5. Old volume/plan layouts are invalidated by explicit materializer/layout
-   versions; stale deletion still hashes the live tree before removal.
+   versions; stale deletion still compares the live tree with its immutable
+   prior graph source before removal.
 6. Dev omission is an in-memory install projection, not a lockfile rewrite:
    the complete lock remains frozen-validation authority and only retained
    records are fetched/materialized. It retains normal/optional runtime edges

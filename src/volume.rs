@@ -26,14 +26,15 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::graph::{
-    graph_id_with_prepared_and_profile, InstallProfile, ManagedEntry, IDENTITY_RELAY, IDENTITY_TREE,
+    graph_id_with_prepared_and_profile, InstallProfile, ManagedEntry, IDENTITY_RELAY,
+    IDENTITY_TREE, IDENTITY_TREE_VOLUME,
 };
 use crate::integrity::ArtifactId;
 use crate::lockfile::Lockfile;
 #[cfg(unix)]
 use crate::materializer::reflink_tree;
 use crate::materializer::{
-    materialize_with_backend_serial, MaterializeBackend, MaterializeError, MaterializeStats,
+    materialize_with_backend_by_depth, MaterializeBackend, MaterializeError, MaterializeStats,
 };
 use crate::metrics::Metrics;
 use crate::store::ArtifactStore;
@@ -62,7 +63,7 @@ struct VolumeMeta {
     #[serde(default)]
     derived: Vec<String>,
     /// Canonical identities for every direct entry under node_modules. These
-    /// are computed once before publication and inherited by isolated views.
+    /// reference immutable volume entries and are inherited by isolated views.
     #[serde(default)]
     entry_identities: Vec<VolumeEntryIdentity>,
 }
@@ -86,8 +87,9 @@ const META_FILE: &str = "metadata.json";
 /// materialization of package images). A cached volume whose recorded layout
 /// differs is discarded and rebuilt so every project sees the current layout.
 /// v7 also writes the complete artifact/derived inventory so the metadata
-/// index can rebuild graph edges from durable filesystem state alone.
-const VOLUME_LAYOUT_VERSION: u32 = 8;
+/// index can rebuild graph edges from durable filesystem state alone. v9 uses
+/// graph-entry references for project ownership instead of eager tree hashes.
+const VOLUME_LAYOUT_VERSION: u32 = 9;
 
 /// Current durable-inventory schema version written into [`VolumeMeta`]. A
 /// volume whose `inventory_version` is below this is treated as
@@ -247,7 +249,7 @@ fn valid_entry_identities(meta: &VolumeMeta, volume: &Path) -> Option<BTreeMap<S
         if entry.name.is_empty()
             || entry.name.contains('/')
             || entry.name.contains('\\')
-            || !entry.identity.starts_with(IDENTITY_TREE)
+            || entry.identity.strip_prefix(IDENTITY_TREE_VOLUME) != Some(entry.name.as_str())
             || identities
                 .insert(entry.name.clone(), entry.identity.clone())
                 .is_some()
@@ -403,18 +405,11 @@ pub fn ensure_graph_volume_with_prepared_and_profile(
     // symlinked package image is not safe here. Hardlinks also let the plan
     // validator prove that pristine package files still match their immutable
     // store images using device/inode identity.
-    // Serial materialization: graph volumes contain nested ancestor/descendant
-    // package paths (e.g. `node_modules/@scope/pkg` and a transitive
-    // `node_modules/@scope/pkg/node_modules/<dep>`) that race under parallel
-    // `create_dir_all` / `clonefile_directory` (EEXIST on the ancestor target).
-    // Empirically (measured 2026-08-06) a parallel build with EEXIST-retries is
-    // both slower (macOS `clonefile` is kernel-serialized — volume.rs:487) and
-    // higher-variance than serial, so the serial Pass A is the correct choice
-    // for the graph-volume staging build. The graph volume is a private staging
-    // tree atomically renamed on publish, so Pass-A order does not affect the
-    // published node_modules byte-identity (entry identities are
-    // blake3-fingerprinted post-build). See [`materialize_with_backend_serial`].
-    let stats = materialize_with_backend_serial(
+    // Graph volumes contain nested ancestor/descendant package paths. Complete
+    // one dependency depth before starting the next so a child never races an
+    // ancestor clone, while unrelated package trees within the same depth can
+    // still materialize concurrently.
+    let stats = materialize_with_backend_by_depth(
         staging.as_path(),
         store,
         &resolved,
@@ -477,11 +472,11 @@ fn compute_entry_identities(node_modules: &Path) -> Result<Vec<VolumeEntryIdenti
         .map_err(|source| io_err(node_modules, source))?;
     entries.sort_by_key(|entry| entry.file_name());
 
-    // Validate names up front and hand each worker an owned (name, path) job.
-    // Top-level package trees are disjoint, so per-package fingerprinting is
-    // safe to run concurrently — unlike `materialize_with_backend`, whose
-    // nested ancestor/descendant targets race under parallel `create_dir_all`.
-    let mut jobs: Vec<(String, PathBuf)> = Vec::with_capacity(entries.len());
+    // The published graph is the immutable comparison source. Persist only a
+    // validated direct-entry reference here; stale deletion performs the deep
+    // project/source comparison on demand. This keeps publication O(top-level
+    // entries) instead of rereading every package byte on every cold install.
+    let mut identities = Vec::with_capacity(entries.len());
     for entry in entries {
         let name = entry.file_name().to_string_lossy().into_owned();
         if name.is_empty() || name.contains('/') || name.contains('\\') {
@@ -490,61 +485,12 @@ fn compute_entry_identities(node_modules: &Path) -> Result<Vec<VolumeEntryIdenti
                 std::io::Error::new(std::io::ErrorKind::InvalidData, "unsafe volume entry name"),
             ));
         }
-        jobs.push((name, entry.path()));
+        identities.push(VolumeEntryIdentity {
+            identity: format!("{IDENTITY_TREE_VOLUME}{name}"),
+            name,
+        });
     }
-
-    // `tree_fingerprint` is CPU+I/O bound (it reads and blake3-hashes every
-    // file in the package). Hashing parallelizes well across cores, unlike
-    // APFS `clonefile`, which is kernel-serialized — that asymmetry is why the
-    // graph-volume *relay* loop stays serial while this *fingerprint* loop does
-    // not. `std::thread::scope` is used instead of rayon (not a dependency).
-    let workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .saturating_mul(2)
-        .min(16)
-        .min(jobs.len().max(1))
-        .max(1);
-
-    let mut pairs: Vec<(String, String)> = if workers <= 1 {
-        jobs.iter()
-            .map(|(name, path)| {
-                Ok::<(String, String), VolumeError>((name.clone(), tree_fingerprint(path)?))
-            })
-            .collect::<Result<Vec<_>, _>>()?
-    } else {
-        let chunk = jobs.len().div_ceil(workers).max(1);
-        std::thread::scope(|s| {
-            let mut handles = Vec::with_capacity(workers);
-            for jobs_chunk in jobs.chunks(chunk) {
-                handles.push(s.spawn(move || {
-                    jobs_chunk
-                        .iter()
-                        .map(|(name, path)| Ok((name.clone(), tree_fingerprint(path)?)))
-                        .collect::<Result<Vec<(String, String)>, VolumeError>>()
-                }));
-            }
-            // Chunks were sliced from a name-sorted job list, so `out` is in
-            // name order; the post-merge sort below is cheap insurance.
-            let mut out = Vec::with_capacity(jobs.len());
-            for handle in handles {
-                match handle.join() {
-                    Ok(Ok(values)) => out.extend(values),
-                    Ok(Err(err)) => return Err(err),
-                    Err(panic) => std::panic::resume_unwind(panic),
-                }
-            }
-            Ok(out)
-        })?
-    };
-
-    // Guarantee a byte-identical `entry_identities` regardless of thread
-    // scheduling: sort by name once, matching the original serial output.
-    pairs.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(pairs
-        .into_iter()
-        .map(|(name, identity)| VolumeEntryIdentity { name, identity })
-        .collect())
+    Ok(identities)
 }
 
 fn read_entry_identities(volume: &Path) -> Result<BTreeMap<String, String>, VolumeError> {
@@ -568,7 +514,8 @@ fn read_entry_identities(volume: &Path) -> Result<BTreeMap<String, String>, Volu
 }
 
 /// Write a canonical `metadata.json` manifest for a test volume rooted at
-/// `root`, computing real tree-blake3 entry identities from `<root>/node_modules`.
+/// `root`, recording validated references to direct `<root>/node_modules`
+/// entries.
 /// Integration tests use this to publish a volume that
 /// [`attach_project_local_with_backend`] can read; production code publishes
 /// volumes via [`PendingVolume::publish`]. Panics on IO/serialization failure
@@ -601,9 +548,9 @@ impl PendingVolume {
     /// Atomically publish the staging tree to the final graph path.
     /// After success the volume is ready for reuse.
     pub fn publish(mut self) -> Result<VolumeRef, VolumeError> {
-        // Compute ownership identities only after lifecycle has completed and
-        // immediately before publication. Attachments inherit these identities
-        // without rereading copied project file bodies.
+        // Record ownership references only after lifecycle has completed and
+        // immediately before publication. This enumerates direct entries but
+        // deliberately does not reread package file bodies.
         let entry_identities = compute_entry_identities(&self.staging.join("node_modules"))?;
         let meta = VolumeMeta {
             graph_id_hex: self.graph_id_hex.clone(),
@@ -936,9 +883,10 @@ pub struct ReconcileOutcome {
 /// Remove stale BPM-owned project-view entries that are no longer desired.
 /// Uses the prior plan's `owned_entries` for exact identity preflight: a relay
 /// entry is removed only when the live symlink still points at the recorded
-/// target, and a local/reflink entry is removed only when the live tree
-/// fingerprint still equals the recorded one. `new_desired` is the set of
-/// project-relative paths the new attachment owns (skipped untouched).
+/// target, and a local/reflink entry is removed only when the live tree still
+/// matches either its legacy fingerprint or its referenced entry in
+/// `prior_volume_path`. `new_desired` is the set of project-relative paths the
+/// new attachment owns (skipped untouched).
 ///
 /// A mismatched or unverifiable entry is **preserved and reported**, never
 /// deleted on assumption. Empty `@scope` parent containers may be tidied only
@@ -947,6 +895,18 @@ pub fn reconcile_project_view(
     project_root: &Path,
     old_owned: &[ManagedEntry],
     new_desired: &std::collections::BTreeSet<String>,
+) -> Result<ReconcileOutcome, VolumeError> {
+    reconcile_project_view_with_prior_volume(project_root, old_owned, new_desired, None)
+}
+
+/// Source-aware counterpart of [`reconcile_project_view`]. New volume-backed
+/// identities require the prior immutable graph root to prove an unchanged
+/// project tree; a missing source conservatively preserves the entry.
+pub fn reconcile_project_view_with_prior_volume(
+    project_root: &Path,
+    old_owned: &[ManagedEntry],
+    new_desired: &std::collections::BTreeSet<String>,
+    prior_volume_path: Option<&Path>,
 ) -> Result<ReconcileOutcome, VolumeError> {
     let mut outcome = ReconcileOutcome::default();
     // Deepest paths first so nested stale entries clear before their scope
@@ -983,11 +943,30 @@ pub fn reconcile_project_view(
                     })
             }
             "local" | "reflink" => {
-                meta.is_dir()
-                    && entry.identity.starts_with(IDENTITY_TREE)
-                    && tree_fingerprint(&full_path)
+                if !meta.is_dir() {
+                    false
+                } else if entry.identity.starts_with(IDENTITY_TREE) {
+                    // Migration support for pre-v5 plans.
+                    tree_fingerprint(&full_path)
                         .map(|live| live == entry.identity)
                         .unwrap_or(false)
+                } else if let Some(name) = entry.identity.strip_prefix(IDENTITY_TREE_VOLUME) {
+                    let expected_relative = format!("node_modules/{name}");
+                    !name.is_empty()
+                        && !name.contains('/')
+                        && !name.contains('\\')
+                        && entry.path == expected_relative
+                        && prior_volume_path.is_some_and(|volume| {
+                            let source = volume.join("node_modules").join(name);
+                            source.is_dir()
+                                && match (tree_fingerprint(&full_path), tree_fingerprint(&source)) {
+                                    (Ok(live), Ok(expected)) => live == expected,
+                                    _ => false,
+                                }
+                        })
+                } else {
+                    false
+                }
             }
             _ => false,
         };
@@ -1026,7 +1005,8 @@ pub fn reconcile_project_view(
 /// - a project symlink is claimed as `relay` only when its `read_link` target
 ///   exactly equals the corresponding prior volume entry path;
 /// - a project directory is claimed as `local` only when its deterministic tree
-///   fingerprint equals the prior volume entry's fingerprint;
+///   fingerprint equals the prior volume entry's fingerprint; the inferred
+///   identity then references that immutable entry for future checks;
 /// - missing, unreadable, or mismatched paths are skipped (never inferred from
 ///   the current lockfile alone).
 ///
@@ -1072,7 +1052,7 @@ pub fn infer_prior_ownership(project_root: &Path, prior_volume_path: &Path) -> V
                 inferred.push(ManagedEntry {
                     path: format!("node_modules/{name_str}"),
                     mode: "local".to_string(),
-                    identity: live,
+                    identity: format!("{IDENTITY_TREE_VOLUME}{name_str}"),
                 });
             }
         }
@@ -1553,9 +1533,7 @@ mod ownership_tests {
     }
 
     #[test]
-    fn parallel_compute_entry_identities_matches_serial() {
-        // Several top-level packages (so the parallel path engages), each with
-        // nested files and a symlink so tree_fingerprint does non-trivial work.
+    fn compute_entry_identities_records_sorted_volume_references() {
         let dir = tempdir().unwrap();
         let vol = dir.path().join("node_modules");
         for name in ["alpha", "beta", "gamma", "delta", "epsilon"] {
@@ -1572,30 +1550,16 @@ mod ownership_tests {
             .map(|i| (i.name, i.identity))
             .collect();
 
-        // Serial reference: sort entries by name, fingerprint each.
-        let mut entries = fs::read_dir(&vol)
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        entries.sort_by_key(|e| e.file_name());
-        let want: Vec<(String, String)> = entries
-            .iter()
-            .map(|e| {
-                (
-                    e.file_name().to_string_lossy().into_owned(),
-                    tree_fingerprint(&e.path()).unwrap(),
-                )
-            })
-            .collect();
+        let want = ["alpha", "beta", "delta", "epsilon", "gamma"]
+            .into_iter()
+            .map(|name| (name.to_string(), format!("{IDENTITY_TREE_VOLUME}{name}")))
+            .collect::<Vec<_>>();
 
-        assert_eq!(
-            got, want,
-            "parallel output must equal serial, in name order"
-        );
+        assert_eq!(got, want);
     }
 
     #[test]
-    fn parallel_compute_entry_identities_is_stable_across_runs() {
+    fn compute_entry_identities_is_stable_across_runs() {
         let dir = tempdir().unwrap();
         let vol = dir.path().join("node_modules");
         for name in ["a", "b", "c", "d"] {
@@ -1605,15 +1569,12 @@ mod ownership_tests {
         let first = compute_entry_identities(&vol).unwrap();
         for _ in 0..20 {
             let again = compute_entry_identities(&vol).unwrap();
-            assert_eq!(
-                again, first,
-                "identities must be stable across concurrent runs"
-            );
+            assert_eq!(again, first, "volume references must be stable across runs");
         }
     }
 
     #[test]
-    fn parallel_compute_entry_identities_rejects_unsafe_names() {
+    fn compute_entry_identities_rejects_unsafe_names() {
         let dir = tempdir().unwrap();
         let vol = dir.path().join("node_modules");
         fs::create_dir_all(vol.join("good")).unwrap();
@@ -1648,11 +1609,11 @@ mod ownership_tests {
         );
         let entry = &outcome.owned[0];
         assert!(matches!(entry.mode.as_str(), "reflink" | "local"));
-        assert!(entry.identity.starts_with(IDENTITY_TREE));
+        assert_eq!(entry.identity, format!("{IDENTITY_TREE_VOLUME}foo"));
     }
 
     #[test]
-    fn local_attachment_records_tree_fingerprint_identities() {
+    fn local_attachment_records_volume_entry_identities() {
         let volume_root = tempdir().unwrap();
         let project = tempdir().unwrap();
         make_volume(
@@ -1667,10 +1628,7 @@ mod ownership_tests {
         );
         let entry = &outcome.owned[0];
         assert!(matches!(entry.mode.as_str(), "reflink" | "local"));
-        assert!(entry.identity.starts_with(IDENTITY_TREE));
-        // The recorded identity must match the live project tree.
-        let live = tree_fingerprint(&project.path().join("node_modules").join("foo")).unwrap();
-        assert_eq!(entry.identity, live);
+        assert_eq!(entry.identity, format!("{IDENTITY_TREE_VOLUME}foo"));
     }
 
     fn desired(paths: &[&str]) -> BTreeSet<String> {
@@ -1719,6 +1677,59 @@ mod ownership_tests {
         assert_eq!(outcome.removed, 1);
         assert!(outcome.preserved.is_empty());
         assert!(!nm.exists());
+    }
+
+    #[test]
+    fn reconcile_removes_volume_referenced_tree_on_exact_match() {
+        let volume_root = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        make_volume(volume_root.path(), &[("gone", r#"{"name":"gone"}"#)]);
+        let attached =
+            attach_project_local(project.path(), &volume_ref(volume_root.path())).unwrap();
+
+        let outcome = reconcile_project_view_with_prior_volume(
+            project.path(),
+            &attached.owned,
+            &desired(&[]),
+            Some(volume_root.path()),
+        )
+        .unwrap();
+        assert_eq!(outcome.removed, 1);
+        assert!(outcome.preserved.is_empty());
+        assert!(!project.path().join("node_modules/gone").exists());
+    }
+
+    #[test]
+    fn reconcile_preserves_volume_referenced_tree_when_changed_or_source_missing() {
+        let volume_root = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        make_volume(volume_root.path(), &[("kept", r#"{"name":"kept"}"#)]);
+        let attached =
+            attach_project_local(project.path(), &volume_ref(volume_root.path())).unwrap();
+        let project_file = project.path().join("node_modules/kept/package.json");
+        fs::write(&project_file, b"user change").unwrap();
+
+        let changed = reconcile_project_view_with_prior_volume(
+            project.path(),
+            &attached.owned,
+            &desired(&[]),
+            Some(volume_root.path()),
+        )
+        .unwrap();
+        assert_eq!(changed.removed, 0);
+        assert_eq!(changed.preserved, vec!["node_modules/kept"]);
+        assert!(project_file.exists());
+
+        let missing = reconcile_project_view_with_prior_volume(
+            project.path(),
+            &attached.owned,
+            &desired(&[]),
+            None,
+        )
+        .unwrap();
+        assert_eq!(missing.removed, 0);
+        assert_eq!(missing.preserved, vec!["node_modules/kept"]);
+        assert!(project_file.exists());
     }
 
     #[test]
@@ -1837,7 +1848,7 @@ mod ownership_tests {
             if e.mode == "relay" {
                 assert!(e.identity.starts_with(IDENTITY_RELAY));
             } else {
-                assert!(e.identity.starts_with(IDENTITY_TREE));
+                assert!(e.identity.starts_with(IDENTITY_TREE_VOLUME));
             }
         }
     }

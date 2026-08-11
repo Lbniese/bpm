@@ -42,7 +42,7 @@ use crate::resolver::peer::{PeerMode, VisibleProviders};
 use crate::resolver::platform::{self, check_package_platform, PackageReachability};
 use crate::resolver::workspaces::WorkspaceIndex;
 use crate::resolver::DependencySource;
-use crate::resolver::{ResolveSink, ResolvedDownloadUnit};
+use crate::resolver::{ResolveSink, ResolvedDownloadHint, ResolvedDownloadUnit};
 
 // ── Public types ────────────────────────────────────────────────────────
 
@@ -120,6 +120,16 @@ use tokio::sync::{watch, Mutex as AsyncMutex, Semaphore};
 /// registry latency on HTTP/1.1.
 const DEFAULT_MAX_IN_FLIGHT: usize = 32;
 
+/// Maximum number of transitive packuments speculatively fetched from the
+/// root warmup. The resolver still fetches every required package through its
+/// normal inline path; this budget only bounds latency-hiding lookahead.
+const ROOT_LOOKAHEAD_BUDGET: u64 = 64;
+
+/// Number of dependency waves below each completed root packument that may be
+/// prefetched. Selection happens from the fetched version metadata, so this is
+/// narrower than blindly walking every version in a full packument.
+const ROOT_LOOKAHEAD_LEVELS: u8 = 2;
+
 /// Cache/singleflight key for a *full* packument (all versions): the
 /// registry URL plus the package name, NUL-separated. Shared by the inline
 /// `packument()` path and the prefetch fan-out so a prefetch fills the cache
@@ -139,18 +149,65 @@ pub fn version_cache_key(registry_url: &str, name: &str, version: &Version) -> S
     )
 }
 
+/// Registry requests declared by the version selected for `parent`.
+///
+/// Lookahead uses the same version selector and merged dependency semantics as
+/// placement. Unresolvable ranges and non-registry sources are skipped because
+/// prefetch is only a best-effort latency hint.
+fn selected_registry_children(parent: &PackageSpec, packument: &Packument) -> Vec<PackageSpec> {
+    let Ok(version) = registry::select_version(&parent.name, &parent.req, packument) else {
+        return Vec::new();
+    };
+    let Some(metadata) = packument.versions.get(version.to_string().as_str()) else {
+        return Vec::new();
+    };
+    resolver::merged_dependencies(metadata)
+        .into_iter()
+        .filter_map(|(child, child_spec)| {
+            if DependencySource::parse(&child_spec).is_some() {
+                return None;
+            }
+            parse_spec(&format!("{child}@{child_spec}")).ok()
+        })
+        .collect()
+}
+
+/// Best-effort artifact hint for the exact version selected from `packument`.
+/// Invalid integrity is skipped so speculation never weakens the verified
+/// artifact path; placement remains responsible for reporting bad metadata.
+fn selected_download_hint(
+    parent: &PackageSpec,
+    packument: &Packument,
+) -> Option<ResolvedDownloadHint> {
+    let version = registry::select_version(&parent.name, &parent.req, packument).ok()?;
+    let metadata = packument.versions.get(version.to_string().as_str())?;
+    if metadata.dist.tarball.is_empty() {
+        return None;
+    }
+    let integrity = if metadata.dist.integrity.is_empty() {
+        None
+    } else {
+        Some(Integrity::parse(&metadata.dist.integrity).ok()?)
+    };
+    Some(ResolvedDownloadHint {
+        name: metadata.name.clone(),
+        url: metadata.dist.tarball.clone(),
+        integrity,
+    })
+}
+
 /// Singleflight state for one in-flight packument fetch, shared between the
 /// launcher and any concurrent waiters. The producer
 /// transitions `Pending` -> `Done` exactly once; waiters block on the watch
-/// until `Done`. The shared payload is `Result<Packument, String>`: the
-/// packument is cheaply cloneable, and the error is pre-stringified by the
-/// producer (the original `AsyncResolveError` is not `Clone`). The producer
-/// returns its own verbatim error; waiters reconstruct an equivalent one via
-/// `AsyncResolveError::Http`.
+/// until `Done`. The shared payload is `Result<Arc<Packument>, String>`: the
+/// immutable packument is shared without cloning its version map, and the
+/// error is pre-stringified by the producer (the original `AsyncResolveError`
+/// is not `Clone`). The producer returns its own verbatim error; waiters
+/// reconstruct an equivalent one via `AsyncResolveError::Http`.
 #[derive(Clone)]
 enum FetchState {
     Pending,
-    Done(Result<Packument, String>),
+    Done(Result<Arc<Packument>, String>),
 }
 
 impl FetchState {
@@ -635,7 +692,7 @@ impl InFlightEntry {
 pub struct AsyncRegistryClient {
     config: NpmConfig,
     http: reqwest::Client,
-    packument_cache: Arc<AsyncMutex<BTreeMap<String, Packument>>>,
+    packument_cache: Arc<AsyncMutex<BTreeMap<String, Arc<Packument>>>>,
     /// Singleflight map of in-flight packument fetches keyed by
     /// `{registry}\0{name}`. The map lock is held only briefly (to insert /
     /// look up an `Arc<InFlightEntry>`); the network fetch runs *outside* both
@@ -645,6 +702,7 @@ pub struct AsyncRegistryClient {
     inline_fetches: Arc<AtomicU64>,
     prefetch_fetches: Arc<AtomicU64>,
     batch_prefetch_fetches: Arc<AtomicU64>,
+    root_lookahead_budget: Arc<AtomicU64>,
     cache_hits: Arc<AtomicU64>,
     /// Waiters that joined an in-flight singleflight fetch instead of fetching
     /// inline. Non-zero means the prefetch/inline overlap is real.
@@ -661,6 +719,10 @@ pub struct AsyncRegistryClient {
     peak_in_flight: Arc<AtomicU64>,
     http_in_flight: Arc<AtomicU64>,
     observed_http2: Arc<AtomicBool>,
+    /// Optional best-effort artifact sink used by graph lookahead. The sink is
+    /// owned so detached packument-prefetch tasks can announce the selected
+    /// tarball before deterministic placement reaches that node.
+    download_prefetch_sink: Option<Arc<dyn ResolveSink + Send + Sync>>,
 }
 
 impl AsyncRegistryClient {
@@ -675,6 +737,7 @@ impl AsyncRegistryClient {
             inline_fetches: Arc::new(AtomicU64::new(0)),
             prefetch_fetches: Arc::new(AtomicU64::new(0)),
             batch_prefetch_fetches: Arc::new(AtomicU64::new(0)),
+            root_lookahead_budget: Arc::new(AtomicU64::new(ROOT_LOOKAHEAD_BUDGET)),
             cache_hits: Arc::new(AtomicU64::new(0)),
             cache_waits: Arc::new(AtomicU64::new(0)),
             network_wait_ns: Arc::new(AtomicU64::new(0)),
@@ -684,6 +747,7 @@ impl AsyncRegistryClient {
             peak_in_flight: Arc::new(AtomicU64::new(0)),
             http_in_flight: Arc::new(AtomicU64::new(0)),
             observed_http2: Arc::new(AtomicBool::new(false)),
+            download_prefetch_sink: None,
         }
     }
 
@@ -702,6 +766,14 @@ impl AsyncRegistryClient {
         self
     }
 
+    /// Send best-effort selected-artifact hints discovered by packument
+    /// lookahead to a streaming install pipeline. Hints never affect graph
+    /// selection; the ordinary placement sink remains authoritative.
+    pub fn with_download_prefetch_sink(mut self, sink: Arc<dyn ResolveSink + Send + Sync>) -> Self {
+        self.download_prefetch_sink = Some(sink);
+        self
+    }
+
     pub fn registry_for_package(&self, package: &str) -> &str {
         self.config.registry_for_package(package)
     }
@@ -711,8 +783,8 @@ impl AsyncRegistryClient {
         spec: &PackageSpec,
     ) -> Result<registry::ResolvedArtifact, AsyncResolveError> {
         let registry_url = self.config.registry_for_package(&spec.name);
-        let packument = self.packument_for(spec).await?;
-        resolve_packument(spec, &packument, registry_url).map_err(|source| {
+        let packument = self.packument_for_shared(spec).await?;
+        resolve_packument(spec, packument.as_ref(), registry_url).map_err(|source| {
             AsyncResolveError::Registry {
                 package: spec.name.clone(),
                 spec: spec.name.clone(),
@@ -722,6 +794,13 @@ impl AsyncRegistryClient {
     }
 
     pub async fn packument_for(&self, spec: &PackageSpec) -> Result<Packument, AsyncResolveError> {
+        Ok(self.packument_for_shared(spec).await?.as_ref().clone())
+    }
+
+    async fn packument_for_shared(
+        &self,
+        spec: &PackageSpec,
+    ) -> Result<Arc<Packument>, AsyncResolveError> {
         match &spec.req {
             VersionRequest::Exact(version) => {
                 let registry_url = self.config.registry_for_package(&spec.name);
@@ -734,11 +813,17 @@ impl AsyncRegistryClient {
                 self.fetch_version_packument_singleflighted(&spec.name, version, registry_url)
                     .await
             }
-            VersionRequest::Latest | VersionRequest::Range(_) => self.packument(&spec.name).await,
+            VersionRequest::Latest | VersionRequest::Range(_) => {
+                self.packument_shared(&spec.name).await
+            }
         }
     }
 
     pub async fn packument(&self, name: &str) -> Result<Packument, AsyncResolveError> {
+        Ok(self.packument_shared(name).await?.as_ref().clone())
+    }
+
+    async fn packument_shared(&self, name: &str) -> Result<Arc<Packument>, AsyncResolveError> {
         let registry_url = self.config.registry_for_package(name);
         let key = packument_cache_key(registry_url, name);
 
@@ -771,8 +856,8 @@ impl AsyncRegistryClient {
             .await
     }
 
-    /// Best-effort, non-blocking hint that a packument will be needed soon
-    ///. If the packument is already cached or in flight,
+    /// Best-effort, non-blocking hint that a packument will be needed soon.
+    /// If the packument is already cached or in flight,
     /// this is a no-op. Otherwise it launches the fetch as a detached
     /// background task that drives the singleflight to completion and fills
     /// the cache; the result is later observed by `packument`/`packument_for`
@@ -782,42 +867,52 @@ impl AsyncRegistryClient {
     ///
     /// Must be called from within a tokio runtime context (it spawns a task).
     pub fn prefetch_packument(&self, name: &str, version_spec: Option<&str>) {
+        let requested = version_spec.unwrap_or("latest");
+        let Ok(spec) = parse_spec(&format!("{name}@{requested}")) else {
+            return;
+        };
+        self.prefetch_parsed_packument(spec, 0);
+    }
+
+    /// Prefetch one parsed registry request and, after it completes, schedule
+    /// up to `lookahead_levels` additional dependency waves. Callers claim the
+    /// shared root-lookahead budget before entering this method, so recursive
+    /// fan-out stays globally bounded for the install.
+    fn prefetch_parsed_packument(&self, spec: PackageSpec, lookahead_levels: u8) {
         // Route exact-version specs to the single-version endpoint so the
         // prefetch fills the same version-scoped cache key that `packument_for`
-        // reads. Range/latest/unknown specs fetch the full packument.
+        // reads. Range/latest specs fetch the full packument.
         // Failures are silently dropped: `packument_for` remains the single
         // source of truth for error reporting (it will re-fetch and surface
         // the real error on a miss).
-        let registry_url = self.config.registry_for_package(name).to_owned();
-        // Parse outside the spawned task: the borrowed `version_spec` cannot
-        // escape the method body, and we want an owned `Version` to move in.
-        let exact_version = version_spec
-            .and_then(|spec| parse_spec(&format!("{name}@{spec}")).ok())
-            .and_then(|parsed| match parsed.req {
-                VersionRequest::Exact(version) => Some(version),
-                _ => None,
-            });
+        let registry_url = self.config.registry_for_package(&spec.name).to_owned();
+        let exact_version = match &spec.req {
+            VersionRequest::Exact(version) => Some(version.clone()),
+            VersionRequest::Latest | VersionRequest::Range(_) => None,
+        };
         let key = match &exact_version {
-            Some(version) => version_cache_key(&registry_url, name, version),
-            None => packument_cache_key(&registry_url, name),
+            Some(version) => version_cache_key(&registry_url, &spec.name, version),
+            None => packument_cache_key(&registry_url, &spec.name),
         };
         let this = self.clone();
-        let name_owned = name.to_owned();
+        let name_owned = spec.name.clone();
         // `spawn` detaches the task; if the runtime is dropped first the task
         // is cancelled, which is safe (the cache stays authoritative).
         tokio::spawn(async move {
             // Cheap re-check under the cache lock to avoid a redundant
             // singleflight entry for an already-cached packument.
-            {
+            let cached = {
                 let cache = this.packument_cache.lock().await;
-                if cache.contains_key(&key) {
-                    return;
-                }
+                cache.get(&key).cloned()
+            };
+            if let Some(packument) = cached {
+                this.prefetch_selected_children(&spec, &packument, lookahead_levels);
+                return;
             }
             this.prefetch_fetches.fetch_add(1, Ordering::Relaxed);
             // Drive the fetch to completion; the result fills the cache via
             // the singleflight. Errors are intentionally ignored here.
-            let _ = match exact_version {
+            let result = match exact_version {
                 Some(version) => {
                     this.fetch_version_packument_singleflighted(
                         &name_owned,
@@ -831,7 +926,51 @@ impl AsyncRegistryClient {
                         .await
                 }
             };
+            if let Ok(packument) = result {
+                this.prefetch_selected_children(&spec, &packument, lookahead_levels);
+            }
         });
+    }
+
+    /// Select the exact version the resolver would choose for `parent`, then
+    /// prefetch its registry dependencies. Each scheduled child consumes one
+    /// slot from a client-wide budget; cache and singleflight deduplication
+    /// make repeated names or cycles no-ops.
+    fn prefetch_selected_children(
+        &self,
+        parent: &PackageSpec,
+        packument: &Packument,
+        lookahead_levels: u8,
+    ) {
+        if lookahead_levels == 0 {
+            return;
+        }
+        // The selected packument entry already contains the immutable tarball
+        // URL and integrity. Let streaming installs warm that artifact while
+        // metadata lookahead and deterministic placement continue. The final
+        // placed unit will re-enter the integrity-keyed store path and reuse
+        // the result; speculative failures are ignored by the sink. Restrict
+        // artifact hints to the root lookahead frontier: level-zero calls also
+        // arise from ordinary DFS child prefetch and are too broad to be a
+        // useful download predictor.
+        if let (Some(sink), Some(hint)) = (
+            self.download_prefetch_sink.as_ref(),
+            selected_download_hint(parent, packument),
+        ) {
+            sink.prefetch(hint);
+        }
+        for parsed in selected_registry_children(parent, packument) {
+            if self
+                .root_lookahead_budget
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_err()
+            {
+                break;
+            }
+            self.prefetch_parsed_packument(parsed, lookahead_levels - 1);
+        }
     }
 
     /// Singleflighted packument fetch keyed by `{registry}\0{name}`. If a fetch
@@ -850,7 +989,7 @@ impl AsyncRegistryClient {
         key: &str,
         name: &str,
         registry_url: &str,
-    ) -> Result<Packument, AsyncResolveError> {
+    ) -> Result<Arc<Packument>, AsyncResolveError> {
         // Build a producer factory (full packument) and delegate to the
         // generic singleflight core, which unifies the producer body so the
         // exact-version path can share it. The factory is `Fn` so the
@@ -906,7 +1045,7 @@ impl AsyncRegistryClient {
         name: &str,
         version: &Version,
         registry_url: &str,
-    ) -> Result<Packument, AsyncResolveError> {
+    ) -> Result<Arc<Packument>, AsyncResolveError> {
         let key = version_cache_key(registry_url, name, version);
         // Fast path: a completed version packument is already cached.
         {
@@ -973,7 +1112,7 @@ impl AsyncRegistryClient {
         &self,
         key: &str,
         producer: F,
-    ) -> Result<Packument, AsyncResolveError>
+    ) -> Result<Arc<Packument>, AsyncResolveError>
     where
         F: Fn() -> Fut,
         Fut: std::future::Future<Output = Result<Packument, AsyncResolveError>>,
@@ -999,7 +1138,7 @@ impl AsyncRegistryClient {
             // cold-path profile can attribute `dependency_resolution` time to
             // network vs CPU.
             let fetch_start = Instant::now();
-            let result = producer().await;
+            let result = producer().await.map(Arc::new);
             self.network_wait_ns
                 .fetch_add(fetch_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
@@ -1014,8 +1153,8 @@ impl AsyncRegistryClient {
 
             // Publish the result to every waiter, then remove the in-flight
             // marker so a future miss re-fetches. The producer returns its
-            // own verbatim `result`; waiters get a clone (`Packument` is
-            // `Clone`; errors are shared as a stringified render).
+            // own verbatim `result`; waiters clone only the `Arc` (errors are
+            // shared as a stringified render).
             let shared = match &result {
                 Ok(packument) => Ok(packument.clone()),
                 Err(error) => Err(error.to_string()),
@@ -1040,7 +1179,7 @@ impl AsyncRegistryClient {
             // miss and re-fetched inline below. Resolve and drop the borrow
             // *before* the lock `.await` below so the future stays `Send`.
             let mut rx = entry.rx.clone();
-            let joined_result: Option<Result<Packument, String>> =
+            let joined_result: Option<Result<Arc<Packument>, String>> =
                 match rx.wait_for(|state| state.is_done()).await {
                     Ok(guard) => match &*guard {
                         FetchState::Done(result) => Some(result.clone()),
@@ -1058,7 +1197,7 @@ impl AsyncRegistryClient {
             // re-entering the singleflight, so this path never recurses.
             self.in_flight.lock().await.remove(key);
             let fetch_start = Instant::now();
-            let packument = producer().await?;
+            let packument = Arc::new(producer().await?);
             self.network_wait_ns
                 .fetch_add(fetch_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
             let mut cache = self.packument_cache.lock().await;
@@ -1119,12 +1258,14 @@ pub struct AsyncResolverDiagnostics {
 
 /// Lift a singleflight result out of `FetchState::Done` for a waiter.
 ///
-/// The shared payload is `Result<Packument, String>`: we clone the packument
-/// on success, or reconstruct an `AsyncResolveError::Http` from the
+/// The shared payload is `Result<Arc<Packument>, String>`: we clone only the
+/// `Arc` on success, or reconstruct an `AsyncResolveError::Http` from the
 /// stringified error on failure. Errors are never cached, so this
 /// reconstruction is only observed by concurrent waiters that joined an
 /// in-flight fetch; the producing caller gets the original error verbatim.
-fn clone_shared_result(result: &Result<Packument, String>) -> Result<Packument, AsyncResolveError> {
+fn clone_shared_result(
+    result: &Result<Arc<Packument>, String>,
+) -> Result<Arc<Packument>, AsyncResolveError> {
     match result {
         Ok(packument) => Ok(packument.clone()),
         Err(message) => Err(AsyncResolveError::Http {
@@ -1303,32 +1444,30 @@ impl<'a> AsyncGraphResolver<'a> {
                 .registry
                 .registry_for_package(&registry_name)
                 .to_owned();
-            let packument = self
-                .registry
-                .packument_for(&parsed)
-                .await
+            let packument =
+                self.registry
+                    .packument_for_shared(&parsed)
+                    .await
+                    .map_err(|source| AsyncResolveError::Registry {
+                        package: name.to_owned(),
+                        spec: spec.clone(),
+                        source: match source {
+                            AsyncResolveError::Registry {
+                                package: _,
+                                spec: _,
+                                source,
+                            } => source,
+                            other => Box::new(RegistryError::Network {
+                                package: name.to_owned(),
+                                source: other.to_string().into(),
+                            }),
+                        },
+                    })?;
+            let mut resolved = resolve_packument(&parsed, packument.as_ref(), &registry_base)
                 .map_err(|source| AsyncResolveError::Registry {
                     package: name.to_owned(),
                     spec: spec.clone(),
-                    source: match source {
-                        AsyncResolveError::Registry {
-                            package: _,
-                            spec: _,
-                            source,
-                        } => source,
-                        other => Box::new(RegistryError::Network {
-                            package: name.to_owned(),
-                            source: other.to_string().into(),
-                        }),
-                    },
-                })?;
-            let mut resolved =
-                resolve_packument(&parsed, &packument, &registry_base).map_err(|source| {
-                    AsyncResolveError::Registry {
-                        package: name.to_owned(),
-                        spec: spec.clone(),
-                        source: Box::new(source),
-                    }
+                    source: Box::new(source),
                 })?;
 
             // ── Peer backtracking ───────────────────────────────────────────
@@ -1798,9 +1937,10 @@ pub async fn resolve_manifest_with_options_and_target_async_sink(
     // ── Prefetch root-level packuments (concurrent warmup) ──────────
     // Fan out all root-level packument fetches concurrently. Each
     // launch goes through the singleflight so duplicates dedup; the JoinSet
-    // awaits them as a batch. Exact-version requests are skipped (they fetch
-    // a single version, not the full packument). Failures are ignored here —
-    // the real resolve below surfaces any genuine error via `packument_for`.
+    // awaits them as a batch. Exact-version requests use their smaller
+    // single-version endpoint; ranges and tags use the full packument.
+    // Failures are ignored here — the real resolve below surfaces any genuine
+    // error via `packument_for`.
     let mut warmup = tokio::task::JoinSet::new();
     for (name, spec) in &root_deps {
         // Only registry specs benefit from packument prefetch.
@@ -1821,7 +1961,13 @@ pub async fn resolve_manifest_with_options_and_target_async_sink(
         // `packument_for` routes exact-version requests to the version-scoped
         // singleflight/cache and range/latest to the full packument.
         warmup.spawn(async move {
-            let _ = registry_clone.packument_for(&parsed).await;
+            if let Ok(packument) = registry_clone.packument_for_shared(&parsed).await {
+                registry_clone.prefetch_selected_children(
+                    &parsed,
+                    &packument,
+                    ROOT_LOOKAHEAD_LEVELS,
+                );
+            }
         });
     }
     while warmup.join_next().await.is_some() {}
@@ -2024,6 +2170,119 @@ mod tests {
     use super::*;
     use crate::resolver;
     use std::thread;
+
+    #[test]
+    fn singleflight_waiters_share_packument_allocation() {
+        let packument = Arc::new(Packument {
+            name: "shared".to_owned(),
+            dist_tags: BTreeMap::new(),
+            versions: BTreeMap::new(),
+        });
+        let shared = Ok(Arc::clone(&packument));
+
+        let waiter = clone_shared_result(&shared).expect("shared success");
+
+        assert!(Arc::ptr_eq(&packument, &waiter));
+    }
+
+    #[test]
+    fn root_lookahead_uses_selected_version_and_registry_dependencies_only() {
+        use crate::registry::Dist;
+
+        let metadata = |version: Version, dependencies, optional_dependencies| VersionMetadata {
+            name: "root".to_owned(),
+            version,
+            deprecated: None,
+            dependencies,
+            optional_dependencies,
+            peer_dependencies: BTreeMap::new(),
+            peer_dependencies_meta: BTreeMap::new(),
+            bin: BTreeMap::new(),
+            dist: Dist::default(),
+            engines: BTreeMap::new(),
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            has_install_script: false,
+            has_shrinkwrap: false,
+        };
+        let packument = Packument {
+            name: "root".to_owned(),
+            dist_tags: BTreeMap::from([("latest".to_owned(), "2.0.0".to_owned())]),
+            versions: BTreeMap::from([
+                (
+                    "1.0.0".to_owned(),
+                    metadata(
+                        Version::new(1, 0, 0),
+                        BTreeMap::from([
+                            ("registry-child".to_owned(), "^3.0.0".to_owned()),
+                            ("local-child".to_owned(), "file:../local".to_owned()),
+                        ]),
+                        BTreeMap::from([("registry-child".to_owned(), "3.2.1".to_owned())]),
+                    ),
+                ),
+                (
+                    "2.0.0".to_owned(),
+                    metadata(
+                        Version::new(2, 0, 0),
+                        BTreeMap::from([("wrong-version".to_owned(), "1.0.0".to_owned())]),
+                        BTreeMap::new(),
+                    ),
+                ),
+            ]),
+        };
+        let parent = parse_spec("root@^1.0.0").unwrap();
+
+        let children = selected_registry_children(&parent, &packument);
+
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].name, "registry-child");
+        assert!(matches!(
+            &children[0].req,
+            VersionRequest::Exact(version) if *version == Version::new(3, 2, 1)
+        ));
+    }
+
+    #[test]
+    fn selected_download_hint_uses_selected_version_distribution() {
+        use crate::integrity::Sha512Digest;
+        use crate::registry::Dist;
+
+        let integrity = Integrity::sha512(Sha512Digest::from_bytes([7; 64]));
+        let metadata = VersionMetadata {
+            name: "pkg".to_owned(),
+            version: Version::new(1, 2, 3),
+            deprecated: None,
+            dependencies: BTreeMap::new(),
+            optional_dependencies: BTreeMap::new(),
+            peer_dependencies: BTreeMap::new(),
+            peer_dependencies_meta: BTreeMap::new(),
+            bin: BTreeMap::new(),
+            dist: Dist {
+                tarball: "https://registry.example/pkg/-/pkg-1.2.3.tgz".to_owned(),
+                integrity: integrity.to_npm_string(),
+                shasum: None,
+            },
+            engines: BTreeMap::new(),
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            has_install_script: false,
+            has_shrinkwrap: false,
+        };
+        let packument = Packument {
+            name: "pkg".to_owned(),
+            dist_tags: BTreeMap::new(),
+            versions: BTreeMap::from([("1.2.3".to_owned(), metadata)]),
+        };
+
+        let hint = selected_download_hint(&parse_spec("pkg@1.2.3").unwrap(), &packument)
+            .expect("selected version should yield an artifact hint");
+
+        assert_eq!(hint.name, "pkg");
+        assert_eq!(hint.url, "https://registry.example/pkg/-/pkg-1.2.3.tgz");
+        assert_eq!(hint.integrity, Some(integrity));
+    }
 
     #[tokio::test]
     async fn test_looks_like_registry_spec() {

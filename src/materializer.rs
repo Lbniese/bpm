@@ -21,7 +21,7 @@
 //! conflicting entry is replaced. Re-running `bpm install --frozen` is a no-op
 //! on the filesystem when nothing changed.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::thread;
@@ -264,7 +264,13 @@ pub fn materialize_with_backend(
     resolved: &[(&PackageEntry, ArtifactId)],
     backend: MaterializeBackend,
 ) -> Result<MaterializeStats, MaterializeError> {
-    materialize_with_backend_impl(project_root, store, resolved, backend, true)
+    materialize_with_backend_impl(
+        project_root,
+        store,
+        resolved,
+        backend,
+        PassAStrategy::FullyParallel,
+    )
 }
 
 /// Serial variant of [`materialize_with_backend`]: processes Pass A on a
@@ -284,7 +290,40 @@ pub fn materialize_with_backend_serial(
     resolved: &[(&PackageEntry, ArtifactId)],
     backend: MaterializeBackend,
 ) -> Result<MaterializeStats, MaterializeError> {
-    materialize_with_backend_impl(project_root, store, resolved, backend, false)
+    materialize_with_backend_impl(
+        project_root,
+        store,
+        resolved,
+        backend,
+        PassAStrategy::Serial,
+    )
+}
+
+/// Depth-ordered parallel variant of [`materialize_with_backend`]. Packages at
+/// one `node_modules` nesting depth have disjoint target trees and are linked
+/// concurrently; the next depth starts only after its parents are complete.
+/// This retains the graph-volume builder's ancestor/descendant safety without
+/// forcing unrelated packages through a single serial lane.
+pub(crate) fn materialize_with_backend_by_depth(
+    project_root: &Path,
+    store: &ArtifactStore,
+    resolved: &[(&PackageEntry, ArtifactId)],
+    backend: MaterializeBackend,
+) -> Result<MaterializeStats, MaterializeError> {
+    materialize_with_backend_impl(
+        project_root,
+        store,
+        resolved,
+        backend,
+        PassAStrategy::ByDepth,
+    )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PassAStrategy {
+    FullyParallel,
+    ByDepth,
+    Serial,
 }
 
 fn materialize_with_backend_impl(
@@ -292,7 +331,7 @@ fn materialize_with_backend_impl(
     store: &ArtifactStore,
     resolved: &[(&PackageEntry, ArtifactId)],
     backend: MaterializeBackend,
-    parallel: bool,
+    strategy: PassAStrategy,
 ) -> Result<MaterializeStats, MaterializeError> {
     preflight_resolved(resolved)?;
     let mut stats = MaterializeStats::default();
@@ -314,18 +353,67 @@ fn materialize_with_backend_impl(
     // Count skipped entries into stats up front.
     stats.links_skipped = resolved.len() - work.len();
 
-    // Pass A — tree linking. Parallel by default (each scoped thread returns
-    // its original index so Pass B can iterate in the original `resolved`
-    // order); serial when the caller opts out via `parallel = false` to avoid
-    // nested ancestor/descendant path races (see
-    // [`materialize_with_backend_serial`]).
-    let workers = if parallel {
-        worker_count(work.len())
-    } else {
+    // Pass A — tree linking. The ordinary path parallelizes the full set; the
+    // graph-volume path runs depth-ordered parallel waves; the compatibility
+    // fallback stays serial. Every concurrent worker returns original work
+    // indices so Pass B retains deterministic `resolved` order.
+    let workers = if strategy == PassAStrategy::Serial {
         1
+    } else {
+        worker_count(work.len())
     };
     let mut symlink_bins_flags = vec![false; work.len()];
-    if workers <= 1 {
+    if strategy == PassAStrategy::ByDepth && workers > 1 {
+        let mut waves: BTreeMap<usize, Vec<(usize, &PackageEntry, ArtifactId)>> = BTreeMap::new();
+        for (work_index, (_, entry, id)) in work.iter().enumerate() {
+            let depth = entry
+                .path
+                .split('/')
+                .filter(|component| *component == "node_modules")
+                .count();
+            waves
+                .entry(depth)
+                .or_default()
+                .push((work_index, *entry, *id));
+        }
+        for wave in waves.values() {
+            let wave_workers = workers.min(wave.len()).max(1);
+            let chunk = wave.len().div_ceil(wave_workers).max(1);
+            thread::scope(|scope| {
+                let mut handles = Vec::with_capacity(wave_workers);
+                for chunk in wave.chunks(chunk) {
+                    handles.push(scope.spawn(move || {
+                        let mut flags = Vec::with_capacity(chunk.len());
+                        for (work_index, entry, id) in chunk {
+                            let image_dir = store.image_path(id);
+                            flags.push((
+                                *work_index,
+                                link_one_backend(
+                                    backend,
+                                    &image_dir,
+                                    &project_root.join(&entry.path),
+                                )?,
+                            ));
+                        }
+                        Ok::<_, MaterializeError>(flags)
+                    }));
+                }
+                for handle in handles {
+                    match handle.join() {
+                        Ok(Ok(flags)) => {
+                            for (work_index, flag) in flags {
+                                symlink_bins_flags[work_index] = flag;
+                                stats.packages_materialized += 1;
+                            }
+                        }
+                        Ok(Err(error)) => return Err(error),
+                        Err(panic) => std::panic::resume_unwind(panic),
+                    }
+                }
+                Ok::<_, MaterializeError>(())
+            })?;
+        }
+    } else if workers <= 1 {
         for (i, (_, entry, id)) in work.iter().enumerate() {
             let image_dir = store.image_path(id);
             let target = project_root.join(&entry.path);
@@ -2037,7 +2125,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn parallel_materialize_is_identical_to_serial() {
+    fn depth_parallel_materialize_is_identical_to_serial() {
         let _project = tempdir().unwrap();
         let store_dir = tempdir().unwrap();
         let src = tempdir().unwrap();
@@ -2065,7 +2153,7 @@ mod tests {
         e_a.bin.insert("acli".into(), "./cli.js".into());
         let mut e_b = entry("node_modules/b", "b", "file://x", &id_b);
         e_b.bin.insert("bcli".into(), "./cli.js".into());
-        let mut e_c = entry("node_modules/c", "c", "file://x", &id_c);
+        let mut e_c = entry("node_modules/a/node_modules/c", "c", "file://x", &id_c);
         e_c.bin.insert("ccli".into(), "./cli.js".into());
 
         let resolved: Vec<(&PackageEntry, ArtifactId)> =
@@ -2073,7 +2161,7 @@ mod tests {
 
         // Materialize once into project_a.
         let project_a = tempdir().unwrap();
-        let stats_a = materialize_with_backend(
+        let stats_a = materialize_with_backend_serial(
             project_a.path(),
             &store,
             &resolved,
@@ -2086,7 +2174,7 @@ mod tests {
 
         // Materialize again into project_b (fresh target).
         let project_b = tempdir().unwrap();
-        let stats_b = materialize_with_backend(
+        let stats_b = materialize_with_backend_by_depth(
             project_b.path(),
             &store,
             &resolved,

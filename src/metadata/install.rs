@@ -106,11 +106,26 @@ impl InstallSession {
         graph_hex: &str,
         inventory: Option<&crate::volume::GraphInventory>,
     ) -> Result<(), MetadataError> {
+        self.record_graph_with_size_hint(graph_hex, inventory, None)
+    }
+
+    /// Record a graph with an optional precomputed logical size for its
+    /// contents (excluding the durable graph marker). The repository falls
+    /// back to its recursive walk when the hint is unavailable.
+    pub fn record_graph_with_size_hint(
+        &mut self,
+        graph_hex: &str,
+        inventory: Option<&crate::volume::GraphInventory>,
+        contents_size_hint: Option<u64>,
+    ) -> Result<(), MetadataError> {
         let graph_key = ObjectKey::graph(graph_hex)?;
         match inventory {
             Some(inventory) => {
-                self.repository
-                    .record_graph_with_inventory(graph_hex, inventory)?;
+                self.repository.record_graph_with_inventory_and_size(
+                    graph_hex,
+                    inventory,
+                    contents_size_hint,
+                )?;
             }
             None => {
                 // Legacy/incomplete volume: record the object only so it is
@@ -133,6 +148,20 @@ impl InstallSession {
             );
         }
         Ok(())
+    }
+
+    /// Sum the indexed logical sizes of extracted images for `artifacts`.
+    /// Duplicate artifact ids remain duplicated because npm-compatible graph
+    /// placement may materialize the same image at multiple paths.
+    pub fn recorded_image_size_sum(
+        &self,
+        artifacts: &[ArtifactId],
+    ) -> Result<Option<u64>, MetadataError> {
+        let keys = artifacts
+            .iter()
+            .map(|id| ObjectKey::image(id.to_hex()))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.repository.recorded_logical_size_sum(&keys)
     }
 
     /// Verify the install lease is still held (heartbeat alive, token valid).

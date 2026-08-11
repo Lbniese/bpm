@@ -587,6 +587,19 @@ impl MetadataRepository {
         graph_hex: &str,
         inventory: &crate::volume::GraphInventory,
     ) -> Result<(), MetadataError> {
+        self.record_graph_with_inventory_and_size(graph_hex, inventory, None)
+    }
+
+    /// Size-aware counterpart of [`record_graph_with_inventory`].
+    /// `contents_size_hint` is the already-measured logical size of everything
+    /// below the graph root except its durable `metadata.json` marker. When
+    /// absent, the repository preserves the general recursive-walk fallback.
+    pub fn record_graph_with_inventory_and_size(
+        &self,
+        graph_hex: &str,
+        inventory: &crate::volume::GraphInventory,
+        contents_size_hint: Option<u64>,
+    ) -> Result<(), MetadataError> {
         let graph_key = ObjectKey::graph(graph_hex)?;
         self.ensure_published(&graph_key)?;
         let graph_path = self.store_root.join(graph_key.relative_path());
@@ -604,9 +617,21 @@ impl MetadataRepository {
         // New/incomplete graph: walk the filesystem for size and timestamp.
         let metadata =
             fs::symlink_metadata(&graph_path).map_err(|source| io_error(&graph_path, source))?;
+        let size_bytes = match contents_size_hint {
+            Some(contents_size) => {
+                let marker = graph_path.join("metadata.json");
+                let marker_size = fs::symlink_metadata(&marker)
+                    .map_err(|source| io_error(&marker, source))?
+                    .len();
+                contents_size
+                    .checked_add(marker_size)
+                    .ok_or(MetadataError::TimeOverflow)?
+            }
+            None => logical_size(&graph_path)?,
+        };
         let graph_record = ObjectRecord {
             key: graph_key,
-            size_bytes: logical_size(&graph_path)?,
+            size_bytes,
             published_at: modified_timestamp(&metadata)?,
         };
         self.record_graph_publication(&GraphRecord {
@@ -615,6 +640,27 @@ impl MetadataRepository {
             derived: inventory.derived.clone(),
         })?;
         Ok(())
+    }
+
+    /// Sum sizes already recorded for `keys`, preserving duplicate keys in the
+    /// total because one immutable image can appear at multiple graph paths.
+    /// Returns `None` when any key is not indexed, allowing callers to fall
+    /// back to a filesystem walk rather than guess.
+    pub fn recorded_logical_size_sum(
+        &self,
+        keys: &[ObjectKey],
+    ) -> Result<Option<u64>, MetadataError> {
+        let existing = self.existing_object_records(&canonical_keys(keys))?;
+        let mut total = 0_u64;
+        for key in keys {
+            let Some(record) = existing.get(key) else {
+                return Ok(None);
+            };
+            total = total
+                .checked_add(record.size_bytes)
+                .ok_or(MetadataError::TimeOverflow)?;
+        }
+        Ok(Some(total))
     }
 
     /// Whether the graph is already recorded in the index as complete. A
@@ -2058,6 +2104,59 @@ mod tests {
             })
             .unwrap();
         assert_eq!(access, 50);
+    }
+
+    #[test]
+    fn recorded_size_sum_preserves_placements_and_graph_hint_adds_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = MetadataRepository::open(temp.path()).unwrap();
+        let image = ObjectKey::image(id('a', 128)).unwrap();
+        let artifact = ObjectKey::artifact(id('a', 128)).unwrap();
+        publish(temp.path(), &artifact, b"tarball");
+        publish(temp.path(), &image, b"image");
+        repository
+            .record_published_objects_batch(&[artifact, image.clone()], Timestamp::from_millis(10))
+            .unwrap();
+
+        assert_eq!(
+            repository
+                .recorded_logical_size_sum(&[image.clone(), image.clone()])
+                .unwrap(),
+            Some(10),
+            "the same immutable image at two graph paths counts twice"
+        );
+        let missing = ObjectKey::image(id('b', 128)).unwrap();
+        assert_eq!(
+            repository
+                .recorded_logical_size_sum(&[image, missing])
+                .unwrap(),
+            None,
+            "an incomplete index must force the filesystem fallback"
+        );
+
+        let graph_hex = id('c', 64);
+        let graph = ObjectKey::graph(graph_hex.clone()).unwrap();
+        let graph_path = temp.path().join(graph.relative_path());
+        fs::create_dir_all(graph_path.join("node_modules/pkg")).unwrap();
+        fs::write(graph_path.join("node_modules/pkg/file"), vec![0_u8; 99]).unwrap();
+        fs::write(graph_path.join("metadata.json"), b"marker").unwrap();
+        repository
+            .record_graph_with_inventory_and_size(
+                &graph_hex,
+                &crate::volume::GraphInventory::default(),
+                Some(10),
+            )
+            .unwrap();
+
+        let connection = repository.connection().unwrap();
+        let recorded: i64 = connection
+            .query_row(
+                "SELECT size_bytes FROM graphs WHERE id=?1",
+                [&graph_hex],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(recorded, 16, "hint plus six-byte marker, not tree walk");
     }
 
     #[test]
