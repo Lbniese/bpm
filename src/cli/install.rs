@@ -338,26 +338,6 @@ pub(super) fn install_resolved_lockfile(
     };
 
     let config = effective_npm_config(project_root, options.registry.as_deref())?;
-    let http = HttpClient::new(config.clone());
-    let registry = open_registry_client(store_root_path, config, http.clone(), options.cache_mode)?;
-    let remote = if options.cache_mode.allows_network() {
-        options
-            .remote_cache
-            .as_deref()
-            .map(|base| {
-                let token = env::var("BPM_REMOTE_CACHE_TOKEN").ok();
-                bpm::remote_cache::RemoteCacheConfig::new(base, token)
-                    .map_err(|error| anyhow::anyhow!("invalid remote cache configuration: {error}"))
-                    .and_then(|config| {
-                        bpm::remote_cache::RemoteCacheClient::new(config).map_err(|error| {
-                            anyhow::anyhow!("invalid remote cache configuration: {error}")
-                        })
-                    })
-            })
-            .transpose()?
-    } else {
-        None
-    };
 
     let plan_path = graph::plan_path_for(lockfile_path);
     let cached_plan = graph::read_plan(&plan_path)?;
@@ -369,8 +349,11 @@ pub(super) fn install_resolved_lockfile(
             .any(|resolution| matches!(resolution.source, LockSource::Git { .. }));
     let plan_valid = !git_prepare_enabled
         && cached_plan.as_ref().is_some_and(|plan| {
-            graph::validate_plan_with_profile(plan, &lockfile, project_root, &store, profile)
-                .is_ok()
+            let started = std::time::Instant::now();
+            let outcome =
+                graph::validate_plan_with_profile(plan, &lockfile, project_root, &store, profile);
+            metrics.record("plan_validate", started.elapsed());
+            outcome.is_ok()
         });
     if plan_valid {
         metrics.record("plan_cache_hit", std::time::Duration::ZERO);
@@ -391,14 +374,18 @@ pub(super) fn install_resolved_lockfile(
         // refresh ownership so a concurrent `bpm gc` cannot age out the cached
         // graph or its dependencies: re-lease the graph's durable inventory,
         // record access, and rewrite the durable project registration + SQLite
-        // reference. A legacy/incomplete cached volume returns an error here so
-        // the caller retries a full install to avoid a false no-op success.
+        // reference. When that protection is already durably recorded the
+        // refresh short-circuits without writes. A legacy/incomplete cached
+        // volume returns an error here so the caller retries a full install to
+        // avoid a false no-op success.
         let graph_id = graph::graph_id_for_project_with_profile(&lockfile, project_root, profile);
         let graph_hex = graph_id.to_hex();
         let graph_hex_short = graph_id.to_hex_short();
         let graph_path = store.graph_volume_path(&graph_hex);
+        let refresh_started = std::time::Instant::now();
         let refreshed = bpm::metadata::InstallSession::open(store.root())
             .and_then(|mut session| session.refresh_cached_graph(project_root, &graph_hex));
+        metrics.record("ownership_refresh", refresh_started.elapsed());
         match refreshed {
             Ok(()) => {
                 println!(
@@ -407,7 +394,6 @@ pub(super) fn install_resolved_lockfile(
                     materialized,
                     bins
                 );
-                metrics.add_requests(http.request_count());
                 return write_metrics(&metrics, options.json_metrics.clone());
             }
             Err(error) => {
@@ -428,6 +414,30 @@ pub(super) fn install_resolved_lockfile(
         }
     }
     metrics.record("plan_cache_miss", std::time::Duration::ZERO);
+
+    // A cache hit performs zero outbound requests, so the HTTP client,
+    // registry client, and remote cache are constructed only now that a
+    // fetch/rebuild path is actually reachable.
+    let http = HttpClient::new(config.clone());
+    let registry = open_registry_client(store_root_path, config, http.clone(), options.cache_mode)?;
+    let remote = if options.cache_mode.allows_network() {
+        options
+            .remote_cache
+            .as_deref()
+            .map(|base| {
+                let token = env::var("BPM_REMOTE_CACHE_TOKEN").ok();
+                bpm::remote_cache::RemoteCacheConfig::new(base, token)
+                    .map_err(|error| anyhow::anyhow!("invalid remote cache configuration: {error}"))
+                    .and_then(|config| {
+                        bpm::remote_cache::RemoteCacheClient::new(config).map_err(|error| {
+                            anyhow::anyhow!("invalid remote cache configuration: {error}")
+                        })
+                    })
+            })
+            .transpose()?
+    } else {
+        None
+    };
 
     let work = build_install_work(&lockfile, options.frozen, lock_kind.filename())?;
     let workers = adaptive_workers(options.concurrency, work.len(), project_root);
@@ -2118,10 +2128,26 @@ fn finalize_install(
         .filter_map(|(maybe_id, pkg)| if pkg.link { None } else { *maybe_id })
         .collect();
     let prepared_derived: Vec<String> = prepared.values().map(|image| image.key.to_hex()).collect();
+    // Volume-reuse installs read only the immutable graph volume from the
+    // store: its hardlinks keep every artifact/image inode alive even if a
+    // concurrent collector unlinks the store copies, so leasing the graph
+    // object alone covers the read window and skips the 2N+D publication,
+    // access, and lease-row writes. Any install that will (re)build the
+    // volume reads store images directly and takes the full object lease.
+    let volume_reuse_hex = if direct_materialization {
+        None
+    } else {
+        bpm::volume::graph_volume_reuse_expected(store, lockfile, &prepared, profile)
+    };
     let metadata_lease_start = Instant::now();
-    session
-        .lease_objects(&lease_artifacts, &prepared_derived)
-        .map_err(|error| anyhow::anyhow!("lease store objects failed: {error}"))?;
+    match &volume_reuse_hex {
+        Some(graph_hex) => session
+            .lease_graph_object(graph_hex)
+            .map_err(|error| anyhow::anyhow!("lease graph volume failed: {error}"))?,
+        None => session
+            .lease_objects(&lease_artifacts, &prepared_derived)
+            .map_err(|error| anyhow::anyhow!("lease store objects failed: {error}"))?,
+    }
     metrics.record("metadata_lease", metadata_lease_start.elapsed());
     // On Unix, an ignore-scripts graph without workspace/prepared overlays is
     // exactly the sum of its immutable image sizes per placement; directories

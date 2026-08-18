@@ -678,6 +678,61 @@ impl MetadataRepository {
         Ok(complete == Some(1))
     }
 
+    /// Whether the durable protection a plan-cache-hit refresh would restore is
+    /// already fully in place: the graph is indexed `complete`, the SQLite
+    /// project reference points at it, and the durable registration file
+    /// matches it. When true, every write the refresh performs is semantically
+    /// redundant — the GC protection rules keep a project-referenced complete
+    /// graph, and every artifact/image/derived object its inventory records,
+    /// alive regardless of access age — and a cache-hit install reads no store
+    /// object content, so there is no read window for a transient lease to
+    /// cover. Any missing piece returns `false` so the caller runs the full
+    /// refresh, which self-heals the index exactly as before.
+    pub fn cached_graph_protection_current(
+        &self,
+        root: &Path,
+        graph_hex: &str,
+    ) -> Result<bool, MetadataError> {
+        let canonical = match absolute_lexical(root) {
+            Ok(path) if path == root => path,
+            _ => return Ok(false),
+        };
+        let connection = self.connection()?;
+        let complete: i64 = connection
+            .query_row(
+                "SELECT complete FROM graphs WHERE id=?1",
+                [graph_hex],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        if complete != 1 {
+            return Ok(false);
+        }
+        let referenced: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM project_graph_refs r
+                 JOIN projects p ON p.id = r.project_id
+                 WHERE p.path_key = ?1 AND r.graph_id = ?2",
+                params![path_key(&canonical), graph_hex],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        if referenced == 0 {
+            return Ok(false);
+        }
+        // The durable registration file is what an index rebuild restores the
+        // reference from; a missing or stale file means the refresh must
+        // rewrite it.
+        let registration = registration_path(&self.store_root, &canonical);
+        let Ok(bytes) = fs::read(&registration) else {
+            return Ok(false);
+        };
+        let Ok(record) = serde_json::from_slice::<RegistrationFile>(&bytes) else {
+            return Ok(false);
+        };
+        Ok(record.graph_id == graph_hex)
+    }
+
     /// Acquire one renewable lease covering a sorted, deduplicated object set.
     pub fn acquire_lease(
         &self,

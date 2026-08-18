@@ -275,6 +275,29 @@ fn current_meta(meta: &VolumeMeta, graph_hex: &str, volume: &Path) -> bool {
         && valid_entry_identities(meta, volume).is_some()
 }
 
+/// Whether the next [`ensure_graph_volume_with_prepared_and_profile`] call
+/// would take the volume-reuse fast path, returning the graph hex it would
+/// reuse. Pure read of the volume marker using the exact same id computation
+/// and validity predicate as `ensure`; callers use it to skip work that only a
+/// volume build (which reads store artifacts/images) requires. A `None` result
+/// means a build is expected and the full object lease must be held first.
+pub fn graph_volume_reuse_expected(
+    store: &ArtifactStore,
+    lockfile: &Lockfile,
+    prepared: &BTreeMap<String, crate::lifecycle::PreparedImage>,
+    profile: InstallProfile,
+) -> Option<String> {
+    let prepared_keys = prepared
+        .iter()
+        .map(|(path, image)| (path.clone(), *image.key.as_bytes()))
+        .collect::<BTreeMap<_, _>>();
+    let graph_hex = graph_id_with_prepared_and_profile(lockfile, &prepared_keys, profile).to_hex();
+    let volume_dir = store.graph_volume_path(&graph_hex);
+    let meta_bytes = fs::read(volume_dir.join(META_FILE)).ok()?;
+    let meta = serde_json::from_slice::<VolumeMeta>(&meta_bytes).ok()?;
+    current_meta(&meta, &graph_hex, &volume_dir).then_some(graph_hex)
+}
+
 /// Ensure the graph volume for `graph_hex` exists and is complete. Idempotent:
 /// if `<volume>/metadata.json` already records this graph id, the volume is
 /// reused untouched (cached). Otherwise the volume's `node_modules` is built

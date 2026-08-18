@@ -13,6 +13,7 @@ is unavailable.
 
 ## Recent Changes
 
+- 2026-08-18: Cut warm-install ownership overhead across the board — plan-cache hits skip the redundant metadata refresh, volume-reuse installs lease only the graph object and skip already-recorded registrations, and HTTP/registry clients are constructed lazily; `repeat_install` is ~2x faster than bun, `warm_store` 100.8→57.7ms, `partial_dependency_change` 100.1→57.0ms, and `monorepo_incremental` 94.4→24.6ms, with permanent `plan_validate`/`ownership_refresh` phase metrics for future profiling.
 - 2026-08-04: Restored green CI on Windows and Ubuntu; copy and reflink-fallback materialization now preserve source modification times for stable repeat-install reuse, and `v0.3.0` ships as a signed GitHub Release for Apple Silicon and Linux.
 - 2026-08-03: Released bpm 0.3.0 — npm-compatible developer and registry-management commands (`init`, `ls`, `view`, `cache`, `whoami`, `token`, `dist-tag`, `owner`, `link`), dev-only install profiles, `package-lock.json` lockfileVersion 2/3 import, directory-clonefile materialization, and parallel graph-package fingerprinting.
 - 2026-08-03: Regenerated the cold-path reference baseline at bpm 0.2.1; the headline `large-frontend` `true_cold` install improved to 3.67x pnpm, with per-run registry request counts and phase timings recorded under `bpm_metrics`.
