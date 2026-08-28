@@ -661,6 +661,13 @@ enum ProjectView {
     /// Project-local copy-on-write reflink tree per package; isolated from the
     /// store image on supporting filesystems, hardlink fallback otherwise.
     Reflink,
+    /// Shallow top-level symlinks into the immutable graph volume. Relaxes the
+    /// architecture's write-isolation guarantee (an in-place write under the
+    /// relay reaches the shared graph), the trade both bun and pnpm make via
+    /// shared file content. The auto-detected default on Unix for projects
+    /// without realpath-fragile toolchains; never auto-selected on platforms
+    /// without unix symlinks.
+    Relay,
 }
 
 fn resolve_project_view(lockfile: &Lockfile, project_root: &Path) -> ProjectView {
@@ -671,20 +678,35 @@ fn resolve_project_view(lockfile: &Lockfile, project_root: &Path) -> ProjectView
 }
 
 fn resolve_project_view_with(
-    _lockfile: &Lockfile,
+    lockfile: &Lockfile,
     _project_root: &Path,
     view: Option<&str>,
 ) -> ProjectView {
-    let auto = || ProjectView::Reflink;
+    let auto = || {
+        // Realpath-fragile toolchains (Next/Turbopack) canonicalize dependency
+        // realpaths and reject symlinked node_modules entries; they must keep
+        // a project-local view.
+        if auto_local_project_view(lockfile) {
+            return ProjectView::Local;
+        }
+        // Ordinary projects default to the relay view: a near-free attach
+        // (~4ms vs ~100-120ms of clonefile per attach) in exchange for the
+        // documented write-isolation relaxation — the same trade pnpm's
+        // virtual store and bun's hardlink mode make. Platforms without unix
+        // symlinks keep the isolated reflink/copy view.
+        #[cfg(unix)]
+        {
+            ProjectView::Relay
+        }
+        #[cfg(not(unix))]
+        {
+            ProjectView::Reflink
+        }
+    };
     match view {
         Some("reflink") => ProjectView::Reflink,
         Some("local") => ProjectView::Local,
-        Some("relay") => {
-            eprintln!(
-                "warning: BPM_PROJECT_VIEW=relay is unsafe; using isolated reflink/copy view"
-            );
-            ProjectView::Reflink
-        }
+        Some("relay") => ProjectView::Relay,
         Some(value) => {
             eprintln!(
                 "warning: unsupported BPM_PROJECT_VIEW={value:?}; expected relay, local, or reflink; using auto"
@@ -706,7 +728,6 @@ fn resolve_project_view_with(
 /// comma-separated list of package names that is merged with the built-in
 /// `next` default; the built-in `next` entry is always retained so existing
 /// Next.js installs never regress even if the env list omits it.
-#[cfg(test)]
 fn local_view_fragile_packages() -> Vec<String> {
     let mut packages = vec!["next".to_string()];
     if let Ok(value) = env::var("BPM_LOCAL_VIEW_PACKAGES") {
@@ -723,7 +744,6 @@ fn local_view_fragile_packages() -> Vec<String> {
     packages
 }
 
-#[cfg(test)]
 fn auto_local_project_view(lockfile: &Lockfile) -> bool {
     // Check the resolved graph rather than only root declarations. Imported
     // lockfiles and workspace layouts can represent the app's Next package as
@@ -733,7 +753,6 @@ fn auto_local_project_view(lockfile: &Lockfile) -> bool {
     auto_local_project_view_with_fragile(lockfile, &fragile)
 }
 
-#[cfg(test)]
 fn auto_local_project_view_with_fragile(lockfile: &Lockfile, fragile: &[String]) -> bool {
     lockfile
         .packages
@@ -2189,6 +2208,10 @@ fn finalize_install(
                 match project_view {
                     ProjectView::Reflink => bpm::materializer::MaterializeBackend::Reflink,
                     ProjectView::Local => bpm::materializer::MaterializeBackend::IsolatedCopy,
+                    // Direct materialization has no graph volume to relay
+                    // into; the opt-in relay view still materializes an
+                    // isolated tree on this path.
+                    ProjectView::Relay => bpm::materializer::MaterializeBackend::Reflink,
                 },
             );
             let lease = lease_handle.join().expect("lease thread panicked");
@@ -2301,7 +2324,20 @@ fn finalize_install(
                     session.record_graph_with_size_hint(&hex, inventory.as_ref(), graph_size_hint);
                 (result, start.elapsed())
             });
-            let attach = bpm::volume::attach_project(project_root, &volume);
+            let attach = match project_view {
+                ProjectView::Local | ProjectView::Reflink => {
+                    bpm::volume::attach_project(project_root, &volume)
+                }
+                // Shallow relays alias the immutable graph, relaxing the
+                // isolated view's write isolation in exchange for a near-free
+                // attach. Non-unix platforms have no attach_project_relay;
+                // their auto default never selects relay and the env override
+                // falls back to the isolated view.
+                #[cfg(unix)]
+                ProjectView::Relay => bpm::volume::attach_project_relay(project_root, &volume),
+                #[cfg(not(unix))]
+                ProjectView::Relay => bpm::volume::attach_project(project_root, &volume),
+            };
             let (record_result, elapsed) = record.join().unwrap();
             (attach, record_result, elapsed)
         });
@@ -2761,16 +2797,38 @@ mod tests {
         );
         assert_eq!(
             resolve_project_view_with(&lockfile, project_root, Some("relay")),
-            ProjectView::Reflink
+            ProjectView::Relay
         );
-        // Automatic and unsupported values always select an isolated view.
+        // Automatic and unsupported values select the auto view: relay on
+        // unix for ordinary graphs, the isolated reflink view elsewhere.
+        #[cfg(unix)]
+        let expected_auto = ProjectView::Relay;
+        #[cfg(not(unix))]
+        let expected_auto = ProjectView::Reflink;
         assert_eq!(
             resolve_project_view_with(&lockfile, project_root, None),
-            ProjectView::Reflink
+            expected_auto
         );
         assert_eq!(
             resolve_project_view_with(&lockfile, project_root, Some("bogus")),
-            ProjectView::Reflink
+            expected_auto
+        );
+    }
+
+    #[test]
+    fn auto_view_selects_local_for_fragile_graphs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut lockfile = Lockfile::new("test");
+        lockfile.packages.push(PackageEntry {
+            path: "node_modules/next".into(),
+            name: "next".into(),
+            version: "15.0.0".into(),
+            ..Default::default()
+        });
+        // A realpath-fragile graph overrides the relay default everywhere.
+        assert_eq!(
+            resolve_project_view_with(&lockfile, tmp.path(), None),
+            ProjectView::Local
         );
     }
 

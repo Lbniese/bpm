@@ -1241,6 +1241,85 @@ pub fn attach_project_local(
     attach_project_local_with_backend(project_root, volume, MaterializeBackend::Auto)
 }
 
+/// Attach a project to a graph volume via shallow top-level relays: every
+/// top-level entry in `<volume>/node_modules` becomes
+/// `<project>/node_modules/<entry>` as a symlink to the volume entry
+/// (created or confirmed; a wrong target is replaced).
+///
+/// OPT-IN EXPERIMENT behind `BPM_PROJECT_VIEW=relay`. Relays trade the
+/// architecture's isolation guarantee (docs/architecture.md: "projects never
+/// receive writable ... relay aliases" — in-place writes under a relay reach
+/// the shared immutable graph) for a near-free attach, the same trade both
+/// bun and pnpm make by sharing file content across projects. The default
+/// remains the isolated Reflink view; this variant exists so the trade-off
+/// can be measured and decided on data.
+#[cfg(unix)]
+pub fn attach_project_relay(
+    project_root: &Path,
+    volume: &VolumeRef,
+) -> Result<AttachOutcome, VolumeError> {
+    let vol_nm = volume.path.join("node_modules");
+    let proj_nm = project_root.join("node_modules");
+    fs::create_dir_all(&proj_nm).map_err(|source| io_err(&proj_nm, source))?;
+    let mut entries = fs::read_dir(&vol_nm)
+        .map_err(|source| io_err(&vol_nm, source))?
+        .filter_map(Result::ok)
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.file_name());
+    let mut stats = AttachStats::default();
+    let mut owned = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy().into_owned();
+        let target = vol_nm.join(&name);
+        let link = proj_nm.join(&name);
+        let expected = target.display().to_string();
+        match fs::symlink_metadata(&link) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let current = fs::read_link(&link)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                if current == expected {
+                    stats.relays_unchanged += 1;
+                } else {
+                    fs::remove_file(&link).map_err(|source| io_err(&link, source))?;
+                    std::os::unix::fs::symlink(&target, &link)
+                        .map_err(|source| io_err(&link, source))?;
+                    stats.relays_created += 1;
+                }
+            }
+            Ok(meta) => {
+                // A non-symlink entry occupying the path is either a foreign
+                // tree or bpm's own prior isolated view of the same graph
+                // (view migration: isolated -> relay). Attach owns the
+                // placement of top-level node_modules entries — the isolated
+                // view's backend link has the same replace semantics — so
+                // remove the occupant and place the relay.
+                if meta.is_dir() {
+                    fs::remove_dir_all(&link).map_err(|source| io_err(&link, source))?;
+                } else {
+                    fs::remove_file(&link).map_err(|source| io_err(&link, source))?;
+                }
+                std::os::unix::fs::symlink(&target, &link)
+                    .map_err(|source| io_err(&link, source))?;
+                stats.relays_created += 1;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::os::unix::fs::symlink(&target, &link)
+                    .map_err(|source| io_err(&link, source))?;
+                stats.relays_created += 1;
+            }
+            Err(source) => return Err(io_err(&link, source)),
+        }
+        owned.push(ManagedEntry {
+            path: format!("node_modules/{name_str}"),
+            mode: "relay".to_string(),
+            identity: format!("{}{expected}", crate::graph::IDENTITY_RELAY),
+        });
+    }
+    Ok(AttachOutcome::new(stats, owned))
+}
+
 /// Windows has no reflink syscall binding; the backend argument is accepted
 /// for API symmetry but the local view always hardlinks (copy fallback).
 #[cfg(windows)]
@@ -1315,7 +1394,15 @@ pub fn project_attached(project_root: &Path, volume_path: &Path) -> bool {
         let Ok(meta) = fs::symlink_metadata(&project_entry) else {
             return false;
         };
-        if meta.file_type().is_symlink() || !meta.is_dir() {
+        if meta.file_type().is_symlink() {
+            // Relay view: the entry must alias exactly this volume entry.
+            // Content integrity is already covered per-package by the plan
+            // validator's volume-side pristine check.
+            match fs::read_link(&project_entry) {
+                Ok(target) if target == vol_nm.join(entry.file_name()) => {}
+                _ => return false,
+            }
+        } else if !meta.is_dir() {
             return false;
         }
     }
@@ -1374,6 +1461,63 @@ mod tests {
             entry_identities: compute_entry_identities(&root.join("node_modules")).unwrap(),
         };
         fs::write(root.join(META_FILE), serde_json::to_vec(&meta).unwrap()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relay_attachment_creates_top_level_symlinks_with_relay_ownership() {
+        let volume_root = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        let volume = volume_root.path().join("node_modules");
+        fs::create_dir_all(volume.join("foo")).unwrap();
+        fs::write(
+            volume.join("foo/package.json"),
+            br#"{"name":"foo","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        write_test_meta(volume_root.path());
+
+        let volume_ref = VolumeRef {
+            path: volume_root.path().to_path_buf(),
+            cached: false,
+            stats: MaterializeStats::default(),
+        };
+        let outcome = attach_project_relay(project.path(), &volume_ref).unwrap();
+        assert_eq!(outcome.stats.relays_created, 1);
+        assert_eq!(outcome.owned.len(), 1);
+        let entry = &outcome.owned[0];
+        assert_eq!(entry.path, "node_modules/foo");
+        assert_eq!(entry.mode, "relay");
+        assert!(entry.identity.starts_with(crate::graph::IDENTITY_RELAY));
+
+        let link = project.path().join("node_modules/foo");
+        let target = fs::read_link(&link).unwrap();
+        assert_eq!(target, volume.join("foo"));
+        // Files resolve through the relay.
+        assert!(link.join("package.json").is_file());
+
+        // Re-attaching is idempotent (unchanged, not replaced).
+        let again = attach_project_relay(project.path(), &volume_ref).unwrap();
+        assert_eq!(again.stats.relays_unchanged, 1);
+        assert_eq!(again.stats.relays_created, 0);
+
+        // A non-symlink occupant (a prior isolated view of the same entry)
+        // is replaced by the relay, matching the isolated view's attach
+        // semantics.
+        fs::remove_file(&link).unwrap();
+        fs::create_dir(project.path().join("node_modules/foo")).unwrap();
+        let migrated = attach_project_relay(project.path(), &volume_ref).unwrap();
+        assert_eq!(migrated.stats.relays_created, 1);
+        assert!(
+            fs::symlink_metadata(project.path().join("node_modules/foo"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(project
+            .path()
+            .join("node_modules/foo/package.json")
+            .is_file());
     }
 
     #[test]

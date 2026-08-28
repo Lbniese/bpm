@@ -56,20 +56,26 @@ cold-vs-warm performance story with cited benchmark numbers, see
    staging and lifecycle-completed before atomic publication. Graph entries are
    isolated Reflink-or-Copy materializations of immutable store images; `.bin`
    entries remain relative symlinks so Node resolves bin scripts correctly.
-   Projects never receive writable hardlink, symlink, junction, or relay aliases.
-   Nested dependency resolution and relative `.bin` semantics remain npm-
-   compatible, including for tools such as Turbopack that require project-local
-   realpaths. `BPM_PROJECT_VIEW=relay|local|reflink` is accepted for
-   compatibility, but every value selects a safe isolated view:
-   `reflink` selects the project-local view via the copy-on-write `Reflink`
+   On Unix, projects attach to a published volume through the **relay view**:
+   each top-level `node_modules` entry becomes a symlink to the immutable
+   graph entry, making attach near-free. A relay aliases the immutable graph,
+   so an in-place write under the project view reaches shared content — the
+   same trade pnpm's virtual store and bun's hardlink mode make; the pristine
+   volume itself is validated independently during plan-cache checks.
+   Projects whose toolchains require project-local realpaths (Next.js /
+   Turbopack; extensible via `BPM_LOCAL_VIEW_PACKAGES`) automatically get the
+   safe local view instead, and `BPM_PROJECT_VIEW=relay|local|reflink` forces
+   a view explicitly. `reflink` selects the project-local view via the
+   copy-on-write `Reflink`
    backend, which clones each package file with macOS `clonefile(2)` / Linux
    `FICLONE` (distinct inode, shared data extents) so writes in the project
    view never reach the read-only store image — the same isolation as a full
    copy, with deep-copy fallback on unsupported filesystems. A filesystem-capability probe
    (`probe_fs_capabilities`) confirms reflink at runtime; on unsupported
    filesystems (ext4, HFS+, cross-device) the backend transparently degrades
-   to an independent deep copy. Windows uses the same correctness-first
-   isolated-copy fallback; no junction or hardlink exposes shared content.
+   to an independent deep copy. Windows and other non-Unix platforms always
+   select an isolated copy view; no junction or hardlink exposes shared
+   content there.
    Published graph metadata stores validated references to immutable top-level
    graph entries, so cold publication and normal attachment do not rehash
    package file bodies. Stale deletion compares a project tree with its prior
