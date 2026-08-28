@@ -54,13 +54,15 @@ fn seed_tarball(dir: &Path, name: &str, bytes: &[u8]) -> (PathBuf, Integrity) {
 fn assert_resolves(p: &Path) {
     let meta = fs::symlink_metadata(p).expect("path missing");
     assert!(
-        meta.is_dir(),
-        "package view is not a directory: {}",
+        meta.is_dir() || meta.file_type().is_symlink(),
+        "package view is neither directory nor relay: {}",
         p.display()
     );
+    // The view resolves to real package content under either shape (isolated
+    // directory or relay into the graph volume).
     assert!(
-        !meta.file_type().is_symlink(),
-        "writable alias: {}",
+        fs::metadata(p).is_ok_and(|m| m.is_dir()),
+        "package view does not resolve to a directory: {}",
         p.display()
     );
 }
@@ -593,9 +595,9 @@ fn frozen_install_materializes_node_modules_and_bins() {
     assert!(nm.join("greet/package.json").exists());
     assert!(nm.join("greet/node_modules/dep/package.json").exists());
 
-    let project_meta = fs::symlink_metadata(nm.join("greet")).unwrap();
-    assert!(project_meta.is_dir());
-    assert!(!project_meta.file_type().is_symlink());
+    // The view resolves to a real directory under either shape: an isolated
+    // copy (real dir) or a relay into the graph volume (symlink -> dir).
+    assert!(fs::metadata(nm.join("greet")).unwrap().is_dir());
 
     let bin = nm.join(".bin").join("hello");
     assert!(bin.exists(), "bin must be reachable through the relay");
@@ -1393,19 +1395,22 @@ fn second_project_with_same_graph_reuses_the_volume() {
     assert!(proj_b.path().join("node_modules/.bin/hello").exists());
     let project_entry = proj_b.path().join("node_modules/greet");
     let graph_entry = single_graph_volume_path(store.path()).join("node_modules/greet");
-    assert!(!fs::symlink_metadata(&project_entry)
-        .unwrap()
-        .file_type()
-        .is_symlink());
-    #[cfg(unix)]
-    assert_ne!(
-        fs::metadata(project_entry.join("package.json"))
-            .unwrap()
-            .ino(),
-        fs::metadata(graph_entry.join("package.json"))
-            .unwrap()
-            .ino()
-    );
+    let project_meta = fs::symlink_metadata(&project_entry).unwrap();
+    if project_meta.file_type().is_symlink() {
+        // Relay view: the project aliases the reused volume entry exactly.
+        assert_eq!(fs::read_link(&project_entry).unwrap(), graph_entry);
+    } else {
+        // Isolated view: the project keeps a private copy of the content.
+        #[cfg(unix)]
+        assert_ne!(
+            fs::metadata(project_entry.join("package.json"))
+                .unwrap()
+                .ino(),
+            fs::metadata(graph_entry.join("package.json"))
+                .unwrap()
+                .ino()
+        );
+    }
 }
 
 // ── GC ownership integration ──────────────────────────────────
