@@ -347,6 +347,31 @@ pub fn ensure_graph_volume_with_prepared_and_profile(
     profile: InstallProfile,
     metrics: &mut Metrics,
 ) -> Result<EnsuredVolume, VolumeError> {
+    ensure_graph_volume_with_prestaged(
+        store,
+        lockfile,
+        artifact_ids,
+        prepared,
+        profile,
+        metrics,
+        None,
+    )
+}
+
+/// [`ensure_graph_volume_with_prepared_and_profile`] with an optional staging
+/// tree pre-populated by the streaming pipeline's [`VolumeStager`]. The staged
+/// `(path -> artifact id)` set must exactly equal the lockfile's placement, or
+/// the staging is discarded (its Drop guard removes it) and the volume is
+/// rebuilt from scratch — streaming staging is purely an optimization.
+pub fn ensure_graph_volume_with_prestaged(
+    store: &ArtifactStore,
+    lockfile: &Lockfile,
+    artifact_ids: &[Option<ArtifactId>],
+    prepared: &BTreeMap<String, crate::lifecycle::PreparedImage>,
+    profile: InstallProfile,
+    metrics: &mut Metrics,
+    mut prestaged: Option<PreStagedVolume>,
+) -> Result<EnsuredVolume, VolumeError> {
     let build_start = std::time::Instant::now();
     let prepared_keys = prepared
         .iter()
@@ -400,44 +425,62 @@ pub fn ensure_graph_volume_with_prepared_and_profile(
         let _ = fs::remove_dir_all(&volume_dir);
     }
 
-    // Build under a staging directory so that a crash during materialization
-    // or overlay leaves no partial volume visible.  Staging is cleaned up by
-    // PendingVolume::drop if publish is not called.
-    let staging_base = store.root().join("tmp");
-    fs::create_dir_all(&staging_base).map_err(|source| VolumeError::Io {
-        path: staging_base.display().to_string(),
-        source,
-    })?;
-    let staging = staging_base.join(format!("graph-{}-{}", graph_hex, std::process::id()));
-    let _ = fs::remove_dir_all(&staging);
-    fs::create_dir_all(staging.join("node_modules")).map_err(|source| io_err(&staging, source))?;
-
     // Materialize the full node_modules projection inside staging as
     // HARDLINKS (real directories sharing inodes with the immutable store
-    // images) rather than symlinks into the store. A package's realpath then
-    // lands inside the volume, where `node_modules/<self>` is reachable as a
-    // sibling, so self-referential requires (e.g. `require('next/...')` issued
-    // from within next's own code) resolve instead of escaping into the store
-    // (which has no node_modules and breaks them).
+    // images) rather than symlinks into the store, so a package's realpath
+    // lands inside the volume where self-referential requires resolve.
     let resolved: Vec<(_, ArtifactId)> = artifact_ids
         .iter()
         .zip(lockfile.packages.iter())
         .filter_map(|(maybe_id, pkg)| maybe_id.map(|id| (pkg, id)))
         .collect();
-    // Graph volumes must keep package realpaths inside the volume, so a
-    // symlinked package image is not safe here. Hardlinks also let the plan
-    // validator prove that pristine package files still match their immutable
-    // store images using device/inode identity.
-    // Graph volumes contain nested ancestor/descendant package paths. Complete
-    // one dependency depth before starting the next so a child never races an
-    // ancestor clone, while unrelated package trees within the same depth can
-    // still materialize concurrently.
-    let stats = materialize_with_backend_by_depth(
-        staging.as_path(),
-        store,
-        &resolved,
-        MaterializeBackend::Reflink,
-    )?;
+    // The streaming pipeline may have pre-populated a staging tree while its
+    // download/extract workers were still running. It is usable only if the
+    // staged placement set exactly equals the authoritative lockfile
+    // placement; anything else falls back to the batched build. A mismatched
+    // staging removes itself via its Drop guard.
+    let expected: BTreeMap<String, ArtifactId> = resolved
+        .iter()
+        .map(|(pkg, id)| (pkg.path.clone(), *id))
+        .collect();
+    let prestaged_usable = prestaged
+        .as_ref()
+        .is_some_and(|p| p.packages == expected && p.staging.join("node_modules").is_dir());
+
+    let (staging, stats) = if prestaged_usable {
+        let staged = prestaged.as_ref().expect("checked above");
+        // Pass A (tree linking) already happened incrementally; run only the
+        // deterministic first-declarant-wins `.bin` pass over the staged tree.
+        // On failure the `?` still drops `prestaged` un-adopted, so the
+        // staging directory cleans itself up.
+        let stats =
+            crate::materializer::link_bins_for_staged(staged.staging.as_path(), store, &resolved)?;
+        let mut staged = prestaged.take().expect("checked above");
+        staged.adopted = true;
+        (std::mem::take(&mut staged.staging), stats)
+    } else {
+        // Build under a staging directory so that a crash during
+        // materialization or overlay leaves no partial volume visible.
+        // Staging is cleaned up by PendingVolume::drop if publish is not
+        // called.
+        let staging_base = store.root().join("tmp");
+        fs::create_dir_all(&staging_base).map_err(|source| VolumeError::Io {
+            path: staging_base.display().to_string(),
+            source,
+        })?;
+        let staging = staging_base.join(format!("graph-{}-{}", graph_hex, std::process::id()));
+        let _ = fs::remove_dir_all(&staging);
+        fs::create_dir_all(staging.join("node_modules"))
+            .map_err(|source| io_err(&staging, source))?;
+        let stats = materialize_with_backend_by_depth(
+            staging.as_path(),
+            store,
+            &resolved,
+            MaterializeBackend::Reflink,
+        )?;
+        (staging, stats)
+    };
+
     for package in lockfile.packages.iter().filter(|package| package.link) {
         let Some(source) = package.workspace_target.as_deref() else {
             continue;
@@ -461,6 +504,203 @@ pub fn ensure_graph_volume_with_prepared_and_profile(
     };
     metrics.record("graph_volume_build", build_start.elapsed());
     Ok(EnsuredVolume::Building(pending))
+}
+
+/// Shared slot through which the streaming pipeline's volume stager hands its
+/// result to the post-pipeline materialization phase.
+pub type PrestagedSlot = std::sync::Arc<std::sync::Mutex<Option<PreStagedVolume>>>;
+
+/// A graph-volume staging tree populated incrementally by the streaming
+/// install pipeline: as each extractor finishes a package image, the stager
+/// clones that image into its final nested position, hiding the tree-linking
+/// cost inside the (network-bound) pipeline window instead of running it
+/// serially after the pipeline joins.
+///
+/// Correctness contract (enforced by [`ensure_graph_volume_with_prestaged`]):
+/// the staged `(package path -> artifact id)` set must EXACTLY equal the final
+/// lockfile placement, or the staging is discarded and the volume is rebuilt
+/// from scratch. The stager never publishes, renames, or registers anything —
+/// ownership transfers to [`PendingVolume`] only after validation.
+pub struct PreStagedVolume {
+    /// Store-tmp directory already containing `node_modules/<placements>`.
+    pub staging: PathBuf,
+    /// Placement paths staged so far, mapped to their artifact ids.
+    pub packages: BTreeMap<String, ArtifactId>,
+    /// Cleared by the adopter before the directory is renamed or removed, so
+    /// the [`Drop`] cleanup below never deletes a published volume.
+    pub(crate) adopted: bool,
+}
+
+impl Drop for PreStagedVolume {
+    fn drop(&mut self) {
+        if !self.adopted {
+            let _ = fs::remove_dir_all(&self.staging);
+        }
+    }
+}
+
+/// Incremental graph-volume stager fed by extractor completions.
+///
+/// Activation is gated on the first *freshly extracted* image: installs whose
+/// images are all cache hits (volume-reuse fast paths) never rebuild a volume,
+/// so staying dormant there avoids redundant clone work.
+///
+/// Ordering rule: a package may only be staged once every ancestor package
+/// path (its npm nesting parents) is staged, because a directory-level
+/// ancestor clone replaces its target and would clobber an already-staged
+/// descendant. Packages arriving before their ancestors wait; the end-of-unit
+/// stream flush releases them, and the exact-set validation downstream is the
+/// authority on usability.
+pub struct VolumeStager<'a> {
+    store: &'a ArtifactStore,
+    staging: Option<PathBuf>,
+    packages: BTreeMap<String, ArtifactId>,
+    waiting: Vec<(String, ArtifactId)>,
+    /// Placed units that completed before the first fresh extraction. They
+    /// must not be dropped: with propagated artifact hints a package's
+    /// tarball is often speculatively extracted first, so its authoritative
+    /// placed unit arrives with a cache-hit image — the activation gate
+    /// exists only to avoid staging work on all-cached (volume-reuse)
+    /// installs, so these queue until activation (or are discarded at stream
+    /// end if the install never activates the stager).
+    pre_activation: Vec<(String, ArtifactId)>,
+    dead: bool,
+}
+
+impl<'a> VolumeStager<'a> {
+    pub fn new(store: &'a ArtifactStore) -> Self {
+        Self {
+            store,
+            staging: None,
+            packages: BTreeMap::new(),
+            waiting: Vec::new(),
+            pre_activation: Vec::new(),
+            dead: false,
+        }
+    }
+
+    /// Record one completed placed-unit extraction. `fresh` is whether the
+    /// store image was extracted by this install (vs a cache hit).
+    pub fn stage(&mut self, path: &str, id: ArtifactId, fresh: bool) {
+        if self.dead {
+            return;
+        }
+        if self.staging.is_none() {
+            if !fresh {
+                self.pre_activation.push((path.to_string(), id));
+                return;
+            }
+            let staging = self.store.root().join("tmp").join(format!(
+                "prestage-{}.{}.tmp",
+                std::process::id(),
+                unique_suffix()
+            ));
+            if let Err(source) = fs::create_dir_all(staging.join("node_modules")) {
+                let _ = fs::remove_dir_all(&staging);
+                self.dead = true;
+                let _ = io_err(&staging, source);
+                return;
+            }
+            self.staging = Some(staging);
+            self.waiting.append(&mut self.pre_activation);
+        }
+        self.waiting.push((path.to_string(), id));
+        self.drain(true);
+    }
+
+    /// Close the unit stream and return the staged tree, if one was started
+    /// and stayed healthy.
+    pub fn finish(mut self) -> Option<PreStagedVolume> {
+        if self.dead {
+            if let Some(staging) = self.staging.take() {
+                let _ = fs::remove_dir_all(staging);
+            }
+            return None;
+        }
+        self.drain(false);
+        self.drain(false);
+        let staging = self.staging?;
+        if self.packages.is_empty() {
+            let _ = fs::remove_dir_all(&staging);
+            return None;
+        }
+        Some(PreStagedVolume {
+            staging,
+            packages: self.packages,
+            adopted: false,
+        })
+    }
+
+    /// Stage every waiter whose ancestor constraint is satisfied (or every
+    /// waiter when `gate` is false). Stops at the first error and kills the
+    /// stager; the install falls back to the batched volume build.
+    fn drain(&mut self, gate: bool) {
+        let Some(staging) = self.staging.clone() else {
+            return;
+        };
+        let mut progressed = true;
+        while progressed {
+            progressed = false;
+            let mut remaining = Vec::with_capacity(self.waiting.len());
+            for (path, id) in self.waiting.drain(..) {
+                let ready = !gate
+                    || ancestor_package_paths(&path)
+                        .iter()
+                        .all(|ancestor| self.packages.contains_key(ancestor));
+                if !ready {
+                    remaining.push((path, id));
+                    continue;
+                }
+                let source = self.store.image_path(&id);
+                if reflink_tree(&source, &staging.join(&path)).is_err() {
+                    self.dead = true;
+                    self.packages.clear();
+                    return;
+                }
+                self.packages.insert(path, id);
+                progressed = true;
+            }
+            self.waiting = remaining;
+        }
+    }
+}
+
+/// Proper ancestor package paths of an npm-layout placement path: every
+/// prefix that ends at a complete `node_modules/[<@scope>/]<name>` boundary.
+pub(crate) fn ancestor_package_paths(path: &str) -> Vec<String> {
+    let components: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
+    let mut ancestors = Vec::new();
+    let mut index = 0usize;
+    while index < components.len() {
+        if components[index] != "node_modules" {
+            return ancestors;
+        }
+        let mut boundary = index + 2;
+        if components
+            .get(index + 1)
+            .is_some_and(|name| name.starts_with('@'))
+        {
+            boundary = index + 3;
+        }
+        if boundary > components.len() {
+            return ancestors;
+        }
+        if boundary < components.len() {
+            ancestors.push(components[..boundary].join("/"));
+        }
+        index = boundary;
+    }
+    ancestors
+}
+
+/// Collision-resistant suffix for private scratch directory names.
+fn unique_suffix() -> u128 {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() + u128::from(n))
+        .unwrap_or(u128::from(n))
 }
 
 /// Acquire an exclusive per-graph lock file at `<store>/locks/graph-<hex>.lock`.
@@ -1450,6 +1690,129 @@ mod tests {
     use super::*;
     use std::os::unix::fs::{symlink, MetadataExt};
     use tempfile::tempdir;
+
+    #[test]
+    fn ancestor_paths_walk_npm_nesting_boundaries() {
+        assert!(ancestor_package_paths("node_modules/a").is_empty());
+        assert_eq!(
+            ancestor_package_paths("node_modules/a/node_modules/b"),
+            vec!["node_modules/a".to_string()]
+        );
+        assert_eq!(
+            ancestor_package_paths("node_modules/a/node_modules/@s/x/node_modules/b"),
+            vec![
+                "node_modules/a".to_string(),
+                "node_modules/a/node_modules/@s/x".to_string(),
+            ]
+        );
+        assert!(ancestor_package_paths("src/lib.rs").is_empty());
+        assert!(ancestor_package_paths("node_modules").is_empty());
+        assert!(ancestor_package_paths("node_modules/@dangling").is_empty());
+    }
+
+    #[test]
+    fn stager_stays_dormant_until_a_fresh_image_arrives() {
+        let dir = tempdir().unwrap();
+        let store = crate::store::ArtifactStore::open(dir.path()).unwrap();
+        let mut stager = VolumeStager::new(&store);
+        stager.stage("node_modules/a", ArtifactId::from_bytes([7u8; 64]), false);
+        assert!(stager.finish().is_none());
+        let tmp = store.root().join("tmp");
+        let leftovers = fs::read_dir(&tmp).map(|it| it.count()).unwrap_or(0);
+        assert_eq!(leftovers, 0, "dormant stager must not create staging dirs");
+    }
+
+    #[test]
+    fn stager_stages_queued_and_ordered_packages() {
+        let dir = tempdir().unwrap();
+        let store = crate::store::ArtifactStore::open(dir.path()).unwrap();
+        let parent_id = ArtifactId::from_bytes([1u8; 64]);
+        let child_id = ArtifactId::from_bytes([2u8; 64]);
+        for (id, name) in [(parent_id, "p"), (child_id, "c")] {
+            let image = store.image_path(&id);
+            fs::create_dir_all(&image).unwrap();
+            fs::write(
+                image.join("package.json"),
+                format!(r#"{{"name":"{name}"}}"#),
+            )
+            .unwrap();
+            fs::write(
+                store.image_version_path(&id),
+                crate::store::IMAGE_LAYOUT_VERSION,
+            )
+            .unwrap();
+        }
+        let mut stager = VolumeStager::new(&store);
+        // Descendant arrives before its ancestor and queues; a pre-activation
+        // cache-hit ancestor (parent_id reused) queues separately.
+        stager.stage("node_modules/p/node_modules/c", child_id, false);
+        stager.stage("node_modules/p", parent_id, true);
+        let staged = stager.finish().expect("both packages staged");
+        assert!(staged.packages.contains_key("node_modules/p"));
+        assert!(staged
+            .packages
+            .contains_key("node_modules/p/node_modules/c"));
+        assert!(staged
+            .staging
+            .join("node_modules/p/node_modules/c/package.json")
+            .is_file());
+    }
+
+    #[test]
+    fn mismatched_prestaged_set_falls_back_to_batched_build() {
+        let dir = tempdir().unwrap();
+        let store = crate::store::ArtifactStore::open(dir.path()).unwrap();
+        let id = ArtifactId::from_bytes([3u8; 64]);
+        let image = store.image_path(&id);
+        fs::create_dir_all(&image).unwrap();
+        fs::write(image.join("package.json"), r#"{"name":"real"}"#).unwrap();
+        fs::write(
+            store.image_version_path(&id),
+            crate::store::IMAGE_LAYOUT_VERSION,
+        )
+        .unwrap();
+
+        let mut lockfile = Lockfile::new("test");
+        lockfile.packages.push(crate::lockfile::PackageEntry {
+            path: "node_modules/real".to_string(),
+            name: "real".to_string(),
+            resolved: "https://registry.example/real/-/real-1.0.0.tgz".to_string(),
+            ..Default::default()
+        });
+
+        let wrong_id = ArtifactId::from_bytes([9u8; 64]);
+        let wrong_image = store.image_path(&wrong_id);
+        fs::create_dir_all(&wrong_image).unwrap();
+        fs::write(wrong_image.join("package.json"), r#"{"name":"wrong"}"#).unwrap();
+        fs::write(
+            store.image_version_path(&wrong_id),
+            crate::store::IMAGE_LAYOUT_VERSION,
+        )
+        .unwrap();
+        let mut stager = VolumeStager::new(&store);
+        stager.stage("node_modules/real", wrong_id, true);
+        let prestaged = stager.finish().expect("staged wrong package");
+
+        let mut metrics = crate::metrics::Metrics::new();
+        let ensured = ensure_graph_volume_with_prestaged(
+            &store,
+            &lockfile,
+            &[Some(id)],
+            &BTreeMap::new(),
+            InstallProfile::default_profile(),
+            &mut metrics,
+            Some(prestaged),
+        )
+        .unwrap();
+        let pending = match ensured {
+            EnsuredVolume::Building(pending) => pending,
+            EnsuredVolume::Ready(_) => panic!("fresh store cannot reuse a volume"),
+        };
+        let volume = pending.publish().unwrap();
+        let body = fs::read_to_string(volume.path.join("node_modules/real/package.json")).unwrap();
+        assert!(body.contains("real"));
+        assert!(!body.contains("wrong"));
+    }
 
     fn write_test_meta(root: &Path) {
         let meta = VolumeMeta {

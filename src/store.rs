@@ -41,7 +41,7 @@ const IMAGES: &str = "images/sha512";
 const GRAPHS: &str = "graphs/blake3";
 const TMP: &str = "tmp";
 const LOCKS: &str = "locks";
-const IMAGE_LAYOUT_VERSION: &str = "2\n";
+pub(crate) const IMAGE_LAYOUT_VERSION: &str = "2\n";
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -160,7 +160,7 @@ impl ArtifactStore {
         self.image_path(id).with_extension("bpi")
     }
 
-    fn image_version_path(&self, id: &ArtifactId) -> PathBuf {
+    pub(crate) fn image_version_path(&self, id: &ArtifactId) -> PathBuf {
         self.image_path(id).with_extension("version")
     }
 

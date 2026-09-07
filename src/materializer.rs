@@ -319,6 +319,39 @@ pub(crate) fn materialize_with_backend_by_depth(
     )
 }
 
+/// Run only the deterministic `.bin` linking pass (Pass B) over a staging tree
+/// whose package trees (Pass A) were already populated incrementally by the
+/// streaming volume stager. The `symlink_bins` flags mirror what
+/// `link_one_backend` returns for the Reflink backend the stager uses.
+pub(crate) fn link_bins_for_staged(
+    project_root: &Path,
+    store: &ArtifactStore,
+    resolved: &[(&PackageEntry, ArtifactId)],
+) -> Result<MaterializeStats, MaterializeError> {
+    preflight_resolved(resolved)?;
+    let mut stats = MaterializeStats::default();
+    let mut linked_bins: BTreeSet<String> = BTreeSet::new();
+    for (entry, id) in resolved.iter() {
+        if entry.link || entry.resolved.is_empty() {
+            stats.links_skipped += 1;
+            continue;
+        }
+        stats.packages_materialized += 1;
+        if !entry.bin.is_empty() {
+            link_bins(
+                project_root,
+                &entry.path,
+                &store.image_path(id),
+                &entry.bin,
+                &mut linked_bins,
+                &mut stats,
+                cfg!(unix),
+            )?;
+        }
+    }
+    Ok(stats)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PassAStrategy {
     FullyParallel,
