@@ -473,6 +473,7 @@ pub(super) fn install_resolved_lockfile(
             unit_rx,
             download_workers,
             workers,
+            None,
         );
         for item in work {
             if unit_tx.send(item).is_err() {
@@ -503,6 +504,7 @@ pub(super) fn install_resolved_lockfile(
         &registry,
         cached_plan.as_ref(),
         profile,
+        None,
     )
 }
 
@@ -1338,6 +1340,7 @@ fn spawn_fetch_pipeline<'scope, 'env>(
     unit_rx: std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<InstallWork>>>,
     download_workers: usize,
     extract_workers: usize,
+    prestaged_slot: Option<&'env bpm::volume::PrestagedSlot>,
 ) -> (
     Vec<DownloaderHandle<'scope>>,
     Vec<ExtractorHandle<'scope>>,
@@ -1347,6 +1350,25 @@ fn spawn_fetch_pipeline<'scope, 'env>(
     let download_workers = download_workers.max(1);
     let extract_workers = extract_workers.max(1);
     let clock = Arc::new(PipelineClock::new());
+    // Optional streaming volume stager: extractors forward each placed-unit
+    // image completion so the graph volume's tree-linking cost overlaps the
+    // (network-bound) pipeline window instead of running after it. The
+    // unbounded channel never blocks an extractor; the stager dies silently
+    // on any staging error and the batched build takes over.
+    let volume_stage_tx = prestaged_slot.map(|slot| {
+        let (stage_tx, stage_rx) =
+            std::sync::mpsc::channel::<(String, bpm::integrity::ArtifactId, bool)>();
+        scope.spawn(move || {
+            let mut stager = bpm::volume::VolumeStager::new(store);
+            for (path, id, fresh) in stage_rx {
+                stager.stage(&path, id, fresh);
+            }
+            if let Some(prestaged) = stager.finish() {
+                *slot.lock().expect("prestaged slot lock") = Some(prestaged);
+            }
+        });
+        stage_tx
+    });
     // The download→extract handoff channel is sized by the *extract* pool: a
     // download only blocks here once extract has `extract_workers * 2` pending
     // artifacts queued, which is the natural backpressure point (extraction is
@@ -1429,6 +1451,7 @@ fn spawn_fetch_pipeline<'scope, 'env>(
     for _ in 0..extract_workers {
         let receive = receive.clone();
         let clock = Arc::clone(&clock);
+        let volume_stage_tx = volume_stage_tx.clone();
         extractors.push(
             scope.spawn(move || -> Result<(Vec<FetchOutcome>, Metrics), FetchFail> {
                 clock.mark_start();
@@ -1455,6 +1478,16 @@ fn spawn_fetch_pipeline<'scope, 'env>(
                     match store.ensure_image(&pending.artifact.id, &mut local) {
                         Ok(image) => {
                             if let Some(path) = pending.path.clone() {
+                                if let Some(stage_tx) = volume_stage_tx.as_ref() {
+                                    // Best-effort hand-off to the streaming
+                                    // volume stager; a gone stager just means
+                                    // the batched volume build takes over.
+                                    let _ = stage_tx.send((
+                                        path.clone(),
+                                        pending.artifact.id,
+                                        image.cached,
+                                    ));
+                                }
                                 outcomes.push(FetchOutcome {
                                     path,
                                     id: pending.artifact.id,
@@ -1815,6 +1848,11 @@ fn run_streaming_async_install(
     let workers = adaptive_workers(concurrency, usize::MAX, root);
     let download_workers = download_worker_count(workers);
     let overflow = std::sync::Arc::new(std::sync::Mutex::new(Vec::<InstallWork>::new()));
+    // The streaming pipeline stages the graph volume incrementally as images
+    // complete; the slot is filled by the stager thread before this scope
+    // ends and consumed by materialization afterwards.
+    let prestaged_slot: bpm::volume::PrestagedSlot =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
     let (lockfile, outcomes) = std::thread::scope(
         |scope| -> anyhow::Result<(Lockfile, Vec<FetchOutcome>)> {
             let (unit_tx, unit_rx) =
@@ -1828,6 +1866,7 @@ fn run_streaming_async_install(
                 unit_rx,
                 download_workers,
                 workers,
+                Some(&prestaged_slot),
             );
             // Run async resolution on a tokio runtime, emitting placed nodes
             // to the non-blocking TryChannelSink. Units that overflow the live
@@ -1942,6 +1981,10 @@ fn run_streaming_async_install(
     let fetched = outcomes.len() - cached;
     let artifact_ids = outcomes_to_artifact_ids(&outcomes, &lockfile);
     metrics.add_requests(http.request_count());
+    // The stager thread finished before the scope closed; adopt whatever it
+    // staged (None when it stayed dormant or died — materialization then
+    // builds the volume as before).
+    let prestaged = prestaged_slot.lock().expect("prestaged slot lock").take();
     finalize_install(
         root,
         store,
@@ -1955,6 +1998,7 @@ fn run_streaming_async_install(
         &bpm::registry::RegistryClient::new(config),
         prior_plan.as_ref(),
         options.install_profile(),
+        prestaged,
     )
 }
 
@@ -2038,6 +2082,7 @@ fn run_streaming_install(
                 unit_rx,
                 download_workers,
                 workers,
+                None,
             );
             // Run resolution on this thread, emitting each placed node to the
             // sink; dropping `sink` closes the unit channel so downloaders (and
@@ -2119,6 +2164,7 @@ fn run_streaming_install(
         client,
         prior_plan.as_ref(),
         options.install_profile(),
+        None,
     )
 }
 
@@ -2139,6 +2185,7 @@ fn finalize_install(
     registry: &bpm::registry::RegistryClient,
     prior_plan: Option<&bpm::graph::InstallPlan>,
     profile: graph::InstallProfile,
+    prestaged: Option<bpm::volume::PreStagedVolume>,
 ) -> anyhow::Result<()> {
     // Prior ownership for stale-entry reconciliation. A pre-fix (version-2)
     // plan persists `owned_entries` empty; in that one case conservatively
@@ -2294,13 +2341,14 @@ fn finalize_install(
     } else {
         let (ensured, lease) = std::thread::scope(|lease_scope| {
             let lease_handle = lease_scope.spawn(|| run_lease(&mut session));
-            let ensured = bpm::volume::ensure_graph_volume_with_prepared_and_profile(
+            let ensured = bpm::volume::ensure_graph_volume_with_prestaged(
                 store,
                 lockfile,
                 artifact_ids,
                 &prepared,
                 profile,
                 metrics,
+                prestaged,
             );
             let lease = lease_handle.join().expect("lease thread panicked");
             (ensured, lease)
