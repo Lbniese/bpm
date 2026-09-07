@@ -52,7 +52,7 @@ semver = "1.0"
 percent-encoding = "2.3"
 
 # In-memory LRU cache for parsed packument bodies in the resolver
-lru = "0.16"
+lru = "0.18"
 
 # Persistent metadata index (filesystem objects remain the source of truth).
 rusqlite = { version = "0.40.1", features = ["bundled"] }
