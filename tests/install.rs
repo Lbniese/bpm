@@ -878,6 +878,47 @@ fn plan_cache_hit_rebuilds_when_graph_metadata_is_missing() {
 }
 
 #[test]
+fn plain_install_reconciles_edited_package_json() {
+    let (project, store, _tgz) = setup_project();
+
+    let first = run_plain_install(project.path(), store.path());
+    assert!(first.status.success());
+    assert!(project
+        .path()
+        .join("node_modules/greet/package.json")
+        .exists());
+
+    // npm compatibility: editing package.json and re-running `npm install`
+    // reconciles the project. Removing the only dependency must prune the
+    // view and update bpm.lock instead of replaying the stale lock.
+    fs::write(
+        project.path().join("package.json"),
+        r#"{"name":"app","version":"1.0.0","dependencies":{}}"#,
+    )
+    .unwrap();
+    let second = run_plain_install(project.path(), store.path());
+    assert!(second.status.success());
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(
+        stderr.contains("re-resolving"),
+        "expected a re-resolve notice, stderr: {stderr}"
+    );
+    assert!(
+        !project.path().join("node_modules/greet").exists(),
+        "removed dependency must be pruned from the view"
+    );
+
+    // The reconciled state is stable: a third run is a plan-cache no-op.
+    let third = run_plain_install(project.path(), store.path());
+    assert!(third.status.success());
+    let stdout = String::from_utf8_lossy(&third.stdout);
+    assert!(
+        stdout.contains("nothing to install"),
+        "expected plan-cache hit after reconcile, stdout: {stdout}"
+    );
+}
+
+#[test]
 fn frozen_refuses_when_manifest_and_lock_disagree() {
     let (project, store, _tgz) = setup_project();
 

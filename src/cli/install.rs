@@ -146,7 +146,26 @@ pub(super) fn run(mut options: Options) -> anyhow::Result<()> {
 
     let store_root_path = store_root(options.store.clone())?;
     let cwd = env::current_dir()?;
-    let (lockfile_path, lockfile, project_root, lock_kind) = match find_project_lock(&cwd)? {
+    let mut found_lock = find_project_lock(&cwd)?;
+    // npm compatibility: `npm install` after editing package.json reconciles
+    // the project instead of replaying the stale lock. A bpm.lock whose root
+    // declarations drifted from package.json therefore resolves fresh (the
+    // resolver adds new deps and reconciliation prunes removed entries).
+    // package-lock-only projects keep the lockfile-driven path; frozen mode
+    // keeps refusing drift inside install_resolved_lockfile.
+    if let Some(project_lock) = found_lock.as_ref() {
+        if project_lock.kind == ProjectLockKind::Bpm
+            && !options.frozen
+            && manifest_lock_drifted(&project_lock.project_root, &project_lock.lockfile)
+        {
+            eprintln!(
+                "package.json changed since {} was written; re-resolving",
+                project_lock.path.display()
+            );
+            found_lock = None;
+        }
+    }
+    let (lockfile_path, lockfile, project_root, lock_kind) = match found_lock {
         Some(project_lock) => {
             if project_lock.kind == ProjectLockKind::NpmV3 {
                 validate_npm_direct_install(&project_lock.diagnostics)?;
@@ -1099,6 +1118,33 @@ fn render_import_diagnostics(diagnostics: &[bpm::Diagnostic]) {
     }
 }
 
+/// Whether package.json's root declarations disagree with the lockfile's
+/// recorded declarations (the same comparison `enforce_frozen` refuses on).
+/// npm-compatible plain installs treat this as a signal to re-resolve rather
+/// than trust the stale lock; frozen installs keep refusing instead. An
+/// unreadable manifest or invalid overrides counts as drift so the resolver —
+/// which owns those errors — reports them.
+fn manifest_lock_drifted(project_root: &Path, lockfile: &Lockfile) -> bool {
+    let Ok(manifest) = PackageManifest::from_path(&project_root.join("package.json")) else {
+        return false;
+    };
+    // Compare the MERGED declaration map (deps + optional + peer + dev) and
+    // overrides. The dev/optional SPLIT affects only the omit-dev projection,
+    // not whether the lock still satisfies the manifest, and hand-authored or
+    // imported locks legitimately record the split differently; frozen mode
+    // keeps its stricter per-section contract.
+    let root_declarations = manifest.root_dependency_declarations();
+    let locked = &lockfile.root.dependencies;
+    let overrides_match = resolver::overrides::OverrideSet::from_manifest(
+        &manifest.overrides,
+        &root_declarations,
+        resolver::overrides::OverrideOrigin::Root,
+    )
+    .map(|overrides| overrides.as_map() == &lockfile.resolution.root.overrides)
+    .unwrap_or(false);
+    !(root_declarations == *locked && overrides_match)
+}
+
 fn enforce_frozen(
     project_root: &Path,
     lockfile: &Lockfile,
@@ -1877,6 +1923,11 @@ fn run_streaming_async_install(
         },
     )?;
     let path = root.join(bpm::lockfile::BPM_LOCK_FILE);
+    // The prior plan (if any) drives stale-entry reconciliation in
+    // finalize_install: a drifted manifest that re-resolved must prune the
+    // entries the old graph owned. Read it before finalize writes the new
+    // plan at this path.
+    let prior_plan = graph::read_plan(&graph::plan_path_for(&path))?;
     lockfile.write_to(&path)?;
     eprintln!(
         "resolved {} package(s) (async+streaming) and wrote {}",
@@ -1902,7 +1953,7 @@ fn run_streaming_async_install(
         options,
         &path,
         &bpm::registry::RegistryClient::new(config),
-        None,
+        prior_plan.as_ref(),
         options.install_profile(),
     )
 }
@@ -2036,13 +2087,17 @@ fn run_streaming_install(
             Ok((lockfile, outcomes))
         })?;
     let path = root.join(bpm::lockfile::BPM_LOCK_FILE);
+    // The prior plan (if any) drives stale-entry reconciliation in
+    // finalize_install: a drifted manifest that re-resolved must prune the
+    // entries the old graph owned. Read it before finalize writes the new
+    // plan at this path.
+    let prior_plan = graph::read_plan(&graph::plan_path_for(&path))?;
     lockfile.write_to(&path)?;
     eprintln!(
         "resolved {} package(s) and wrote {}",
         lockfile.packages.len(),
         path.display()
     );
-    // Fresh resolve: no prior lockfile, so no prior plan — always install.
     metrics.record("plan_cache_miss", std::time::Duration::ZERO);
     let cached = outcomes
         .iter()
@@ -2062,7 +2117,7 @@ fn run_streaming_install(
         options,
         &path,
         client,
-        None,
+        prior_plan.as_ref(),
         options.install_profile(),
     )
 }
