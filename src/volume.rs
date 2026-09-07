@@ -1387,7 +1387,9 @@ pub fn project_attached(project_root: &Path, volume_path: &Path) -> bool {
     if !proj_nm.is_dir() || !vol_nm.is_dir() {
         return false;
     }
-    let mut seen = false;
+    // An empty graph (all dependencies removed) has nothing to attach; both
+    // directories existing is the complete contract for it.
+    let mut seen = true;
     for entry in fs::read_dir(&vol_nm).into_iter().flatten().flatten() {
         seen = true;
         let project_entry = proj_nm.join(entry.file_name());
