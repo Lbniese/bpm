@@ -31,10 +31,9 @@ use crate::graph::{
 };
 use crate::integrity::ArtifactId;
 use crate::lockfile::Lockfile;
-#[cfg(unix)]
-use crate::materializer::reflink_tree;
 use crate::materializer::{
-    materialize_with_backend_by_depth, MaterializeBackend, MaterializeError, MaterializeStats,
+    materialize_with_backend_by_depth, reflink_tree, MaterializeBackend, MaterializeError,
+    MaterializeStats,
 };
 use crate::metrics::Metrics;
 use crate::store::ArtifactStore;
