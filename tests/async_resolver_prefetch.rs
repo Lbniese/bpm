@@ -358,12 +358,17 @@ async fn gzip_packument_cache_reuses_decoded_body_on_304() {
 
     let cache_url = server.url("cached-gzip");
     let mut cached = None;
-    for _ in 0..100 {
+    // The persistent cache write is fire-and-forget on the blocking pool
+    // (`spawn_async_cache_put`), so `yield_now` polling cannot observe it —
+    // the write only completes once a blocking thread is scheduled, which
+    // tight yielding never guarantees. Poll on real time, bounded generously.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
         if let Some(entry) = cache.get(&cache_url).expect("cache read") {
             cached = Some(entry);
             break;
         }
-        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
     let cached = cached.expect("decoded metadata should be persisted");
     assert_eq!(cached.body, full_body);
