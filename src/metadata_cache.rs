@@ -183,7 +183,7 @@ impl MetadataCache {
     pub fn get(&self, url: &str) -> Result<Option<CachedPackument>, MetadataCacheError> {
         let connection = self.connection.lock().expect("cache connection poisoned");
         let mut statement = connection
-            .prepare("SELECT body, etag, last_modified FROM packuments WHERE url = ?1")
+            .prepare_cached("SELECT body, etag, last_modified FROM packuments WHERE url = ?1")
             .map_err(|source| MetadataCacheError::Sql {
                 context: "prepare get".into(),
                 source,
@@ -214,7 +214,7 @@ impl MetadataCache {
         let fetched_at_ms = now_millis().unwrap_or(0);
         let connection = self.connection.lock().expect("cache connection poisoned");
         connection
-            .execute(
+            .prepare_cached(
                 "INSERT INTO packuments(url, body, etag, last_modified, fetched_at_ms)
                  VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(url) DO UPDATE SET
@@ -222,8 +222,10 @@ impl MetadataCache {
                    etag = excluded.etag,
                    last_modified = excluded.last_modified,
                    fetched_at_ms = excluded.fetched_at_ms",
-                params![url, body, etag, last_modified, fetched_at_ms],
             )
+            .and_then(|mut statement| {
+                statement.execute(params![url, body, etag, last_modified, fetched_at_ms])
+            })
             .map_err(|source| MetadataCacheError::Sql {
                 context: "put".into(),
                 source,
@@ -267,6 +269,69 @@ pub enum MetadataCacheError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    #[test]
+    #[ignore = "manual release timing benchmark; no performance thresholds"]
+    fn repeat_hits_misses_updates_timing() {
+        const OPERATIONS: usize = 20_000;
+        const SAMPLES: usize = 9;
+        let cache = MetadataCache::open_in_memory().unwrap();
+        let urls: Vec<_> = (0..128).map(|i| format!("https://r/package-{i}")).collect();
+        let misses: Vec<_> = (0..128).map(|i| format!("https://r/missing-{i}")).collect();
+        let bodies = [vec![b'a'; 4096], vec![b'b'; 4096]];
+        let etags = [Some("\"a\""), None];
+        for url in &urls {
+            cache.put(url, &bodies[0], etags[0], None).unwrap();
+        }
+
+        // Setup is untimed; sample zero warms each path and is discarded.
+        let mut timings = [Vec::new(), Vec::new(), Vec::new()];
+        for sample in 0..=SAMPLES {
+            for (operation, samples) in timings.iter_mut().enumerate() {
+                let start = Instant::now();
+                match operation {
+                    0 => {
+                        for i in 0..OPERATIONS {
+                            black_box(cache.get(black_box(&urls[i % urls.len()])).unwrap());
+                        }
+                    }
+                    1 => {
+                        for i in 0..OPERATIONS {
+                            black_box(cache.get(black_box(&misses[i % misses.len()])).unwrap());
+                        }
+                    }
+                    2 => {
+                        for i in 0..OPERATIONS {
+                            let version = (i / urls.len()) % bodies.len();
+                            black_box(cache.put(
+                                black_box(&urls[i % urls.len()]),
+                                black_box(&bodies[version]),
+                                black_box(etags[version]),
+                                None,
+                            ))
+                            .unwrap();
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+                let elapsed = start.elapsed();
+                if sample > 0 {
+                    samples.push(elapsed);
+                }
+            }
+        }
+        for (name, mut samples) in ["hits", "misses", "updates"].into_iter().zip(timings) {
+            println!("{name}: {SAMPLES} samples of {OPERATIONS} operations: {samples:?}");
+            samples.sort_unstable();
+            let median = samples[SAMPLES / 2];
+            println!(
+                "{name}: median {median:?}, {:.1} ns/op",
+                median.as_nanos() as f64 / OPERATIONS as f64
+            );
+        }
+    }
 
     #[test]
     fn fresh_database_migrates_to_v1() {
