@@ -1293,6 +1293,125 @@ type ExtractorHandle<'scope> =
 /// metrics sum durations, which cannot show how much work overlapped. This
 /// clock measures the actual critical-path lifetime from the first worker to
 /// the last worker.
+/// Adaptive concurrency governor for artifact downloads.
+///
+/// Real registries shape per-client concurrent load: measured on live npmjs,
+/// per-request latency was ~153ms at 4 concurrent downloads, ~279ms at 8,
+/// and ~1245ms at 24 from one client — with aggregate goodput saturated, so
+/// widening only queued requests and the WHOLE install got slower. A fixed
+/// width cannot satisfy both that regime and a quiet network where wide
+/// fan-out wins. The governor starts at full width (correct wherever the
+/// network is not shaping the client), watches a latency EWMA of completed
+/// network downloads, and halves the width when latency balloons; it
+/// re-probes one step upward every few seconds so a shrink taken during a
+/// transient slowdown recovers. Learning converges within a handful of
+/// ~350ms windows, well inside one install.
+pub(crate) struct DownloadGovernor {
+    limit: std::sync::atomic::AtomicUsize,
+    in_flight: std::sync::atomic::AtomicUsize,
+    ewma_ms: std::sync::atomic::AtomicU64,
+    samples: std::sync::atomic::AtomicU64,
+    next_evaluate: std::sync::Mutex<Instant>,
+    min: usize,
+    max: usize,
+}
+
+const GOVERNOR_WINDOW_MS: u64 = 350;
+/// Per-request latency above which concurrent load is presumed shaped.
+const GOVERNOR_SLOW_MS: u64 = 800;
+/// Windows between upward re-probes (recovery from over-eager shrinks).
+const GOVERNOR_REPROBE_WINDOWS: u64 = 8;
+
+impl DownloadGovernor {
+    pub fn new(max: usize) -> Self {
+        let max = max.max(1);
+        Self {
+            limit: std::sync::atomic::AtomicUsize::new(max),
+            in_flight: std::sync::atomic::AtomicUsize::new(0),
+            ewma_ms: std::sync::atomic::AtomicU64::new(0),
+            samples: std::sync::atomic::AtomicU64::new(0),
+            next_evaluate: std::sync::Mutex::new(Instant::now()),
+            min: max.min(4),
+            max,
+        }
+    }
+
+    /// Block until a download slot is available.
+    pub fn acquire(&self) {
+        loop {
+            let current = self.in_flight.load(std::sync::atomic::Ordering::Relaxed);
+            let limit = self.limit.load(std::sync::atomic::Ordering::Relaxed);
+            if current < limit
+                && self
+                    .in_flight
+                    .compare_exchange(
+                        current,
+                        current + 1,
+                        std::sync::atomic::Ordering::Relaxed,
+                        std::sync::atomic::Ordering::Relaxed,
+                    )
+                    .is_ok()
+            {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    /// Release the slot and feed one observed network download duration
+    /// (cache hits carry no congestion signal) into the latency EWMA.
+    pub fn release(&self, network: Option<(std::time::Duration, u64)>) {
+        self.in_flight
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        let Some((duration, _bytes)) = network else {
+            return;
+        };
+        let sample = duration.as_millis() as u64;
+        let prev = self.ewma_ms.load(std::sync::atomic::Ordering::Relaxed);
+        let ewma = if prev == 0 {
+            sample
+        } else {
+            prev / 4 * 3 + sample / 4
+        };
+        self.ewma_ms
+            .store(ewma, std::sync::atomic::Ordering::Relaxed);
+        let n = self
+            .samples
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // A single download's duration conflates size and congestion; the
+        // EWMA over several completions within a window is the signal.
+        if !n.is_multiple_of(4) {
+            return;
+        }
+        let Ok(mut next) = self.next_evaluate.try_lock() else {
+            return;
+        };
+        let now = Instant::now();
+        if *next > now {
+            return;
+        }
+        *next = now + std::time::Duration::from_millis(GOVERNOR_WINDOW_MS);
+        let limit = self.limit.load(std::sync::atomic::Ordering::Relaxed);
+        let new_limit = if ewma > GOVERNOR_SLOW_MS && limit > self.min {
+            // Latency ballooned (per-client load shaping): back off hard.
+            (limit / 2).max(self.min)
+        } else if ewma < GOVERNOR_SLOW_MS / 2
+            && limit < self.max
+            && n >= GOVERNOR_REPROBE_WINDOWS * 4
+            && (n / 4).is_multiple_of(GOVERNOR_REPROBE_WINDOWS)
+        {
+            // Latency healthy again after a shrink: probe one step up.
+            limit + 1
+        } else {
+            limit
+        };
+        if new_limit != limit {
+            self.limit
+                .store(new_limit, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
 struct PipelineClock {
     start: std::sync::Mutex<Option<Instant>>,
     end: std::sync::Mutex<Option<Instant>>,
@@ -1355,6 +1474,7 @@ fn spawn_fetch_pipeline<'scope, 'env>(
     // (network-bound) pipeline window instead of running after it. The
     // unbounded channel never blocks an extractor; the stager dies silently
     // on any staging error and the batched build takes over.
+    let governor = Arc::new(DownloadGovernor::new(download_workers));
     let volume_stage_tx = prestaged_slot.map(|slot| {
         let (stage_tx, stage_rx) =
             std::sync::mpsc::channel::<(String, bpm::integrity::ArtifactId, bool)>();
@@ -1382,6 +1502,7 @@ fn spawn_fetch_pipeline<'scope, 'env>(
         let http = http.clone();
         let remote = remote.cloned();
         let clock = Arc::clone(&clock);
+        let governor = Arc::clone(&governor);
         downloaders.push(scope.spawn(move || -> Result<Metrics, FetchFail> {
             clock.mark_start();
             let mut local = Metrics::new();
@@ -1399,6 +1520,8 @@ fn spawn_fetch_pipeline<'scope, 'env>(
                     continue;
                 }
                 let speculative = item.path.is_none();
+                governor.acquire();
+                let dl_start = Instant::now();
                 let result = if let Some(remote) = remote.as_ref() {
                     store
                         .ensure_artifact_with_remote(
@@ -1428,6 +1551,18 @@ fn spawn_fetch_pipeline<'scope, 'env>(
                     url: item.url.clone(),
                     source: Box::new(source),
                 });
+                // Cache hits carry no congestion signal; only fresh network
+                // downloads feed the governor, with their transferred size.
+                let network = result
+                    .as_ref()
+                    .ok()
+                    .filter(|pending| !pending.artifact.cached)
+                    .and_then(|pending| {
+                        std::fs::metadata(store.artifact_path(&pending.artifact.id))
+                            .ok()
+                            .map(|meta| (dl_start.elapsed(), meta.len()))
+                    });
+                governor.release(network);
                 // Lookahead hints are deliberately best-effort. If metadata
                 // selected an artifact that placement later rejects (or the
                 // speculative fetch itself fails), only an authoritative

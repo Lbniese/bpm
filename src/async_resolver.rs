@@ -91,14 +91,25 @@ pub enum AsyncResolveError {
 /// `HttpClient` configuration (user-agent, timeout, auth token handling).
 fn build_async_client(config: &NpmConfig) -> reqwest::Client {
     let timeout = config.network.fetch_timeout;
-    reqwest::Client::builder()
+    let use_http2 = std::env::var("BPM_HTTP2")
+        .ok()
+        .and_then(|v| v.parse::<u8>().ok())
+        .unwrap_or(1)
+        != 0;
+    let builder = reqwest::Client::builder()
         .user_agent(concat!("bpm/", env!("CARGO_PKG_VERSION"), " (async)"))
-        .timeout(timeout)
-        // npm registry traffic commonly remains HTTP/1.1. Keep enough idle
-        // connections for the bounded prefetch fan-out so sibling requests
-        // can reuse established TLS connections instead of paying setup cost
-        // repeatedly. HTTP/2 negotiation remains enabled when the registry
-        // supports it; this pool setting is harmless in that mode.
+        .timeout(timeout);
+    let builder = if use_http2 {
+        builder
+    } else {
+        builder.http1_only()
+    };
+    // Keep enough idle connections for the bounded prefetch fan-out so
+    // sibling requests reuse established TLS connections instead of paying
+    // setup cost repeatedly. Under per-connection stream shaping (observed
+    // on the real registry), HTTP/1.1 with a wide pool spreads concurrent
+    // requests across connections; BPM_HTTP2=0 selects that mode.
+    builder
         .pool_max_idle_per_host(64)
         .pool_idle_timeout(std::time::Duration::from_secs(90))
         .tcp_keepalive(std::time::Duration::from_secs(30))
