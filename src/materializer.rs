@@ -703,7 +703,8 @@ fn link_tree_by_walking_directory(
 fn parse_image_index(
     index_path: &Path,
 ) -> Result<Vec<crate::package_image::IndexEntry>, MaterializeError> {
-    let mut file = fs::File::open(index_path).map_err(|source| io_err(index_path, source))?;
+    let file = fs::File::open(index_path).map_err(|source| io_err(index_path, source))?;
+    let mut file = std::io::BufReader::new(file);
     crate::package_image::decode_index(&mut file).map_err(|error| MaterializeError::Io {
         path: index_path.display().to_string(),
         source: std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()),
@@ -1834,6 +1835,121 @@ mod tests {
         assert_eq!(caps.preferred_backend(), MaterializeBackend::Reflink);
         assert!(caps.symlink);
         assert!(caps.hardlink);
+    }
+
+    #[test]
+    fn parse_image_index_matches_unbuffered_decoder() {
+        use crate::package_image::{decode_index, encode, from_directory_index, Entry};
+
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().join("image");
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::write(root.join("a.txt"), b"alpha").unwrap();
+        fs::write(root.join("sub/b.txt"), b"beta").unwrap();
+        let mut entries = vec![
+            Entry::File {
+                path: "a.txt".into(),
+                bytes: b"alpha".to_vec(),
+            },
+            Entry::File {
+                path: "sub/b.txt".into(),
+                bytes: b"beta".to_vec(),
+            },
+        ];
+        if cfg!(unix) {
+            make_symlink(Path::new("../a.txt"), &root.join("sub/link")).unwrap();
+            entries.push(Entry::Symlink {
+                path: "sub/link".into(),
+                target: "../a.txt".into(),
+            });
+        }
+        let index_path = tmp.path().join("image.bpi");
+        let metadata = from_directory_index(&root).unwrap();
+        let expected = decode_index(&mut std::io::Cursor::new(&metadata)).unwrap();
+        for bytes in [metadata, encode(&entries).unwrap()] {
+            fs::write(&index_path, &bytes).unwrap();
+            assert_eq!(parse_image_index(&index_path).unwrap(), expected);
+            assert_eq!(
+                parse_image_index(&index_path).unwrap(),
+                decode_index(&mut fs::File::open(&index_path).unwrap()).unwrap()
+            );
+
+            let mut trailing = bytes.clone();
+            trailing.push(0);
+            for malformed in (0..bytes.len())
+                .map(|end| &bytes[..end])
+                .chain(std::iter::once(trailing.as_slice()))
+            {
+                fs::write(&index_path, malformed).unwrap();
+                let expected_error =
+                    decode_index(&mut fs::File::open(&index_path).unwrap()).unwrap_err();
+                match parse_image_index(&index_path).unwrap_err() {
+                    MaterializeError::Io { path, source } => {
+                        assert_eq!(path, index_path.display().to_string());
+                        assert_eq!(source.kind(), std::io::ErrorKind::InvalidData);
+                        assert_eq!(source.to_string(), expected_error.to_string());
+                    }
+                    error => panic!("unexpected error: {error}"),
+                }
+            }
+        }
+    }
+
+    /// Warm-cache, real-file parser timing; fixture creation is not timed.
+    #[test]
+    #[ignore = "release timing: run with --release --ignored --nocapture"]
+    fn parse_image_index_release_timing() {
+        use crate::package_image::{encode, from_directory_index, Entry};
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const ENTRIES: usize = 10_000;
+        const SAMPLES: usize = 21;
+        const ITERATIONS: u32 = 3;
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().join("image");
+        fs::create_dir(&root).unwrap();
+        for i in 0..ENTRIES {
+            fs::write(root.join(format!("file-{i:05}.js")), b"x").unwrap();
+        }
+        let metadata_path = tmp.path().join("metadata.bpi");
+        fs::write(&metadata_path, from_directory_index(&root).unwrap()).unwrap();
+        let mut inputs = vec![("metadata".to_string(), metadata_path)];
+        for payload_size in [1024, 16_384] {
+            let entries: Vec<_> = (0..ENTRIES)
+                .map(|i| Entry::File {
+                    path: format!("file-{i:05}.js"),
+                    bytes: vec![b'x'; payload_size],
+                })
+                .collect();
+            let label = format!("legacy-{payload_size}");
+            let path = tmp.path().join(format!("{label}.bpi"));
+            fs::write(&path, encode(&entries).unwrap()).unwrap();
+            inputs.push((label, path));
+        }
+
+        for (label, path) in inputs {
+            for _ in 0..3 {
+                assert_eq!(
+                    black_box(parse_image_index(black_box(&path)).unwrap()).len(),
+                    ENTRIES
+                );
+            }
+            let mut samples = Vec::with_capacity(SAMPLES);
+            for _ in 0..SAMPLES {
+                let start = Instant::now();
+                for _ in 0..ITERATIONS {
+                    black_box(parse_image_index(black_box(&path)).unwrap());
+                }
+                samples.push(start.elapsed() / ITERATIONS);
+            }
+            samples.sort_unstable();
+            eprintln!(
+                "{label}: entries={ENTRIES} bytes={} samples={SAMPLES} iterations={ITERATIONS} median={:.3} us/parse",
+                fs::metadata(&path).unwrap().len(),
+                samples[SAMPLES / 2].as_secs_f64() * 1_000_000.0
+            );
+        }
     }
 
     #[cfg(unix)]
