@@ -29,7 +29,7 @@ mod codes {
     pub const DECLARED_DEPENDENCIES: &str = "DECLARED_DEPENDENCIES";
     pub const LIFECYCLE_SCRIPTS: &str = "LIFECYCLE_SCRIPTS";
     pub const NATIVE_ADDON: &str = "NATIVE_ADDON";
-    pub const WORKSPACES_UNSUPPORTED: &str = "WORKSPACES_UNSUPPORTED";
+    pub const WORKSPACES_DECLARED: &str = "WORKSPACES_DECLARED";
     pub const OVERRIDES_DECLARED: &str = "OVERRIDES_DECLARED";
     pub const ENGINES_NODE: &str = "ENGINES_NODE";
 }
@@ -248,7 +248,7 @@ fn inspect(manifest: &PackageManifest, project_root: &Path, diagnostics: &mut Ve
         diagnostics.push(info(
             codes::DECLARED_DEPENDENCIES,
             format!(
-                "{dep_count} declared dependencies; this BPM build cannot install dependencies yet"
+                "declared dependency entries across dependencies, devDependencies, peerDependencies, and optionalDependencies: {dep_count}"
             ),
         ));
     }
@@ -258,7 +258,7 @@ fn inspect(manifest: &PackageManifest, project_root: &Path, diagnostics: &mut Ve
             info(
                 codes::LIFECYCLE_SCRIPTS,
                 format!(
-                    "{} lifecycle scripts declared; not executed by this BPM build",
+                    "declared package scripts: {}; install lifecycle execution is controlled by lifecycle names and --ignore-scripts",
                     manifest.scripts.len()
                 ),
             )
@@ -269,15 +269,15 @@ fn inspect(manifest: &PackageManifest, project_root: &Path, diagnostics: &mut Ve
     if looks_like_native_addon(manifest, project_root) {
         diagnostics.push(warn(
             codes::NATIVE_ADDON,
-            "native addon dependencies or a binding.gyp detected; compilation is not yet supported",
+            "native-build indicator detected (binding.gyp or a known build helper); install success may depend on lifecycle scripts and the local native toolchain",
         ));
     }
 
-    if manifest.workspaces.is_some() {
+    if let Some(workspaces) = &manifest.workspaces {
         diagnostics.push(
-            warn(
-                codes::WORKSPACES_UNSUPPORTED,
-                "\"workspaces\" declared; native workspace linking is supported for the configured workspace subset",
+            info(
+                codes::WORKSPACES_DECLARED,
+                format!("declared workspace patterns: {}; compatibility depends on the workspace layout and dependency specifications", workspaces.patterns().len()),
             )
             .with_field("workspaces"),
         );

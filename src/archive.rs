@@ -11,12 +11,16 @@
 //! - device/fifo/hardlink/other unsupported entry types
 //! - symlinks whose target escapes the image root (prevents following an
 //!   attacker-controlled link to write outside the store)
-//! - duplicate entries (suspicious in package tarballs, rejected for safety)
+//! - duplicate entries: repeated regular files follow npm's
+//!   last-write-wins convention (agent-base@7.1.4 ships `package/./x` and
+//!   `package/x`); any other duplicate type pair is rejected
 //!
 //! Permissions: executable bits from the archive are preserved, but setuid /
 //! setgid / sticky bits and world-write are dropped (IMPLEMENTATION §21:
 //! "avoid world-writable store paths").
 
+use std::collections::HashMap;
+#[cfg(windows)]
 use std::collections::HashSet;
 use std::fs;
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -211,7 +215,10 @@ fn extract_with_limits(
         .entries()
         .map_err(|e| ExtractError::InvalidArchive(format!("cannot enumerate tar entries: {e}")))?;
 
-    let mut seen: HashSet<PathBuf> = HashSet::new();
+    // Path -> entry type of the first occurrence. Duplicate regular-file
+    // entries are tolerated with npm's last-write-wins semantics; any other
+    // duplicate pair stays an error (see the check below).
+    let mut seen: HashMap<PathBuf, tar::EntryType> = HashMap::new();
     // The mode `File::create` actually produces for a fresh file under this
     // process's umask, learned once from the first extracted file. npm
     // tarballs are almost entirely mode 0o644, which equals that created mode
@@ -242,8 +249,25 @@ fn extract_with_limits(
         // Charge every tar header toward the entry budget before duplicate
         // detection so an entry-heavy archive cannot force unbounded work.
         budget.observe_entry(Some(&rel))?;
-        if !seen.insert(rel.clone()) {
-            return Err(ExtractError::DuplicateEntry(rel.display().to_string()));
+        let entry_type = entry.header().entry_type();
+        let is_regular = matches!(
+            entry_type,
+            tar::EntryType::Regular | tar::EntryType::Continuous
+        );
+        if let Some(previous) = seen.insert(rel.clone(), entry_type) {
+            let previous_regular = matches!(
+                previous,
+                tar::EntryType::Regular | tar::EntryType::Continuous
+            );
+            // npm-packed tarballs occasionally repeat a regular-file path
+            // (e.g. both `package/./dist/index.js` and `package/dist/index.js`
+            // in agent-base@7.1.4). npm installs these with last-write-wins
+            // semantics, so repeat REGULAR entries are re-extracted instead of
+            // rejected; a regular entry colliding with a directory (or any
+            // other duplicate type pair) remains an error.
+            if !is_regular || !previous_regular {
+                return Err(ExtractError::DuplicateEntry(rel.display().to_string()));
+            }
         }
 
         let dest = image_root.join(&rel);

@@ -256,7 +256,7 @@ fn cli_import_metadata_roundtrips_through_ci() {
     .unwrap();
 
     let import = Command::new(env!("CARGO_BIN_EXE_bpm"))
-        .args(["import", "package-lock.json"])
+        .arg("import")
         .current_dir(project.path())
         .output()
         .unwrap();
@@ -303,6 +303,149 @@ fn cli_import_accepts_v2_packages_table() {
         .any(|package| package.name == "left-pad"));
 }
 
+#[cfg(unix)]
+#[test]
+fn cli_import_accepts_renamed_npm_locks_and_preserves_diagnostics() {
+    for content in [
+        REAL_V3.to_owned(),
+        real_v2_with_conflicting_legacy_dependencies(),
+    ] {
+        let mut value: serde_json::Value = serde_json::from_str(&content).unwrap();
+        value["packages"]["node_modules/left-pad"]["os"] = serde_json::json!(["linux"]);
+        let content = serde_json::to_vec(&value).unwrap();
+        for absolute in [false, true] {
+            for json in [false, true] {
+                let project = tempdir().unwrap();
+                let input_dir = project.path().join("input");
+                fs::create_dir(&input_dir).unwrap();
+                let input = input_dir.join("yarn.lock");
+                fs::write(&input, &content).unwrap();
+                fs::write(
+                    input_dir.join("package.json"),
+                    r#"{"devDependencies":{"left-pad":"^1.3.0"}}"#,
+                )
+                .unwrap();
+                let output = if json {
+                    project.path().join("converted.lock")
+                } else {
+                    input_dir.join("bpm.lock")
+                };
+                let mut command = Command::new(env!("CARGO_BIN_EXE_bpm"));
+                command
+                    .arg("import")
+                    .arg(if absolute {
+                        input.as_path()
+                    } else {
+                        std::path::Path::new("input/yarn.lock")
+                    })
+                    .current_dir(project.path());
+                if json {
+                    command.arg("--json").arg("--out").arg(&output);
+                }
+                let result = command.output().unwrap();
+                assert!(
+                    result.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+                let imported = Lockfile::from_path(&output).unwrap();
+                assert_eq!(imported.packages.len(), 2);
+                assert_eq!(
+                    imported.resolution.root.dev_dependencies["left-pad"],
+                    "^1.3.0"
+                );
+                assert_eq!(
+                    imported
+                        .packages
+                        .iter()
+                        .find(|p| p.name == "left-pad")
+                        .unwrap()
+                        .version,
+                    "1.3.0"
+                );
+                assert_eq!(fs::read(&input).unwrap(), content);
+                if json {
+                    let payload: serde_json::Value =
+                        serde_json::from_slice(&result.stdout).unwrap();
+                    assert_eq!(payload["package_count"], 2);
+                    assert_eq!(payload["wrote"], output.to_str().unwrap());
+                    assert_eq!(payload["diagnostics"][0]["code"], "PLATFORM_CONSTRAINT");
+                    assert_eq!(
+                        payload["lockfile"],
+                        serde_json::to_value(&imported).unwrap()
+                    );
+                    assert!(!input_dir.join("bpm.lock").exists());
+                } else {
+                    assert!(String::from_utf8_lossy(&result.stdout)
+                        .contains("imported 2 packages into "));
+                    assert!(String::from_utf8_lossy(&result.stderr)
+                        .contains("info[PLATFORM_CONSTRAINT]"));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn alternate_lock_inputs_fail_without_output() {
+    let cases = [
+        ("yarn.lock", "left-pad@^1.3.0:\n  version \"1.3.0\"\n  resolved \"https://registry/left-pad.tgz\"\n\nrepeat-string@^1.0.0:\n  version \"1.6.1\"\n  resolved \"https://registry/repeat-string.tgz\"\n", "failed to parse package-lock.json"),
+        ("pnpm-lock.yaml", "lockfileVersion: '9.0'\npackages:\n  /foo@1.0.0:\n    resolution: {tarball: https://registry/foo.tgz}\n", "failed to parse package-lock.json"),
+        ("bun.lock", r#"{"packages":{"foo@1.0.0":{"resolved":"https://registry/foo.tgz"}}}"#, "unsupported lockfileVersion 0"),
+        ("unknown.lock", "not a lockfile", "failed to parse package-lock.json"),
+        ("malformed.json", "{", "failed to parse package-lock.json"),
+        ("missing-version.json", r#"{"packages":{}}"#, "unsupported lockfileVersion 0"),
+        ("package-lock.json", r#"{"lockfileVersion":1,"packages":{}}"#, "unsupported lockfileVersion 1"),
+        ("future.json", r#"{"lockfileVersion":4,"packages":{}}"#, "unsupported lockfileVersion 4"),
+    ];
+    for (name, content, reason) in cases {
+        for explicit_out in [false, true] {
+            for existing_out in [false, true] {
+                let project = tempdir().unwrap();
+                let input = project.path().join(name);
+                fs::write(&input, content).unwrap();
+                let outputs = [
+                    project.path().join("bpm.lock"),
+                    project.path().join("converted.lock"),
+                ];
+                let original = existing_out.then_some(b"preserve existing output".as_slice());
+                if let Some(bytes) = original {
+                    for output in &outputs {
+                        fs::write(output, bytes).unwrap();
+                    }
+                }
+                let mut command = Command::new(env!("CARGO_BIN_EXE_bpm"));
+                command.args(["import", name]).current_dir(project.path());
+                if explicit_out {
+                    command.arg("--out").arg(&outputs[1]);
+                }
+                let result = command.output().unwrap();
+                let stderr = String::from_utf8_lossy(&result.stderr);
+                assert!(
+                    !result.status.success(),
+                    "{name} unexpectedly imported: {stderr}"
+                );
+                assert!(
+                    stderr.contains("bpm import accepts only npm package-lock.json v2/v3"),
+                    "{name}: {stderr}"
+                );
+                assert!(stderr.contains(reason), "{name}: {stderr}");
+                assert!(result.stdout.is_empty());
+                assert_eq!(fs::read(input).unwrap(), content.as_bytes());
+                for output in outputs {
+                    assert_eq!(
+                        fs::read(&output).ok().as_deref(),
+                        original,
+                        "{name}: {}",
+                        output.display()
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn nested_package_name_resolution() {
     // Nested node_modules copies resolve to the inner name.
@@ -339,4 +482,66 @@ fn bin_as_string_uses_package_name() {
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
     assert_eq!(bin.get("onebin").copied(), Some("./cli.js"));
+}
+
+#[test]
+fn import_derives_urls_for_npm11_lockfiles_and_repairs_aliases() {
+    // npm 11+ omits `resolved` for standard-registry packages, records
+    // bundled deps without standalone artifacts, and alias entries can carry
+    // a non-existent tarball URL under the alias path. The importer derives
+    // repairs all three instead of marking the packages unresolvable.
+    let json = r#"{
+            "name": "app",
+            "version": "1.0.0",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {"name": "app", "version": "1.0.0"},
+                "node_modules/pkg": {"version": "1.2.3"},
+                "node_modules/@scope/other": {"version": "2.0.0", "resolved": "https://registry.npmjs.org/@scope/other/node_modules/@scope/other/-/other-2.0.0.tgz", "integrity": "sha512-AAAA"},
+                "node_modules/alias": {"name": "real-pkg", "version": "3.1.0", "resolved": "https://registry.npmjs.org/alias/-/alias-3.1.0.tgz", "integrity": "sha512-BBBB"},
+                "node_modules/bundled-parent/node_modules/bundled-dep": {"version": "0.5.0", "inBundle": true}
+            }
+        }"#;
+
+    let report = import(json).expect("import should succeed");
+    let lockfile = &report.lockfile;
+
+    let entries: Vec<_> = lockfile
+        .packages
+        .iter()
+        .map(|p| (p.path.clone(), p.resolved.clone()))
+        .collect();
+
+    let find = |path: &str| {
+        entries
+            .iter()
+            .find(|(p, _)| p.as_str() == path)
+            .unwrap_or_else(|| panic!("missing entry for {path}"))
+            .1
+            .clone()
+    };
+
+    // npm-11 entry without `resolved` derives the standard tarball URL.
+    assert_eq!(
+        find("node_modules/pkg"),
+        "https://registry.npmjs.org/pkg/-/pkg-1.2.3.tgz"
+    );
+    // Nested bundled-style URL is flattened.
+    assert_eq!(
+        find("node_modules/@scope/other"),
+        "https://registry.npmjs.org/@scope/other/-/other-2.0.0.tgz"
+    );
+    // Alias entry points at the real package's tarball.
+    assert_eq!(
+        find("node_modules/alias"),
+        "https://registry.npmjs.org/real-pkg/-/real-pkg-3.1.0.tgz"
+    );
+    // Bundled dependencies are not installable packages.
+    assert!(
+        !lockfile
+            .packages
+            .iter()
+            .any(|p| p.path.ends_with("bundled-dep")),
+        "bundled deps must be skipped"
+    );
 }

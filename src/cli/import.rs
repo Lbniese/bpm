@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 
+use anyhow::Context;
 use bpm::lockfile::{Lockfile, BPM_LOCK_FILE};
 use bpm::project_lock::load_npm_package_lock;
 use serde::Serialize;
@@ -16,19 +17,11 @@ struct ImportJson<'a> {
 
 pub(super) fn run(path: Option<PathBuf>, out: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
     let input = path.unwrap_or_else(|| PathBuf::from("package-lock.json"));
-    let (lockfile, diagnostics) =
-        if input.file_name().and_then(|n| n.to_str()) == Some("package-lock.json") {
-            let bpm::ImportReport {
-                lockfile,
-                diagnostics,
-            } = load_npm_package_lock(&input)?;
-            (lockfile, diagnostics)
-        } else {
-            (
-                bpm::alternate_lock::import(&input).map_err(|e| anyhow::anyhow!(e.to_string()))?,
-                Vec::new(),
-            )
-        };
+    let bpm::ImportReport {
+        lockfile,
+        diagnostics,
+    } = load_npm_package_lock(&input)
+        .context("bpm import accepts only npm package-lock.json v2/v3")?;
     let out_path = out.unwrap_or_else(|| {
         input
             .parent()
