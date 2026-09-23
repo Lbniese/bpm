@@ -27,7 +27,9 @@ jobs:
             runner: macos-14
             use_cross: false
           - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
+            # ubuntu-22.04 (glibc 2.35) so the binary also runs on Debian
+            # bookworm-based images (oven/bun etc.) and older runners
+            runner: ubuntu-22.04
             use_cross: false
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-latest

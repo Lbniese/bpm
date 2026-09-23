@@ -8,6 +8,7 @@ use std::fs;
 use std::path::Path;
 
 use bpm::doctor::{run, DoctorReport};
+use bpm::{Diagnostic, Severity};
 
 use tempfile::tempdir;
 
@@ -21,6 +22,13 @@ fn codes(report: &DoctorReport) -> Vec<String> {
         .iter()
         .map(|d| d.code.to_string())
         .collect()
+}
+
+fn diagnostic<'a>(report: &'a DoctorReport, code: &str) -> &'a Diagnostic {
+    let mut matches = report.diagnostics.iter().filter(|d| d.code == code);
+    let diagnostic = matches.next().expect("diagnostic is present");
+    assert!(matches.next().is_none(), "duplicate diagnostic: {code}");
+    diagnostic
 }
 
 #[test]
@@ -48,8 +56,14 @@ fn reports_clean_manifest_with_declared_dependencies() {
     assert!(!report.has_error());
     assert_eq!(report.manifest.name.as_deref(), Some("app"));
     assert_eq!(report.manifest.declared_dependencies, 1);
-    assert!(codes(&report).contains(&"DECLARED_DEPENDENCIES".to_string()));
-    assert!(codes(&report).contains(&"LIFECYCLE_SCRIPTS".to_string()));
+    let dependencies = diagnostic(&report, "DECLARED_DEPENDENCIES");
+    assert_eq!(dependencies.message, "declared dependency entries across dependencies, devDependencies, peerDependencies, and optionalDependencies: 1");
+    assert_eq!(dependencies.severity, Severity::Info);
+    assert_eq!(dependencies.field, None);
+    let scripts = diagnostic(&report, "LIFECYCLE_SCRIPTS");
+    assert_eq!(scripts.message, "declared package scripts: 1; install lifecycle execution is controlled by lifecycle names and --ignore-scripts");
+    assert_eq!(scripts.severity, Severity::Info);
+    assert_eq!(scripts.field.as_deref(), Some("scripts"));
     assert!(!codes(&report).contains(&"MANIFEST_NAME_MISSING".to_string()));
 }
 
@@ -95,7 +109,10 @@ fn detects_native_addon_via_binding_gyp() {
     );
     write(root, "binding.gyp", r#"{}"#);
     let report = run(root);
-    assert!(codes(&report).contains(&"NATIVE_ADDON".to_string()));
+    let native = diagnostic(&report, "NATIVE_ADDON");
+    assert_eq!(native.message, "native-build indicator detected (binding.gyp or a known build helper); install success may depend on lifecycle scripts and the local native toolchain");
+    assert_eq!(native.severity, Severity::Warning);
+    assert_eq!(native.field, None);
 }
 
 #[test]
@@ -107,7 +124,10 @@ fn detects_native_addon_via_known_builder() {
         r#"{"name":"native","version":"1.0.0","devDependencies":{"node-gyp":"^10.0.0"}}"#,
     );
     let report = run(tmp.path());
-    assert!(codes(&report).contains(&"NATIVE_ADDON".to_string()));
+    let native = diagnostic(&report, "NATIVE_ADDON");
+    assert_eq!(native.message, "native-build indicator detected (binding.gyp or a known build helper); install success may depend on lifecycle scripts and the local native toolchain");
+    assert_eq!(native.severity, Severity::Warning);
+    assert_eq!(native.field, None);
 }
 
 #[test]
@@ -121,9 +141,14 @@ fn reports_workspaces_overrides_and_engines() {
     );
     let report = run(tmp.path());
     let c = codes(&report);
-    assert!(c.contains(&"WORKSPACES_UNSUPPORTED".to_string()));
-    assert!(c.contains(&"OVERRIDES_DECLARED".to_string()));
-    assert!(c.contains(&"ENGINES_NODE".to_string()));
+    assert_eq!(
+        c,
+        ["ENGINES_NODE", "OVERRIDES_DECLARED", "WORKSPACES_DECLARED"]
+    );
+    let workspaces = diagnostic(&report, "WORKSPACES_DECLARED");
+    assert_eq!(workspaces.message, "declared workspace patterns: 1; compatibility depends on the workspace layout and dependency specifications");
+    assert_eq!(workspaces.severity, Severity::Info);
+    assert_eq!(workspaces.field.as_deref(), Some("workspaces"));
     assert_eq!(report.manifest.workspaces, 1);
     assert_eq!(report.manifest.overrides, 1);
     assert_eq!(report.manifest.engines_node.as_deref(), Some(">=20"));
@@ -148,6 +173,10 @@ fn reports_peer_override_and_optional_dependency_diagnostics_together() {
     let actual = codes(&report);
 
     assert_eq!(report.manifest.declared_dependencies, 2);
+    let dependencies = diagnostic(&report, "DECLARED_DEPENDENCIES");
+    assert_eq!(dependencies.message, "declared dependency entries across dependencies, devDependencies, peerDependencies, and optionalDependencies: 2");
+    assert_eq!(dependencies.severity, Severity::Info);
+    assert_eq!(dependencies.field, None);
     assert_eq!(report.manifest.overrides, 1);
     assert_eq!(
         actual,

@@ -42,24 +42,7 @@ exit 1
             .expect("chmod");
     }
 
-    // Fake cargo: record arguments and exit 1 (toolchain not found path).
-    let cargo_script = bin.join("cargo");
-    let mut f = std::fs::File::create(&cargo_script).expect("create fake cargo");
-    write!(
-        f,
-        r#"#!/bin/sh
-echo "CARGO_ARGS: $@" >> "{marker}"
-exit 1
-"#,
-        marker = dir.path().join("cargo_args.txt").display()
-    )
-    .expect("write cargo script");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&cargo_script, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod");
-    }
+    stub_source_tools(dir.path());
 
     let path = format!(
         "{}:{}",
@@ -78,6 +61,9 @@ fn api_failure_falls_back_to_latest_redirect() {
 
     let output = Command::new("sh")
         .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/install.sh"))
+        .current_dir(dir.path())
+        .env_remove("BPM_VERSION")
+        .env("BPM_VERSION_EXPLICIT", "1") // Internal state must ignore the environment.
         .env("PATH", &path)
         .env("BPM_REPO", "https://github.com/Lbniese/bpm")
         .env("BPM_INSTALL_DIR", install_dir.to_str().unwrap())
@@ -111,6 +97,36 @@ fn api_failure_falls_back_to_latest_redirect() {
         !install_dir.join("bpm").exists(),
         "no bpm binary should be installed"
     );
+    let curl_args = std::fs::read_to_string(dir.path().join("curl_args.txt")).unwrap();
+    assert!(curl_args.contains("/releases/latest/download/"));
+    assert!(
+        dir.path().join("git_args.txt").exists(),
+        "latest mode must reach fake source fallback"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn api_discovered_version_still_allows_source_fallback() {
+    let (fake, path) = setup_fake_environment();
+    let curl = fake.path().join("bin/curl");
+    let script = std::fs::read_to_string(&curl).unwrap().replace(
+        "\nexit 1\n",
+        "\ncase \"$*\" in *api.github.com*) echo '{\"tag_name\":\"v0.3.0\"}'; exit 0 ;; esac\nexit 1\n",
+    );
+    std::fs::write(&curl, script).unwrap();
+    let install_dir = fake.path().join("install");
+    std::fs::create_dir(&install_dir).unwrap();
+    let out = installer_command(&path, Path::new(""), &install_dir)
+        .env("BPM_VERSION", "")
+        .env("BPM_VERSION_EXPLICIT", "1")
+        .output()
+        .unwrap();
+    assert!(!out.status.success()); // Fake git refuses the source clone.
+    let urls = std::fs::read_to_string(fake.path().join("curl_args.txt")).unwrap();
+    assert!(urls.contains("/releases/download/v0.3.0/"), "{urls}");
+    assert!(fake.path().join("git_args.txt").exists());
+    assert!(!install_dir.join("bpm").exists());
 }
 
 #[test]
@@ -122,6 +138,7 @@ fn explicit_version_uses_exact_asset_url() {
 
     let output = Command::new("sh")
         .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/install.sh"))
+        .current_dir(dir.path())
         .env("PATH", &path)
         .env("BPM_REPO", "https://github.com/Lbniese/bpm")
         .env("BPM_VERSION", "0.0.1")
@@ -138,14 +155,11 @@ fn explicit_version_uses_exact_asset_url() {
     );
 
     // Check curl arguments contain the exact version asset URL pattern.
-    let curl_args_path = dir.path().join("curl_args.txt");
-    if curl_args_path.exists() {
-        let args = std::fs::read_to_string(&curl_args_path).unwrap_or_default();
-        assert!(
-            args.contains("/releases/download/v0.0.1/"),
-            "curl arguments should contain exact version URL: {args}"
-        );
-    }
+    let args = std::fs::read_to_string(dir.path().join("curl_args.txt")).unwrap();
+    assert!(
+        args.contains("/releases/download/v0.0.1/"),
+        "exact version URL: {args}"
+    );
 }
 
 #[test]
@@ -157,6 +171,7 @@ fn invalid_version_override_is_rejected() {
 
     let output = Command::new("sh")
         .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/install.sh"))
+        .current_dir(dir.path())
         .env("PATH", &path)
         .env("BPM_REPO", "https://github.com/Lbniese/bpm")
         .env("BPM_VERSION", "-malicious")
@@ -207,6 +222,14 @@ fn host_platform() -> String {
 /// `SHA256SUMS`, and `SHA256SUMS.sig`. Returns the fixture directory.
 #[cfg(unix)]
 fn build_signed_release(root: &Path) -> PathBuf {
+    build_signed_release_with_binary(root, FAKE_BPM)
+}
+
+#[cfg(unix)]
+const FAKE_BPM: &str = "#!/bin/sh\ncase \"$1\" in\n  fetch) echo '  --registry <url>' ;;\n  install) echo '  --global' ;;\n  --version) echo 'bpm 0.3.0' ;;\nesac\n";
+
+#[cfg(unix)]
+fn build_signed_release_with_binary(root: &Path, binary: &str) -> PathBuf {
     let release = root.join("release");
     std::fs::create_dir_all(&release).unwrap();
     let key = release.join("key.pem");
@@ -235,16 +258,11 @@ fn build_signed_release(root: &Path) -> PathBuf {
         .unwrap();
     assert!(status.success(), "extract test public key");
 
-    // Fake bpm that satisfies verify_binary (--registry on fetch, bin
-    // directory on install).
+    // Fake bpm with the real CLI's stable capability and version tokens.
     let staging = root.join("staging");
     std::fs::create_dir_all(&staging).unwrap();
     let bpm = staging.join("bpm");
-    std::fs::write(
-        &bpm,
-        "#!/bin/sh\ncase \"$1\" in\n  fetch) echo '  --registry <url>' ;;\n  install) echo '  bin directory' ;;\nesac\n",
-    )
-    .unwrap();
+    std::fs::write(&bpm, binary).unwrap();
     make_executable(&bpm);
 
     let platform = host_platform();
@@ -301,6 +319,32 @@ fn make_executable(path: &Path) {
     std::fs::set_permissions(path, perms).unwrap();
 }
 
+#[cfg(unix)]
+fn stub_source_tools(root: &Path) {
+    for tool in ["cargo", "git"] {
+        let script = root.join("bin").join(tool);
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}/{tool}_args.txt'\nexit 1\n",
+                root.display()
+            ),
+        )
+        .unwrap();
+        make_executable(&script);
+    }
+}
+
+#[cfg(unix)]
+fn assert_no_source_fallback(root: &Path) {
+    for tool in ["cargo", "git"] {
+        assert!(
+            !root.join(format!("{tool}_args.txt")).exists(),
+            "unexpected {tool} invocation"
+        );
+    }
+}
+
 /// Build a PATH with a fake `curl` that serves the signed-release fixtures by
 /// URL suffix, an optional fake `openssl` (when `fake_openssl` is true), and
 /// the rest of the real PATH (for real tar/install/openssl).
@@ -316,6 +360,7 @@ fn release_path(fixture_dir: &Path, fake_openssl: bool) -> (tempfile::TempDir, S
         &curl_script,
         format!(
             r#"#!/bin/sh
+printf '%s\n' "$*" >> "{marker}"
 # Parse `-o <dest>` and the trailing URL from a minimal curl subset.
 dest=""
 url=""
@@ -334,15 +379,14 @@ case "$url" in
   *) exit 1 ;;
 esac
 "#,
-            fix = fixture.display()
+            fix = fixture.display(),
+            marker = dir.path().join("curl_args.txt").display()
         ),
     )
     .unwrap();
     make_executable(&curl_script);
 
-    let cargo_script = bin.join("cargo");
-    std::fs::write(&cargo_script, "#!/bin/sh\nexit 1\n").unwrap();
-    make_executable(&cargo_script);
+    stub_source_tools(dir.path());
 
     if fake_openssl {
         let openssl_script = bin.join("openssl");
@@ -360,14 +404,193 @@ esac
 
 #[cfg(unix)]
 fn run_installer(path: &str, pubkey: &Path, install_dir: &Path) -> std::process::Output {
-    Command::new("sh")
+    installer_command(path, pubkey, install_dir)
+        .output()
+        .expect("run install.sh")
+}
+
+#[cfg(unix)]
+fn installer_command(path: &str, pubkey: &Path, install_dir: &Path) -> Command {
+    let mut command = Command::new("sh");
+    command
         .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/install.sh"))
+        .current_dir(install_dir.parent().unwrap())
+        .env_remove("BPM_VERSION")
         .env("PATH", path)
         .env("BPM_REPO", "https://github.com/Lbniese/bpm")
         .env("BPM_INSTALL_DIR", install_dir.to_str().unwrap())
-        .env("_BPM_TEST_PUBKEY_FILE", pubkey)
-        .output()
-        .expect("run install.sh")
+        .env("_BPM_TEST_PUBKEY_FILE", pubkey);
+    command
+}
+
+#[test]
+#[cfg(unix)]
+fn explicit_version_normalization() {
+    for requested in [
+        "0.3.0",
+        "v0.3.0",
+        "1.2.3-0",
+        "v1.2.3-rc.1",
+        "1.2.3-rc01",
+        "1.2.3-x-1",
+    ] {
+        let version = requested.strip_prefix('v').unwrap_or(requested);
+        let root = tempfile::tempdir().unwrap();
+        let fixture =
+            build_signed_release_with_binary(root.path(), &FAKE_BPM.replace("0.3.0", version));
+        let (fake, path) = release_path(&fixture, false);
+        let install_dir = root.path().join("install");
+        std::fs::create_dir(&install_dir).unwrap();
+        let out = installer_command(&path, &fixture.join("pubkey.pem"), &install_dir)
+            .env("BPM_VERSION", requested)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{requested}: {} {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let urls = std::fs::read_to_string(fake.path().join("curl_args.txt")).unwrap();
+        assert_eq!(urls.lines().count(), 3);
+        assert!(
+            urls.lines()
+                .all(|line| line.contains(&format!("/releases/download/v{version}/"))),
+            "{urls}"
+        );
+        let installed = Command::new(install_dir.join("bpm"))
+            .arg("--version")
+            .output()
+            .unwrap();
+        assert!(installed.status.success());
+        assert_eq!(
+            String::from_utf8(installed.stdout).unwrap(),
+            format!("bpm {version}\n")
+        );
+        assert_no_source_fallback(fake.path());
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn explicit_version_rejects_invalid_grammar_before_tools() {
+    for version in [
+        "vv1.2.3",
+        "V1.2.3",
+        "v",
+        "1.2",
+        "1.2.3.4",
+        "01.2.3",
+        "1.02.3",
+        "1.2.03",
+        "1.2.3-01",
+        "1.2.3-rc.01",
+        "1.2.3-",
+        "1.2.3-.rc",
+        "1.2.3-rc.",
+        "1.2.3-rc..1",
+        "1.2.3+build",
+        " 1.2.3",
+        "1.2.3 ",
+        "1.2.3\n",
+        "1.2.3\r",
+        "1.2.3\t",
+        "1.2.3\n4.5.6",
+        "1.2.3/path",
+        "1.2.3;true",
+        "1.2.3-å",
+        "1.2.3-rc_1",
+    ] {
+        let (fake, path) = setup_fake_environment();
+        let install_dir = fake.path().join("install");
+        std::fs::create_dir(&install_dir).unwrap();
+        let out = installer_command(&path, &fake.path().join("unused.pem"), &install_dir)
+            .env("BPM_VERSION", version)
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "accepted {version:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("Invalid BPM_VERSION"),
+            "{version:?}"
+        );
+        assert!(
+            !fake.path().join("curl_args.txt").exists(),
+            "download attempted for {version:?}"
+        );
+        assert_no_source_fallback(fake.path());
+        assert!(!install_dir.join("bpm").exists());
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn explicit_version_failures_never_fall_back() {
+    for failure in [
+        "missing",
+        "platform",
+        "signature",
+        "checksum",
+        "openssl",
+        "capability",
+        "help-status",
+        "version",
+        "version-status",
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let binary = match failure {
+            "capability" => FAKE_BPM.replace("--global", "--obsolete"),
+            "help-status" => FAKE_BPM.replace("echo '  --global'", "echo '  --global'; exit 1"),
+            "version" => FAKE_BPM.replace("0.3.0", "0.3.1"),
+            "version-status" => FAKE_BPM.replace("echo 'bpm 0.3.0'", "echo 'bpm 0.3.0'; exit 1"),
+            _ => FAKE_BPM.to_string(),
+        };
+        let fixture = build_signed_release_with_binary(root.path(), &binary);
+        let tarball = fixture.join(format!("bpm-{}.tar.gz", host_platform()));
+        match failure {
+            "missing" => std::fs::remove_file(&tarball).unwrap(),
+            "signature" => std::fs::write(fixture.join("SHA256SUMS.sig"), b"invalid").unwrap(),
+            "checksum" => std::fs::write(&tarball, b"invalid").unwrap(),
+            _ => {}
+        }
+        let (fake, path) = release_path(&fixture, failure == "openssl");
+        if failure == "platform" {
+            let uname = fake.path().join("bin/uname");
+            std::fs::write(&uname, "#!/bin/sh\necho unsupported\n").unwrap();
+            make_executable(&uname);
+        }
+        let install_dir = root.path().join("install");
+        std::fs::create_dir(&install_dir).unwrap();
+        let out = installer_command(&path, &fixture.join("pubkey.pem"), &install_dir)
+            .env("BPM_VERSION", "v0.3.0")
+            .env("BPM_VERSION_EXPLICIT", "0")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(!out.status.success(), "accepted {failure}: {stdout}");
+        assert!(
+            stdout.contains("v0.3.0") && stdout.contains("source fallback is refused"),
+            "{failure}: {stdout}"
+        );
+        assert!(
+            !stdout.contains("falling back to source"),
+            "{failure}: {stdout}"
+        );
+        assert!(!install_dir.join("bpm").exists(), "installed {failure}");
+        assert_no_source_fallback(fake.path());
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn real_cli_exposes_installer_capability_tokens() {
+    for (command, token) in [("fetch", "--registry"), ("install", "--global")] {
+        let output = Command::new(env!("CARGO_BIN_EXE_bpm"))
+            .args([command, "--help"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains(token));
+    }
 }
 
 #[test]
@@ -460,11 +683,7 @@ fn unsafe_archive_with_extra_file_is_rejected() {
     let staging = root.path().join("unsafe-staging");
     std::fs::create_dir_all(&staging).unwrap();
     let bpm = staging.join("bpm");
-    std::fs::write(
-        &bpm,
-        "#!/bin/sh\ncase \"$1\" in\n  fetch) echo '  --registry <url>' ;;\n  install) echo '  bin directory' ;;\nesac\n",
-    )
-    .unwrap();
+    std::fs::write(&bpm, FAKE_BPM).unwrap();
     make_executable(&bpm);
     std::fs::write(staging.join("evil"), "pwned").unwrap();
     let platform = host_platform();
@@ -495,16 +714,22 @@ fn unsafe_archive_with_extra_file_is_rejected() {
         .unwrap();
     assert!(status.success());
 
-    let (_fake, path) = release_path(&fixture, false);
+    let (fake, path) = release_path(&fixture, false);
     let install_dir = root.path().join("install");
     std::fs::create_dir_all(&install_dir).unwrap();
-    let out = run_installer(&path, &pubkey, &install_dir);
+    let out = installer_command(&path, &pubkey, &install_dir)
+        .env("BPM_VERSION", "0.3.0")
+        .output()
+        .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("archive shape unsafe"),
         "expected unsafe-archive rejection; stdout: {stdout}"
     );
+    assert!(!out.status.success());
+    assert!(stdout.contains("source fallback is refused"));
     assert!(!install_dir.join("bpm").exists());
+    assert_no_source_fallback(fake.path());
 }
 
 #[test]

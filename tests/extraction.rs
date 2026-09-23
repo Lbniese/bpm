@@ -153,13 +153,18 @@ fn rejects_malformed_archive() {
 }
 
 #[test]
-fn rejects_duplicate_entries() {
+fn duplicate_regular_entries_use_last_write_wins() {
+    // npm tolerates repeated regular-file paths (agent-base@7.1.4 ships both
+    // `package/./dist/index.js` and `package/dist/index.js`); the last entry
+    // wins, matching npm's installer.
+    let tmp = tempfile::tempdir().unwrap();
     let tgz = build_tgz(|b| {
         add_file(b, "package/x.js", 0o644, b"first");
         add_file(b, "package/x.js", 0o644, b"second");
     });
-    let msg = must_reject(&tgz);
-    assert!(msg.contains("duplicate"), "got: {msg}");
+    extract_archive(&tgz, tmp.path()).unwrap();
+    let contents = fs::read(tmp.path().join("x.js")).unwrap();
+    assert_eq!(contents, b"second", "last duplicate entry should win");
 }
 
 #[test]

@@ -90,6 +90,12 @@ struct RawPkg {
     dev: Option<bool>,
     #[serde(default)]
     optional: Option<bool>,
+    /// True for dependencies bundled inside their parent package's tarball.
+    /// npm lists them in the lock for completeness, but they have no
+    /// standalone registry artifact (their recorded `resolved` URLs 404),
+    /// so the importer must not treat them as installable packages.
+    #[serde(default, rename = "inBundle")]
+    in_bundle: Option<bool>,
     #[serde(default)]
     bin: serde_json::Value,
     #[serde(default)]
@@ -151,6 +157,17 @@ pub fn package_name_from_path(path: &str) -> String {
         // path segment as the name.
         None => path.rsplit('/').next().unwrap_or(path).to_string(),
     }
+}
+
+/// Derive the standard npm registry tarball URL for a package version.
+///
+/// npm 11+ omits `resolved` for standard-registry packages (the URL is
+/// derivable from name + version), and alias entries sometimes record a
+/// tarball path under the alias name that does not exist on the registry.
+/// Both reconstruct to `https://registry.npmjs.org/<name>/-/<base>-<version>.tgz`.
+fn derive_registry_url(name: &str, version: &str) -> String {
+    let base = name.rsplit('/').next().unwrap_or(name);
+    format!("https://registry.npmjs.org/{name}/-/{base}-{version}.tgz")
 }
 
 fn parse_bin(
@@ -255,6 +272,12 @@ pub fn import(json: &str) -> Result<ImportReport, NpmLockError> {
             continue;
         }
 
+        // Bundled dependencies ship inside their parent's tarball; they have
+        // no standalone registry artifact to install.
+        if pkg.in_bundle.unwrap_or(false) {
+            continue;
+        }
+
         let link_target = link
             .then(|| pkg.resolved.clone())
             .flatten()
@@ -279,17 +302,43 @@ pub fn import(json: &str) -> Result<ImportReport, NpmLockError> {
             ));
         }
 
-        let resolved = pkg.resolved.clone().unwrap_or_default();
+        let mut resolved = pkg.resolved.clone().unwrap_or_default();
         let integrity = pkg.integrity.clone();
-        if !link && resolved.is_empty() {
-            diagnostics.push(warn(
-                "MISSING_RESOLVED",
-                name.clone(),
-                format!(
-                    "package \"{name}\" at {path} has no resolved URL; \
-                     it cannot be installed from a registry"
-                ),
-            ));
+        if !link {
+            // npm 11+ omits `resolved` for standard-registry packages, and
+            // nested bundled placements record parent-tarball URLs that 404.
+            // Both are derivable from the (canonical) package name + version.
+            let source_name = pkg.name.as_deref().unwrap_or(&name);
+            if (resolved.is_empty() || resolved.contains("/node_modules/"))
+                && !source_name.is_empty()
+                && !version.is_empty()
+            {
+                resolved = derive_registry_url(source_name, &version);
+            }
+            // Alias entries (`"alias": "npm:real@^1"`) sometimes record the
+            // tarball under the alias name, which does not exist on the
+            // registry; the real package name is the canonical one.
+            if let Some(real_name) = pkg.name.as_deref() {
+                if real_name != name {
+                    let real_base = real_name.rsplit('/').next().unwrap_or(real_name);
+                    let real_url = format!(
+                        "https://registry.npmjs.org/{real_name}/-/{real_base}-{version}.tgz"
+                    );
+                    if !resolved.contains(&format!("/{real_name}/-")) {
+                        resolved = real_url;
+                    }
+                }
+            }
+            if resolved.is_empty() {
+                diagnostics.push(warn(
+                    "MISSING_RESOLVED",
+                    name.clone(),
+                    format!(
+                        "package \"{name}\" at {path} has no resolved URL; \
+                         it cannot be installed from a registry"
+                    ),
+                ));
+            }
         }
 
         let bin = parse_bin(path, &name, &pkg.bin)?;
@@ -352,6 +401,77 @@ pub fn import(json: &str) -> Result<ImportReport, NpmLockError> {
                 dependencies
             },
         });
+    }
+
+    // Some lockfile placements omit `integrity` (nested copies, npm 11
+    // optimizations). The same name+version always resolves to the same
+    // registry artifact, so an integrity recorded on any placement fills
+    // the rest; truly unverifiable entries keep failing the frozen check.
+    let integrity_by_artifact: BTreeMap<(String, String), String> = lockfile
+        .packages
+        .iter()
+        .filter(|p| !p.link)
+        .filter_map(|p| {
+            p.integrity
+                .clone()
+                .map(|i| ((p.name.clone(), p.version.clone()), i))
+        })
+        .collect();
+    for entry in &mut lockfile.packages {
+        if entry.integrity.is_none() && !entry.link {
+            if let Some(integrity) =
+                integrity_by_artifact.get(&(entry.name.clone(), entry.version.clone()))
+            {
+                entry.integrity = Some(integrity.clone());
+            }
+        }
+    }
+
+    // Rare npm 11 entries record neither `resolved` nor `integrity`. The
+    // derived registry URL is known at this point, so fetch the tarball and
+    // compute the integrity hash here; without it a frozen install could
+    // never verify the package. Failures fall back to a diagnostic and keep
+    // the entry unverifiable rather than fabricating a hash.
+    let needs_fetch: Vec<(usize, String)> = lockfile
+        .packages
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| {
+            !p.link
+                && p.integrity.is_none()
+                && p.resolved.starts_with("https://registry.npmjs.org/")
+        })
+        .map(|(i, p)| (i, p.resolved.clone()))
+        .collect();
+    if !needs_fetch.is_empty() {
+        let client = crate::http::HttpClient::new(crate::config::NpmConfig::default());
+        for (index, url) in needs_fetch {
+            let fetched = client
+                .get(&url)
+                .ok()
+                .filter(|response| response.status() == 200)
+                .map(|response| response.into_reader().into_inner());
+            let digest = fetched
+                .as_deref()
+                .map(crate::integrity::Sha512Digest::hash_bytes);
+            if let Some(digest) = digest {
+                lockfile.packages[index].integrity =
+                    Some(crate::integrity::Integrity::sha512(digest).to_npm_string());
+            } else {
+                let entry = &lockfile.packages[index];
+                diagnostics.push(warn(
+                    "MISSING_INTEGRITY",
+                    entry.name.clone(),
+                    format!(
+                        "package \"{name}\" at {path}: could not fetch {url} to compute \
+                         integrity; frozen installs will reject it",
+                        name = entry.name,
+                        path = entry.path,
+                        url = url
+                    ),
+                ));
+            }
+        }
     }
 
     lockfile.sort_packages();
