@@ -14,6 +14,7 @@ set -eu
 
 BPM_REPO="${BPM_REPO:-https://github.com/Lbniese/bpm}"
 BPM_INSTALL_DIR="${BPM_INSTALL_DIR:-/usr/local/bin}"
+BPM_VERSION_EXPLICIT=0
 
 INSTALL_URL="https://raw.githubusercontent.com/Lbniese/bpm/main/install.sh"
 
@@ -55,6 +56,33 @@ EOF
     fi
 }
 
+# Validate a release pin and print its bare version. Filter control bytes before
+# passing the value to line-oriented tools; keep numeric checks string-based.
+normalize_version() (
+    LC_ALL=C
+    export LC_ALL
+    case "$1" in
+        ''|*[!0-9A-Za-z.-]*) return 1 ;;
+    esac
+    printf '%s\n' "${1#v}" | awk '
+        {
+            version = $0
+            dash = index(version, "-")
+            core = dash ? substr(version, 1, dash - 1) : version
+            if (split(core, parts, ".") != 3) exit 1
+            for (i = 1; i <= 3; i++)
+                if (parts[i] !~ /^(0|[1-9][0-9]*)$/) exit 1
+            if (dash) {
+                count = split(substr(version, dash + 1), parts, ".")
+                if (!count) exit 1
+                for (i = 1; i <= count; i++)
+                    if (parts[i] !~ /^[0-9A-Za-z-]+$/ || parts[i] ~ /^0[0-9]+$/) exit 1
+            }
+            print version
+        }
+    '
+)
+
 # Resolve the release version to download.
 # - If BPM_VERSION is set and non-empty, use it exactly (after validation).
 # - Otherwise, try the GitHub API for the latest release tag.
@@ -62,13 +90,9 @@ EOF
 #   latest-asset redirect URL in try_prebuilt.
 resolve_version() {
     if [ -n "${BPM_VERSION:-}" ]; then
-        # Validate: reject values starting with '-' (option injection) or
-        # containing shell separators.
-        case "$BPM_VERSION" in
-            -*|*/*|*\ *)
-                die "Invalid BPM_VERSION: $BPM_VERSION"
-                ;;
-        esac
+        BPM_VERSION=$(normalize_version "$BPM_VERSION") ||
+            die "Invalid BPM_VERSION: expected [v]MAJOR.MINOR.PATCH with an optional prerelease suffix"
+        BPM_VERSION_EXPLICIT=1
         return 0
     fi
     # Try the GitHub API for the latest release tag.
@@ -104,21 +128,20 @@ install_binary() {
     sudo install -m 755 "$src" "$dst"
 }
 
-# Return 0 iff the downloaded binary actually supports npm-style package-name
-# resolution (the `fetch` command exposes a `--registry` flag). Pre-built
-# release assets that predate the registry feature lack this flag and would
-# fail on `bpm fetch lodash` with `RelativeUrlWithoutBase`; we detect that and
-# fall back to a source build instead of shipping a broken binary.
-#
-# $1 = path to the candidate binary.
-# Reject binaries that lack the npm-name resolution (`--registry` on `fetch`)
-# or the single-package bin install (`bin directory` on `install`). Either
-# gap means the asset is a stale pre-feature build that would fail real use.
+# Require stable CLI capability tokens and, for an explicit pin, exact version
+# identity. $1 is the verified candidate; $2 is an optional expected bare version.
 verify_binary() {
     bin=$1
     [ -x "$bin" ] || return 1
-    "$bin" fetch --help 2>&1 | grep -q -- '--registry' && \
-        "$bin" install --help 2>&1 | grep -q -- 'bin directory'
+    fetch_help=$("$bin" fetch --help 2>&1) || return 1
+    install_help=$("$bin" install --help 2>&1) || return 1
+    case "$fetch_help" in *--registry*) ;; *) return 1 ;; esac
+    case "$install_help" in *--global*) ;; *) return 1 ;; esac
+    if [ -n "${2:-}" ]; then
+        candidate_version=$("$bin" --version) || return 1
+        [ "$candidate_version" = "bpm $2" ] || return 1
+    fi
+    return 0
 }
 
 # Verify a release asset before extraction or execution.
@@ -128,7 +151,7 @@ verify_binary() {
 # exact platform tarball line, verifies the archive hash, inspects the archive
 # shape, and only then extracts and executes. Any failure (missing verifier,
 # missing/invalid signature, bad checksum, unsafe archive) returns nonzero so
-# the caller falls back to a source build. Checksums alone are NOT trusted —
+# the caller refuses an explicit pin or falls back in latest mode. Checksums alone are NOT trusted —
 # the detached signature is mandatory for prebuilt use.
 #
 # The production key lives in `.github/release-signing-public.pem` in the
@@ -248,16 +271,16 @@ try_prebuilt() {
     sig="$tmpdir/SHA256SUMS.sig"
     pubkey="$tmpdir/release-signing-public.pem"
 
-    # Verification requires openssl; without it, fall back to source.
+    # Verification requires openssl.
     command -v openssl >/dev/null 2>&1 || {
-        print_info "openssl unavailable; falling back to source build."
+        print_info "openssl unavailable; cannot verify the release."
         rm -rf "$tmpdir"
         return 1
     }
 
-    # No production signing key configured: stay inert, fall back to source.
+    # Without a signing key, no prebuilt is trusted.
     materialize_pubkey "$pubkey" || {
-        print_info "No release signing key configured; falling back to source build."
+        print_info "No release signing key configured."
         rm -rf "$tmpdir"
         return 1
     }
@@ -271,7 +294,7 @@ try_prebuilt() {
     # 1. Verify the detached signature over the manifest BEFORE trusting any
     #    checksum line.
     verify_signature "$manifest" "$sig" "$pubkey" || {
-        print_info "Release signature invalid; falling back to source build."
+        print_info "Release signature invalid."
         rm -rf "$tmpdir"
         return 1
     }
@@ -279,13 +302,13 @@ try_prebuilt() {
 
     # 2. Select exactly this platform's line and verify the archive hash.
     expected=$(select_checksum "$manifest" "$tarball_name") || {
-        print_info "Release manifest missing/malformed entry; falling back to source build."
+        print_info "Release manifest missing/malformed entry."
         rm -rf "$tmpdir"
         return 1
     }
     actual=$(sha256_file "$tarball")
     [ -n "$actual" ] && [ "$actual" = "$expected" ] || {
-        print_info "Release archive checksum mismatch; falling back to source build."
+        print_info "Release archive checksum mismatch."
         rm -rf "$tmpdir"
         return 1
     }
@@ -293,7 +316,7 @@ try_prebuilt() {
 
     # 3. Inspect the archive shape before extracting.
     inspect_archive "$tarball" || {
-        print_info "Release archive shape unsafe; falling back to source build."
+        print_info "Release archive shape unsafe."
         rm -rf "$tmpdir"
         return 1
     }
@@ -301,7 +324,11 @@ try_prebuilt() {
 
     # Only after signature + checksum + shape pass do we extract and execute.
     tar -xzf "$tarball" -C "$tmpdir" 2>/dev/null || { rm -rf "$tmpdir"; return 1; }
-    if [ -f "$tmpdir/bpm" ] && verify_binary "$tmpdir/bpm"; then
+    expected_version=""
+    if [ "$BPM_VERSION_EXPLICIT" = 1 ]; then
+        expected_version=$BPM_VERSION
+    fi
+    if [ -f "$tmpdir/bpm" ] && verify_binary "$tmpdir/bpm" "$expected_version"; then
         print_info "Installing ${BPM_VERSION:-latest} release binary..."
         install_binary "$tmpdir/bpm" "$BPM_INSTALL_DIR/bpm" || {
             print_err "Installation failed."
@@ -376,15 +403,18 @@ main() {
 
     platform=$(detect_platform)
     if [ -z "$platform" ]; then
-        print_info "Platform not recognized: $(uname -s)/$(uname -m) — will try building from source."
+        print_info "Platform not recognized: $(uname -s)/$(uname -m)."
     else
         print_ok "Detected: $platform"
         if try_prebuilt "$platform"; then
             return 0
         fi
-        print_info "Pre-built binary not available; falling back to source build."
     fi
 
+    if [ "$BPM_VERSION_EXPLICIT" = 1 ]; then
+        die "Cannot install verified release v$BPM_VERSION on this platform; source fallback is refused for an explicit BPM_VERSION."
+    fi
+    print_info "Verified pre-built binary not available; falling back to source build."
     build_from_source
 }
 

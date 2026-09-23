@@ -721,7 +721,10 @@ fn package_lock_v1_and_future_versions_are_rejected() {
     fs::write(project.path().join("package.json"), r#"{"name":"app"}"#).unwrap();
     fs::write(
         project.path().join("package-lock.json"),
-        r#"{"lockfileVersion":3,"packages":{"":{"name":"app"},"packages/local":{"version":"1.0.0","link":true},"node_modules/missing":{"version":"1.0.0"}}}"#,
+        // `node_modules/missing` has a version, so its registry URL is
+        // derivable and no longer warns; `node_modules/nover` has neither
+        // version nor resolved URL and still warns.
+        r#"{"lockfileVersion":3,"packages":{"":{"name":"app"},"packages/local":{"version":"1.0.0","link":true},"node_modules/missing":{"version":"1.0.0"},"node_modules/nover":{"name":"nover"}}}"#,
     )
     .unwrap();
 
@@ -915,6 +918,112 @@ fn plain_install_reconciles_edited_package_json() {
     assert!(
         stdout.contains("nothing to install"),
         "expected plan-cache hit after reconcile, stdout: {stdout}"
+    );
+}
+
+#[test]
+fn non_frozen_lock_only_installs_remain_supported() {
+    for authority in ["bpm", "npm-v2", "npm-v3"] {
+        let (project, store, _tgz) = if authority == "bpm" {
+            setup_project()
+        } else {
+            setup_package_lock_project()
+        };
+        if authority == "npm-v2" {
+            convert_package_lock_to_v2(project.path());
+        }
+        let lock_path = project.path().join(if authority == "bpm" {
+            "bpm.lock"
+        } else {
+            "package-lock.json"
+        });
+        let original_lock = fs::read(&lock_path).unwrap();
+        fs::remove_file(project.path().join("package.json")).unwrap();
+
+        let out = run_plain_install(project.path(), store.path());
+        assert!(
+            out.status.success(),
+            "{authority}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(project
+            .path()
+            .join("node_modules/greet/package.json")
+            .is_file());
+        assert!(project.path().join(".bpm-state").exists());
+        assert!(!project.path().join("package.json").exists());
+        assert_eq!(fs::read(lock_path).unwrap(), original_lock);
+        if authority != "bpm" {
+            assert!(!project.path().join("bpm.lock").exists());
+        }
+    }
+}
+
+fn assert_frozen_manifest_refused(contents: Option<&[u8]>, prefix: &str) {
+    for authority in ["bpm", "npm-v2", "npm-v3"] {
+        for command in ["install --frozen", "ci"] {
+            let (project, store, _tgz) = if authority == "bpm" {
+                setup_project()
+            } else {
+                setup_package_lock_project()
+            };
+            if authority == "npm-v2" {
+                convert_package_lock_to_v2(project.path());
+            }
+            let lock_path = project.path().join(if authority == "bpm" {
+                "bpm.lock"
+            } else {
+                "package-lock.json"
+            });
+            let original_lock = fs::read(&lock_path).unwrap();
+            let manifest_path = project.path().join("package.json");
+            match contents {
+                Some(bytes) => fs::write(&manifest_path, bytes).unwrap(),
+                None => fs::remove_file(&manifest_path).unwrap(),
+            }
+
+            let out = if command == "ci" {
+                run_ci(project.path(), store.path())
+            } else {
+                run_install(project.path(), store.path())
+            };
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(!out.status.success(), "{authority}, {command}: {stderr}");
+            // current_dir resolves macOS's /var -> /private/var symlink.
+            let expected_path = project.path().canonicalize().unwrap().join("package.json");
+            assert!(
+                stderr.contains(&format!("{prefix}{}", expected_path.display())),
+                "{authority}, {command}: {stderr}"
+            );
+            assert!(!stderr.contains("warning:"), "{stderr}");
+            assert!(!project.path().join("node_modules").exists());
+            assert!(!project.path().join(".bpm-state").exists());
+            assert_eq!(fs::read(lock_path).unwrap(), original_lock);
+            if authority != "bpm" {
+                assert!(!project.path().join("bpm.lock").exists());
+            }
+        }
+    }
+}
+
+#[test]
+fn frozen_manifest_missing_is_required() {
+    assert_frozen_manifest_refused(None, "frozen install refused: package.json is required at ");
+}
+
+#[test]
+fn frozen_manifest_malformed_is_refused() {
+    assert_frozen_manifest_refused(
+        Some(b"{"),
+        "frozen install refused: malformed package.json at ",
+    );
+}
+
+#[test]
+fn frozen_manifest_invalid_utf8_is_unreadable() {
+    assert_frozen_manifest_refused(
+        Some(b"\xff"),
+        "frozen install refused: cannot read package.json at ",
     );
 }
 
