@@ -89,6 +89,12 @@ fn windows_frozen_install_materializes_packages_and_bins() {
     );
     let store = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
+    // Frozen installs require a manifest in the project directory.
+    fs::write(
+        project.path().join("package.json"),
+        r#"{"name":"app","dependencies":{"demo":"^1.0.0"}}"#,
+    )
+    .unwrap();
     let tarball_path = store.path().join("demo-1.0.0.tgz");
     fs::write(&tarball_path, &tgz).unwrap();
     let integrity = integrity_of(&tgz);

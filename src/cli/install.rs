@@ -20,10 +20,12 @@ use bpm::graph;
 use bpm::http::{redact_url, HttpClient};
 use bpm::integrity::{ArtifactId, Integrity};
 use bpm::lockfile::{LockSource, Lockfile};
-use bpm::manifest::PackageManifest;
+use bpm::manifest::{ManifestError, PackageManifest};
 use bpm::metrics::Metrics;
 use bpm::path_safety::{validate_bin_name, validate_bin_target};
-use bpm::project_lock::{find_project_lock, validate_npm_direct_install, ProjectLockKind};
+use bpm::project_lock::{
+    find_project_lock, validate_npm_direct_install, ProjectLockError, ProjectLockKind,
+};
 use bpm::resolution_cache::{key_for as resolution_snapshot_key, ResolutionSnapshotCache};
 use bpm::resolver;
 use bpm::resolver::model::PlatformConstraints;
@@ -146,7 +148,12 @@ pub(super) fn run(mut options: Options) -> anyhow::Result<()> {
 
     let store_root_path = store_root(options.store.clone())?;
     let cwd = env::current_dir()?;
-    let mut found_lock = find_project_lock(&cwd)?;
+    let mut found_lock = find_project_lock(&cwd).map_err(|error| match error {
+        ProjectLockError::Manifest { source, .. } if options.frozen => {
+            frozen_manifest_error(source)
+        }
+        other => other.into(),
+    })?;
     // npm compatibility: `npm install` after editing package.json reconciles
     // the project instead of replaying the stale lock. A bpm.lock whose root
     // declarations drifted from package.json therefore resolves fresh (the
@@ -1147,22 +1154,27 @@ fn manifest_lock_drifted(project_root: &Path, lockfile: &Lockfile) -> bool {
     !(root_declarations == *locked && overrides_match)
 }
 
+fn frozen_manifest_error(error: ManifestError) -> anyhow::Error {
+    match error {
+        ManifestError::Read { path, source } if source.kind() == std::io::ErrorKind::NotFound => {
+            anyhow::anyhow!("frozen install refused: package.json is required at {path}")
+        }
+        ManifestError::Read { path, source } => {
+            anyhow::anyhow!("frozen install refused: cannot read package.json at {path}: {source}")
+        }
+        ManifestError::Parse { path, source } => {
+            anyhow::anyhow!("frozen install refused: malformed package.json at {path}: {source}")
+        }
+    }
+}
+
 fn enforce_frozen(
     project_root: &Path,
     lockfile: &Lockfile,
     lock_label: &str,
 ) -> anyhow::Result<()> {
     let manifest_path = project_root.join("package.json");
-    let manifest = match PackageManifest::from_path(&manifest_path) {
-        Ok(manifest) => manifest,
-        Err(error) => {
-            eprintln!(
-                "warning: --frozen given but no readable package.json at {} ({error}); skipping drift check",
-                project_root.display()
-            );
-            return Ok(());
-        }
-    };
+    let manifest = PackageManifest::from_path(&manifest_path).map_err(frozen_manifest_error)?;
     let root_declarations = manifest.root_dependency_declarations();
     let locked = &lockfile.root.dependencies;
     let expected_overrides = resolver::overrides::OverrideSet::from_manifest(
