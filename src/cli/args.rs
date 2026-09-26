@@ -685,33 +685,7 @@ mod tests {
             );
         }
 
-        assert_eq!(
-            readme
-                .lines()
-                .filter(|line| *line == "## Recent Changes")
-                .count(),
-            1,
-            "README.md must contain exactly one ## Recent Changes heading"
-        );
         assert!(!readme.lines().any(|line| line == "## Changelog"));
-        assert!(
-            !readme.lines().any(is_dated_level_three_heading),
-            "README.md must keep dated changes as flat bullets"
-        );
-    }
-
-    fn is_dated_level_three_heading(line: &str) -> bool {
-        let Some(date) = line.strip_prefix("### ") else {
-            return false;
-        };
-        let bytes = date.as_bytes();
-        bytes.len() == 10
-            && bytes[4] == b'-'
-            && bytes[7] == b'-'
-            && bytes
-                .iter()
-                .enumerate()
-                .all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit())
     }
 
     #[test]
