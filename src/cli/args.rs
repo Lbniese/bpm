@@ -665,7 +665,6 @@ mod tests {
     fn documented_command_inventory() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let readme = std::fs::read_to_string(root.join("README.md")).unwrap();
-        let cli_reference = std::fs::read_to_string(root.join("docs/cli.md")).unwrap();
         let command = Cli::command();
         let names = command
             .get_subcommands()
@@ -679,16 +678,26 @@ mod tests {
                 readme.contains(&marker),
                 "README.md does not document primary command {name}"
             );
-            assert!(
-                cli_reference.contains(&marker),
-                "docs/cli.md does not document primary command {name}"
-            );
         }
         assert!(!readme.lines().any(|line| line == "## Changelog"));
         assert!(
             !readme.lines().any(is_dated_level_three_heading),
             "README.md must keep dated changes as flat bullets"
         );
+    }
+
+    fn is_dated_level_three_heading(line: &str) -> bool {
+        let Some(date) = line.strip_prefix("### ") else {
+            return false;
+        };
+        let bytes = date.as_bytes();
+        bytes.len() == 10
+            && bytes[4] == b'-'
+            && bytes[7] == b'-'
+            && bytes
+                .iter()
+                .enumerate()
+                .all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit())
     }
 
     #[test]

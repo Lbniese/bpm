@@ -1486,7 +1486,7 @@ pub fn attach_project_local(
 /// (created or confirmed; a wrong target is replaced).
 ///
 /// OPT-IN EXPERIMENT behind `BPM_PROJECT_VIEW=relay`. Relays trade the
-/// architecture's isolation guarantee (docs/architecture.md: "projects never
+/// architecture's isolation guarantee ("projects never
 /// receive writable ... relay aliases" — in-place writes under a relay reach
 /// the shared immutable graph) for a near-free attach, the same trade both
 /// bun and pnpm make by sharing file content across projects. The default

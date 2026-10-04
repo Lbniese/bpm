@@ -93,9 +93,6 @@ semantics without writable hardlink or relay aliases.
 | `bpm why <pkg>` | Explain why a package is in the dependency tree |
 | `bpm ls [<pkg>]` (`bpm list`) | Render the installed dependency tree |
 
-## Documentation
-
-📖 [Documentation site](https://lbniese.github.io/bpm/) — [Architecture](docs/architecture.md) · [CLI reference](docs/cli.md) · [Development](docs/development.md) · [Contributing](CONTRIBUTING.md)
 
 ## Building from source
 
