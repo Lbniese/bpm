@@ -1697,6 +1697,7 @@ fn paired_result(
                 wall_clock_ms: Stats::compute(bpm_values),
                 exit_codes: vec![0; number_of_runs],
                 bpm_metrics: None,
+                resource_usage: None,
                 network: None,
                 network_samples: Vec::new(),
             },
@@ -1705,6 +1706,7 @@ fn paired_result(
                 wall_clock_ms: Stats::compute(target_values),
                 exit_codes: vec![0; number_of_runs],
                 bpm_metrics: None,
+                resource_usage: None,
                 network: None,
                 network_samples: Vec::new(),
             },
@@ -1762,6 +1764,7 @@ fn result_with_tools(
                 },
                 exit_codes,
                 bpm_metrics: None,
+                resource_usage: None,
                 network: None,
                 network_samples: Vec::new(),
             })

@@ -331,6 +331,56 @@ pub struct BpmMetricsSummary {
     pub counters: BTreeMap<String, Stats>,
 }
 
+/// CPU and disk-write cost of the timed runs. Wall time alone cannot tell a
+/// CPU-bound install from an I/O-bound one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourceUsageSummary {
+    pub cpu_user_ms: Stats,
+    pub cpu_sys_ms: Stats,
+    /// Megabytes the block layer was asked to write (`ru_oublock` * 512).
+    pub disk_write_mb: Stats,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ResourceSample {
+    cpu_user_ms: f64,
+    cpu_sys_ms: f64,
+    disk_write_mb: f64,
+}
+
+/// Cumulative resource usage of all waited-for child processes so far.
+#[cfg(unix)]
+fn children_usage() -> Option<ResourceSample> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    // SAFETY: `getrusage` fully initializes `usage` when it returns 0.
+    if unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, usage.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    let usage = unsafe { usage.assume_init() };
+    let ms = |t: libc::timeval| t.tv_sec as f64 * 1000.0 + t.tv_usec as f64 / 1000.0;
+    Some(ResourceSample {
+        cpu_user_ms: ms(usage.ru_utime),
+        cpu_sys_ms: ms(usage.ru_stime),
+        disk_write_mb: usage.ru_oublock as f64 * 512.0 / 1_000_000.0,
+    })
+}
+
+#[cfg(not(unix))]
+fn children_usage() -> Option<ResourceSample> {
+    None
+}
+
+/// Flush dirty pages and pending unlinks left by sample preparation (and the
+/// previous sample's cleanup) so they do not compete with the timed run.
+#[cfg(all(target_os = "linux", not(test)))]
+fn settle_disk() {
+    // SAFETY: `sync` takes no arguments and has no failure mode.
+    unsafe { libc::sync() };
+}
+
+#[cfg(not(all(target_os = "linux", not(test))))]
+fn settle_disk() {}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolResults {
     pub tool: String,
@@ -342,6 +392,11 @@ pub struct ToolResults {
     /// runner), so existing baselines without this field still deserialize.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bpm_metrics: Option<BpmMetricsSummary>,
+    /// Per-run CPU time and disk writes of the timed install process tree,
+    /// measured for every tool from `getrusage(RUSAGE_CHILDREN)` deltas.
+    /// Absent on non-unix hosts and in baselines that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_usage: Option<ResourceUsageSummary>,
     /// Cross-tool network shape captured by the parity proxy when
     /// `bpm bench --profile-parity` is set. Absent otherwise so existing
     /// baselines without this field still deserialize.
@@ -1409,12 +1464,14 @@ struct SampleExecution {
     wall_clock_ms: f64,
     exit_code: i32,
     bpm_metrics: Option<BpmMetricsFile>,
+    resource: Option<ResourceSample>,
 }
 
 #[derive(Default)]
 struct ToolAccumulator {
     wall_times: Vec<f64>,
     exit_codes: Vec<i32>,
+    resource_samples: Vec<ResourceSample>,
     request_counts: Vec<f64>,
     phase_samples: BTreeMap<String, Vec<f64>>,
     counter_samples: BTreeMap<String, Vec<f64>>,
@@ -1426,6 +1483,7 @@ impl ToolAccumulator {
     fn record_execution(&mut self, tool: Tool, execution: SampleExecution) {
         self.wall_times.push(execution.wall_clock_ms);
         self.exit_codes.push(execution.exit_code);
+        self.resource_samples.extend(execution.resource);
         if tool != Tool::Bpm {
             return;
         }
@@ -1472,11 +1530,24 @@ impl ToolAccumulator {
                 &self.network_records,
             ))
         };
+        let resource_usage = if self.resource_samples.is_empty() {
+            None
+        } else {
+            let stats = |f: fn(&ResourceSample) -> f64| {
+                Stats::compute(self.resource_samples.iter().map(f).collect())
+            };
+            Some(ResourceUsageSummary {
+                cpu_user_ms: stats(|r| r.cpu_user_ms),
+                cpu_sys_ms: stats(|r| r.cpu_sys_ms),
+                disk_write_mb: stats(|r| r.disk_write_mb),
+            })
+        };
         ToolResults {
             tool: tool.name().to_string(),
             wall_clock_ms: Stats::compute(self.wall_times),
             exit_codes: self.exit_codes,
             bpm_metrics,
+            resource_usage,
             network,
             network_samples: self.network_samples,
         }
@@ -1581,9 +1652,18 @@ fn run_one_sample(
         ignore_scripts,
         &sample_env,
     );
+    settle_disk();
+    let usage_before = children_usage();
     let start = Instant::now();
     let outcome = runner.run(&timed_command)?;
     let elapsed = start.elapsed();
+    let resource = children_usage()
+        .zip(usage_before)
+        .map(|(after, before)| ResourceSample {
+            cpu_user_ms: after.cpu_user_ms - before.cpu_user_ms,
+            cpu_sys_ms: after.cpu_sys_ms - before.cpu_sys_ms,
+            disk_write_mb: after.disk_write_mb - before.disk_write_mb,
+        });
     if outcome.exit_code != 0 {
         anyhow::bail!(
             "timed benchmark failed: tool={}, fixture={}, scenario={}, run={}, exit_code={}",
@@ -1616,6 +1696,7 @@ fn run_one_sample(
         wall_clock_ms: elapsed.as_secs_f64() * 1000.0,
         exit_code: outcome.exit_code,
         bpm_metrics,
+        resource,
     })
 }
 
@@ -3549,6 +3630,7 @@ mod tests {
                 )]),
                 counters: BTreeMap::new(),
             }),
+            resource_usage: None,
             network: None,
             network_samples: Vec::new(),
         };
@@ -3563,6 +3645,7 @@ mod tests {
             wall_clock_ms: Stats::compute(vec![1.0]),
             exit_codes: vec![0],
             bpm_metrics: None,
+            resource_usage: None,
             network: None,
             network_samples: Vec::new(),
         };
