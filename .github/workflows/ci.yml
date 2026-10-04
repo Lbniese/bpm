@@ -205,6 +205,47 @@ jobs:
             ${{ runner.temp }}/current.json
           if-no-files-found: ignore
 
+  # Linux is the reference platform for benchmark numbers. Informational only:
+  # it records bpm vs pnpm across all scenarios (with CPU and disk-write
+  # usage) as a downloadable artifact and never gates a change. Scheduled and
+  # manual runs only, since cold runs hit the live registry.
+  benchmark-linux:
+    name: benchmark (linux reference)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.96.1
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '26.0.0'
+      - name: Install pinned pnpm
+        run: npm install --global pnpm@10.13.1
+      - name: Record environment
+        run: |
+          node --version
+          npm --version
+          pnpm --version
+          uname -a
+          df -T "$RUNNER_TEMP"
+      - run: cargo build --release
+      - name: Benchmark large-frontend (all scenarios, bpm vs pnpm)
+        run: |
+          ./target/release/bpm bench \
+            --fixture large-frontend \
+            --tools pnpm,bpm \
+            --require-tools \
+            --runs 7 \
+            --json "${RUNNER_TEMP}/linux-large-frontend.json"
+      - name: Upload benchmark JSON
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-linux-results
+          path: ${{ runner.temp }}/linux-large-frontend.json
+          if-no-files-found: ignore
+
   git-prepare-oracle:
     name: git-prepare oracle (pinned npm)
     runs-on: ubuntu-latest
