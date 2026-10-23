@@ -88,7 +88,7 @@ const META_FILE: &str = "metadata.json";
 /// v7 also writes the complete artifact/derived inventory so the metadata
 /// index can rebuild graph edges from durable filesystem state alone. v9 uses
 /// graph-entry references for project ownership instead of eager tree hashes.
-const VOLUME_LAYOUT_VERSION: u32 = 9;
+const VOLUME_LAYOUT_VERSION: u32 = 10;
 
 /// Current durable-inventory schema version written into [`VolumeMeta`]. A
 /// volume whose `inventory_version` is below this is treated as
@@ -297,6 +297,157 @@ pub fn graph_volume_reuse_expected(
     current_meta(&meta, &graph_hex, &volume_dir).then_some(graph_hex)
 }
 
+/// A top-level `link:` package placement for the project view.
+///
+/// Workspace links must stay **live**: the project entry symlinks to the
+/// source directory (npm workspace semantics — `node_modules/@scope/pkg ->
+/// ../../workspaces/pkg`), never to the volume's frozen overlay copy. The
+/// overlay copy inside the volume exists so lifecycle scripts and consumers
+/// resolve the workspace at graph-build time; the project view must reflect
+/// source edits immediately.
+#[derive(Debug, Clone)]
+pub struct ProjectLink {
+    /// Lockfile placement, e.g. `node_modules/@scope/name` (always top-level).
+    pub path: String,
+    /// Absolute source directory (the workspace or `link:` target).
+    pub source: PathBuf,
+    /// Bins declared by the source manifest (`name -> relative target`),
+    /// used to route project `.bin` entries through the live link.
+    pub bins: BTreeMap<String, String>,
+}
+
+impl ProjectLink {
+    /// Collect the top-level link placements of a lockfile, reading each
+    /// source's declared bins from its manifest. Nested link placements are
+    /// skipped: they live entirely inside the graph volume's overlay.
+    pub fn collect(lockfile: &Lockfile, project_root: &Path) -> Vec<Self> {
+        lockfile
+            .packages
+            .iter()
+            .filter(|package| package.link && !package.path.contains("/node_modules/"))
+            .filter_map(|package| {
+                let source = project_root.join(package.workspace_target.as_deref()?);
+                let bins =
+                    crate::manifest::PackageManifest::from_path(&source.join("package.json"))
+                        .ok()
+                        .and_then(|manifest| manifest.bin)
+                        .map(|field| match field {
+                            crate::manifest::BinField::One(path) => {
+                                BTreeMap::from([(package.name.clone(), path)])
+                            }
+                            crate::manifest::BinField::Map(map) => map,
+                        })
+                        .unwrap_or_default();
+                Some(Self {
+                    path: package.path.clone(),
+                    source,
+                    bins,
+                })
+            })
+            .collect()
+    }
+}
+
+/// Split a top-level placement into its project-view entry name:
+/// `node_modules/@scope/pkg` yields (`@scope`, Some(`pkg`));
+/// `node_modules/foo` yields (`foo`, None). Nested placements (anything
+/// under a second `node_modules/`) and bare scopes yield `None`.
+fn split_placement(path: &str) -> Option<(String, Option<String>)> {
+    let rest = path.strip_prefix("node_modules/")?;
+    let mut parts = rest.split('/');
+    let first = parts.next()?.to_string();
+    let second = parts.next();
+    if parts.next().is_some() {
+        return None;
+    }
+    match (first.starts_with('@'), second) {
+        (true, Some(member)) => Some((first, Some(member.to_string()))),
+        (false, None) => Some((first, None)),
+        _ => None,
+    }
+}
+
+/// `target` relative to `base_dir`, both joined from the same root — npm's
+/// workspace-link shape. Falls back to `target` when no relative form exists.
+fn relative_to(base_dir: &Path, target: &Path) -> PathBuf {
+    let mut base = base_dir.components();
+    let mut tgt = target.components();
+    loop {
+        match (base.clone().next(), tgt.clone().next()) {
+            (Some(a), Some(b)) if a == b => {
+                base.next();
+                tgt.next();
+            }
+            _ => break,
+        }
+    }
+    let mut out = PathBuf::new();
+    for _ in 0..base.count() {
+        out.push("..");
+    }
+    for component in tgt {
+        out.push(component);
+    }
+    if out.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        out
+    }
+}
+
+/// Replace whatever occupies `link` (stale symlink, file, or directory) with
+/// a symlink to `target`.
+#[cfg(unix)]
+fn replace_with_symlink(link: &Path, target: &Path) -> Result<(), VolumeError> {
+    match fs::symlink_metadata(link) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                fs::remove_file(link).map_err(|source| io_err(link, source))?;
+            } else if meta.is_dir() {
+                fs::remove_dir_all(link).map_err(|source| io_err(link, source))?;
+            } else {
+                fs::remove_file(link).map_err(|source| io_err(link, source))?;
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => return Err(io_err(link, source)),
+    }
+    std::os::unix::fs::symlink(target, link).map_err(|source| io_err(link, source))
+}
+
+/// Ensure `dir` exists as a real directory, replacing a relay symlink or file
+/// that previously occupied the path.
+#[cfg(unix)]
+fn ensure_real_dir(dir: &Path) -> Result<(), VolumeError> {
+    match fs::symlink_metadata(dir) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                fs::remove_file(dir).map_err(|source| io_err(dir, source))?;
+                fs::create_dir_all(dir).map_err(|source| io_err(dir, source))?;
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(dir).map_err(|source| io_err(dir, source))?;
+        }
+        Err(source) => return Err(io_err(dir, source)),
+    }
+    Ok(())
+}
+
+/// Sorted directory-entry names of `dir` (empty when unreadable).
+fn sorted_entry_names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
 /// Ensure the graph volume for `graph_hex` exists and is complete. Idempotent:
 /// if `<volume>/metadata.json` already records this graph id, the volume is
 /// reused untouched (cached). Otherwise the volume's `node_modules` is built
@@ -304,11 +455,19 @@ pub fn graph_volume_reuse_expected(
 /// then the marker is written.
 pub fn ensure_graph_volume(
     store: &ArtifactStore,
+    project_root: &Path,
     lockfile: &Lockfile,
     artifact_ids: &[Option<ArtifactId>],
     metrics: &mut Metrics,
 ) -> Result<EnsuredVolume, VolumeError> {
-    ensure_graph_volume_with_prepared(store, lockfile, artifact_ids, &BTreeMap::new(), metrics)
+    ensure_graph_volume_with_prepared(
+        store,
+        project_root,
+        lockfile,
+        artifact_ids,
+        &BTreeMap::new(),
+        metrics,
+    )
 }
 
 /// Ensure a graph volume with prepared package images overlaid on raw images.
@@ -318,6 +477,7 @@ pub fn ensure_graph_volume(
 /// can never be reused after preparation becomes available or changes.
 pub fn ensure_graph_volume_with_prepared(
     store: &ArtifactStore,
+    project_root: &Path,
     lockfile: &Lockfile,
     artifact_ids: &[Option<ArtifactId>],
     prepared: &BTreeMap<String, crate::lifecycle::PreparedImage>,
@@ -325,6 +485,7 @@ pub fn ensure_graph_volume_with_prepared(
 ) -> Result<EnsuredVolume, VolumeError> {
     ensure_graph_volume_with_prepared_and_profile(
         store,
+        project_root,
         lockfile,
         artifact_ids,
         prepared,
@@ -340,6 +501,7 @@ pub fn ensure_graph_volume_with_prepared(
 /// differ under `NODE_ENV=production`.
 pub fn ensure_graph_volume_with_prepared_and_profile(
     store: &ArtifactStore,
+    project_root: &Path,
     lockfile: &Lockfile,
     artifact_ids: &[Option<ArtifactId>],
     prepared: &BTreeMap<String, crate::lifecycle::PreparedImage>,
@@ -348,6 +510,7 @@ pub fn ensure_graph_volume_with_prepared_and_profile(
 ) -> Result<EnsuredVolume, VolumeError> {
     ensure_graph_volume_with_prestaged(
         store,
+        project_root,
         lockfile,
         artifact_ids,
         prepared,
@@ -362,8 +525,10 @@ pub fn ensure_graph_volume_with_prepared_and_profile(
 /// `(path -> artifact id)` set must exactly equal the lockfile's placement, or
 /// the staging is discarded (its Drop guard removes it) and the volume is
 /// rebuilt from scratch — streaming staging is purely an optimization.
+#[allow(clippy::too_many_arguments)]
 pub fn ensure_graph_volume_with_prestaged(
     store: &ArtifactStore,
+    project_root: &Path,
     lockfile: &Lockfile,
     artifact_ids: &[Option<ArtifactId>],
     prepared: &BTreeMap<String, crate::lifecycle::PreparedImage>,
@@ -446,7 +611,7 @@ pub fn ensure_graph_volume_with_prestaged(
         .as_ref()
         .is_some_and(|p| p.packages == expected && p.staging.join("node_modules").is_dir());
 
-    let (staging, stats) = if prestaged_usable {
+    let (staging, mut stats) = if prestaged_usable {
         let staged = prestaged.as_ref().expect("checked above");
         // Pass A (tree linking) already happened incrementally; run only the
         // deterministic first-declarant-wins `.bin` pass over the staged tree.
@@ -485,7 +650,44 @@ pub fn ensure_graph_volume_with_prestaged(
             continue;
         };
         let target = staging.join(&package.path);
-        overlay_prepared_image(Path::new(source), &target)?;
+        overlay_prepared_image(&project_root.join(source), &target)?;
+    }
+    // Workspace/link overlays carry their own declared bins. The registry
+    // pass above linked bins first-declarant-wins over store images only;
+    // repeat it over the overlaid manifests so the shared volume `.bin`
+    // exposes workspace bins deterministically. Names the registry pass
+    // already claimed (it is deterministic) keep their first declarant.
+    if lockfile.packages.iter().any(|package| package.link) {
+        let mut claimed: BTreeSet<String> =
+            sorted_entry_names(&staging.join("node_modules").join(".bin"))
+                .into_iter()
+                .collect();
+        let mut bin_stats = MaterializeStats::default();
+        for package in lockfile.packages.iter().filter(|package| package.link) {
+            let image_dir = staging.join(&package.path);
+            let Ok(manifest) =
+                crate::manifest::PackageManifest::from_path(&image_dir.join("package.json"))
+            else {
+                continue;
+            };
+            let bins = match manifest.bin {
+                Some(crate::manifest::BinField::One(path)) => {
+                    BTreeMap::from([(package.name.clone(), path)])
+                }
+                Some(crate::manifest::BinField::Map(map)) => map,
+                None => continue,
+            };
+            crate::materializer::link_bins(
+                &staging,
+                &package.path,
+                &image_dir,
+                &bins,
+                &mut claimed,
+                &mut bin_stats,
+                cfg!(unix),
+            )?;
+        }
+        stats.bins_linked += bin_stats.bins_linked;
     }
     for (package_path, prepared_image) in prepared {
         let target = staging.join(package_path);
@@ -1103,26 +1305,29 @@ fn hash_file_contents(
 pub fn attach_project(
     project_root: &Path,
     volume: &VolumeRef,
+    links: &[ProjectLink],
 ) -> Result<AttachOutcome, VolumeError> {
     // Published graphs are immutable sources. Every project receives an
     // isolated local view; no project-facing symlink may alias the graph.
-    attach_project_local_with_backend(project_root, volume, MaterializeBackend::Reflink)
+    attach_project_local_with_backend(project_root, volume, MaterializeBackend::Reflink, links)
 }
 
 #[cfg(windows)]
 pub fn attach_project(
     project_root: &Path,
     volume: &VolumeRef,
+    links: &[ProjectLink],
 ) -> Result<AttachOutcome, VolumeError> {
     // Correctness-first Windows view: hardlinks where possible, copies as a
     // cross-volume fallback. No junctions or privileged symlinks are needed.
-    attach_project_local(project_root, volume)
+    attach_project_local(project_root, volume, links)
 }
 
 #[cfg(all(not(unix), not(windows)))]
 pub fn attach_project(
     _project_root: &Path,
     _volume: &VolumeRef,
+    _links: &[ProjectLink],
 ) -> Result<AttachOutcome, VolumeError> {
     Err(VolumeError::Materialize(
         MaterializeError::SymlinksUnsupported,
@@ -1336,8 +1541,9 @@ pub fn infer_prior_ownership(project_root: &Path, prior_volume_path: &Path) -> V
 pub fn attach_project_local(
     project_root: &Path,
     volume: &VolumeRef,
+    links: &[ProjectLink],
 ) -> Result<AttachOutcome, VolumeError> {
-    attach_project_local_with_backend(project_root, volume, MaterializeBackend::Reflink)
+    attach_project_local_with_backend(project_root, volume, MaterializeBackend::Reflink, links)
 }
 
 /// Like [`attach_project_local`], but selects the per-package linking strategy
@@ -1350,15 +1556,28 @@ pub fn attach_project_local_with_backend(
     project_root: &Path,
     volume: &VolumeRef,
     backend: MaterializeBackend,
+    links: &[ProjectLink],
 ) -> Result<AttachOutcome, VolumeError> {
     let vol_nm = volume.path.join("node_modules");
     let proj_nm = project_root.join("node_modules");
     fs::create_dir_all(&proj_nm).map_err(|source| io_err(&proj_nm, source))?;
     let identities = read_entry_identities(&volume.path)?;
 
+    // Unscoped top-level links replace their entry outright (no volume copy
+    // is materialized for them); scoped links replace members inside the
+    // reflinked scope container after the main pass below.
+    let direct_link_names: BTreeSet<String> = links
+        .iter()
+        .filter_map(|link| match split_placement(&link.path) {
+            Some((name, None)) => Some(name),
+            _ => None,
+        })
+        .collect();
+
     let mut entries = fs::read_dir(&vol_nm)
         .map_err(|source| io_err(&vol_nm, source))?
         .filter_map(Result::ok)
+        .filter(|entry| !direct_link_names.contains(entry.file_name().to_string_lossy().as_ref()))
         .collect::<Vec<_>>();
     entries.sort_by_key(|entry| entry.file_name());
 
@@ -1463,6 +1682,22 @@ pub fn attach_project_local_with_backend(
             Ok::<_, VolumeError>(out)
         })?
     };
+    // Live workspace links (npm semantics): the project entry symlinks to
+    // the source directory. Unscoped entries were skipped above; scoped
+    // links replace the copied member inside their scope container.
+    for link in links {
+        let link_path = project_root.join(&link.path);
+        let fallback = project_root.join("node_modules");
+        let parent = link_path.parent().unwrap_or(fallback.as_path());
+        let target = relative_to(parent, &link.source);
+        replace_with_symlink(&link_path, &target)?;
+        stats.relays_created += 1;
+        owned.push(ManagedEntry {
+            path: link.path.clone(),
+            mode: "relay".to_string(),
+            identity: format!("{}{}", crate::graph::IDENTITY_RELAY, target.display()),
+        });
+    }
     // Sort by path to guarantee deterministic output regardless of
     // thread scheduling (mirrors compute_entry_identities).
     owned.sort_by(|a, b| a.path.cmp(&b.path));
@@ -1473,11 +1708,12 @@ pub fn attach_project_local_with_backend(
 pub fn attach_project_local(
     project_root: &Path,
     volume: &VolumeRef,
+    links: &[ProjectLink],
 ) -> Result<AttachOutcome, VolumeError> {
     // Windows project views always copy (no reflink syscall); the backend is
     // ignored, so delegate to the with-backend impl for API symmetry with the
     // unix variant.
-    attach_project_local_with_backend(project_root, volume, MaterializeBackend::Auto)
+    attach_project_local_with_backend(project_root, volume, MaterializeBackend::Auto, links)
 }
 
 /// Attach a project to a graph volume via shallow top-level relays: every
@@ -1496,10 +1732,39 @@ pub fn attach_project_local(
 pub fn attach_project_relay(
     project_root: &Path,
     volume: &VolumeRef,
+    links: &[ProjectLink],
 ) -> Result<AttachOutcome, VolumeError> {
     let vol_nm = volume.path.join("node_modules");
     let proj_nm = project_root.join("node_modules");
     fs::create_dir_all(&proj_nm).map_err(|source| io_err(&proj_nm, source))?;
+    // Top-level link placements: `node_modules/<name>` replaces its entry
+    // outright with a live symlink; `node_modules/@scope/<pkg>` turns the
+    // scope into a mixed container materialized member-by-member (a whole
+    // scope relay could not be overridden member-wise without writing
+    // through the symlink into the shared volume).
+    let mut direct_links: BTreeMap<String, &ProjectLink> = BTreeMap::new();
+    let mut scoped_links: BTreeMap<String, BTreeMap<String, &ProjectLink>> = BTreeMap::new();
+    for link in links {
+        match split_placement(&link.path) {
+            Some((name, Some(member))) => {
+                scoped_links.entry(name).or_default().insert(member, link);
+            }
+            Some((name, None)) => {
+                direct_links.insert(name, link);
+            }
+            None => continue,
+        }
+    }
+    // Bin names declared by a link manifest: their `.bin` entries must route
+    // through the project's live link, not the volume's overlay copy.
+    let mut live_bins: BTreeMap<&str, (&ProjectLink, &str)> = BTreeMap::new();
+    for link in links {
+        for (bin, target) in &link.bins {
+            live_bins
+                .entry(bin.as_str())
+                .or_insert((link, target.as_str()));
+        }
+    }
     let mut entries = fs::read_dir(&vol_nm)
         .map_err(|source| io_err(&vol_nm, source))?
         .filter_map(Result::ok)
@@ -1510,6 +1775,87 @@ pub fn attach_project_relay(
     for entry in entries {
         let name = entry.file_name();
         let name_str = name.to_string_lossy().into_owned();
+        if name_str == ".bin" && !live_bins.is_empty() {
+            // Mixed `.bin`: a real directory with per-name entries so link
+            // bins can resolve through live project links.
+            let vol_bin = vol_nm.join(".bin");
+            let proj_bin = proj_nm.join(".bin");
+            match fs::symlink_metadata(&proj_bin) {
+                Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {}
+                Ok(meta) => {
+                    if meta.file_type().is_symlink() {
+                        fs::remove_file(&proj_bin).map_err(|source| io_err(&proj_bin, source))?;
+                    } else {
+                        fs::remove_dir_all(&proj_bin)
+                            .map_err(|source| io_err(&proj_bin, source))?;
+                    }
+                    fs::create_dir_all(&proj_bin).map_err(|source| io_err(&proj_bin, source))?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    fs::create_dir_all(&proj_bin).map_err(|source| io_err(&proj_bin, source))?;
+                }
+                Err(source) => return Err(io_err(&proj_bin, source)),
+            }
+            for bin_name in sorted_entry_names(&vol_bin) {
+                let link_path = proj_bin.join(&bin_name);
+                let expected = match live_bins.get(bin_name.as_str()) {
+                    Some((link, target)) => {
+                        // npm shape: `../<placement>/<target>` relative to
+                        // node_modules/.bin, resolving through the live link.
+                        let placement = link
+                            .path
+                            .strip_prefix("node_modules/")
+                            .unwrap_or(&link.path);
+                        let joined = Path::new(placement).join(target);
+                        PathBuf::from("../").join(joined)
+                    }
+                    None => vol_bin.join(&bin_name),
+                };
+                replace_with_symlink(&link_path, &expected)?;
+                stats.relays_created += 1;
+                owned.push(ManagedEntry {
+                    path: format!("node_modules/.bin/{bin_name}"),
+                    mode: "relay".to_string(),
+                    identity: format!("{}{}", crate::graph::IDENTITY_RELAY, expected.display()),
+                });
+            }
+            continue;
+        }
+        if let Some(link) = direct_links.get(&name_str) {
+            // Live workspace link replaces the relay for this whole entry.
+            let target = relative_to(&proj_nm, &link.source);
+            replace_with_symlink(&proj_nm.join(&name_str), &target)?;
+            stats.relays_created += 1;
+            owned.push(ManagedEntry {
+                path: link.path.clone(),
+                mode: "relay".to_string(),
+                identity: format!("{}{}", crate::graph::IDENTITY_RELAY, target.display()),
+            });
+            continue;
+        }
+        if let Some(members) = scoped_links.get(&name_str) {
+            // Mixed scope container: a real directory whose members are
+            // individually relayed into the volume or symlinked to sources.
+            let vol_scope = vol_nm.join(&name_str);
+            let proj_scope = proj_nm.join(&name_str);
+            ensure_real_dir(&proj_scope)?;
+            for member_name in sorted_entry_names(&vol_scope) {
+                let member_link = proj_scope.join(&member_name);
+                let member_path = format!("node_modules/{name_str}/{member_name}");
+                let target = match members.get(&member_name) {
+                    Some(link) => relative_to(&proj_scope, &link.source),
+                    None => vol_scope.join(&member_name),
+                };
+                replace_with_symlink(&member_link, &target)?;
+                stats.relays_created += 1;
+                owned.push(ManagedEntry {
+                    path: member_path,
+                    mode: "relay".to_string(),
+                    identity: format!("{}{}", crate::graph::IDENTITY_RELAY, target.display()),
+                });
+            }
+            continue;
+        }
         let target = vol_nm.join(&name);
         let link = proj_nm.join(&name);
         let expected = target.display().to_string();
@@ -1566,6 +1912,7 @@ pub fn attach_project_local_with_backend(
     project_root: &Path,
     volume: &VolumeRef,
     _backend: MaterializeBackend,
+    links: &[ProjectLink],
 ) -> Result<AttachOutcome, VolumeError> {
     // Windows project views are always independent copies. Junctions and
     // hardlinks would expose writable aliases to the published graph.
@@ -1573,9 +1920,19 @@ pub fn attach_project_local_with_backend(
     let proj_nm = project_root.join("node_modules");
     fs::create_dir_all(&proj_nm).map_err(|source| io_err(&proj_nm, source))?;
     let identities = read_entry_identities(&volume.path)?;
+    // Unscoped top-level links copy from their source instead of the volume's
+    // overlay; scoped links keep the copied member (no unprivileged symlink).
+    let direct_link_names: BTreeSet<String> = links
+        .iter()
+        .filter_map(|link| match split_placement(&link.path) {
+            Some((name, None)) => Some(name),
+            _ => None,
+        })
+        .collect();
     let mut entries = fs::read_dir(&vol_nm)
         .map_err(|source| io_err(&vol_nm, source))?
         .filter_map(Result::ok)
+        .filter(|entry| !direct_link_names.contains(entry.file_name().to_string_lossy().as_ref()))
         .collect::<Vec<_>>();
     entries.sort_by_key(|entry| entry.file_name());
     let mut stats = AttachStats::default();
@@ -1602,6 +1959,27 @@ pub fn attach_project_local_with_backend(
             identity: identity.clone(),
         });
     }
+    for link in links {
+        if !matches!(split_placement(&link.path), Some((_, None))) {
+            continue; // scoped links keep their copied member on Windows
+        }
+        let target = proj_nm.join(
+            Path::new(&link.path)
+                .strip_prefix("node_modules")
+                .unwrap_or(&link.path),
+        );
+        crate::materializer::copy_tree(&link.source, &target).map_err(VolumeError::Materialize)?;
+        stats.relays_created += 1;
+        owned.push(ManagedEntry {
+            path: link.path.clone(),
+            mode: "local".to_string(),
+            identity: format!(
+                "{}{}",
+                crate::graph::IDENTITY_TREE,
+                tree_fingerprint(&target).map_err(|source| io_err(&target, source))?
+            ),
+        });
+    }
     Ok(AttachOutcome::new(stats, owned))
 }
 
@@ -1610,6 +1988,7 @@ pub fn attach_project_local_with_backend(
     _project_root: &Path,
     _volume: &VolumeRef,
     _backend: MaterializeBackend,
+    _links: &[ProjectLink],
 ) -> Result<AttachOutcome, VolumeError> {
     Err(VolumeError::Materialize(
         MaterializeError::SymlinksUnsupported,
@@ -1795,6 +2174,7 @@ mod tests {
         let mut metrics = crate::metrics::Metrics::new();
         let ensured = ensure_graph_volume_with_prestaged(
             &store,
+            Path::new("."),
             &lockfile,
             &[Some(id)],
             &BTreeMap::new(),
@@ -1846,7 +2226,7 @@ mod tests {
             cached: false,
             stats: MaterializeStats::default(),
         };
-        let outcome = attach_project_relay(project.path(), &volume_ref).unwrap();
+        let outcome = attach_project_relay(project.path(), &volume_ref, &[]).unwrap();
         assert_eq!(outcome.stats.relays_created, 1);
         assert_eq!(outcome.owned.len(), 1);
         let entry = &outcome.owned[0];
@@ -1861,7 +2241,7 @@ mod tests {
         assert!(link.join("package.json").is_file());
 
         // Re-attaching is idempotent (unchanged, not replaced).
-        let again = attach_project_relay(project.path(), &volume_ref).unwrap();
+        let again = attach_project_relay(project.path(), &volume_ref, &[]).unwrap();
         assert_eq!(again.stats.relays_unchanged, 1);
         assert_eq!(again.stats.relays_created, 0);
 
@@ -1870,7 +2250,7 @@ mod tests {
         // semantics.
         fs::remove_file(&link).unwrap();
         fs::create_dir(project.path().join("node_modules/foo")).unwrap();
-        let migrated = attach_project_relay(project.path(), &volume_ref).unwrap();
+        let migrated = attach_project_relay(project.path(), &volume_ref, &[]).unwrap();
         assert_eq!(migrated.stats.relays_created, 1);
         assert!(
             fs::symlink_metadata(project.path().join("node_modules/foo"))
@@ -1882,6 +2262,221 @@ mod tests {
             .path()
             .join("node_modules/foo/package.json")
             .is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relay_attachment_places_live_workspace_links() {
+        // Volume contains a scope with one registry member and the frozen
+        // overlay copy of a workspace member, plus an unscoped overlay.
+        let volume_root = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        let volume = volume_root.path().join("node_modules");
+        for member in [
+            "@scope/registry-pkg",
+            "@scope/workspace-pkg",
+            "top-workspace",
+        ] {
+            fs::create_dir_all(volume.join(member)).unwrap();
+            fs::write(
+                volume.join(member).join("package.json"),
+                format!(r#"{{"name":"{}"}}"#, member),
+            )
+            .unwrap();
+        }
+        write_test_meta(volume_root.path());
+        // Workspace sources live in the project.
+        let ws_a = project.path().join("packages/scoped");
+        let ws_b = project.path().join("packages/top");
+        for (dir, bin) in [(&ws_a, Some("bin/cli.js")), (&ws_b, None)] {
+            fs::create_dir_all(dir.join("bin")).unwrap();
+            fs::write(dir.join("package.json"), r#"{"name":"ws"}"#).unwrap();
+            if let Some(bin) = bin {
+                fs::write(dir.join(bin), "#!/usr/bin/env node\n").unwrap();
+            }
+        }
+        let links = vec![
+            ProjectLink {
+                path: "node_modules/@scope/workspace-pkg".to_string(),
+                source: ws_a.clone(),
+                bins: BTreeMap::from([("ws-cli".to_string(), "bin/cli.js".to_string())]),
+            },
+            ProjectLink {
+                path: "node_modules/top-workspace".to_string(),
+                source: ws_b.clone(),
+                bins: BTreeMap::new(),
+            },
+        ];
+        let volume_ref = VolumeRef {
+            path: volume_root.path().to_path_buf(),
+            cached: false,
+            stats: MaterializeStats::default(),
+        };
+        let outcome = attach_project_relay(project.path(), &volume_ref, &links).unwrap();
+
+        // The mixed scope is a real directory with member-level entries:
+        // the registry member relays into the volume, the workspace member
+        // symlinks to its live source (npm's relative shape).
+        let scope = project.path().join("node_modules/@scope");
+        let scope_meta = fs::symlink_metadata(&scope).unwrap();
+        assert!(scope_meta.is_dir());
+        assert!(!scope_meta.file_type().is_symlink());
+        let registry_member = scope.join("registry-pkg");
+        assert_eq!(
+            fs::read_link(&registry_member).unwrap(),
+            volume.join("@scope/registry-pkg")
+        );
+        let workspace_member = scope.join("workspace-pkg");
+        assert_eq!(
+            fs::read_link(&workspace_member).unwrap(),
+            Path::new("../../packages/scoped")
+        );
+        // The unscoped overlay entry is replaced by a live link.
+        let top = project.path().join("node_modules/top-workspace");
+        assert_eq!(fs::read_link(&top).unwrap(), Path::new("../packages/top"));
+        // Ownership covers members, not the scope container.
+        let paths: Vec<&str> = outcome.owned.iter().map(|e| e.path.as_str()).collect();
+        assert!(paths.contains(&"node_modules/@scope/registry-pkg"));
+        assert!(paths.contains(&"node_modules/@scope/workspace-pkg"));
+        assert!(paths.contains(&"node_modules/top-workspace"));
+        assert!(!paths.contains(&"node_modules/@scope"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relay_attachment_routes_workspace_bins_through_live_links() {
+        let volume_root = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        let volume = volume_root.path().join("node_modules");
+        // Registry bin and the workspace overlay bin both exist in the
+        // volume's shared .bin.
+        fs::create_dir_all(volume.join(".bin")).unwrap();
+        fs::create_dir_all(volume.join("@scope/workspace-pkg/bin")).unwrap();
+        fs::create_dir_all(volume.join("reg-pkg/bin")).unwrap();
+        fs::write(volume.join("reg-pkg/bin/reg.js"), "#!/usr/bin/env node\n").unwrap();
+        fs::write(
+            volume.join("@scope/workspace-pkg/bin/cli.js"),
+            "#!/usr/bin/env node\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("../reg-pkg/bin/reg.js", volume.join(".bin/reg-cli")).unwrap();
+        std::os::unix::fs::symlink(
+            "../@scope/workspace-pkg/bin/cli.js",
+            volume.join(".bin/ws-cli"),
+        )
+        .unwrap();
+        write_test_meta(volume_root.path());
+        let ws = project.path().join("packages/ws");
+        fs::create_dir_all(ws.join("bin")).unwrap();
+        fs::write(ws.join("package.json"), r#"{"name":"ws"}"#).unwrap();
+        fs::write(ws.join("bin/cli.js"), "#!/usr/bin/env node\n").unwrap();
+        let links = vec![ProjectLink {
+            path: "node_modules/@scope/workspace-pkg".to_string(),
+            source: ws,
+            bins: BTreeMap::from([("ws-cli".to_string(), "bin/cli.js".to_string())]),
+        }];
+        let volume_ref = VolumeRef {
+            path: volume_root.path().to_path_buf(),
+            cached: false,
+            stats: MaterializeStats::default(),
+        };
+        let outcome = attach_project_relay(project.path(), &volume_ref, &links).unwrap();
+        // .bin is a real directory (not a relay) with per-name entries.
+        let bin = project.path().join("node_modules/.bin");
+        assert!(fs::symlink_metadata(&bin).unwrap().is_dir());
+        assert!(!fs::symlink_metadata(&bin).unwrap().file_type().is_symlink());
+        // The registry bin relays into the volume.
+        assert_eq!(
+            fs::read_link(bin.join("reg-cli")).unwrap(),
+            volume.join(".bin/reg-cli")
+        );
+        // The workspace bin resolves through the live project link.
+        assert_eq!(
+            fs::read_link(bin.join("ws-cli")).unwrap(),
+            Path::new("../@scope/workspace-pkg/bin/cli.js")
+        );
+        let paths: Vec<&str> = outcome.owned.iter().map(|e| e.path.as_str()).collect();
+        assert!(paths.contains(&"node_modules/.bin/reg-cli"));
+        assert!(paths.contains(&"node_modules/.bin/ws-cli"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_attachment_places_live_workspace_links() {
+        let volume_root = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        let volume = volume_root.path().join("node_modules");
+        fs::create_dir_all(volume.join("@scope/workspace-pkg")).unwrap();
+        fs::write(
+            volume.join("@scope/workspace-pkg/package.json"),
+            r#"{"name":"stale-copy"}"#,
+        )
+        .unwrap();
+        write_test_meta(volume_root.path());
+        let ws = project.path().join("packages/ws");
+        fs::create_dir_all(&ws).unwrap();
+        fs::write(ws.join("package.json"), r#"{"name":"ws-live"}"#).unwrap();
+        let links = vec![ProjectLink {
+            path: "node_modules/@scope/workspace-pkg".to_string(),
+            source: ws.clone(),
+            bins: BTreeMap::new(),
+        }];
+        let volume_ref = VolumeRef {
+            path: volume_root.path().to_path_buf(),
+            cached: false,
+            stats: MaterializeStats::default(),
+        };
+        let outcome = attach_project_local(project.path(), &volume_ref, &links).unwrap();
+        let member = project.path().join("node_modules/@scope/workspace-pkg");
+        assert_eq!(
+            fs::read_link(&member).unwrap(),
+            Path::new("../../packages/ws")
+        );
+        // Resolution reaches the live source, not the frozen copy.
+        let manifest: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(member.join("package.json")).unwrap())
+                .unwrap();
+        assert_eq!(manifest["name"], "ws-live");
+        let paths: Vec<&str> = outcome.owned.iter().map(|e| e.path.as_str()).collect();
+        assert!(paths.contains(&"node_modules/@scope/workspace-pkg"));
+    }
+
+    #[test]
+    fn split_placement_shapes() {
+        assert_eq!(
+            split_placement("node_modules/foo"),
+            Some(("foo".to_string(), None))
+        );
+        assert_eq!(
+            split_placement("node_modules/@scope/pkg"),
+            Some(("@scope".to_string(), Some("pkg".to_string())))
+        );
+        assert_eq!(split_placement("node_modules/@scope"), None);
+        assert_eq!(split_placement("node_modules/a/b"), None);
+        assert_eq!(split_placement("node_modules/a/node_modules/b"), None);
+        assert_eq!(split_placement("other/foo"), None);
+    }
+
+    #[test]
+    fn relative_to_walks_common_components() {
+        assert_eq!(
+            relative_to(
+                Path::new("/proj/node_modules/@scope"),
+                Path::new("/proj/packages/ws")
+            ),
+            Path::new("../../packages/ws")
+        );
+        assert_eq!(
+            relative_to(
+                Path::new("/proj/node_modules"),
+                Path::new("/proj/packages/ws")
+            ),
+            Path::new("../packages/ws")
+        );
+        assert_eq!(
+            relative_to(Path::new("/a"), Path::new("/a/b/c")),
+            Path::new("b/c")
+        );
     }
 
     #[test]
@@ -1905,7 +2500,7 @@ mod tests {
             cached: false,
             stats: MaterializeStats::default(),
         };
-        let stats = attach_project_local(project.path(), &volume_ref).unwrap();
+        let stats = attach_project_local(project.path(), &volume_ref, &[]).unwrap();
         assert_eq!(stats.stats.relays_created, 2);
 
         let project_pkg = project.path().join("node_modules/foo");
@@ -1958,6 +2553,7 @@ mod tests {
             project.path(),
             &volume_ref,
             MaterializeBackend::Reflink,
+            &[],
         )
         .unwrap();
         assert_eq!(stats.stats.relays_created, 1);
@@ -2132,7 +2728,7 @@ mod ownership_tests {
             volume_root.path(),
             &[("foo", r#"{"name":"foo","version":"1.0.0"}"#)],
         );
-        let outcome = attach_project(project.path(), &volume_ref(volume_root.path())).unwrap();
+        let outcome = attach_project(project.path(), &volume_ref(volume_root.path()), &[]).unwrap();
         assert_eq!(outcome.stats.relays_created, 1);
         assert_eq!(
             read_owned_names(&outcome),
@@ -2152,7 +2748,7 @@ mod ownership_tests {
             &[("foo", r#"{"name":"foo","version":"1.0.0"}"#)],
         );
         let outcome =
-            attach_project_local(project.path(), &volume_ref(volume_root.path())).unwrap();
+            attach_project_local(project.path(), &volume_ref(volume_root.path()), &[]).unwrap();
         assert_eq!(
             read_owned_names(&outcome),
             vec!["node_modules/foo".to_string()]
@@ -2216,7 +2812,7 @@ mod ownership_tests {
         let project = tempdir().unwrap();
         make_volume(volume_root.path(), &[("gone", r#"{"name":"gone"}"#)]);
         let attached =
-            attach_project_local(project.path(), &volume_ref(volume_root.path())).unwrap();
+            attach_project_local(project.path(), &volume_ref(volume_root.path()), &[]).unwrap();
 
         let outcome = reconcile_project_view_with_prior_volume(
             project.path(),
@@ -2236,7 +2832,7 @@ mod ownership_tests {
         let project = tempdir().unwrap();
         make_volume(volume_root.path(), &[("kept", r#"{"name":"kept"}"#)]);
         let attached =
-            attach_project_local(project.path(), &volume_ref(volume_root.path())).unwrap();
+            attach_project_local(project.path(), &volume_ref(volume_root.path()), &[]).unwrap();
         let project_file = project.path().join("node_modules/kept/package.json");
         fs::write(&project_file, b"user change").unwrap();
 
@@ -2348,7 +2944,7 @@ mod ownership_tests {
         )
         .unwrap();
         // Local entry: hardlinked view (byte-identical to the volume entry).
-        let local_outcome = attach_project_local(project.path(), &vol_ref).unwrap();
+        let local_outcome = attach_project_local(project.path(), &vol_ref, &[]).unwrap();
         // attach_project_local also attached "relay" as a dir, which clobbered
         // the symlink above; re-create a clean project to isolate the two.
         let project2 = tempdir().unwrap();
@@ -2392,7 +2988,7 @@ mod ownership_tests {
         let vol_ref = volume_ref(volume_root.path());
         // Attach a local view, then replace the project dir so it no longer
         // matches the prior volume entry fingerprint.
-        let _ = attach_project_local(project.path(), &vol_ref).unwrap();
+        let _ = attach_project_local(project.path(), &vol_ref, &[]).unwrap();
         fs::write(
             project
                 .path()
@@ -2421,6 +3017,7 @@ mod ownership_tests {
             project_a.path(),
             &vol_ref,
             MaterializeBackend::Reflink,
+            &[],
         )
         .unwrap();
 
@@ -2430,6 +3027,7 @@ mod ownership_tests {
             project_b.path(),
             &vol_ref,
             MaterializeBackend::Reflink,
+            &[],
         )
         .unwrap();
 

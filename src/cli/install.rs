@@ -2352,22 +2352,18 @@ fn finalize_install(
     metrics.record("ownership_reconciliation", ownership_start.elapsed());
     let prior_owned = prior_owned_vec.as_slice();
     let git_prepare_enabled = options.git_prepare
+        && !options.ignore_scripts
         && lockfile
             .resolution
             .packages
             .values()
             .any(|resolution| matches!(resolution.source, LockSource::Git { .. }));
-    let has_workspace_links = lockfile.packages.iter().any(|package| package.link);
-    // Nested `file:` dependencies need a graph volume: direct symlink
-    // materialization cannot place a child under an immutable package image.
-    // The volume copies those source links into its image. Top-level workspace
-    // links retain the existing direct-materialization path.
-    let has_nested_links = lockfile
-        .packages
-        .iter()
-        .any(|package| package.link && package.path.contains("/node_modules/"));
-    let direct_materialization = has_workspace_links && !has_nested_links;
-    let prepared = if git_prepare_enabled && !options.ignore_scripts && !direct_materialization {
+    // Live workspace/link placements for the project view. Installs with
+    // links build the graph volume like any other install (link sources are
+    // overlaid into the volume so lifecycle scripts resolve them), and the
+    // project attaches those entries as symlinks to their sources.
+    let project_links = bpm::volume::ProjectLink::collect(lockfile, project_root);
+    let prepared = if git_prepare_enabled && !options.ignore_scripts {
         bpm::lifecycle::prepare_git_packages_with_profile(
             project_root,
             store,
@@ -2402,11 +2398,8 @@ fn finalize_install(
     // object alone covers the read window and skips the 2N+D publication,
     // access, and lease-row writes. Any install that will (re)build the
     // volume reads store images directly and takes the full object lease.
-    let volume_reuse_hex = if direct_materialization {
-        None
-    } else {
-        bpm::volume::graph_volume_reuse_expected(store, lockfile, &prepared, profile)
-    };
+    let volume_reuse_hex =
+        bpm::volume::graph_volume_reuse_expected(store, lockfile, &prepared, profile);
     // Turbopack and similar bundlers enforce that dependency realpaths remain
     // inside the project. Keep the O(top-level) relay fast path for ordinary
     // projects, but use a local hardlink view automatically for Next projects;
@@ -2416,13 +2409,12 @@ fn finalize_install(
     // view only chooses the direct-materialization backend.
     // `final_ownership` is the sorted `ManagedEntry` set BPM actually created
     // this install, used both as the reconciliation desired set and persisted
-    // into the next plan. For graph-volume views it is the final attachment
-    // result (the local-view outcome supersedes the transient relay set when
-    // local/reflink is selected). Direct materialization synthesizes no
-    // graph-volume ownership.
+    // into the next plan. It is the final attachment result (the local-view
+    // outcome supersedes the transient relay set when local/reflink is
+    // selected).
     let mut final_ownership: Vec<bpm::graph::ManagedEntry> = Vec::new();
-    let mut graph_hex: Option<String> = None;
-    let mut graph_record_elapsed = std::time::Duration::ZERO;
+    let graph_hex: Option<String>;
+    let graph_record_elapsed: std::time::Duration;
     // Acquire the install lease CONCURRENTLY with materialization, joining it
     // in each branch once the fs-heavy work has hidden it. Ordering rationale:
     // freshly extracted store objects are categorically protected by GC's
@@ -2445,51 +2437,12 @@ fn finalize_install(
         (result, elapsed)
     };
     let materialization_start = Instant::now();
-    let (volume, view_entry_count, lifecycle) = if direct_materialization {
-        let (materialized, lease) = std::thread::scope(|lease_scope| {
-            let lease_handle = lease_scope.spawn(|| run_lease(&mut session));
-            let materialized = bpm::materializer::materialize_lockfile_with_backend(
-                project_root,
-                store,
-                lockfile,
-                artifact_ids,
-                bpm::materializer::MaterializeMode::Compatible,
-                match project_view {
-                    ProjectView::Reflink => bpm::materializer::MaterializeBackend::Reflink,
-                    ProjectView::Local => bpm::materializer::MaterializeBackend::IsolatedCopy,
-                    // Direct materialization has no graph volume to relay
-                    // into; the opt-in relay view still materializes an
-                    // isolated tree on this path.
-                    ProjectView::Relay => bpm::materializer::MaterializeBackend::Reflink,
-                },
-            );
-            let lease = lease_handle.join().expect("lease thread panicked");
-            (materialized, lease)
-        });
-        metrics.record("metadata_lease", lease.1);
-        lease.0?;
-        materialized?;
-        (
-            None,
-            0usize,
-            run_lifecycle_if_enabled(
-                project_root,
-                store,
-                lockfile,
-                artifact_ids,
-                None,
-                options.ignore_scripts,
-                false,
-                options.derived_store,
-                profile,
-                metrics,
-            )?,
-        )
-    } else {
+    let (volume, view_entry_count, lifecycle) = {
         let (ensured, lease) = std::thread::scope(|lease_scope| {
             let lease_handle = lease_scope.spawn(|| run_lease(&mut session));
             let ensured = bpm::volume::ensure_graph_volume_with_prestaged(
                 store,
+                project_root,
                 lockfile,
                 artifact_ids,
                 &prepared,
@@ -2547,7 +2500,7 @@ fn finalize_install(
         // walk.
         let graph_size_hint = if cfg!(unix)
             && options.ignore_scripts
-            && !has_workspace_links
+            && project_links.is_empty()
             && prepared.is_empty()
         {
             session
@@ -2576,7 +2529,7 @@ fn finalize_install(
             });
             let attach = match project_view {
                 ProjectView::Local | ProjectView::Reflink => {
-                    bpm::volume::attach_project(project_root, &volume)
+                    bpm::volume::attach_project(project_root, &volume, &project_links)
                 }
                 // Shallow relays alias the immutable graph, relaxing the
                 // isolated view's write isolation in exchange for a near-free
@@ -2584,9 +2537,13 @@ fn finalize_install(
                 // their auto default never selects relay and the env override
                 // falls back to the isolated view.
                 #[cfg(unix)]
-                ProjectView::Relay => bpm::volume::attach_project_relay(project_root, &volume),
+                ProjectView::Relay => {
+                    bpm::volume::attach_project_relay(project_root, &volume, &project_links)
+                }
                 #[cfg(not(unix))]
-                ProjectView::Relay => bpm::volume::attach_project(project_root, &volume),
+                ProjectView::Relay => {
+                    bpm::volume::attach_project(project_root, &volume, &project_links)
+                }
             };
             let (record_result, elapsed) = record.join().unwrap();
             (attach, record_result, elapsed)

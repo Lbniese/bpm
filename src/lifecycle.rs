@@ -300,7 +300,7 @@ pub fn run_lifecycle_with_profile(
                 continue;
             }
             let image = store.image_path(&id);
-            let scripts = read_scripts(&image.join("package.json"))?;
+            let scripts = read_scripts_healing(store, &image, &id, metrics)?;
             if LIFECYCLE_PHASES.iter().any(|p| scripts.contains_key(*p)) {
                 stats.packages_with_scripts += 1;
                 stats.derived_paths.push(pkg.path.clone());
@@ -339,7 +339,7 @@ pub fn run_lifecycle_with_profile(
         };
         // Read the package's own scripts from its (immutable) image manifest.
         let image = store.image_path(&id);
-        let scripts = read_scripts(&image.join("package.json"))?;
+        let scripts = read_scripts_healing(store, &image, &id, metrics)?;
         let has_lifecycle = LIFECYCLE_PHASES.iter().any(|p| scripts.contains_key(*p));
         if !has_lifecycle {
             continue;
@@ -798,6 +798,33 @@ struct LifecycleManifest {
 }
 
 /// Read the `scripts` map from a `package.json` at `manifest_path`.
+/// Read a package image's scripts, self-healing a store left inconsistent by
+/// a previously failed extraction: `ensure_image` re-extracts from the
+/// immutable artifact when the image directory is missing, so one aborted
+/// install cannot poison every later install of the same package.
+fn read_scripts_healing(
+    store: &ArtifactStore,
+    image: &Path,
+    id: &ArtifactId,
+    metrics: &mut Metrics,
+) -> Result<BTreeMap<String, String>, LifecycleError> {
+    match read_scripts(&image.join("package.json")) {
+        Ok(scripts) => Ok(scripts),
+        Err(LifecycleError::ManifestRead { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            let healed = store
+                .ensure_image(id, metrics)
+                .map_err(|source| LifecycleError::Io {
+                    path: image.display().to_string(),
+                    source: std::io::Error::other(source.to_string()),
+                })?;
+            read_scripts(&healed.path.join("package.json"))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn read_scripts(manifest_path: &Path) -> Result<BTreeMap<String, String>, LifecycleError> {
     let bytes = fs::read(manifest_path).map_err(|source| LifecycleError::ManifestRead {
         path: manifest_path.to_path_buf(),
@@ -866,10 +893,25 @@ fn run_script(
     )
     .unwrap_or_else(|| PathBuf::from("node"));
     cmd.env("NODE", node);
-    // Project node_modules/.bin should be reachable for scripts; prepend it.
+    // npm script PATH: every `node_modules/.bin` from the script's own
+    // directory upward (a package's postinstall may invoke its own or its
+    // tree's bins, e.g. `template-oss-apply`), then the project's
+    // node_modules/.bin, then the inherited PATH. Against a graph volume the
+    // script runs inside the volume, so its `.bin` chain resolves there.
     if let Some(path) = environment.get(std::ffi::OsStr::new("PATH")) {
-        let bin = project_root.join("node_modules").join(".bin");
-        let mut paths = vec![bin];
+        let mut paths: Vec<PathBuf> = Vec::new();
+        let mut dir = Some(cwd);
+        while let Some(current) = dir {
+            let bin = current.join("node_modules").join(".bin");
+            if bin.is_dir() && !paths.contains(&bin) {
+                paths.push(bin);
+            }
+            dir = current.parent();
+        }
+        let project_bin = project_root.join("node_modules").join(".bin");
+        if !paths.contains(&project_bin) {
+            paths.push(project_bin);
+        }
         paths.extend(std::env::split_paths(path));
         let new_path = std::env::join_paths(paths).map_err(|error| {
             std::io::Error::new(

@@ -41,7 +41,7 @@ const IMAGES: &str = "images/sha512";
 const GRAPHS: &str = "graphs/blake3";
 const TMP: &str = "tmp";
 const LOCKS: &str = "locks";
-pub(crate) const IMAGE_LAYOUT_VERSION: &str = "2\n";
+pub(crate) const IMAGE_LAYOUT_VERSION: &str = "3\n";
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -473,6 +473,10 @@ impl ArtifactStore {
         let version = self.image_version_path(id);
         if img.exists()
             && fs::read_to_string(&version).ok().as_deref() == Some(IMAGE_LAYOUT_VERSION)
+            // A tarball's root always carries package.json; an image without
+            // one was extracted unstripped by an older build (or truncated)
+            // and must heal rather than serve cached.
+            && img.join("package.json").is_file()
         {
             let index = self.image_index_path(id);
             if !index.exists() {

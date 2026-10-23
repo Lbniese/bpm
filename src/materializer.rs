@@ -1009,7 +1009,7 @@ fn link_path(link: &Path, target: &Path) -> Result<(), MaterializeError> {
 }
 
 /// Record each declared bin as a relative `node_modules/.bin/<name>` link.
-fn link_bins(
+pub(crate) fn link_bins(
     project_root: &Path,
     pkg_path: &str,
     image_dir: &Path,
