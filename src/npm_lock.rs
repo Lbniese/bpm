@@ -272,9 +272,18 @@ pub fn import(json: &str) -> Result<ImportReport, NpmLockError> {
             continue;
         }
 
-        // Bundled dependencies ship inside their parent's tarball; they have
-        // no standalone registry artifact to install.
-        if pkg.in_bundle.unwrap_or(false) {
+        // Bundled dependencies OF A DEPENDENCY ship inside their parent's
+        // tarball; their nested placements record parent-tarball URLs
+        // (containing `/node_modules/`) that 404 and must not be installed
+        // standalone. Root-project `bundleDependencies` (e.g. the npm CLI
+        // itself) are ordinary registry packages that `npm ci` installs
+        // normally, so keep them.
+        let parent_tarball_bundle = pkg.in_bundle.unwrap_or(false)
+            && pkg
+                .resolved
+                .as_deref()
+                .is_some_and(|url| url.contains("/node_modules/"));
+        if parent_tarball_bundle {
             continue;
         }
 
@@ -760,6 +769,40 @@ mod tests {
             }
           }
         }"#
+    }
+
+    #[test]
+    fn keeps_root_bundle_dependencies_skips_parent_tarball_bundles() {
+        // Root-project bundleDependencies (npm marks them inBundle, e.g. the
+        // npm CLI's own tree) are ordinary registry packages that `npm ci`
+        // installs; only parent-tarball URLs (containing `/node_modules/`)
+        // are unfetchable bundled-in-parent entries.
+        let json = r#"{
+            "name": "root", "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "root", "version": "1.0.0",
+                      "dependencies": { "bundled-root-dep": "^1.0.0" } },
+                "node_modules/bundled-root-dep": {
+                    "name": "bundled-root-dep", "version": "1.0.0",
+                    "resolved": "https://registry.npmjs.org/bundled-root-dep/-/bundled-root-dep-1.0.0.tgz",
+                    "integrity": "sha512-AAA", "inBundle": true
+                },
+                "node_modules/parent/node_modules/inside-parent": {
+                    "name": "inside-parent", "version": "2.0.0",
+                    "resolved": "https://registry.npmjs.org/parent/-/parent-3.0.0.tgz/node_modules/inside-parent",
+                    "integrity": "sha512-BBB", "inBundle": true
+                }
+            }
+        }"#;
+        let report = import(json).unwrap();
+        let paths: Vec<&str> = report
+            .lockfile
+            .packages
+            .iter()
+            .map(|p| p.path.as_str())
+            .collect();
+        assert!(paths.contains(&"node_modules/bundled-root-dep"));
+        assert!(!paths.contains(&"node_modules/parent/node_modules/inside-parent"));
     }
 
     #[test]

@@ -499,7 +499,8 @@ fn import_derives_urls_for_npm11_lockfiles_and_repairs_aliases() {
                 "node_modules/pkg": {"version": "1.2.3"},
                 "node_modules/@scope/other": {"version": "2.0.0", "resolved": "https://registry.npmjs.org/@scope/other/node_modules/@scope/other/-/other-2.0.0.tgz", "integrity": "sha512-AAAA"},
                 "node_modules/alias": {"name": "real-pkg", "version": "3.1.0", "resolved": "https://registry.npmjs.org/alias/-/alias-3.1.0.tgz", "integrity": "sha512-BBBB"},
-                "node_modules/bundled-parent/node_modules/bundled-dep": {"version": "0.5.0", "inBundle": true}
+                "node_modules/bundled-parent/node_modules/bundled-dep": {"version": "0.5.0", "inBundle": true},
+                "node_modules/bundled-parent/node_modules/parent-tarball-dep": {"version": "0.6.0", "inBundle": true, "resolved": "https://registry.npmjs.org/bundled-parent/-/bundled-parent-1.0.0.tgz/node_modules/parent-tarball-dep"}
             }
         }"#;
 
@@ -536,12 +537,20 @@ fn import_derives_urls_for_npm11_lockfiles_and_repairs_aliases() {
         find("node_modules/alias"),
         "https://registry.npmjs.org/real-pkg/-/real-pkg-3.1.0.tgz"
     );
-    // Bundled dependencies are not installable packages.
+    // Bundled dependencies of a DEPENDENCY with a parent-tarball URL are not
+    // standalone-installable and must be skipped. Modern npm 11 locks record
+    // nested bundled deps without `resolved` (they are ordinary registry
+    // packages that `npm ci` installs), so the importer derives their URL and
+    // keeps them; only `/node_modules/` parent-tarball URLs are skipped.
     assert!(
         !lockfile
             .packages
             .iter()
-            .any(|p| p.path.ends_with("bundled-dep")),
-        "bundled deps must be skipped"
+            .any(|p| p.path.ends_with("parent-tarball-dep")),
+        "parent-tarball bundled deps must be skipped"
+    );
+    assert_eq!(
+        find("node_modules/bundled-parent/node_modules/bundled-dep"),
+        "https://registry.npmjs.org/bundled-dep/-/bundled-dep-0.5.0.tgz"
     );
 }
