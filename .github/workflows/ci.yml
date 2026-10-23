@@ -246,6 +246,28 @@ jobs:
           path: ${{ runner.temp }}/linux-large-frontend.json
           if-no-files-found: ignore
 
+  # End-to-end validation against pinned upstream repositories that commit
+  # npm lockfiles (jquery, axios, nyc, mocha, npm/cli, vscode). Asserts exact
+  # installed package counts — the gate for silent package-dropping — plus
+  # targeted smokes for live workspace links and root bundleDependencies.
+  # Runs on push/schedule/dispatch (not per-PR): each run clones the pinned
+  # corpus and downloads every artifact into an isolated cold store.
+  realworld-corpus:
+    name: real-world corpus (linux)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.96.1
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '26.0.0'
+      - run: cargo build --release
+      - name: Run pinned real-world corpus
+        run: ./scripts/ci-realworld.sh
+
   git-prepare-oracle:
     name: git-prepare oracle (pinned npm)
     runs-on: ubuntu-latest
