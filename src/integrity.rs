@@ -5,8 +5,10 @@
 //! tarball bytes. We reuse that exact digest as the artifact's identity in the
 //! store: `artifact_id = sha512(package tarball bytes)`.
 //!
-//! Only `sha512` is supported. Other algorithms are rejected rather than
-//! silently ignored.
+//! Only `sha512` is supported as an identity. npm lockfiles sometimes list
+//! several digests per package (`"sha1-… sha512-…"`); the `sha512` token is
+//! selected from such composite strings, and other algorithms are rejected
+//! rather than silently ignored when no `sha512` token is present.
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use std::fmt;
@@ -130,27 +132,42 @@ impl Integrity {
         self.digest.to_npm_string()
     }
 
-    /// Parse `sha512-<value>` where `value` is base64 (npm) or hex.
+    /// Parse an npm integrity field: one or more space-separated
+    /// `<algo>-<value>` tokens where `value` is base64 (npm) or hex.
     ///
-    /// npm records the digest as standard (padded) base64; we also accept a
-    /// 128-char hex form. We accept by *decoding to 64 bytes* rather than
-    /// matching on the encoded length, so the canonical npm length is handled
-    /// without being brittle to padding.
+    /// Real-world npm lockfiles carry composite strings such as
+    /// `"sha1-… sha512-…"` (npm records every digest the registry served).
+    /// Any listed digest can verify the artifact in cacache semantics, and
+    /// the store is keyed by SHA-512, so the first decodable `sha512` token
+    /// wins and the remaining tokens are ignored. A digest decodes to 64
+    /// bytes rather than matching an encoded length, so the canonical npm
+    /// base64 padding is handled without being brittle.
     pub fn parse(s: &str) -> Result<Self, IntegrityError> {
-        let (algo, value) = s
-            .split_once('-')
-            .ok_or_else(|| IntegrityError::InvalidFormat(s.to_string()))?;
-        if algo != SHA512 {
-            return Err(IntegrityError::UnsupportedAlgorithm(algo.to_string()));
-        }
-        match Sha512Digest::from_base64(value) {
-            Ok(digest) => Ok(Self { digest }),
+        let mut other_algorithms: Vec<String> = Vec::new();
+        for token in s.split_whitespace() {
+            let Some((algo, value)) = token.split_once('-') else {
+                continue;
+            };
+            if algo != SHA512 {
+                other_algorithms.push(algo.to_string());
+                continue;
+            }
+            if let Ok(digest) = Sha512Digest::from_base64(value) {
+                return Ok(Self { digest });
+            }
             // Fall back to a 128-char hex digest; any other shape is invalid.
-            Err(_) if value.len() == 128 => Ok(Self {
-                digest: Sha512Digest::from_hex(value)?,
-            }),
-            Err(_) => Err(IntegrityError::InvalidFormat(s.to_string())),
+            if value.len() == 128 {
+                if let Ok(digest) = Sha512Digest::from_hex(value) {
+                    return Ok(Self { digest });
+                }
+            }
         }
+        if !other_algorithms.is_empty() {
+            return Err(IntegrityError::UnsupportedAlgorithm(
+                other_algorithms.join(", "),
+            ));
+        }
+        Err(IntegrityError::InvalidFormat(s.to_string()))
     }
 }
 
@@ -187,6 +204,31 @@ mod tests {
     #[test]
     fn rejects_non_sha512() {
         let err = Integrity::parse("sha1-AAAA").unwrap_err();
+        assert!(matches!(err, IntegrityError::UnsupportedAlgorithm(_)));
+    }
+
+    #[test]
+    fn selects_sha512_from_composite_string() {
+        // Shape recorded for @gulp-sourcemaps/map-sources in vscode's
+        // package-lock.json: a legacy sha1 digest beside the sha512 one.
+        let digest = Sha512Digest::hash_bytes(b"tarball");
+        let composite = format!(
+            "sha1-iQrnxdjId/bThIYCFazp1+yUW9o= {}",
+            digest.to_npm_string()
+        );
+        let parsed = Integrity::parse(&composite).unwrap();
+        assert_eq!(*parsed.digest(), digest);
+        // Prefer the sha512 even when it is listed first.
+        let reversed = format!(
+            "{} sha1-iQrnxdjId/bThIYCFazp1+yUW9o=",
+            digest.to_npm_string()
+        );
+        assert_eq!(Integrity::parse(&reversed).unwrap(), parsed);
+    }
+
+    #[test]
+    fn rejects_sha1_only_composite() {
+        let err = Integrity::parse("sha1-AAAA sha256-BBBB").unwrap_err();
         assert!(matches!(err, IntegrityError::UnsupportedAlgorithm(_)));
     }
 

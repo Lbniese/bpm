@@ -250,6 +250,22 @@ fn extract_with_limits(
         // detection so an entry-heavy archive cannot force unbounded work.
         budget.observe_entry(Some(&rel))?;
         let entry_type = entry.header().entry_type();
+        // Metadata-only header entries never produce image files. GNU/git
+        // archives emit a `pax_global_header` (`g`) entry carrying
+        // archive-wide pax keys (e.g. a `comment`); npm's node-tar consumes
+        // and ignores it, and the tar crate already applies any keys it
+        // understands to the entries that follow. Skip these (and the other
+        // header-only types, which the crate normally consumes itself) so
+        // real-world tarballs like busboy@1.6.0 extract the way npm does.
+        if matches!(
+            entry_type,
+            tar::EntryType::XGlobalHeader
+                | tar::EntryType::XHeader
+                | tar::EntryType::GNULongName
+                | tar::EntryType::GNULongLink
+        ) {
+            continue;
+        }
         let is_regular = matches!(
             entry_type,
             tar::EntryType::Regular | tar::EntryType::Continuous
@@ -294,28 +310,36 @@ fn extract_with_limits(
                 // guarantee; callers can safely retry an unpublished temp
                 // image after a crash.
                 let mode = entry.header().mode().unwrap_or(0o644);
+                // npm preserves only the executable bit from tarball file
+                // modes: a file installs as 755 when any execute bit is set
+                // and 644 otherwise (pngjs@7.0.0 ships 0o666 files that npm
+                // installs as 644). Normalizing also guarantees the image
+                // never carries group/world-write bits into shared stores.
+                let normalized = if mode & 0o111 != 0 { 0o755 } else { 0o644 };
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
-                    let masked = (mode & 0o777) & !0o002;
                     let default_mode = *created_file_mode.get_or_insert_with(|| {
                         out.get_ref()
                             .metadata()
                             .map(|m| m.permissions().mode() & 0o777)
                             .unwrap_or(u32::MAX)
                     });
-                    if default_mode != masked {
-                        apply_mode(&dest, mode).map_err(|source| write_err(&dest, source))?;
+                    if default_mode != normalized {
+                        apply_mode(&dest, normalized).map_err(|source| write_err(&dest, source))?;
                     }
                 }
                 #[cfg(not(unix))]
-                apply_mode(&dest, mode).map_err(|source| write_err(&dest, source))?;
+                apply_mode(&dest, normalized).map_err(|source| write_err(&dest, source))?;
             }
             tar::EntryType::Directory => {
                 fs::create_dir_all(&dest).map_err(|source| write_err(&dest, source))?;
-                let mode = entry.header().mode().unwrap_or(0o755);
-                // Directory mode is advisory; ignore failure on read-only trees.
-                let _ = apply_mode(&dest, mode);
+                // npm does not preserve tarball directory modes either:
+                // directories install as 755. pngjs@7.0.0 ships `lib/` as
+                // 0o666 — applying that before the directory's contents land
+                // makes it unwritable mid-extraction (os error 13). Directory
+                // mode application stays advisory for read-only trees.
+                let _ = apply_mode(&dest, 0o755);
             }
             tar::EntryType::Symlink => {
                 let target = entry
@@ -521,6 +545,19 @@ fn detect_archive_root_prefix(archive_path: &Path) -> Result<Option<PathBuf>, Ex
     for entry in entries {
         let entry =
             entry.map_err(|e| ExtractError::InvalidArchive(format!("corrupt tar entry: {e}")))?;
+        // Metadata-only headers (git-archive's `pax_global_header`) are not
+        // archive entries for prefix purposes: their single-component name
+        // would seed the common-prefix candidate and make detection reject
+        // the real root (busboy@1.6.0 extracts unstripped otherwise).
+        if matches!(
+            entry.header().entry_type(),
+            tar::EntryType::XGlobalHeader
+                | tar::EntryType::XHeader
+                | tar::EntryType::GNULongName
+                | tar::EntryType::GNULongLink
+        ) {
+            continue;
+        }
         budget.observe_entry(None)?;
         let raw = entry
             .path()
@@ -769,6 +806,107 @@ mod tests {
             std::fs::read(image.path().join("sub/b.txt")).unwrap(),
             b"world!"
         );
+    }
+
+    #[test]
+    fn skips_git_archive_pax_global_header() {
+        // busboy@1.6.0's registry tarball opens with a `pax_global_header`
+        // (`g`) metadata entry emitted by git-archive; npm's node-tar ignores
+        // it, and extraction must too.
+        use std::io::Write;
+        let enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut builder = tar::Builder::new(enc);
+        let pax_body = b"26 comment=mscdex-busboy-9aadb7a\n";
+        let mut h = tar::Header::new_gnu();
+        h.set_path("pax_global_header").unwrap();
+        h.set_size(pax_body.len() as u64);
+        h.set_entry_type(tar::EntryType::XGlobalHeader);
+        h.set_mode(0o644);
+        h.set_cksum();
+        builder.append(&h, &pax_body[..]).unwrap();
+        // A non-`package/` root plus a prefixed manifest, exactly like the
+        // real tarball: detection must find `mscdex-busboy-9aadb7a` even
+        // though the global header preceded it.
+        let files: &[(&str, &[u8])] = &[
+            (
+                "mscdex-busboy-9aadb7a/package.json",
+                b"{\"name\":\"busboy\"}",
+            ),
+            ("mscdex-busboy-9aadb7a/lib/index.js", b"module.exports = 1;"),
+        ];
+        for (path, data) in files {
+            let mut h = tar::Header::new_gnu();
+            h.set_path(path).unwrap();
+            h.set_size(data.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            builder.append(&h, *data).unwrap();
+        }
+        let mut enc = builder.into_inner().unwrap();
+        enc.flush().unwrap();
+        let tgz = enc.finish().unwrap();
+        let (result, image) = extract_limits(&tgz, limits(1000, 1000, 1000));
+        result.expect("pax global header must be skipped, not rejected");
+        // The detected root must be stripped: contents land at the image
+        // root, not nested under the tarball's root folder.
+        assert_eq!(
+            std::fs::read(image.path().join("package.json")).unwrap(),
+            b"{\"name\":\"busboy\"}"
+        );
+        assert_eq!(
+            std::fs::read(image.path().join("lib/index.js")).unwrap(),
+            b"module.exports = 1;"
+        );
+        assert!(!image.path().join("pax_global_header").exists());
+        assert!(!image.path().join("mscdex-busboy-9aadb7a").exists());
+    }
+
+    #[test]
+    fn normalizes_npm_tarball_modes() {
+        // pngjs@7.0.0 ships `lib/` as a 0o666 directory and 0o666 files;
+        // applying the directory mode before its contents land fails with
+        // os error 13, and npm normalizes both to 755/644 anyway.
+        use std::io::Write;
+        let enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut builder = tar::Builder::new(enc);
+        let entries: &[(&str, tar::EntryType, u32, &[u8])] = &[
+            ("package/lib", tar::EntryType::Directory, 0o666, b""),
+            (
+                "package/lib/bitmapper.js",
+                tar::EntryType::Regular,
+                0o666,
+                b"bits",
+            ),
+            (
+                "package/bin/run.sh",
+                tar::EntryType::Regular,
+                0o755,
+                b"#!/bin/sh\n",
+            ),
+        ];
+        for (path, kind, mode, data) in entries {
+            let mut h = tar::Header::new_gnu();
+            h.set_path(path).unwrap();
+            h.set_size(data.len() as u64);
+            h.set_entry_type(*kind);
+            h.set_mode(*mode);
+            h.set_cksum();
+            builder.append(&h, *data).unwrap();
+        }
+        let mut enc = builder.into_inner().unwrap();
+        enc.flush().unwrap();
+        let tgz = enc.finish().unwrap();
+        let (result, image) = extract_limits(&tgz, limits(1000, 1000, 1000));
+        result.expect("0o666 directory must not break extraction");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir_mode =
+                |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(dir_mode(&image.path().join("lib")), 0o755);
+            assert_eq!(dir_mode(&image.path().join("lib/bitmapper.js")), 0o644);
+            assert_eq!(dir_mode(&image.path().join("bin/run.sh")), 0o755);
+        }
     }
 
     #[test]
