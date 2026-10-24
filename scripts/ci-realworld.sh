@@ -12,14 +12,14 @@
 #   - jquery:  a declared bin executes from the project view
 #   - cli:     workspace links stay live symlinks (npm shape) and a
 #              root-project bundleDependency resolves
+#   - socket.io: a hosted Git dependency (uWebSockets.js, no registry
+#              integrity) imports as a commit-keyed codeload tarball
 #
 # Corpus pins move only deliberately: update the commit and the expected
 # count together, after running locally with
 #   BPM=./target/release/bpm ./scripts/ci-realworld.sh
 #
 # Excluded, with reasons:
-#   - socket.io: git dependency (uWebSockets.js) — frozen installs cannot
-#     fetch git sources yet
 #   - vscode scripts: `node-gyp rebuild` install scripts need a bundled
 #     node-gyp; validated with --ignore-scripts instead
 set -euo pipefail
@@ -40,6 +40,7 @@ CORPUS=(
   "https://github.com/istanbuljs/nyc.git|908620475199fa7b9ea0ea8b21d6d8ad6921e3ae|943|"
   "https://github.com/mochajs/mocha.git|cb21a4eba550da665fb2c3fa1ce021777a191e23|742|"
   "https://github.com/npm/cli.git|52f30938bd372dac25667f38fb771f5fe825e6e6|1169|"
+  "https://github.com/socketio/socket.io.git|1eaa582d3b453e3e6f522300ed05b10da0a0799b|1487|"
   "https://github.com/microsoft/vscode.git|53b7b197990e6d9354dba0e42cce9b34d7c56c5c|1669|--ignore-scripts"
 )
 

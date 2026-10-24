@@ -9,14 +9,14 @@
 //! anything BPM does not yet honor. The source lockfile is never modified
 //! (§10).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
 
 use crate::diagnostic::{Diagnostic, Severity};
-use crate::lockfile::{LockSource, Lockfile, PackageEntry, RootEntry};
+use crate::lockfile::{LockSource, Lockfile, PackageEntry, PackageResolution, RootEntry};
 use crate::manifest::PackageManifest;
 use crate::path_safety::{validate_bin_name, validate_bin_target, validate_package_path};
 use crate::resolver::overrides::{OverrideOrigin, OverrideSet};
@@ -168,6 +168,44 @@ pub fn package_name_from_path(path: &str) -> String {
 fn derive_registry_url(name: &str, version: &str) -> String {
     let base = name.rsplit('/').next().unwrap_or(name);
     format!("https://registry.npmjs.org/{name}/-/{base}-{version}.tgz")
+}
+
+/// Map an npm-lock Git `resolved` URL onto the equivalent hosted tarball.
+///
+/// npm records Git dependencies as `git+ssh://git@github.com/<owner>/<repo>.git#<commit>`
+/// (or `git+https://`/`git://`/`github:` forms) with no integrity; `npm ci`
+/// clones the pinned commit. BPM verifies frozen installs by content, so a
+/// hosted dependency is rewritten to its codeload/archive tarball URL — keyed
+/// by the immutable commit, the same URL family the resolver produces for
+/// native Git specs — and its integrity is computed by the importer's fetch
+/// pass. Returns `(normalized git source, commit, tarball URL)`. Non-hosted
+/// Git remotes and refs that are not a full commit stay unmapped: the frozen
+/// gate rejects them explicitly rather than guessing an identity.
+fn hosted_git_from_npm_resolved(resolved: &str) -> Option<(String, String, String)> {
+    let (spec, commit) = resolved.split_once('#')?;
+    if !crate::resolver::sources::is_full_git_commit(commit) {
+        return None;
+    }
+    let stripped = spec
+        .strip_prefix("git+ssh://git@")
+        .or_else(|| spec.strip_prefix("git+ssh://"))
+        .or_else(|| spec.strip_prefix("ssh://git@"))
+        .or_else(|| spec.strip_prefix("git+https://"))
+        .or_else(|| spec.strip_prefix("git+http://"))
+        .or_else(|| spec.strip_prefix("git://"));
+    let normalized = match stripped {
+        Some(rest) => {
+            let (host, path) = rest.split_once('/')?;
+            if !matches!(host, "github.com" | "gitlab.com" | "bitbucket.org") {
+                return None;
+            }
+            format!("https://{host}/{path}")
+        }
+        None => spec.to_string(),
+    };
+    let normalized = normalized.trim_end_matches(".git").to_string();
+    let tarball = crate::resolver::sources::hosted_git_tarball_url(&normalized, Some(commit))?;
+    Some((normalized, commit.to_string(), tarball))
 }
 
 fn parse_bin(
@@ -350,6 +388,37 @@ pub fn import(json: &str) -> Result<ImportReport, NpmLockError> {
             }
         }
 
+        // Git dependencies: rewrite to the hosted tarball keyed by the pinned
+        // commit (integrity is computed by the fetch pass below) and record
+        // resolver metadata so Git prepare semantics survive the round trip.
+        if !link {
+            if let Some((git_source, commit, tarball_url)) =
+                hosted_git_from_npm_resolved(pkg.resolved.as_deref().unwrap_or(""))
+            {
+                resolved = tarball_url;
+                lockfile.resolution.packages.insert(
+                    path.clone(),
+                    PackageResolution {
+                        source: LockSource::Git {
+                            url: git_source,
+                            reference: None,
+                            resolved_commit: commit,
+                        },
+                        dev_optional: false,
+                        peer: false,
+                        libc: Vec::new(),
+                        dependencies: BTreeMap::new(),
+                        optional_dependencies: BTreeMap::new(),
+                        peer_dependencies: BTreeMap::new(),
+                        optional_peers: BTreeSet::new(),
+                        peer_context: BTreeMap::new(),
+                        workspace_target: None,
+                        has_install_script: false,
+                    },
+                );
+            }
+        }
+
         let bin = parse_bin(path, &name, &pkg.bin)?;
 
         // Reject unsafe paths and bin entries before any filesystem operation.
@@ -436,20 +505,17 @@ pub fn import(json: &str) -> Result<ImportReport, NpmLockError> {
         }
     }
 
-    // Rare npm 11 entries record neither `resolved` nor `integrity`. The
-    // derived registry URL is known at this point, so fetch the tarball and
-    // compute the integrity hash here; without it a frozen install could
+    // Rare npm 11 entries record neither `resolved` nor `integrity`, and
+    // imported Git dependencies rewrite to hosted tarball URLs without one.
+    // For any https tarball the URL is known at this point, so fetch the bytes
+    // and compute the integrity hash here; without it a frozen install could
     // never verify the package. Failures fall back to a diagnostic and keep
     // the entry unverifiable rather than fabricating a hash.
     let needs_fetch: Vec<(usize, String)> = lockfile
         .packages
         .iter()
         .enumerate()
-        .filter(|(_, p)| {
-            !p.link
-                && p.integrity.is_none()
-                && p.resolved.starts_with("https://registry.npmjs.org/")
-        })
+        .filter(|(_, p)| !p.link && p.integrity.is_none() && p.resolved.starts_with("https://"))
         .map(|(i, p)| (i, p.resolved.clone()))
         .collect();
     if !needs_fetch.is_empty() {
@@ -769,6 +835,91 @@ mod tests {
             }
           }
         }"#
+    }
+
+    #[test]
+    fn maps_hosted_git_resolved_onto_tarball_urls() {
+        let commit = "d04e707a1292928d50163ff7545e45c3e84c5ec3";
+        // npm's dominant form: git+ssh with the github host and a .git suffix.
+        let (source, sha, tarball) = hosted_git_from_npm_resolved(&format!(
+            "git+ssh://git@github.com/uNetworking/uWebSockets.js.git#{commit}"
+        ))
+        .unwrap();
+        assert_eq!(source, "https://github.com/uNetworking/uWebSockets.js");
+        assert_eq!(sha, commit);
+        assert_eq!(
+            tarball,
+            format!("https://codeload.github.com/uNetworking/uWebSockets.js/tar.gz/{commit}")
+        );
+        // git+https and bare shorthand forms map to the same family.
+        let (_, _, https_tarball) =
+            hosted_git_from_npm_resolved(&format!("git+https://github.com/a/b.git#{commit}"))
+                .unwrap();
+        assert_eq!(
+            https_tarball,
+            format!("https://codeload.github.com/a/b/tar.gz/{commit}")
+        );
+        assert_eq!(
+            hosted_git_from_npm_resolved(&format!("gitlab:grp/proj#{commit}"))
+                .unwrap()
+                .2,
+            format!("https://gitlab.com/grp/proj/-/archive/{commit}/proj-{commit}.tar.gz")
+        );
+        // Non-hosted remotes, non-commit refs, and fragmentless URLs stay
+        // unmapped; the frozen gate rejects them explicitly.
+        assert!(hosted_git_from_npm_resolved(&format!(
+            "git+ssh://git@git.corp.example/a/b.git#{commit}"
+        ))
+        .is_none());
+        assert!(hosted_git_from_npm_resolved("git+ssh://git@github.com/a/b.git#v1.2.3").is_none());
+        assert!(hosted_git_from_npm_resolved("git+ssh://git@github.com/a/b.git").is_none());
+    }
+
+    #[test]
+    fn imports_git_dependency_with_tarball_resolution_metadata() {
+        let commit = "d04e707a1292928d50163ff7545e45c3e84c5ec3";
+        let json = format!(
+            r#"{{
+                "name": "app", "lockfileVersion": 3,
+                "packages": {{
+                    "": {{"name": "app", "version": "1.0.0",
+                          "devDependencies": {{"uWebSockets.js": "github:uNetworking/uWebSockets.js#v20.56.0"}}}},
+                    "node_modules/uWebSockets.js": {{
+                        "version": "20.56.0",
+                        "resolved": "git+ssh://git@github.com/uNetworking/uWebSockets.js.git#{commit}"
+                    }}
+                }}
+            }}"#
+        );
+        let report = import(&json).unwrap();
+        let entry = report
+            .lockfile
+            .packages
+            .iter()
+            .find(|p| p.name == "uWebSockets.js")
+            .unwrap();
+        assert_eq!(
+            entry.resolved,
+            format!("https://codeload.github.com/uNetworking/uWebSockets.js/tar.gz/{commit}")
+        );
+        let resolution = report
+            .lockfile
+            .resolution
+            .packages
+            .get("node_modules/uWebSockets.js")
+            .expect("git resolution metadata recorded");
+        match &resolution.source {
+            LockSource::Git {
+                url,
+                reference,
+                resolved_commit,
+            } => {
+                assert_eq!(url, "https://github.com/uNetworking/uWebSockets.js");
+                assert_eq!(reference.as_deref(), None);
+                assert_eq!(resolved_commit, commit);
+            }
+            other => panic!("expected git source, got {other:?}"),
+        }
     }
 
     #[test]
