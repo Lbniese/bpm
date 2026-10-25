@@ -65,6 +65,13 @@ struct VolumeMeta {
     /// reference immutable volume entries and are inherited by isolated views.
     #[serde(default)]
     entry_identities: Vec<VolumeEntryIdentity>,
+    /// Whether this volume was built with lifecycle scripts skipped. A
+    /// scriptless volume never served a scripted install — its packages lack
+    /// postinstall output — so it must be rebuilt when scripts are requested.
+    /// The reverse reuse is a harmless superset: a scripted volume already
+    /// contains everything a scriptless install would materialize.
+    #[serde(default)]
+    ignore_scripts: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -86,9 +93,12 @@ const META_FILE: &str = "metadata.json";
 /// materialization of package images). A cached volume whose recorded layout
 /// differs is discarded and rebuilt so every project sees the current layout.
 /// v7 also writes the complete artifact/derived inventory so the metadata
-/// index can rebuild graph edges from durable filesystem state alone. v9 uses
+/// index can rebuild graph edges from filesystem state alone. v9 uses
 /// graph-entry references for project ownership instead of eager tree hashes.
-const VOLUME_LAYOUT_VERSION: u32 = 10;
+/// v11 records the lifecycle scripts policy in the marker: volumes built
+/// before it carry no marker and their scripts provenance is unknowable, so
+/// they rebuild once.
+const VOLUME_LAYOUT_VERSION: u32 = 11;
 
 /// Current durable-inventory schema version written into [`VolumeMeta`]. A
 /// volume whose `inventory_version` is below this is treated as
@@ -153,6 +163,9 @@ pub struct PendingVolume {
     /// Complete artifact/derived inventory written into the volume marker so
     /// the metadata index can rebuild graph edges from durable state.
     inventory: GraphInventory,
+    /// The scripts policy this volume was built under; recorded in the
+    /// marker so a scriptless volume is never reused for a scripted install.
+    ignore_scripts: bool,
     /// The lock file guard.  Kept alive for the lifetime of this object.
     _lock: fs::File,
 }
@@ -268,6 +281,14 @@ fn valid_entry_identities(meta: &VolumeMeta, volume: &Path) -> Option<BTreeMap<S
     Some(identities)
 }
 
+/// Whether a volume marker built under `meta.ignore_scripts` can serve an
+/// install whose requested policy is `requested_ignore_scripts`. A scriptless
+/// volume never ran postinstalls and must be rebuilt for a scripted install;
+/// a scripted volume is a superset and serves both directions.
+fn scriptless_meta_serves(meta: &VolumeMeta, requested_ignore_scripts: bool) -> bool {
+    !meta.ignore_scripts || requested_ignore_scripts
+}
+
 fn current_meta(meta: &VolumeMeta, graph_hex: &str, volume: &Path) -> bool {
     meta.graph_id_hex == graph_hex
         && meta.layout_version == VOLUME_LAYOUT_VERSION
@@ -285,6 +306,7 @@ pub fn graph_volume_reuse_expected(
     lockfile: &Lockfile,
     prepared: &BTreeMap<String, crate::lifecycle::PreparedImage>,
     profile: InstallProfile,
+    ignore_scripts: bool,
 ) -> Option<String> {
     let prepared_keys = prepared
         .iter()
@@ -294,7 +316,10 @@ pub fn graph_volume_reuse_expected(
     let volume_dir = store.graph_volume_path(&graph_hex);
     let meta_bytes = fs::read(volume_dir.join(META_FILE)).ok()?;
     let meta = serde_json::from_slice::<VolumeMeta>(&meta_bytes).ok()?;
-    current_meta(&meta, &graph_hex, &volume_dir).then_some(graph_hex)
+    // A scriptless volume never ran lifecycle; a scripted install must
+    // rebuild rather than reuse packages without postinstall output.
+    let scripts_compatible = scriptless_meta_serves(&meta, ignore_scripts);
+    (current_meta(&meta, &graph_hex, &volume_dir) && scripts_compatible).then_some(graph_hex)
 }
 
 /// A top-level `link:` package placement for the project view.
@@ -458,6 +483,7 @@ pub fn ensure_graph_volume(
     project_root: &Path,
     lockfile: &Lockfile,
     artifact_ids: &[Option<ArtifactId>],
+    ignore_scripts: bool,
     metrics: &mut Metrics,
 ) -> Result<EnsuredVolume, VolumeError> {
     ensure_graph_volume_with_prepared(
@@ -466,6 +492,7 @@ pub fn ensure_graph_volume(
         lockfile,
         artifact_ids,
         &BTreeMap::new(),
+        ignore_scripts,
         metrics,
     )
 }
@@ -481,6 +508,7 @@ pub fn ensure_graph_volume_with_prepared(
     lockfile: &Lockfile,
     artifact_ids: &[Option<ArtifactId>],
     prepared: &BTreeMap<String, crate::lifecycle::PreparedImage>,
+    ignore_scripts: bool,
     metrics: &mut Metrics,
 ) -> Result<EnsuredVolume, VolumeError> {
     ensure_graph_volume_with_prepared_and_profile(
@@ -490,6 +518,7 @@ pub fn ensure_graph_volume_with_prepared(
         artifact_ids,
         prepared,
         InstallProfile::default_profile(),
+        ignore_scripts,
         metrics,
     )
 }
@@ -499,6 +528,7 @@ pub fn ensure_graph_volume_with_prepared(
 /// An omitted-dev profile gets a distinct durable volume even if its projected
 /// package set happens to equal the normal set, because lifecycle output may
 /// differ under `NODE_ENV=production`.
+#[allow(clippy::too_many_arguments)]
 pub fn ensure_graph_volume_with_prepared_and_profile(
     store: &ArtifactStore,
     project_root: &Path,
@@ -506,6 +536,7 @@ pub fn ensure_graph_volume_with_prepared_and_profile(
     artifact_ids: &[Option<ArtifactId>],
     prepared: &BTreeMap<String, crate::lifecycle::PreparedImage>,
     profile: InstallProfile,
+    ignore_scripts: bool,
     metrics: &mut Metrics,
 ) -> Result<EnsuredVolume, VolumeError> {
     ensure_graph_volume_with_prestaged(
@@ -515,6 +546,7 @@ pub fn ensure_graph_volume_with_prepared_and_profile(
         artifact_ids,
         prepared,
         profile,
+        ignore_scripts,
         metrics,
         None,
     )
@@ -533,6 +565,7 @@ pub fn ensure_graph_volume_with_prestaged(
     artifact_ids: &[Option<ArtifactId>],
     prepared: &BTreeMap<String, crate::lifecycle::PreparedImage>,
     profile: InstallProfile,
+    ignore_scripts: bool,
     metrics: &mut Metrics,
     mut prestaged: Option<PreStagedVolume>,
 ) -> Result<EnsuredVolume, VolumeError> {
@@ -548,11 +581,15 @@ pub fn ensure_graph_volume_with_prestaged(
     // Reuse: a complete marker whose graph id AND layout version match means
     // another process/project already built this exact volume; attaching to it
     // is the fast path. A graph or layout mismatch means the on-disk volume is
-    // stale and must be rebuilt from scratch.
+    // stale and must be rebuilt from scratch. A scriptless volume additionally
+    // cannot serve a scripted install: its packages never ran postinstalls.
     let mut stale = false;
     if let Ok(meta_bytes) = fs::read(volume_dir.join(META_FILE)) {
         match serde_json::from_slice::<VolumeMeta>(&meta_bytes) {
-            Ok(meta) if current_meta(&meta, &graph_hex, &volume_dir) => {
+            Ok(meta)
+                if current_meta(&meta, &graph_hex, &volume_dir)
+                    && scriptless_meta_serves(&meta, ignore_scripts) =>
+            {
                 metrics.record("graph_volume_hit", std::time::Duration::ZERO);
                 return Ok(EnsuredVolume::Ready(VolumeRef {
                     path: volume_dir,
@@ -571,7 +608,9 @@ pub fn ensure_graph_volume_with_prestaged(
     // completed the volume under lock while we were waiting.
     if let Ok(meta_bytes) = fs::read(volume_dir.join(META_FILE)) {
         if let Ok(meta) = serde_json::from_slice::<VolumeMeta>(&meta_bytes) {
-            if current_meta(&meta, &graph_hex, &volume_dir) {
+            if current_meta(&meta, &graph_hex, &volume_dir)
+                && scriptless_meta_serves(&meta, ignore_scripts)
+            {
                 metrics.record("graph_volume_hit", std::time::Duration::ZERO);
                 return Ok(EnsuredVolume::Ready(VolumeRef {
                     path: volume_dir,
@@ -694,13 +733,14 @@ pub fn ensure_graph_volume_with_prestaged(
         overlay_prepared_image(&prepared_image.image_path, &target)?;
     }
 
-    // Atomically publish the staging directory to the final path.
+    // Atomically publish the staging directory to the final graph path.
     let pending = PendingVolume {
         staging,
         final_path: volume_dir,
         graph_id_hex: graph_hex,
         stats,
         inventory: build_graph_inventory(lockfile, artifact_ids, prepared),
+        ignore_scripts,
         _lock: lock,
     };
     metrics.record("graph_volume_build", build_start.elapsed());
@@ -995,6 +1035,7 @@ pub fn write_test_meta_for_tests(root: &Path) {
         derived: Vec::new(),
         entry_identities: compute_entry_identities(&root.join("node_modules"))
             .expect("test node_modules must be readable"),
+        ignore_scripts: false,
     };
     fs::write(
         root.join(META_FILE),
@@ -1033,6 +1074,7 @@ impl PendingVolume {
                 .collect(),
             derived: self.inventory.derived.clone(),
             entry_identities,
+            ignore_scripts: self.ignore_scripts,
         };
         let meta_bytes = serde_json::to_vec_pretty(&meta).unwrap_or_default();
         fs::write(self.staging.join(META_FILE), meta_bytes)
@@ -2179,6 +2221,7 @@ mod tests {
             &[Some(id)],
             &BTreeMap::new(),
             InstallProfile::default_profile(),
+            false,
             &mut metrics,
             Some(prestaged),
         )
@@ -2203,8 +2246,36 @@ mod tests {
             artifacts: Vec::new(),
             derived: Vec::new(),
             entry_identities: compute_entry_identities(&root.join("node_modules")).unwrap(),
+            ignore_scripts: false,
         };
         fs::write(root.join(META_FILE), serde_json::to_vec(&meta).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn scriptless_volume_marker_rejects_scripted_reuse() {
+        // A volume published with --ignore-scripts records the policy; the
+        // reuse predicate must refuse it for a scripted install while still
+        // accepting it for another scriptless one (and accepting a scripted
+        // volume for both directions).
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let mut meta = VolumeMeta {
+            graph_id_hex: String::new(),
+            layout_version: VOLUME_LAYOUT_VERSION,
+            packages_materialized: 0,
+            bins_linked: 0,
+            inventory_version: INVENTORY_VERSION,
+            artifacts: Vec::new(),
+            derived: Vec::new(),
+            entry_identities: Vec::new(),
+            ignore_scripts: true,
+        };
+        fs::write(root.join(META_FILE), serde_json::to_vec(&meta).unwrap()).unwrap();
+        assert!(!scriptless_meta_serves(&meta, false));
+        assert!(scriptless_meta_serves(&meta, true));
+        meta.ignore_scripts = false;
+        assert!(scriptless_meta_serves(&meta, false));
+        assert!(scriptless_meta_serves(&meta, true));
     }
 
     #[cfg(unix)]
@@ -2610,6 +2681,7 @@ mod ownership_tests {
             artifacts: Vec::new(),
             derived: Vec::new(),
             entry_identities: compute_entry_identities(&vol).unwrap(),
+            ignore_scripts: false,
         };
         fs::write(
             volume_root.join(META_FILE),

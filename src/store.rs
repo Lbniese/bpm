@@ -178,7 +178,7 @@ impl ArtifactStore {
     }
 
     /// Block until an exclusive per-`key` lock is acquired. Released on drop.
-    fn acquire_lock(&self, key: &str) -> Result<FileGuard, StoreError> {
+    pub(crate) fn acquire_lock(&self, key: &str) -> Result<FileGuard, StoreError> {
         let path = self.lock_path(key);
         let file = OpenOptions::new()
             .create(true)
@@ -606,7 +606,7 @@ impl ArtifactStore {
 }
 
 /// RAII exclusive lock; the OS releases it when the file handle closes.
-struct FileGuard(std::fs::File);
+pub(crate) struct FileGuard(std::fs::File);
 
 impl Drop for FileGuard {
     fn drop(&mut self) {

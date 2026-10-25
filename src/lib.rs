@@ -52,6 +52,7 @@ pub mod resolution_cache;
 pub mod resolver;
 pub mod store;
 pub mod store_lock;
+pub mod tools;
 pub mod volume;
 pub mod workspace;
 

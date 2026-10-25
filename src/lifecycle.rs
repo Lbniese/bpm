@@ -318,6 +318,12 @@ pub fn run_lifecycle_with_profile(
     // meaningful against a graph volume; without one, scripts run in a sandbox
     // with no dependency resolution, so caching their output is unsound.
     let bounded_env = bounded_environment_for_profile(profile);
+    // npm ships node-gyp inside itself and exposes it to every lifecycle
+    // script. Provision BPM's managed copy lazily — only when some script
+    // actually invokes it — and surface its bin after the tree's own chains
+    // so a project's own node-gyp dependency still takes precedence.
+    let mut node_gyp_bin: Option<PathBuf> = None;
+    let mut node_gyp_probed = false;
     let owned_runtime = if policy.use_derived_store && volume_path.is_some() {
         probe_runtime()
     } else {
@@ -340,6 +346,20 @@ pub fn run_lifecycle_with_profile(
         // Read the package's own scripts from its (immutable) image manifest.
         let image = store.image_path(&id);
         let scripts = read_scripts_healing(store, &image, &id, metrics)?;
+        if !node_gyp_probed
+            && LIFECYCLE_PHASES
+                .iter()
+                .filter_map(|phase| scripts.get(*phase))
+                .any(|command| command.contains("node-gyp"))
+        {
+            node_gyp_probed = true;
+            match crate::tools::ensure_node_gyp(store) {
+                Ok(bin) => node_gyp_bin = Some(bin),
+                Err(error) => eprintln!(
+                    "warning: managed node-gyp unavailable; scripts invoking it will fail: {error}"
+                ),
+            }
+        }
         let has_lifecycle = LIFECYCLE_PHASES.iter().any(|p| scripts.contains_key(*p));
         if !has_lifecycle {
             continue;
@@ -418,6 +438,7 @@ pub fn run_lifecycle_with_profile(
                                 store,
                                 &pkg_clone,
                                 &bounded_env,
+                                node_gyp_bin.as_deref(),
                             );
                             let code = status
                                 .map(|status| status.code().unwrap_or(-1))
@@ -527,7 +548,16 @@ pub fn run_lifecycle_with_profile(
                 continue;
             };
             let status = metrics.measure("lifecycle", || {
-                run_script(&cwd, phase, cmd, project_root, store, pkg, &bounded_env)
+                run_script(
+                    &cwd,
+                    phase,
+                    cmd,
+                    project_root,
+                    store,
+                    pkg,
+                    &bounded_env,
+                    node_gyp_bin.as_deref(),
+                )
             });
             let code = status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
             let outcome = LifecycleOutcome {
@@ -702,6 +732,12 @@ pub fn prepare_git_packages_with_profile(
                             store,
                             &package_for_script,
                             &environment,
+                            // Git prepare scripts may build native modules
+                            // too; provision the managed tool on demand.
+                            crate::tools::ensure_node_gyp(store)
+                                .ok()
+                                .filter(|_| command.contains("node-gyp"))
+                                .as_deref(),
                         )
                         .map_err(|error| {
                             SandboxFailure::new(
@@ -859,6 +895,7 @@ fn read_scripts(manifest_path: &Path) -> Result<BTreeMap<String, String>, Lifecy
 }
 
 /// Execute one script via `sh -c` with an npm-compatible environment.
+#[allow(clippy::too_many_arguments)]
 fn run_script(
     cwd: &Path,
     phase: &str,
@@ -867,6 +904,7 @@ fn run_script(
     _store: &ArtifactStore,
     pkg: &PackageEntry,
     environment: &BTreeMap<OsString, OsString>,
+    tool_bin: Option<&Path>,
 ) -> std::io::Result<std::process::ExitStatus> {
     let mut cmd = crate::platform::script_command(command);
     cmd.current_dir(cwd);
@@ -911,6 +949,14 @@ fn run_script(
         let project_bin = project_root.join("node_modules").join(".bin");
         if !paths.contains(&project_bin) {
             paths.push(project_bin);
+        }
+        // The package-manager-provided tool bin (npm ships node-gyp this
+        // way). Last of the managed segments: the tree's own `.bin` chains
+        // and the project bin shadow it, matching npm's resolution order.
+        if let Some(tool_bin) = tool_bin {
+            if !paths.contains(&tool_bin.to_path_buf()) {
+                paths.push(tool_bin.to_path_buf());
+            }
         }
         paths.extend(std::env::split_paths(path));
         let new_path = std::env::join_paths(paths).map_err(|error| {
