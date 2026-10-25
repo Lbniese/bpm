@@ -202,9 +202,13 @@ fn windows_attach_with_reflink_backend_isolates_source() {
         stats: MaterializeStats::default(),
     };
 
-    let stats =
-        attach_project_local_with_backend(project.path(), &volume_ref, MaterializeBackend::Reflink)
-            .expect("reflink backend must not error on windows (copy fallback)");
+    let stats = attach_project_local_with_backend(
+        project.path(),
+        &volume_ref,
+        MaterializeBackend::Reflink,
+        &[],
+    )
+    .expect("reflink backend must not error on windows (copy fallback)");
     assert_eq!(
         stats.stats.relays_created, 1,
         "one package should be attached"
