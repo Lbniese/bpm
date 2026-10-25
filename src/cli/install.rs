@@ -2398,8 +2398,13 @@ fn finalize_install(
     // object alone covers the read window and skips the 2N+D publication,
     // access, and lease-row writes. Any install that will (re)build the
     // volume reads store images directly and takes the full object lease.
-    let volume_reuse_hex =
-        bpm::volume::graph_volume_reuse_expected(store, lockfile, &prepared, profile);
+    let volume_reuse_hex = bpm::volume::graph_volume_reuse_expected(
+        store,
+        lockfile,
+        &prepared,
+        profile,
+        options.ignore_scripts,
+    );
     // Turbopack and similar bundlers enforce that dependency realpaths remain
     // inside the project. Keep the O(top-level) relay fast path for ordinary
     // projects, but use a local hardlink view automatically for Next projects;
@@ -2447,6 +2452,7 @@ fn finalize_install(
                 artifact_ids,
                 &prepared,
                 profile,
+                options.ignore_scripts,
                 metrics,
                 prestaged,
             );
@@ -2668,11 +2674,10 @@ fn finalize_install(
             .map_err(|error| anyhow::anyhow!("metadata lease lost before completion: {error}"))?;
     }
     metrics.record("metadata_finalize", metadata_finalize_start.elapsed());
-    let package_count = lockfile
-        .packages
-        .iter()
-        .filter(|package| !package.link && !package.resolved.is_empty())
-        .count();
+    // Actual placements: entries with a resolved artifact id. This excludes
+    // platform-skipped and pruned-unreachable optionals, which have none —
+    // counting lock entries instead would over-report.
+    let package_count = artifact_ids.iter().filter(|id| id.is_some()).count();
     println!(
         "installed {} package(s) into {} ({} cached, {} fetched; graph volume {}, {} project-view entry(s))",
         package_count,
@@ -2698,20 +2703,16 @@ fn build_install_work(
 ) -> anyhow::Result<Vec<InstallWork>> {
     let mut work = Vec::new();
     let target = resolver::current_target_platform();
+    // First pass: platform dispositions. Optional packages that cannot run
+    // here are skipped; their own optional dependencies then become
+    // unreachable (npm prunes them because nothing installed declares them)
+    // and are propagated to a fixpoint below.
+    let mut platform_skipped: BTreeSet<String> = BTreeSet::new();
     for package in lockfile.packages.iter() {
         if package.link || package.resolved.is_empty() {
             continue;
         }
-        let constraints = PlatformConstraints {
-            os: package.os.iter().cloned().collect(),
-            cpu: package.cpu.iter().cloned().collect(),
-            libc: lockfile
-                .resolution
-                .packages
-                .get(&package.path)
-                .map(|resolution| resolution.libc.iter().cloned().collect())
-                .unwrap_or_default(),
-        };
+        let constraints = platform_constraints_for(lockfile, package);
         match check_package_platform(
             &format!("{}@{}", package.name, package.version),
             &constraints,
@@ -2725,10 +2726,29 @@ fn build_install_work(
         .map_err(|error| anyhow::anyhow!("platform filtering failed: {error}"))?
         {
             PlatformDisposition::Compatible => {}
-            PlatformDisposition::SkipOptional(diagnostic) => {
-                eprintln!("platform: {}", diagnostic.message);
-                continue;
+            PlatformDisposition::SkipOptional(_) => {
+                platform_skipped.insert(package.path.clone());
             }
+        }
+    }
+    let pruned_optionals = prune_unreachable_optionals(lockfile, &platform_skipped);
+    for package in lockfile.packages.iter() {
+        if package.link || package.resolved.is_empty() {
+            continue;
+        }
+        if platform_skipped.contains(&package.path) {
+            eprintln!(
+                "platform: skipping {}@{} (incompatible with this platform)",
+                package.name, package.version
+            );
+            continue;
+        }
+        if pruned_optionals.contains(&package.path) {
+            eprintln!(
+                "platform: skipping optional {}@{} (every declarer was skipped)",
+                package.name, package.version
+            );
+            continue;
         }
         let integrity = match package.integrity.as_deref() {
             Some(value) => Some(Integrity::parse(value).map_err(|error| {
@@ -2753,6 +2773,76 @@ fn build_install_work(
         });
     }
     Ok(work)
+}
+
+/// Platform constraints of a lock entry: its own os/cpu declarations plus
+/// any libc recorded by resolver metadata.
+fn platform_constraints_for(
+    lockfile: &Lockfile,
+    package: &bpm::lockfile::PackageEntry,
+) -> PlatformConstraints {
+    PlatformConstraints {
+        os: package.os.iter().cloned().collect(),
+        cpu: package.cpu.iter().cloned().collect(),
+        libc: lockfile
+            .resolution
+            .packages
+            .get(&package.path)
+            .map(|resolution| resolution.libc.iter().cloned().collect())
+            .unwrap_or_default(),
+    }
+}
+
+/// Optional entries rendered unreachable because every package that declares
+/// them was platform-skipped (npm prunes these: nothing installed depends on
+/// them). Propagates to a fixpoint so chains of optional deps clear too.
+/// Entries with no recorded declarer, or declared by the root, stay — an
+/// incomplete dependency map must never prune a reachable package.
+fn prune_unreachable_optionals(
+    lockfile: &Lockfile,
+    platform_skipped: &std::collections::BTreeSet<String>,
+) -> std::collections::BTreeSet<String> {
+    let mut declarers: std::collections::BTreeMap<&str, std::collections::BTreeSet<&str>> =
+        std::collections::BTreeMap::new();
+    for package in &lockfile.packages {
+        for name in package.dependencies.keys() {
+            declarers
+                .entry(name.as_str())
+                .or_default()
+                .insert(package.path.as_str());
+        }
+    }
+    let dead = |path: &str, pruned: &std::collections::BTreeSet<String>| {
+        platform_skipped.contains(path) || pruned.contains(path)
+    };
+    let mut pruned = std::collections::BTreeSet::new();
+    loop {
+        let mut changed = false;
+        for package in &lockfile.packages {
+            if !package.optional
+                || pruned.contains(&package.path)
+                || platform_skipped.contains(&package.path)
+                || lockfile.root.dependencies.contains_key(&package.name)
+            {
+                continue;
+            }
+            let Some(declared_by) = declarers.get(package.name.as_str()) else {
+                continue;
+            };
+            if !declared_by.is_empty() && declared_by.iter().all(|path| dead(path, &pruned)) {
+                eprintln!(
+                    "platform: optional {}@{} unreachable (all declarers skipped)",
+                    package.name, package.version
+                );
+                pruned.insert(package.path.clone());
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    pruned
 }
 
 impl std::fmt::Display for FetchFail {

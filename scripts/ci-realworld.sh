@@ -5,23 +5,22 @@
 # end, with `bpm import` + `bpm ci` against an isolated cold store, and
 # asserts the exact installed package count for each. The count assertion is
 # the regression gate for silent package-dropping (the inBundle import bug
-# dropped 286 packages from npm/cli while exiting 0).
+# dropped 286 packages from npm/cli while exiting 0). Counts are true
+# placements: platform-skipped and pruned-unreachable optionals are excluded.
 #
-# Every entry also runs repo-specific smoke checks that encode the failure
-# classes this corpus has already caught:
-#   - jquery:  a declared bin executes from the project view
-#   - cli:     workspace links stay live symlinks (npm shape) and a
-#              root-project bundleDependency resolves
+# Repo-specific smoke checks encode the failure classes this corpus has
+# already caught:
+#   - jquery:    a declared bin executes from the project view
+#   - cli:       workspace links stay live symlinks (npm shape) and a
+#                root-project bundleDependency resolves
 #   - socket.io: a hosted Git dependency (uWebSockets.js, no registry
-#              integrity) imports as a commit-keyed codeload tarball
+#                integrity) imports as a commit-keyed codeload tarball
+#   - vscode:    install scripts run in full — native modules build through
+#                the managed node-gyp and load through the project view
 #
 # Corpus pins move only deliberately: update the commit and the expected
 # count together, after running locally with
 #   BPM=./target/release/bpm ./scripts/ci-realworld.sh
-#
-# Excluded, with reasons:
-#   - vscode scripts: `node-gyp rebuild` install scripts need a bundled
-#     node-gyp; validated with --ignore-scripts instead
 set -euo pipefail
 
 # Absolutize: the loop cd's into each cloned repo, so a relative binary
@@ -35,13 +34,13 @@ WORK=${WORK:-$(mktemp -d)}
 
 # url|commit|expected-installed|extra-ci-flags
 CORPUS=(
-  "https://github.com/jquery/jquery.git|c2f27864e4ffc2d1409c289fcb9a42b6165dfeaf|786|"
-  "https://github.com/axios/axios.git|aa54a5e1e0e50cd1a2561b854ae5490ff589d065|686|"
+  "https://github.com/jquery/jquery.git|c2f27864e4ffc2d1409c289fcb9a42b6165dfeaf|750|"
+  "https://github.com/axios/axios.git|aa54a5e1e0e50cd1a2561b854ae5490ff589d065|632|"
   "https://github.com/istanbuljs/nyc.git|908620475199fa7b9ea0ea8b21d6d8ad6921e3ae|943|"
-  "https://github.com/mochajs/mocha.git|cb21a4eba550da665fb2c3fa1ce021777a191e23|742|"
-  "https://github.com/npm/cli.git|52f30938bd372dac25667f38fb771f5fe825e6e6|1169|"
-  "https://github.com/socketio/socket.io.git|1eaa582d3b453e3e6f522300ed05b10da0a0799b|1487|"
-  "https://github.com/microsoft/vscode.git|53b7b197990e6d9354dba0e42cce9b34d7c56c5c|1669|--ignore-scripts"
+  "https://github.com/mochajs/mocha.git|cb21a4eba550da665fb2c3fa1ce021777a191e23|650|"
+  "https://github.com/npm/cli.git|52f30938bd372dac25667f38fb771f5fe825e6e6|1150|"
+  "https://github.com/socketio/socket.io.git|1eaa582d3b453e3e6f522300ed05b10da0a0799b|1462|"
+  "https://github.com/microsoft/vscode.git|53b7b197990e6d9354dba0e42cce9b34d7c56c5c|1593|"
 )
 
 failures=0
@@ -121,6 +120,16 @@ if [ -f "$WORK/cli/node_modules/proc-log/package.json" ]; then
   echo "  cli: root bundleDependency proc-log present"
 else
   echo "FAIL cli: node_modules/proc-log missing (bundleDependencies dropped by import?)" >&2
+  failures=$((failures + 1))
+fi
+
+# A native module built by the managed node-gyp loads through the project
+# view — proves the lifecycle script PATH, node-gyp provisioning, and the
+# volume's derived-content flow end to end.
+if node -e "require('$WORK/vscode/node_modules/@vscode/fs-copyfile')" 2>/dev/null; then
+  echo "  vscode: native @vscode/fs-copyfile loads"
+else
+  echo "FAIL vscode: native require('@vscode/fs-copyfile') exited nonzero (node-gyp build missing?)" >&2
   failures=$((failures + 1))
 fi
 
