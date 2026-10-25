@@ -896,11 +896,12 @@ mod tests {
         let mut enc = builder.into_inner().unwrap();
         enc.flush().unwrap();
         let tgz = enc.finish().unwrap();
-        let (result, image) = extract_limits(&tgz, limits(1000, 1000, 1000));
+        let (result, _image) = extract_limits(&tgz, limits(1000, 1000, 1000));
         result.expect("0o666 directory must not break extraction");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+            let image = _image;
             let dir_mode =
                 |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
             assert_eq!(dir_mode(&image.path().join("lib")), 0o755);

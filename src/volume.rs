@@ -2018,7 +2018,7 @@ pub fn attach_project_local_with_backend(
             identity: format!(
                 "{}{}",
                 crate::graph::IDENTITY_TREE,
-                tree_fingerprint(&target).map_err(|source| io_err(&target, source))?
+                tree_fingerprint(&target)?
             ),
         });
     }
