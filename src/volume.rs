@@ -394,6 +394,7 @@ fn split_placement(path: &str) -> Option<(String, Option<String>)> {
 
 /// `target` relative to `base_dir`, both joined from the same root — npm's
 /// workspace-link shape. Falls back to `target` when no relative form exists.
+#[cfg(unix)]
 fn relative_to(base_dir: &Path, target: &Path) -> PathBuf {
     let mut base = base_dir.components();
     let mut tgt = target.components();
@@ -2528,6 +2529,7 @@ mod tests {
         assert_eq!(split_placement("other/foo"), None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn relative_to_walks_common_components() {
         assert_eq!(

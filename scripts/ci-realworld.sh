@@ -42,7 +42,7 @@ CORPUS=(
   "https://github.com/mochajs/mocha.git|cb21a4eba550da665fb2c3fa1ce021777a191e23|653|"
   "https://github.com/npm/cli.git|52f30938bd372dac25667f38fb771f5fe825e6e6|1149|"
   "https://github.com/socketio/socket.io.git|1eaa582d3b453e3e6f522300ed05b10da0a0799b|1461|"
-  "https://github.com/microsoft/vscode.git|53b7b197990e6d9354dba0e42cce9b34d7c56c5c|1593|"
+  "https://github.com/microsoft/vscode.git|53b7b197990e6d9354dba0e42cce9b34d7c56c5c|1595|"
 )
 
 failures=0
