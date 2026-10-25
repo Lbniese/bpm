@@ -2008,7 +2008,7 @@ pub fn attach_project_local_with_backend(
         let target = proj_nm.join(
             Path::new(&link.path)
                 .strip_prefix("node_modules")
-                .unwrap_or(&link.path),
+                .unwrap_or(Path::new(link.path.as_str())),
         );
         crate::materializer::copy_tree(&link.source, &target).map_err(VolumeError::Materialize)?;
         stats.relays_created += 1;

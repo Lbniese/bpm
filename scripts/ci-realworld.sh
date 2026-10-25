@@ -19,8 +19,10 @@
 #                the managed node-gyp and load through the project view
 #
 # Corpus pins move only deliberately: update the commit and the expected
-# count together, after running locally with
-#   BPM=./target/release/bpm ./scripts/ci-realworld.sh
+# count together, after verifying. Counts are the Linux/x86_64 reference —
+# the CI job's platform — because platform filtering makes them
+# OS/arch-specific (a local macOS run legitimately reports different
+# numbers). The CI job's failure output prints the actual count to pin.
 set -euo pipefail
 
 # Absolutize: the loop cd's into each cloned repo, so a relative binary
@@ -34,12 +36,12 @@ WORK=${WORK:-$(mktemp -d)}
 
 # url|commit|expected-installed|extra-ci-flags
 CORPUS=(
-  "https://github.com/jquery/jquery.git|c2f27864e4ffc2d1409c289fcb9a42b6165dfeaf|750|"
-  "https://github.com/axios/axios.git|aa54a5e1e0e50cd1a2561b854ae5490ff589d065|632|"
-  "https://github.com/istanbuljs/nyc.git|908620475199fa7b9ea0ea8b21d6d8ad6921e3ae|943|"
-  "https://github.com/mochajs/mocha.git|cb21a4eba550da665fb2c3fa1ce021777a191e23|650|"
-  "https://github.com/npm/cli.git|52f30938bd372dac25667f38fb771f5fe825e6e6|1150|"
-  "https://github.com/socketio/socket.io.git|1eaa582d3b453e3e6f522300ed05b10da0a0799b|1462|"
+  "https://github.com/jquery/jquery.git|c2f27864e4ffc2d1409c289fcb9a42b6165dfeaf|752|"
+  "https://github.com/axios/axios.git|aa54a5e1e0e50cd1a2561b854ae5490ff589d065|635|"
+  "https://github.com/istanbuljs/nyc.git|908620475199fa7b9ea0ea8b21d6d8ad6921e3ae|942|"
+  "https://github.com/mochajs/mocha.git|cb21a4eba550da665fb2c3fa1ce021777a191e23|653|"
+  "https://github.com/npm/cli.git|52f30938bd372dac25667f38fb771f5fe825e6e6|1149|"
+  "https://github.com/socketio/socket.io.git|1eaa582d3b453e3e6f522300ed05b10da0a0799b|1461|"
   "https://github.com/microsoft/vscode.git|53b7b197990e6d9354dba0e42cce9b34d7c56c5c|1593|"
 )
 
