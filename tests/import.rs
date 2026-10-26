@@ -390,7 +390,7 @@ fn cli_import_accepts_renamed_npm_locks_and_preserves_diagnostics() {
 #[test]
 fn alternate_lock_inputs_fail_without_output() {
     let cases = [
-        ("yarn.lock", "left-pad@^1.3.0:\n  version \"1.3.0\"\n  resolved \"https://registry/left-pad.tgz\"\n\nrepeat-string@^1.0.0:\n  version \"1.6.1\"\n  resolved \"https://registry/repeat-string.tgz\"\n", "failed to parse package-lock.json"),
+        ("yarn.lock", "left-pad@^1.3.0:\n  version \"1.3.0\"\n  resolved \"https://registry/left-pad.tgz\"\n\nrepeat-string@^1.0.0:\n  version \"1.6.1\"\n  resolved \"https://registry/repeat-string.tgz\"\n", "cannot read package.json beside yarn.lock"),
         ("pnpm-lock.yaml", "lockfileVersion: '9.0'\npackages:\n  /foo@1.0.0:\n    resolution: {tarball: https://registry/foo.tgz}\n", "failed to parse package-lock.json"),
         ("bun.lock", r#"{"packages":{"foo@1.0.0":{"resolved":"https://registry/foo.tgz"}}}"#, "unsupported lockfileVersion 0"),
         ("unknown.lock", "not a lockfile", "failed to parse package-lock.json"),
@@ -426,10 +426,7 @@ fn alternate_lock_inputs_fail_without_output() {
                     !result.status.success(),
                     "{name} unexpectedly imported: {stderr}"
                 );
-                assert!(
-                    stderr.contains("bpm import accepts only npm package-lock.json v2/v3"),
-                    "{name}: {stderr}"
-                );
+                assert!(stderr.contains("bpm import accepts"), "{name}: {stderr}");
                 assert!(stderr.contains(reason), "{name}: {stderr}");
                 assert!(result.stdout.is_empty());
                 assert_eq!(fs::read(input).unwrap(), content.as_bytes());

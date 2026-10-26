@@ -17,6 +17,8 @@
 #                integrity) imports as a commit-keyed codeload tarball
 #   - vscode:    install scripts run in full — native modules build through
 #                the managed node-gyp and load through the project view
+#   - webpack:   a yarn v1 lockfile (no recorded placements or bins) is
+#                imported and installed with npm-style hoisting
 #
 # Corpus pins move only deliberately: update the commit and the expected
 # count together, after verifying. Counts are the Linux/x86_64 reference —
@@ -43,6 +45,7 @@ CORPUS=(
   "https://github.com/npm/cli.git|52f30938bd372dac25667f38fb771f5fe825e6e6|1149|"
   "https://github.com/socketio/socket.io.git|1eaa582d3b453e3e6f522300ed05b10da0a0799b|1461|"
   "https://github.com/microsoft/vscode.git|53b7b197990e6d9354dba0e42cce9b34d7c56c5c|1595|"
+  "https://github.com/webpack/webpack.git|669012dfc912167fa3b13cff233f8f0fa9755aef|1714|"
 )
 
 failures=0
@@ -132,6 +135,15 @@ if node -e "require('$WORK/vscode/node_modules/@vscode/fs-copyfile')" 2>/dev/nul
   echo "  vscode: native @vscode/fs-copyfile loads"
 else
   echo "FAIL vscode: native require('@vscode/fs-copyfile') exited nonzero (node-gyp build missing?)" >&2
+  failures=$((failures + 1))
+fi
+
+# yarn v1 locks record no bins: the .bin tree must come from the extracted
+# image manifests. A dev tool binary executing proves the fallback.
+if "$WORK/webpack/node_modules/.bin/jest" --version >/dev/null 2>&1; then
+  echo "  webpack: jest bin executes (image-declared bins)"
+else
+  echo "FAIL webpack: node_modules/.bin/jest --version exited nonzero (bins missing from yarn import?)" >&2
   failures=$((failures + 1))
 fi
 

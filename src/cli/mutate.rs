@@ -448,7 +448,9 @@ fn serialize_lock(
                 .map_err(|error| anyhow::anyhow!("cannot export package-lock.json v3: {error}"))?;
             Ok((path, bytes, ProjectLockKind::NpmV3))
         }
-        Some(ProjectLockKind::Bpm) | None => {
+        // A yarn project graduating into a mutation flow canonicalizes to
+        // bpm.lock (writing yarn.lock back out is not supported).
+        Some(ProjectLockKind::YarnV1) | Some(ProjectLockKind::Bpm) | None => {
             let path = project_root.join(BPM_LOCK_FILE);
             let json = lockfile.to_json().map_err(|error| {
                 anyhow::anyhow!("cannot serialize bpm.lock: {}", lock_error(&error))

@@ -55,6 +55,7 @@ pub mod store_lock;
 pub mod tools;
 pub mod volume;
 pub mod workspace;
+pub mod yarn_lock;
 
 pub use diagnostic::{Diagnostic, Severity};
 pub use doctor::{DoctorReport, ManifestSummary};

@@ -337,12 +337,20 @@ pub(crate) fn link_bins_for_staged(
             continue;
         }
         stats.packages_materialized += 1;
-        if !entry.bin.is_empty() {
+        // Locks do not always record bins (yarn v1 has none). The staged
+        // image's manifest is authoritative by then — fall back to it so
+        // imported graphs still get a complete node_modules/.bin.
+        let bins = if entry.bin.is_empty() {
+            image_declared_bins(&store.image_path(id), &entry.name)
+        } else {
+            entry.bin.clone()
+        };
+        if !bins.is_empty() {
             link_bins(
                 project_root,
                 &entry.path,
                 &store.image_path(id),
-                &entry.bin,
+                &bins,
                 &mut linked_bins,
                 &mut stats,
                 cfg!(unix),
@@ -350,6 +358,33 @@ pub(crate) fn link_bins_for_staged(
         }
     }
     Ok(stats)
+}
+
+/// Bins declared by an extracted image's own package.json, npm-shaped
+/// (`bin: "cli.js"` names the bin after the package). Scoped bin names
+/// (`@babel/parser`) flatten to their last segment, matching how yarn/npm
+/// materialize `.bin` entries; names that still fail validation are dropped.
+fn image_declared_bins(image_dir: &Path, package_name: &str) -> BTreeMap<String, String> {
+    let raw = crate::manifest::PackageManifest::from_path(&image_dir.join("package.json"))
+        .ok()
+        .and_then(|manifest| manifest.bin)
+        .map(|field| match field {
+            crate::manifest::BinField::One(path) => {
+                BTreeMap::from([(package_name.to_string(), path)])
+            }
+            crate::manifest::BinField::Map(map) => map,
+        })
+        .unwrap_or_default();
+    let mut bins = BTreeMap::new();
+    for (name, target) in raw {
+        let name = name.rsplit('/').next().unwrap_or(&name).to_string();
+        if crate::path_safety::validate_bin_name(&name).is_ok()
+            && crate::path_safety::validate_bin_target(&target).is_ok()
+        {
+            bins.insert(name, target);
+        }
+    }
+    bins
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -489,13 +524,21 @@ fn materialize_with_backend_impl(
 
     // Pass B — sequential .bin linking (first-declarant-wins semantics).
     for (i, (_, entry, id)) in work.iter().enumerate() {
-        if !entry.bin.is_empty() {
+        // Locks do not always record bins (yarn v1 has none). The extracted
+        // image's manifest is authoritative — fall back to it so imported
+        // graphs still get a complete node_modules/.bin.
+        let bins = if entry.bin.is_empty() {
+            image_declared_bins(&store.image_path(id), &entry.name)
+        } else {
+            entry.bin.clone()
+        };
+        if !bins.is_empty() {
             let image_dir = store.image_path(id);
             link_bins(
                 project_root,
                 &entry.path,
                 &image_dir,
-                &entry.bin,
+                &bins,
                 &mut linked_bins,
                 &mut stats,
                 symlink_bins_flags[i],

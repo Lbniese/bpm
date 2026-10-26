@@ -1,10 +1,10 @@
-//! npm lockfile import orchestration.
+//! Lockfile import orchestration (npm package-lock v2/v3, yarn v1).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use bpm::lockfile::{Lockfile, BPM_LOCK_FILE};
-use bpm::project_lock::load_npm_package_lock;
+use bpm::project_lock::{load_npm_package_lock, load_yarn_lock};
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -16,12 +16,37 @@ struct ImportJson<'a> {
 }
 
 pub(super) fn run(path: Option<PathBuf>, out: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
-    let input = path.unwrap_or_else(|| PathBuf::from("package-lock.json"));
+    let input = match path {
+        Some(path) => path,
+        // Auto-detect the conventional lockfiles in the working directory.
+        None => {
+            if Path::new("package-lock.json").exists() || !Path::new("yarn.lock").exists() {
+                PathBuf::from("package-lock.json")
+            } else {
+                PathBuf::from("yarn.lock")
+            }
+        }
+    };
+    // Dispatch by name, then shape: a file NAMED yarn.lock whose content is
+    // JSON is a renamed npm lock (explicit paths never force-format), and a
+    // yarn.lock always begins with its header comment or a bare spec key.
+    let is_yarn = input
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "yarn.lock")
+        && !std::fs::read_to_string(&input)
+            .map(|text| text.trim_start().starts_with('{'))
+            .unwrap_or(false);
     let bpm::ImportReport {
         lockfile,
         diagnostics,
-    } = load_npm_package_lock(&input)
-        .context("bpm import accepts only npm package-lock.json v2/v3")?;
+    } = if is_yarn {
+        load_yarn_lock(&input)
+            .context("bpm import accepts npm package-lock.json v2/v3 and yarn v1 yarn.lock")?
+    } else {
+        load_npm_package_lock(&input)
+            .context("bpm import accepts only npm package-lock.json v2/v3")?
+    };
     let out_path = out.unwrap_or_else(|| {
         input
             .parent()

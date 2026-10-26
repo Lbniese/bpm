@@ -98,7 +98,9 @@ const META_FILE: &str = "metadata.json";
 /// v11 records the lifecycle scripts policy in the marker: volumes built
 /// before it carry no marker and their scripts provenance is unknowable, so
 /// they rebuild once.
-const VOLUME_LAYOUT_VERSION: u32 = 11;
+/// v12 links .bin from extracted image manifests when the lock records no
+/// bins (yarn v1 imports) — volumes built before it lack a complete .bin.
+const VOLUME_LAYOUT_VERSION: u32 = 12;
 
 /// Current durable-inventory schema version written into [`VolumeMeta`]. A
 /// volume whose `inventory_version` is below this is treated as

@@ -25,6 +25,8 @@ pub enum ProjectLockKind {
     Bpm,
     /// npm `package-lock.json` authority (v2/v3 input; canonical v3 output).
     NpmV3,
+    /// Yarn v1 `yarn.lock` input (converted; canonical v3 output).
+    YarnV1,
 }
 
 impl ProjectLockKind {
@@ -33,6 +35,7 @@ impl ProjectLockKind {
         match self {
             Self::Bpm => BPM_LOCK_FILE,
             Self::NpmV3 => NPM_PACKAGE_LOCK_FILE,
+            Self::YarnV1 => "yarn.lock",
         }
     }
 }
@@ -59,6 +62,11 @@ pub enum ProjectLockError {
     BpmLock { path: String, source: LockfileError },
     #[error("failed to load package-lock.json at {path}: {source}")]
     NpmLock { path: String, source: NpmLockError },
+    #[error("failed to load yarn.lock at {path}: {source}")]
+    YarnLock {
+        path: String,
+        source: crate::yarn_lock::YarnLockError,
+    },
     #[error("failed to load package.json at {path}: {source}")]
     Manifest { path: String, source: ManifestError },
 }
@@ -102,6 +110,20 @@ pub fn load_npm_package_lock(path: &Path) -> Result<ImportReport, ProjectLockErr
     })
 }
 
+/// Read and convert a yarn v1 `yarn.lock` (with its sibling `package.json`)
+/// into a canonical lockfile. The input is never modified and no `bpm.lock`
+/// is created.
+pub fn load_yarn_lock(path: &Path) -> Result<ImportReport, ProjectLockError> {
+    let project_root = path.parent().unwrap_or_else(|| Path::new("."));
+    let manifest_path = project_root.join("package.json");
+    crate::yarn_lock::import_yarn_v1(path, &manifest_path).map_err(|source| {
+        ProjectLockError::YarnLock {
+            path: path.display().to_string(),
+            source,
+        }
+    })
+}
+
 /// Validate that imported npm diagnostics are safe for direct install/CI.
 pub fn validate_npm_direct_install(diagnostics: &[Diagnostic]) -> Result<(), ProjectLockError> {
     let mut blocking = diagnostics
@@ -109,7 +131,10 @@ pub fn validate_npm_direct_install(diagnostics: &[Diagnostic]) -> Result<(), Pro
         .filter(|diagnostic| {
             matches!(
                 diagnostic.code,
-                "LINK_PACKAGE_UNSUPPORTED" | "MISSING_RESOLVED"
+                "LINK_PACKAGE_UNSUPPORTED"
+                    | "MISSING_RESOLVED"
+                    | "YARN_WORKSPACE_UNSUPPORTED"
+                    | "YARN_MISSING_RESOLUTION"
             )
         })
         .cloned()
@@ -166,6 +191,21 @@ pub fn find_project_lock(start: &Path) -> Result<Option<ProjectLock>, ProjectLoc
                 path: npm_path,
                 project_root: current.to_path_buf(),
                 kind: ProjectLockKind::NpmV3,
+                lockfile,
+                diagnostics,
+            }));
+        }
+
+        let yarn_path = current.join("yarn.lock");
+        if yarn_path.is_file() && current.join("package.json").is_file() {
+            let ImportReport {
+                lockfile,
+                diagnostics,
+            } = load_yarn_lock(&yarn_path)?;
+            return Ok(Some(ProjectLock {
+                path: yarn_path,
+                project_root: current.to_path_buf(),
+                kind: ProjectLockKind::YarnV1,
                 lockfile,
                 diagnostics,
             }));
