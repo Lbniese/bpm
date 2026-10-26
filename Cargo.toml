@@ -1,9 +1,35 @@
 [package]
-name = "bpm"
+# The crates.io package is `bloom-pm` — the `bpm` name was registered by an
+# unrelated crate in 2022. The library and binary keep the `bpm` name so
+# internal `use bpm::…` paths and `CARGO_BIN_EXE_bpm` test references are
+# unchanged; `cargo install bloom-pm` still puts a `bpm` binary on PATH.
+name = "bloom-pm"
 version = "0.5.0"
 edition = "2021"
 description = "Bloom Package Manager: an npm-compatible, performance-focused package installer"
 license = "MIT"
+repository = "https://github.com/Lbniese/bpm"
+homepage = "https://lbniese.github.io/bpm/"
+readme = "README.md"
+keywords = ["package-manager", "npm", "javascript", "node", "installer"]
+categories = ["command-line-utilities", "development-tools"]
+rust-version = "1.96"
+exclude = [
+  "/site",
+  "/benchmarks",
+  "/fixtures",
+  "/.github",
+  "/docker-compose.yml",
+  "/Dockerfile",
+  "/scripts",
+]
+
+[lib]
+name = "bpm"
+
+[[bin]]
+name = "bpm"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0"
