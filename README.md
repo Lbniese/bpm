@@ -94,6 +94,32 @@ semantics without writable hardlink or relay aliases.
 | `bpm ls [<pkg>]` (`bpm list`) | Render the installed dependency tree |
 
 
+## Lockfile stability
+
+As of bpm 0.5.0, the `bpm.lock` format (`lockfileVersion: 2`) is **frozen**.
+
+- **Within v2, only additive informational fields may appear.** Readers
+  ignore fields they do not know, so a newer bpm.lock stays readable by
+  older bpm builds. Anything that changes *installation semantics* — new
+  dependency source kinds, new resolution meaning — requires `v3`, which
+  older builds reject with an explicit version error rather than
+  installing something different from what was locked.
+- **Older locks migrate in memory.** v1 locks normalize on read and are
+  never rewritten on disk; frozen installs leave legacy bytes untouched.
+- **Output is canonical and deterministic** — byte-for-byte stable across
+  machines and runs — and readers validate the canonical form (sorted,
+  unique, normalized package paths; safe bin entries; integrity on every
+  frozen package).
+- **Store internals are not part of the contract.** Image and graph-volume
+  layout versions are cache generations: when they change, the store
+  rebuilds once on the next install. Graph ids are cache keys, not a
+  compatibility surface.
+
+The format is guarded by the workspace test suite and the CI real-world
+corpus — ten pinned upstream repositories (npm, yarn v1, and pnpm v9/v10
+lockfiles) imported and installed on every push to main, with exact
+placement counts asserted.
+
 ## Building from source
 
 ```bash
