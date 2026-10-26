@@ -176,7 +176,9 @@ pub(super) fn run(mut options: Options) -> anyhow::Result<()> {
         Some(project_lock) => {
             if matches!(
                 project_lock.kind,
-                ProjectLockKind::NpmV3 | ProjectLockKind::YarnV1
+                ProjectLockKind::NpmV3
+                    | ProjectLockKind::YarnV1
+                    | ProjectLockKind::PnpmV9
             ) {
                 validate_npm_direct_install(&project_lock.diagnostics)?;
                 render_import_diagnostics(&project_lock.diagnostics);

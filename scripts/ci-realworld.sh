@@ -19,6 +19,9 @@
 #                the managed node-gyp and load through the project view
 #   - webpack:   a yarn v1 lockfile (no recorded placements or bins) is
 #                imported and installed with npm-style hoisting
+#   - svelte:    a pnpm v9 lock (workspace links, peer-variant snapshots)
+#   - vue-core:  a pnpm v10 multi-document lock with cross-package
+#                workspace links
 #
 # Corpus pins move only deliberately: update the commit and the expected
 # count together, after verifying. Counts are the Linux/x86_64 reference —
@@ -46,6 +49,8 @@ CORPUS=(
   "https://github.com/socketio/socket.io.git|1eaa582d3b453e3e6f522300ed05b10da0a0799b|1461|"
   "https://github.com/microsoft/vscode.git|53b7b197990e6d9354dba0e42cce9b34d7c56c5c|1595|"
   "https://github.com/webpack/webpack.git|669012dfc912167fa3b13cff233f8f0fa9755aef|1714|"
+  "https://github.com/sveltejs/svelte.git|356c8766a024d5982c276e898903fadaceaca960|406|"
+  "https://github.com/vuejs/core.git|ca034820b8288ab6da3a033626a7857401ee64a5|539|"
 )
 
 failures=0

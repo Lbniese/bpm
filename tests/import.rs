@@ -391,7 +391,7 @@ fn cli_import_accepts_renamed_npm_locks_and_preserves_diagnostics() {
 fn alternate_lock_inputs_fail_without_output() {
     let cases = [
         ("yarn.lock", "left-pad@^1.3.0:\n  version \"1.3.0\"\n  resolved \"https://registry/left-pad.tgz\"\n\nrepeat-string@^1.0.0:\n  version \"1.6.1\"\n  resolved \"https://registry/repeat-string.tgz\"\n", "cannot read package.json beside yarn.lock"),
-        ("pnpm-lock.yaml", "lockfileVersion: '9.0'\npackages:\n  /foo@1.0.0:\n    resolution: {tarball: https://registry/foo.tgz}\n", "failed to parse package-lock.json"),
+        ("pnpm-lock.yaml", "lockfileVersion: '9.0'\npackages:\n  /foo@1.0.0:\n    resolution: {tarball: https://registry/foo.tgz}\n", "cannot read package.json beside pnpm-lock.yaml"),
         ("bun.lock", r#"{"packages":{"foo@1.0.0":{"resolved":"https://registry/foo.tgz"}}}"#, "unsupported lockfileVersion 0"),
         ("unknown.lock", "not a lockfile", "failed to parse package-lock.json"),
         ("malformed.json", "{", "failed to parse package-lock.json"),

@@ -450,7 +450,10 @@ fn serialize_lock(
         }
         // A yarn project graduating into a mutation flow canonicalizes to
         // bpm.lock (writing yarn.lock back out is not supported).
-        Some(ProjectLockKind::YarnV1) | Some(ProjectLockKind::Bpm) | None => {
+        Some(ProjectLockKind::YarnV1)
+        | Some(ProjectLockKind::PnpmV9)
+        | Some(ProjectLockKind::Bpm)
+        | None => {
             let path = project_root.join(BPM_LOCK_FILE);
             let json = lockfile.to_json().map_err(|error| {
                 anyhow::anyhow!("cannot serialize bpm.lock: {}", lock_error(&error))

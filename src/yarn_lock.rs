@@ -19,6 +19,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 
 use crate::diagnostic::{sort_diagnostics, Diagnostic, Severity};
+use crate::hoist::Placer;
 use crate::lockfile::{Lockfile, PackageEntry, RootEntry};
 use crate::manifest::PackageManifest;
 use crate::npm_lock::ImportReport;
@@ -201,82 +202,7 @@ fn spec_name(spec: &str) -> Option<&str> {
     }
 }
 
-/// The parent package path of a placement: `node_modules/a/node_modules/b`
-/// -> `node_modules/a`; `node_modules/a` -> None (the root).
-fn parent_package(path: &str) -> Option<String> {
-    if !path.starts_with("node_modules/") {
-        return None;
-    }
-    path.rfind("/node_modules/")
-        .map(|at| path[..at].to_string())
-}
-
-/// Where resolved packages are physically placed, yarn-v1-style.
-///
-/// A requirement scans its dependent's ancestor chain from the dependent's
-/// own `node_modules` upward: a slot holding the SAME version is shared; a
-/// slot holding a different version blocks everything above it. The claim
-/// target is the ROOT when the whole chain is free (the hoisted common
-/// case), otherwise the dependent's OWN directory. Intermediate directories
-/// are never claimed directly by deep dependents: a free-looking
-/// intermediate can be the resolution path of its owner (placing there
-/// would retroactively shadow it), which is the same hazard that keeps
-/// yarn's linker to root-and-nest-under-dependent placement. Root claims
-/// are always safe (nothing resolves above the root), and own-dir claims
-/// only affect the dependent's subtree. Every edge therefore resolves to
-/// its exact version by construction, and the sorted FIFO seed order gives
-/// root-manifest versions the root slots.
-#[derive(Default)]
-struct Placer {
-    /// node_modules-relative dir -> occupied (name -> version).
-    occupied: BTreeMap<String, BTreeMap<String, String>>,
-}
-
-impl Placer {
-    /// Place `(name, version)` required by the package at `dependent_path`
-    /// ("" for the root). Returns the package's lockfile path.
-    fn place(&mut self, name: &str, version: &str, dependent_path: &str) -> String {
-        let mut chain: Vec<String> = Vec::new();
-        if dependent_path.is_empty() {
-            chain.push("node_modules".to_string());
-        } else {
-            let mut current = Some(dependent_path.to_string());
-            while let Some(package) = current {
-                chain.push(format!("{package}/node_modules"));
-                current = parent_package(&package);
-            }
-            chain.push("node_modules".to_string());
-        }
-        let root = chain.last().expect("chain always ends at the root");
-        let own = &chain[0];
-        let mut root_free = true;
-        for dir in &chain {
-            match self
-                .occupied
-                .get(dir)
-                .and_then(|slot| slot.get(name))
-                .map(String::as_str)
-            {
-                Some(occupied) if occupied == version => {
-                    return format!("{dir}/{name}");
-                }
-                Some(_) => {
-                    root_free = false;
-                    break;
-                }
-                None => continue,
-            }
-        }
-        let target = if root_free { root } else { own };
-        self.occupied
-            .entry(target.clone())
-            .or_default()
-            .insert(name.to_string(), version.to_string());
-        format!("{target}/{name}")
-    }
-}
-
-/// Import a yarn v1 lock plus its sibling `package.json` into a canonical
+/// Import a yarn v1 lock/// Import a yarn v1 lock plus its sibling `package.json` into a canonical
 /// lockfile.
 pub fn import_yarn_v1(
     lock_path: &Path,
@@ -552,35 +478,6 @@ fsevents@^1.2.7:
         // npm: alias ranges contain `@`; the name ends at the first one.
         assert_eq!(spec_name("prettier-2@npm:prettier@^2"), Some("prettier-2"));
         assert_eq!(spec_name("lodash"), None);
-    }
-
-    #[test]
-    fn placer_hoists_root_owner_and_nests_conflicts() {
-        // Root requirements process first and claim the hoisted root slots;
-        // conflicting versions claim the highest free slot on their
-        // dependent's ancestor chain.
-        let mut placer = Placer::default();
-        assert_eq!(placer.place("a", "1.0.0", ""), "node_modules/a");
-        assert_eq!(
-            placer.place("a", "1.0.0", "node_modules/b"),
-            "node_modules/a"
-        );
-        assert_eq!(
-            placer.place("a", "2.0.0", "node_modules/b"),
-            "node_modules/b/node_modules/a"
-        );
-        // A deep dependent whose own dir is free claims it directly, even
-        // though the root holds another version (no shadowing is possible).
-        assert_eq!(
-            placer.place("a", "3.0.0", "node_modules/b/node_modules/c"),
-            "node_modules/b/node_modules/c/node_modules/a"
-        );
-        // parent_package walks the placement chain upward.
-        assert_eq!(
-            parent_package("node_modules/b/node_modules/c"),
-            Some("node_modules/b".to_string())
-        );
-        assert_eq!(parent_package("node_modules/b"), None);
     }
 
     #[test]

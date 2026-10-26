@@ -27,6 +27,8 @@ pub enum ProjectLockKind {
     NpmV3,
     /// Yarn v1 `yarn.lock` input (converted; canonical v3 output).
     YarnV1,
+    /// pnpm v9 `pnpm-lock.yaml` input (converted; canonical v3 output).
+    PnpmV9,
 }
 
 impl ProjectLockKind {
@@ -36,6 +38,7 @@ impl ProjectLockKind {
             Self::Bpm => BPM_LOCK_FILE,
             Self::NpmV3 => NPM_PACKAGE_LOCK_FILE,
             Self::YarnV1 => "yarn.lock",
+            Self::PnpmV9 => "pnpm-lock.yaml",
         }
     }
 }
@@ -66,6 +69,11 @@ pub enum ProjectLockError {
     YarnLock {
         path: String,
         source: crate::yarn_lock::YarnLockError,
+    },
+    #[error("failed to load pnpm-lock.yaml at {path}: {source}")]
+    PnpmLock {
+        path: String,
+        source: crate::pnpm_lock::PnpmLockError,
     },
     #[error("failed to load package.json at {path}: {source}")]
     Manifest { path: String, source: ManifestError },
@@ -124,6 +132,20 @@ pub fn load_yarn_lock(path: &Path) -> Result<ImportReport, ProjectLockError> {
     })
 }
 
+/// Read and convert a pnpm v9 `pnpm-lock.yaml` (with its sibling
+/// `package.json`) into a canonical lockfile. The input is never modified
+/// and no `bpm.lock` is created.
+pub fn load_pnpm_lock(path: &Path) -> Result<ImportReport, ProjectLockError> {
+    let project_root = path.parent().unwrap_or_else(|| Path::new("."));
+    let manifest_path = project_root.join("package.json");
+    crate::pnpm_lock::import_pnpm_v9(path, &manifest_path).map_err(|source| {
+        ProjectLockError::PnpmLock {
+            path: path.display().to_string(),
+            source,
+        }
+    })
+}
+
 /// Validate that imported npm diagnostics are safe for direct install/CI.
 pub fn validate_npm_direct_install(diagnostics: &[Diagnostic]) -> Result<(), ProjectLockError> {
     let mut blocking = diagnostics
@@ -135,6 +157,10 @@ pub fn validate_npm_direct_install(diagnostics: &[Diagnostic]) -> Result<(), Pro
                     | "MISSING_RESOLVED"
                     | "YARN_WORKSPACE_UNSUPPORTED"
                     | "YARN_MISSING_RESOLUTION"
+                    | "PNPM_PATCH_UNSUPPORTED"
+                    | "PNPM_MISSING_RESOLUTION"
+                    | "PNPM_UNNAMED_ENTRY"
+                    | "PNPM_LINK_OUTSIDE_PROJECT"
             )
         })
         .cloned()
@@ -206,6 +232,21 @@ pub fn find_project_lock(start: &Path) -> Result<Option<ProjectLock>, ProjectLoc
                 path: yarn_path,
                 project_root: current.to_path_buf(),
                 kind: ProjectLockKind::YarnV1,
+                lockfile,
+                diagnostics,
+            }));
+        }
+
+        let pnpm_path = current.join("pnpm-lock.yaml");
+        if pnpm_path.is_file() && current.join("package.json").is_file() {
+            let ImportReport {
+                lockfile,
+                diagnostics,
+            } = load_pnpm_lock(&pnpm_path)?;
+            return Ok(Some(ProjectLock {
+                path: pnpm_path,
+                project_root: current.to_path_buf(),
+                kind: ProjectLockKind::PnpmV9,
                 lockfile,
                 diagnostics,
             }));
