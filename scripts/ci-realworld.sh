@@ -49,8 +49,8 @@ CORPUS=(
   "https://github.com/socketio/socket.io.git|1eaa582d3b453e3e6f522300ed05b10da0a0799b|1461|"
   "https://github.com/microsoft/vscode.git|53b7b197990e6d9354dba0e42cce9b34d7c56c5c|1595|"
   "https://github.com/webpack/webpack.git|669012dfc912167fa3b13cff233f8f0fa9755aef|1714|"
-  "https://github.com/sveltejs/svelte.git|356c8766a024d5982c276e898903fadaceaca960|406|"
-  "https://github.com/vuejs/core.git|ca034820b8288ab6da3a033626a7857401ee64a5|539|"
+  "https://github.com/sveltejs/svelte.git|356c8766a024d5982c276e898903fadaceaca960|404|"
+  "https://github.com/vuejs/core.git|ca034820b8288ab6da3a033626a7857401ee64a5|545|"
 )
 
 failures=0

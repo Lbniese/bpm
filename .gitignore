@@ -25,3 +25,4 @@ benchmarks/profiles/*
 # agent / local-only working dirs — never committed
 .opencode/
 .pi/
+rollup/
