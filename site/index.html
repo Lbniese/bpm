@@ -733,54 +733,64 @@
     </div>
   </section>
 
-  <!-- ================= PERFORMANCE (commented out — benchmarks coming soon) =================
   <section id="performance" class="band-alt">
     <div class="wrap">
       <div class="section-head reveal">
         <span class="eyebrow">Performance</span>
         <h2>Where the time actually goes</h2>
-        <p>Illustrative timings for a warm-store reinstall of a mid-sized graph (~200 packages). Run <code class="mono" style="font-size:13px;">bpm bench</code> against your own project for real numbers.</p>
+        <p>Measured on the Linux reference CI runner (x86_64), <code class="mono" style="font-size:13px;">react + react-dom + webpack + typescript</code> fixture, median of 7 runs, bpm 0.5.0 vs pnpm 10.13.1.</p>
       </div>
 
       <div class="perf-layout">
-        <div class="bench-chart reveal">
-          <div class="bench-row">
-            <div class="bench-row-label"><span class="name">bpm</span><span class="val">0.09s</span></div>
-            <div class="bench-track"><div class="bench-fill" data-width="4%"></div></div>
+        <div style="display:flex;flex-direction:column;gap:24px;">
+          <div class="bench-chart reveal">
+            <p class="bench-note" style="text-align:left;margin-bottom:18px;">Warm reinstall — store already populated</p>
+            <div class="bench-row">
+              <div class="bench-row-label"><span class="name">bpm</span><span class="val">0.01s</span></div>
+              <div class="bench-track"><div class="bench-fill" data-width="3%"></div></div>
+            </div>
+            <div class="bench-row">
+              <div class="bench-row-label"><span class="name">pnpm</span><span class="val">0.46s</span></div>
+              <div class="bench-track"><div class="bench-fill alt" data-width="100%"></div></div>
+            </div>
+            <p class="bench-note">the cached graph is reused, not re-resolved or re-extracted</p>
           </div>
-          <div class="bench-row">
-            <div class="bench-row-label"><span class="name">pnpm</span><span class="val">2.10s</span></div>
-            <div class="bench-track"><div class="bench-fill alt" data-width="47%"></div></div>
+
+          <div class="bench-chart reveal">
+            <p class="bench-note" style="text-align:left;margin-bottom:18px;">CI-style frozen install — lockfile committed, empty store</p>
+            <div class="bench-row">
+              <div class="bench-row-label"><span class="name">bpm</span><span class="val">0.66s</span></div>
+              <div class="bench-track"><div class="bench-fill" data-width="58%"></div></div>
+            </div>
+            <div class="bench-row">
+              <div class="bench-row-label"><span class="name">pnpm</span><span class="val">1.14s</span></div>
+              <div class="bench-track"><div class="bench-fill alt" data-width="100%"></div></div>
+            </div>
+            <p class="bench-note">second project sharing the same graph: 0.03s vs 0.64s · partial dependency change: 0.03s vs 0.64s</p>
           </div>
-          <div class="bench-row">
-            <div class="bench-row-label"><span class="name">yarn</span><span class="val">3.40s</span></div>
-            <div class="bench-track"><div class="bench-fill alt" data-width="76%"></div></div>
-          </div>
-          <div class="bench-row">
-            <div class="bench-row-label"><span class="name">npm</span><span class="val">4.50s</span></div>
-            <div class="bench-track"><div class="bench-fill alt" data-width="100%"></div></div>
-          </div>
-          <p class="bench-note">warm store · 214 packages · median of 10 runs (illustrative)</p>
         </div>
 
         <div class="stat-list reveal">
           <div class="stat-item">
-            <div class="stat-num">0<span class="unit">re-downloads</span></div>
-            <p class="stat-label">on a store hit, every artifact is already verified and on disk</p>
+            <div class="stat-num">46×<span class="unit">faster</span></div>
+            <p class="stat-label">warm reinstalls and incremental changes vs pnpm, on the reference fixture above</p>
           </div>
           <div class="stat-item">
-            <div class="stat-num">p50 / p95<span class="unit">/ σ reported</span></div>
-            <p class="stat-label">every <code class="mono" style="font-size:13px;">bpm bench</code> run emits full timing distributions, not a single number</p>
+            <div class="stat-num">1.7×<span class="unit">faster</span></div>
+            <p class="stat-label">frozen CI installs from an empty store — the scenario every pipeline runs on every push</p>
           </div>
           <div class="stat-item">
-            <div class="stat-num">1<span class="unit">global store</span></div>
-            <p class="stat-label">shared across every project on the machine, keyed by content hash</p>
+            <div class="stat-num">0.14s<span class="unit">real project</span></div>
+            <p class="stat-label">warm reinstall of jquery's 786-package dev tree (measured on macOS during validation; <code class="mono" style="font-size:13px;">npm ci</code>: 3.4s)</p>
+          </div>
+          <div class="stat-item">
+            <div class="stat-num">honest<span class="unit">cold installs</span></div>
+            <p class="stat-label">with nothing cached anywhere, pnpm's first install still edges bpm (1.86s vs 2.14s) — bpm spends that time building the reusable graph</p>
           </div>
         </div>
       </div>
     </div>
   </section>
-  ==================== END PERFORMANCE ================= -->
 
   <!-- ================= USAGE ================= -->
   <section id="usage">

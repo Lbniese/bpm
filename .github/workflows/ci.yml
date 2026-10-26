@@ -184,7 +184,7 @@ jobs:
             --json "${RUNNER_TEMP}/current.json" \
             --compare-baseline "${RUNNER_TEMP}/baseline.json" \
             --regression-envelope "${{ github.event.inputs.regression_envelope || '2.0' }}" \
-            ${extra_flags[@]}
+            ${extra_flags[@]+"${extra_flags[@]}"}
       - name: Remove baseline worktree
         if: always()
         shell: bash
