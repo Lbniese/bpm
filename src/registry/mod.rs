@@ -2679,6 +2679,8 @@ mod tests {
         let registry = format!("http://{address}");
         let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let server_count = Arc::clone(&count);
+        let paths: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let server_paths = Arc::clone(&paths);
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let server_shutdown = Arc::clone(&shutdown);
         let server = std::thread::spawn(move || {
@@ -2723,6 +2725,7 @@ mod tests {
                             .and_then(|rest| rest.split(' ').next())
                     })
                     .unwrap_or("");
+                server_paths.lock().unwrap().push(path.to_string());
                 let body = responses.get(path).copied().unwrap_or("{}");
                 write!(
                     stream,
@@ -2768,11 +2771,17 @@ mod tests {
             batch_count = diag.batch_prefetch_fetches
         );
 
-        // Exactly 4 server requests: one per unique packument.
+        // Every unique packument was requested exactly once per path. The
+        // raw connection count is retry-tolerant: a pooled HTTP client may
+        // re-open a socket when the test server closes keep-alive
+        // connections, which surfaced as a flaky Windows off-by-one.
+        let requested = paths.lock().unwrap().clone();
+        let mut sorted = requested;
+        sorted.sort();
         assert_eq!(
-            count.load(std::sync::atomic::Ordering::SeqCst),
-            4,
-            "must issue exactly 4 requests for the 4 unique packages"
+            sorted,
+            vec!["a", "b", "c", "d"],
+            "each unique packument must be requested"
         );
     }
 
