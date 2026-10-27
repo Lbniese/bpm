@@ -170,11 +170,11 @@ impl VersionRange {
     pub fn parse(value: &str) -> Result<Self, semver::Error> {
         let mut ranges = Vec::new();
         for part in value.split("||") {
-            let part = part.trim();
+            let part = normalize_comparator_whitespace(part.trim());
             if part.is_empty() {
-                return Err(VersionReq::parse(part).unwrap_err());
+                return Err(VersionReq::parse(part.trim()).unwrap_err());
             }
-            ranges.push(VersionReq::parse(part)?);
+            ranges.push(VersionReq::parse(&part)?);
         }
         Ok(Self(ranges))
     }
@@ -186,6 +186,55 @@ impl VersionRange {
     pub fn requirements(&self) -> &[VersionReq] {
         &self.0
     }
+}
+
+/// Re-join operator tokens separated from their version by whitespace.
+///
+/// npm's grammar permits `>= 2.1.2 < 3.0.0` (spaces between comparators and
+/// between a comparator and its operand); the semver crate requires
+/// `>=2.1.2, <3.0.0` (glued operators, comma separators). Real manifests
+/// carry the npm spelling (iconv-lite depends on
+/// `safer-buffer@">= 2.1.2 < 3.0.0"`), so operators are glued to their
+/// operands and comparators are re-joined with commas before parsing.
+fn normalize_comparator_whitespace(part: &str) -> String {
+    let mut comparators: Vec<String> = Vec::new();
+    let mut pending_operator: Option<String> = None;
+    for token in part.split_whitespace() {
+        let is_operator = !token.is_empty()
+            && token
+                .chars()
+                .all(|c| matches!(c, '>' | '<' | '=' | '^' | '~'));
+        if is_operator {
+            pending_operator = Some(match pending_operator.take() {
+                Some(previous) => format!("{previous}{token}"),
+                None => token.to_string(),
+            });
+            continue;
+        }
+        match pending_operator.take() {
+            Some(operator) => comparators.push(format!("{operator}{token}")),
+            None => comparators.push(token.to_string()),
+        }
+    }
+    if let Some(operator) = pending_operator {
+        // A dangling operator (no operand) is a parse error downstream; keep
+        // it so VersionReq::parse reports the original shape.
+        comparators.push(operator);
+    }
+    let mut joined = String::new();
+    for comparator in comparators {
+        if joined.is_empty() {
+            joined.push_str(&comparator);
+        } else if joined.ends_with(',') {
+            // The input already carried its own separator.
+            joined.push(' ');
+            joined.push_str(&comparator);
+        } else {
+            joined.push_str(", ");
+            joined.push_str(&comparator);
+        }
+    }
+    joined
 }
 
 impl std::fmt::Display for VersionRange {
@@ -376,11 +425,17 @@ fn deserialize_engines<'de, D>(deserializer: D) -> Result<BTreeMap<String, Strin
 where
     D: Deserializer<'de>,
 {
+    // npm's registry accepts free-form `engines` from historical publishes:
+    // maps (`{"node": ">=18"}`), name lists, and pre-2016 bare strings
+    // (`">=0.10.40"` on qs@5.1.0). Only the map form carries engine ranges
+    // BPM can enforce; everything else is informational and treated as
+    // absent, matching npm's own arborist behavior.
     #[derive(Deserialize)]
     #[serde(untagged)]
     enum WireEngines {
         Map(BTreeMap<String, String>),
         List(Vec<String>),
+        Other(#[allow(dead_code)] serde_json::Value),
     }
 
     Ok(match WireEngines::deserialize(deserializer)? {
@@ -389,6 +444,7 @@ where
             .into_iter()
             .map(|name| (name, "*".to_string()))
             .collect(),
+        WireEngines::Other(_) => BTreeMap::new(),
     })
 }
 
@@ -1274,11 +1330,17 @@ impl PrefetchPool {
                     };
                     diag.prefetch_fetches
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let result = fetch_packument_for_spec(
+                    // The prefetch cache is name-keyed and shared by every
+                    // spec shape the resolver will later request, so the
+                    // stored packument must be the FULL one. Routing an
+                    // exact-pinned spec to the single-version endpoint here
+                    // would poison the name key for range requests on the
+                    // same package (path-to-regexp's isarray@0.0.1 prefetch
+                    // starved readable-stream's isarray@~1.0.0).
+                    let result = fetch_packument(
                         &http,
                         &job.name,
                         &job.registry,
-                        job.version_spec.as_deref(),
                         metadata_cache.as_deref(),
                         cache_mode,
                         &diag,
@@ -1451,7 +1513,7 @@ fn registry_error_for(package: &str, source: HttpError) -> RegistryError {
 pub enum RegistryError {
     #[error("invalid package spec '{0}': {1}")]
     InvalidSpec(String, String),
-    #[error("registry request for {package} failed")]
+    #[error("registry request for {package} failed: {source}")]
     Network {
         package: String,
         #[source]
@@ -1459,7 +1521,7 @@ pub enum RegistryError {
     },
     #[error("registry returned status {code} for {package}")]
     BadStatus { package: String, code: u16 },
-    #[error("registry response for {package} was not valid JSON")]
+    #[error("registry response for {package} was not valid JSON: {source}")]
     BadJson {
         package: String,
         #[source]
@@ -1656,34 +1718,6 @@ fn resolve_tarball_url(
 /// endpoint (a few KB even for packages whose full packument is megabytes);
 /// a range or tag uses the abbreviated packument. This keeps prefetch from
 /// downloading multi-megabyte packuments for pinned-exact dependencies.
-fn fetch_packument_for_spec(
-    http: &HttpClient,
-    name: &str,
-    registry: &str,
-    version_spec: Option<&str>,
-    cache: Option<&MetadataCache>,
-    mode: CacheMode,
-    diagnostics: &Arc<ResolverDiagnostics>,
-) -> Result<Packument, RegistryError> {
-    match exact_version_from_spec(name, version_spec) {
-        Some(version) => {
-            fetch_version_packument(http, name, &version, registry, cache, mode, diagnostics)
-        }
-        None => fetch_packument(http, name, registry, cache, mode, diagnostics),
-    }
-}
-
-/// If `version_spec` pins an exact version, return it. `None` for ranges, tags,
-/// or absent specs (which need the full version list to resolve).
-fn exact_version_from_spec(name: &str, version_spec: Option<&str>) -> Option<Version> {
-    let spec = version_spec?;
-    let parsed = parse_spec(&format!("{name}@{spec}")).ok()?;
-    match parsed.req {
-        VersionRequest::Exact(version) => Some(version),
-        _ => None,
-    }
-}
-
 fn fetch_packument(
     http: &HttpClient,
     name: &str,
@@ -1879,12 +1913,13 @@ pub fn select_version(
                 .filter(|v| r.matches(v))
                 .collect();
             matching.sort();
-            matching
-                .pop()
-                .ok_or_else(|| RegistryError::VersionNotFound {
-                    package: name.to_string(),
-                    req: r.to_string(),
-                })
+            if let Some(version) = matching.pop() {
+                return Ok(version);
+            }
+            Err(RegistryError::VersionNotFound {
+                package: name.to_string(),
+                req: r.to_string(),
+            })
         }
     }
 }
@@ -1995,6 +2030,49 @@ mod tests {
     }
 
     #[test]
+    fn parses_packuments_with_legacy_string_engines() {
+        // qs@5.1.0 (published 2015) carries "engines": ">=0.10.40" — a bare
+        // string. Only map-shaped engines carry enforceable ranges; any other
+        // shape is informational and treated as absent.
+        let packument: Packument = serde_json::from_str(
+            r#"{"name":"qs","dist-tags":{"latest":"5.1.0"},
+                "versions":{"5.1.0":{"name":"qs","version":"5.1.0",
+                "engines":">=0.10.40",
+                "dist":{"tarball":"https://registry.npmjs.org/qs/-/qs-5.1.0.tgz",
+                         "integrity":"sha512-SGDM48EwFLWnYYpNlOkEIRJb4wil5FKJxpR6NVfQjz6qJmX53ki7Xj1cLNEAkb70vUfJmdVLOwODyABgZyDMZw=="}}}}"#,
+        )
+        .expect("string engines must not fail packument parsing");
+        let version = packument
+            .versions
+            .get("5.1.0")
+            .expect("version present after shape normalization");
+        assert!(version.engines.is_empty());
+    }
+
+    #[test]
+    fn parses_npm_spaced_comparator_ranges() {
+        // iconv-lite depends on safer-buffer@">= 2.1.2 < 3.0.0"; npm accepts
+        // spaces between a comparator and its operand.
+        let spaced = VersionRange::parse(">= 2.1.2 < 3.0.0").unwrap();
+        assert!(spaced.matches(&Version::parse("2.1.2").unwrap()));
+        assert!(spaced.matches(&Version::parse("2.9.9").unwrap()));
+        assert!(!spaced.matches(&Version::parse("3.0.0").unwrap()));
+        assert!(!spaced.matches(&Version::parse("2.1.1").unwrap()));
+        // OR-groups keep working, with and without spaces.
+        let compound = VersionRange::parse(">= 2.1.2 < 3.0.0|| >= 4.0.0").unwrap();
+        assert!(compound.matches(&Version::parse("4.2.0").unwrap()));
+        // Already-glued comparators pass through unchanged.
+        let glued = VersionRange::parse(">=2.1.2 <3.0.0").unwrap();
+        assert!(glued.matches(&Version::parse("2.5.0").unwrap()));
+        // A dangling operator surfaces the original parse error.
+        assert!(VersionRange::parse(">=").is_err());
+        // Input already using comma separators is not double-committed.
+        let commas = VersionRange::parse(">=1.2, <2").unwrap();
+        assert!(commas.matches(&Version::parse("1.5.0").unwrap()));
+        assert!(!commas.matches(&Version::parse("2.0.0").unwrap()));
+    }
+
+    #[test]
     fn parses_bare_name_as_latest() {
         let s = parse_spec("lodash").unwrap();
         assert_eq!(s.name, "lodash");
@@ -2006,16 +2084,6 @@ mod tests {
         let s = parse_spec("@scope/pkg").unwrap();
         assert_eq!(s.name, "@scope/pkg");
         assert!(matches!(s.req, VersionRequest::Latest));
-    }
-
-    #[test]
-    fn parses_exact_version() {
-        let s = parse_spec("lodash@4.17.21").unwrap();
-        assert_eq!(s.name, "lodash");
-        match s.req {
-            VersionRequest::Exact(v) => assert_eq!(v, Version::parse("4.17.21").unwrap()),
-            other => panic!("expected exact, got {other:?}"),
-        }
     }
 
     #[test]
@@ -2511,27 +2579,6 @@ mod tests {
         assert!(!looks_like_registry_spec("/absolute/path"));
         assert!(!looks_like_registry_spec("npm:@scope/pkg"));
         assert!(!looks_like_registry_spec("patch:some-patch"));
-    }
-
-    #[test]
-    fn exact_version_from_spec_returns_some_for_exact_versions() {
-        assert_eq!(
-            exact_version_from_spec("lodash", Some("4.17.21")),
-            Some(Version::new(4, 17, 21))
-        );
-        assert_eq!(
-            exact_version_from_spec("@scope/pkg", Some("1.0.0")),
-            Some(Version::new(1, 0, 0))
-        );
-    }
-
-    #[test]
-    fn exact_version_from_spec_returns_none_for_ranges_and_tags() {
-        assert_eq!(exact_version_from_spec("lodash", Some("^4.0.0")), None);
-        assert_eq!(exact_version_from_spec("lodash", Some("~4.0.0")), None);
-        assert_eq!(exact_version_from_spec("lodash", Some("latest")), None);
-        assert_eq!(exact_version_from_spec("lodash", None::<&str>), None);
-        assert_eq!(exact_version_from_spec("lodash", Some("")), None);
     }
 
     fn version_meta(name: &str, version: &str) -> VersionMetadata {

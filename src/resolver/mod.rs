@@ -317,6 +317,53 @@ pub fn resolve_manifest_with_options_and_target_sink(
     // Validate only after the complete placement graph is known; this gives
     // the resolver a deterministic backtracking point instead of rejecting a
     // temporarily-incomplete parent context during depth-first traversal.
+    //
+    // npm v7+ auto-installs missing required peers at the consumer's parent
+    // context, so binding is a repair loop (mirrors the async resolver):
+    // each MissingRequired conflict resolves the peer like a dependency and
+    // re-binds. Conflicts that installation cannot repair surface unchanged.
+    for _ in 0..16 {
+        let paths: Vec<String> = resolver.nodes.keys().cloned().collect();
+        let mut repairs: Vec<(String, crate::resolver::peer::PeerRequest)> = Vec::new();
+        let mut conflict: Option<String> = None;
+        for path in &paths {
+            let (metadata, parent) = {
+                let node = resolver.nodes.get(path).expect("node path exists");
+                (node.metadata.clone(), parent_path(path))
+            };
+            let providers = resolver.visible_providers(&parent);
+            let visible = crate::resolver::peer::VisibleProviders::new(
+                std::iter::once(path.clone()),
+                providers,
+            );
+            match crate::resolver::peer::bind_peer_context(&metadata, &visible, peer_mode) {
+                Ok(_) => {}
+                Err(error) => match error.required_request() {
+                    Some(request) => repairs.push((parent, request)),
+                    None => {
+                        conflict = Some(error.to_string());
+                        break;
+                    }
+                },
+            }
+        }
+        if let Some(details) = conflict {
+            return Err(ResolveError::Peer(details));
+        }
+        if repairs.is_empty() {
+            break;
+        }
+        for (parent, request) in &repairs {
+            resolver
+                .resolve_dependency(parent, &request.peer, &request.range, false, false)
+                .map_err(|error| {
+                    ResolveError::Peer(format!(
+                        "auto-installing peer {}@{} for {}: {error}",
+                        request.peer, request.range, request.consumer
+                    ))
+                })?;
+        }
+    }
     let node_paths: Vec<String> = resolver.nodes.keys().cloned().collect();
     for path in node_paths {
         let (metadata, parent) = {

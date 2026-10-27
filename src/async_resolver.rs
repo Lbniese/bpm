@@ -2077,7 +2077,52 @@ pub async fn resolve_manifest_with_options_and_target_async_sink(
         PeerMode::LegacyIgnore => crate::lockfile::PeerMode::LegacyIgnore,
     };
 
-    // ── Bind peer contexts ──────────────────────────────────────────────
+    // ── Bind peer contexts ────── v2────────────────────────────────────────
+    // npm v7+ auto-installs missing required peers at the consumer's parent
+    // context, so binding is a repair loop: a MissingRequired conflict
+    // resolves the peer like a dependency and re-binds. The loop converges
+    // because each repair places a new node and the node set is finite;
+    // conflicts that cannot be repaired by installation (invalid range,
+    // unsatisfied version) surface unchanged.
+    for _ in 0..16 {
+        let node_paths: Vec<String> = res.nodes.keys().cloned().collect();
+        let mut repairs: Vec<(String, crate::resolver::peer::PeerRequest)> = Vec::new();
+        let mut conflict: Option<String> = None;
+        for path in &node_paths {
+            let (metadata, parent) = {
+                let node = res.nodes.get(path).expect("node path exists");
+                (node.metadata.clone(), resolver::parent_path(path))
+            };
+            let providers = res.visible_providers(&parent);
+            let visible = VisibleProviders::new(std::iter::once(path.clone()), providers);
+            match crate::resolver::peer::bind_peer_context(&metadata, &visible, peer_mode) {
+                Ok(_) => {}
+                Err(e) => match e.required_request() {
+                    Some(request) => repairs.push((parent.to_string(), request)),
+                    None => {
+                        conflict = Some(e.to_string());
+                        break;
+                    }
+                },
+            }
+        }
+        if let Some(details) = conflict {
+            return Err(AsyncResolveError::Peer(details));
+        }
+        if repairs.is_empty() {
+            break;
+        }
+        for (parent, request) in &repairs {
+            res.resolve_dependency(parent, &request.peer, &request.range, false, false)
+                .await
+                .map_err(|e| {
+                    AsyncResolveError::Peer(format!(
+                        "auto-installing peer {}@{} for {}: {e}",
+                        request.peer, request.range, request.consumer
+                    ))
+                })?;
+        }
+    }
     let node_paths: Vec<String> = res.nodes.keys().cloned().collect();
     for path in &node_paths {
         let (metadata, parent) = {
