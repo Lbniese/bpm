@@ -1205,6 +1205,12 @@ fn enforce_frozen(
         && root_resolution.optional_dependencies == manifest.optional_dependencies
         && root_resolution.overrides == expected_overrides
     {
+        validate_frozen_root_versions(
+            lockfile,
+            &root_declarations,
+            &expected_overrides,
+            lock_label,
+        )?;
         return Ok(());
     }
     let only_manifest = root_declarations
@@ -1256,6 +1262,50 @@ fn enforce_frozen(
             changed_specs.join(", ")
         }
     );
+}
+
+/// A frozen install must never silently install a locked root version the
+/// manifest does not declare: matching spec STRINGS do not guard against a
+/// hand-edited lock entry whose version sits outside the declared range
+/// (npm ci rejects the same inconsistency). Registry-shaped declarations
+/// only — `workspace:`, `file:`, `link:`, alias, and URL specs name other
+/// resolution machinery, and an absent placement (omitted-dev installs)
+/// is the installed set's concern, not the frozen check's.
+fn validate_frozen_root_versions(
+    lockfile: &Lockfile,
+    root_declarations: &BTreeMap<String, String>,
+    expected_overrides: &BTreeMap<String, String>,
+    lock_label: &str,
+) -> anyhow::Result<()> {
+    for (name, declared_spec) in root_declarations {
+        let effective_spec = expected_overrides.get(name).unwrap_or(declared_spec);
+        let is_registry_spec = !effective_spec.contains(':')
+            && !effective_spec.starts_with("http://")
+            && !effective_spec.starts_with("https://");
+        if !is_registry_spec {
+            continue;
+        }
+        let Ok(range) = bpm::registry::VersionRange::parse(effective_spec) else {
+            continue;
+        };
+        let Some(placement) = lockfile
+            .packages
+            .iter()
+            .find(|package| package.path == format!("node_modules/{name}"))
+        else {
+            continue;
+        };
+        let Ok(version) = semver::Version::parse(&placement.version) else {
+            continue;
+        };
+        if !range.matches(&version) {
+            anyhow::bail!(
+                "frozen install refused: {lock_label} locks {name}@{version}, \
+                 which does not satisfy the declared range {effective_spec:?}"
+            );
+        }
+    }
+    Ok(())
 }
 
 struct InstallWork {

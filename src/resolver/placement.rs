@@ -160,7 +160,14 @@ impl<'a, S: PackumentSource> GraphResolver<'a, S> {
                             .and_then(|manifest| manifest.source_dir.clone()),
                     },
                 );
-                self.resolve_children(&path, &dependencies, optional, dev)?;
+                // npm installs a workspace member's own dependencies hoisted
+                // at the project root: the member is reached through a live
+                // symlink, so Node resolves its imports from the member's
+                // real directory and only the root slots are visible to it.
+                // A root slot taken by an incompatible version nests under
+                // the link, which the live symlink exposes as the member's
+                // own `node_modules`.
+                self.resolve_children_hoisted(&path, &dependencies, optional, dev)?;
                 return Ok(Some(path));
             }
         }
@@ -295,6 +302,38 @@ impl<'a, S: PackumentSource> GraphResolver<'a, S> {
                 self.resolve_dependency(parent_path, child, child_spec, child_optional, dev)?
             {
                 if let Some(node) = self.nodes.get_mut(parent_path) {
+                    node.targets.insert(child.clone(), target);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve a workspace link's own dependencies hoisted at the project
+    /// root (npm's shape for member packages reached through live symlinks);
+    /// a conflicting root slot nests the child under the link, where the
+    /// symlink exposes it as the member's own `node_modules`.
+    fn resolve_children_hoisted(
+        &mut self,
+        member_path: &str,
+        dependencies: &BTreeMap<String, String>,
+        optional: bool,
+        dev: bool,
+    ) -> Result<(), ResolveError> {
+        for (child, child_spec) in dependencies {
+            let child_optional = self.nodes.get(member_path).is_some_and(|node| {
+                optional || node.metadata.optional_dependencies.contains_key(child)
+            });
+            let resolved = match self.resolve_dependency("", child, child_spec, child_optional, dev)
+            {
+                Ok(resolved) => resolved,
+                Err(ResolveError::PlacementConflict { .. }) => {
+                    self.resolve_dependency(member_path, child, child_spec, child_optional, dev)?
+                }
+                Err(error) => return Err(error),
+            };
+            if let Some(target) = resolved {
+                if let Some(node) = self.nodes.get_mut(member_path) {
                     node.targets.insert(child.clone(), target);
                 }
             }

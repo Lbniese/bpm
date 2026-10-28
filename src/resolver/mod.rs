@@ -291,6 +291,21 @@ pub fn resolve_manifest_with_options_and_target_sink(
             root_targets.insert(name.clone(), (spec.clone(), path));
         }
     }
+    // Workspace members are root-level links even when no manifest edge
+    // depends on them (npm links every configured member at the root), so
+    // their packages and bins resolve project-wide.
+    if let Some(workspace) = workspace {
+        for edge in workspace.top_level_links() {
+            if root_targets.contains_key(&edge.name) {
+                continue;
+            }
+            if let Some(path) =
+                resolver.resolve_dependency("", &edge.name, &edge.spec, false, false)?
+            {
+                root_targets.insert(edge.name.clone(), (edge.spec.clone(), path));
+            }
+        }
+    }
 
     let mut lock = Lockfile::new(generator);
     lock.root = RootEntry {
@@ -1208,9 +1223,81 @@ mod tests {
         assert!(workspace.link);
         assert_eq!(workspace.dependencies["b"], "^1.0.0");
         assert_eq!(workspace.bin["a"], "cli.js");
+        // The member's dependency hoists to the root: Node resolves the
+        // member's imports from its real directory (the live symlink
+        // target), so only root slots are visible to it.
         assert_eq!(
             lock.resolution.packages["node_modules/a"].dependencies["b"].target,
-            "node_modules/a/node_modules/b"
+            "node_modules/b"
+        );
+        assert!(lock
+            .packages
+            .iter()
+            .any(|package| package.path == "node_modules/b"));
+    }
+
+    #[test]
+    fn workspace_members_are_linked_without_root_declarations() {
+        // npm links every configured workspace member at the root even when
+        // nothing depends on it, and hoists the member's own dependencies to
+        // the root (the member resolves through its live symlink).
+        let project = tempfile::tempdir().unwrap();
+        fs::write(
+            project.path().join("package.json"),
+            r#"{"name":"root","version":"1.0.0","private":true,"workspaces":["packages/*"]}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(project.path().join("packages/a")).unwrap();
+        fs::create_dir_all(project.path().join("packages/b")).unwrap();
+        fs::write(
+            project.path().join("packages/a/package.json"),
+            r#"{"name":"pkg-a","version":"1.0.0","dependencies":{"pkg-b":"workspace:*"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            project.path().join("packages/b/package.json"),
+            r#"{"name":"pkg-b","version":"1.0.0"}"#,
+        )
+        .unwrap();
+
+        let client = RegistryClient::new(crate::config::NpmConfig::default());
+        let manifest = PackageManifest::from_path(&project.path().join("package.json")).unwrap();
+        let layout = crate::workspace::discover(project.path());
+        let workspace_index =
+            crate::resolver::workspaces::WorkspaceIndex::from_project_root(project.path(), &layout)
+                .unwrap();
+
+        let lock =
+            resolve_manifest_with_workspaces(&manifest, &client, "test", Some(&workspace_index))
+                .unwrap();
+
+        for name in ["pkg-a", "pkg-b"] {
+            let member = lock
+                .packages
+                .iter()
+                .find(|package| package.name == name)
+                .unwrap_or_else(|| panic!("member {name} must be linked without a root edge"));
+            assert!(member.link);
+            assert_eq!(
+                lock.resolution.packages[&member.path]
+                    .workspace_target
+                    .as_deref(),
+                Some(match name {
+                    "pkg-a" => "packages/a",
+                    _ => "packages/b",
+                })
+            );
+        }
+        // pkg-a's workspace edge resolves to the root-level pkg-b placement.
+        assert_eq!(
+            lock.resolution.packages["node_modules/pkg-a"].dependencies["pkg-b"].target,
+            "node_modules/pkg-b"
+        );
+        // No registry packages: the root declared nothing.
+        assert!(
+            lock.packages.iter().all(|package| package.link),
+            "no phantom registry placements: {:?}",
+            lock.packages
         );
     }
 

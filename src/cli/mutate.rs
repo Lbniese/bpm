@@ -21,10 +21,11 @@ use std::path::{Path, PathBuf};
 
 use bpm::http::HttpClient;
 use bpm::lockfile::{Lockfile, LockfileError, BPM_LOCK_FILE};
+use bpm::manifest::PackageManifest;
 use bpm::manifest_edit::{self, DependencySection, ManifestDocument, PublishPlan};
 use bpm::npm_lock;
 use bpm::project_lock::{find_project_lock, ProjectLockKind};
-use bpm::registry::{self, PackageSpec, RegistryError};
+use bpm::registry::{self, PackageSpec, RegistryClient, RegistryError};
 
 use super::fetch::{open_registry_client, store_root};
 use super::install;
@@ -46,13 +47,88 @@ pub(super) struct UninstallOptions {
     pub global: bool,
 }
 
+/// The manifest a mutation edits and, when it is a workspace member's, that
+/// member's project-root-relative dir. npm semantics: the nearest
+/// package.json at or above the working directory owns the edit (`cd
+/// packages/x && bpm add` edits that member); the lock and the resolution
+/// root stay at the project root either way.
+fn mutation_manifest(
+    cwd: &Path,
+    project_root: &Path,
+    layout: &bpm::workspace::WorkspaceLayout,
+) -> (PathBuf, Option<String>) {
+    for dir in cwd.ancestors() {
+        if dir == project_root {
+            break;
+        }
+        let Ok(relative) = dir.strip_prefix(project_root) else {
+            continue;
+        };
+        let relative = relative.to_string_lossy().replace('\\', "/");
+        if !layout
+            .packages
+            .iter()
+            .any(|package| package.dir == relative)
+        {
+            continue;
+        }
+        let candidate = dir.join("package.json");
+        if candidate.is_file() {
+            return (candidate, Some(relative));
+        }
+    }
+    (project_root.join("package.json"), None)
+}
+
+/// Resolve the project-root graph with the workspace index. When the edit
+/// targeted a workspace member, the root manifest stays the resolution root
+/// and the index sees the edited member manifest in place of the stale
+/// on-disk one. Returns the graph plus the manifest the lock's root section
+/// describes (the project root's, in both cases).
+fn resolve_workspace_graph(
+    project_root: &Path,
+    edited_manifest: &bpm::manifest::PackageManifest,
+    member_dir: Option<&str>,
+    client: &RegistryClient,
+    peer_mode: bpm::resolver::peer::PeerMode,
+) -> anyhow::Result<(bpm::lockfile::Lockfile, bpm::manifest::PackageManifest)> {
+    let workspace_layout = bpm::workspace::discover(project_root);
+    let workspace_index = match member_dir {
+        Some(dir) => bpm::resolver::workspaces::WorkspaceIndex::from_project_root_with_override(
+            project_root,
+            &workspace_layout,
+            dir,
+            edited_manifest.clone(),
+        ),
+        None => bpm::resolver::workspaces::WorkspaceIndex::from_project_root(
+            project_root,
+            &workspace_layout,
+        ),
+    }
+    .map_err(|error| anyhow::anyhow!("workspace resolution failed: {error}"))?;
+    let root_manifest = match member_dir {
+        Some(_) => PackageManifest::from_path(&project_root.join("package.json"))
+            .map_err(|error| anyhow::anyhow!("root package.json is invalid: {error}"))?,
+        None => edited_manifest.clone(),
+    };
+    let lockfile = bpm::resolver::resolve_manifest_with_options(
+        &root_manifest,
+        client,
+        "bpm",
+        Some(&workspace_index),
+        peer_mode,
+    )
+    .map_err(|error| anyhow::anyhow!("dependency resolution failed: {error}"))?;
+    Ok((lockfile, root_manifest))
+}
+
 /// Run `bpm add`/`bpm install <targets>`: edit package.json, resolve the whole
 /// edited graph, write the selected lock, and install.
 pub(super) fn run_add(options: &install::Options) -> anyhow::Result<()> {
     let cwd = env::current_dir()?;
     let (project_root, lock_kind) = project_root_and_lock_kind(&cwd)?;
-
-    let manifest_path = project_root.join("package.json");
+    let workspace_layout = bpm::workspace::discover(&project_root);
+    let (manifest_path, member_dir) = mutation_manifest(&cwd, &project_root, &workspace_layout);
     if !manifest_path.is_file() {
         anyhow::bail!(
             "no package.json found at {} to edit; `bpm add` mutates a local manifest",
@@ -117,35 +193,28 @@ pub(super) fn run_add(options: &install::Options) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // 5. Reparse the rendered document and resolve the entire edited manifest.
+    // 5. Reparse the rendered document and resolve the entire edited graph.
     let manifest = document
         .to_manifest()
         .map_err(|error| anyhow::anyhow!("edited package.json is invalid: {error}"))?;
     let manifest_bytes = document.render();
 
-    let workspace_layout = bpm::workspace::discover(&project_root);
-    let workspace_index = bpm::resolver::workspaces::WorkspaceIndex::from_project_root(
-        &project_root,
-        &workspace_layout,
-    )
-    .map_err(|error| anyhow::anyhow!("workspace resolution failed: {error}"))?;
     let peer_mode = if options.legacy_peer_deps {
         bpm::resolver::peer::PeerMode::LegacyIgnore
     } else {
         bpm::resolver::peer::PeerMode::Strict
     };
-    let lockfile = bpm::resolver::resolve_manifest_with_options(
+    let (lockfile, root_manifest) = resolve_workspace_graph(
+        &project_root,
         &manifest,
+        member_dir.as_deref(),
         &client,
-        "bpm",
-        Some(&workspace_index),
         peer_mode,
-    )
-    .map_err(|error| anyhow::anyhow!("dependency resolution failed: {error}"))?;
+    )?;
 
     // 6. Serialize the lock according to authority.
     let (lock_path, lock_bytes, resolved_kind) =
-        serialize_lock(&project_root, lock_kind, &lockfile, &manifest)?;
+        serialize_lock(&project_root, lock_kind, &lockfile, &root_manifest)?;
 
     // 7. Publish manifest + lock through the crash-bounded publisher. A
     //    failure here restores both files to their pre-publish state.
@@ -214,7 +283,8 @@ pub(super) fn run_link_consume(
 ) -> anyhow::Result<LinkMutationOutcome> {
     let cwd = env::current_dir()?;
     let (project_root, lock_kind) = project_root_and_lock_kind(&cwd)?;
-    let manifest_path = project_root.join("package.json");
+    let workspace_layout = bpm::workspace::discover(&project_root);
+    let (manifest_path, member_dir) = mutation_manifest(&cwd, &project_root, &workspace_layout);
     if !manifest_path.is_file() {
         anyhow::bail!(
             "no package.json in {}; `bpm link <name>` consumes a link into a project",
@@ -238,27 +308,20 @@ pub(super) fn run_link_consume(
     let config = install::effective_npm_config(&project_root, options.registry.as_deref())?;
     let http = HttpClient::new(config.clone());
     let client = open_registry_client(&store_root_path, config, http.clone(), options.cache_mode)?;
-    let workspace_layout = bpm::workspace::discover(&project_root);
-    let workspace_index = bpm::resolver::workspaces::WorkspaceIndex::from_project_root(
-        &project_root,
-        &workspace_layout,
-    )
-    .map_err(|error| anyhow::anyhow!("workspace resolution failed: {error}"))?;
     let peer_mode = if options.legacy_peer_deps {
         bpm::resolver::peer::PeerMode::LegacyIgnore
     } else {
         bpm::resolver::peer::PeerMode::Strict
     };
-    let lockfile = bpm::resolver::resolve_manifest_with_options(
+    let (lockfile, root_manifest) = resolve_workspace_graph(
+        &project_root,
         &manifest,
+        member_dir.as_deref(),
         &client,
-        "bpm",
-        Some(&workspace_index),
         peer_mode,
-    )
-    .map_err(|error| anyhow::anyhow!("dependency resolution failed: {error}"))?;
+    )?;
     let (lock_path, lock_bytes, resolved_kind) =
-        serialize_lock(&project_root, lock_kind, &lockfile, &manifest)?;
+        serialize_lock(&project_root, lock_kind, &lockfile, &root_manifest)?;
     let plan = PublishPlan {
         manifest_path,
         manifest_bytes,
@@ -299,8 +362,8 @@ pub(super) fn run_uninstall(options: UninstallOptions) -> anyhow::Result<()> {
     }
     let cwd = env::current_dir()?;
     let (project_root, lock_kind) = project_root_and_lock_kind(&cwd)?;
-
-    let manifest_path = project_root.join("package.json");
+    let workspace_layout = bpm::workspace::discover(&project_root);
+    let (manifest_path, member_dir) = mutation_manifest(&cwd, &project_root, &workspace_layout);
     if !manifest_path.is_file() {
         anyhow::bail!(
             "no package.json found at {} to edit",
@@ -340,28 +403,21 @@ pub(super) fn run_uninstall(options: UninstallOptions) -> anyhow::Result<()> {
     let http = HttpClient::new(config.clone());
     let client = open_registry_client(&store_root_path, config, http.clone(), options.cache_mode)?;
 
-    let workspace_layout = bpm::workspace::discover(&project_root);
-    let workspace_index = bpm::resolver::workspaces::WorkspaceIndex::from_project_root(
-        &project_root,
-        &workspace_layout,
-    )
-    .map_err(|error| anyhow::anyhow!("workspace resolution failed: {error}"))?;
     let peer_mode = if options.legacy_peer_deps {
         bpm::resolver::peer::PeerMode::LegacyIgnore
     } else {
         bpm::resolver::peer::PeerMode::Strict
     };
-    let lockfile = bpm::resolver::resolve_manifest_with_options(
+    let (lockfile, root_manifest) = resolve_workspace_graph(
+        &project_root,
         &manifest,
+        member_dir.as_deref(),
         &client,
-        "bpm",
-        Some(&workspace_index),
         peer_mode,
-    )
-    .map_err(|error| anyhow::anyhow!("dependency resolution failed: {error}"))?;
+    )?;
 
     let (lock_path, lock_bytes, resolved_kind) =
-        serialize_lock(&project_root, lock_kind, &lockfile, &manifest)?;
+        serialize_lock(&project_root, lock_kind, &lockfile, &root_manifest)?;
 
     let plan = PublishPlan {
         manifest_path: manifest_path.clone(),

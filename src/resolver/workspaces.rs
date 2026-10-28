@@ -108,6 +108,23 @@ impl WorkspaceIndex {
         })
     }
 
+    /// Build the index with one member's manifest overridden: a mutation
+    /// edits the member in memory and resolves before the edit is published,
+    /// so the graph must see the edited manifest, not the stale on-disk one.
+    pub fn from_project_root_with_override(
+        project_root: &Path,
+        layout: &WorkspaceLayout,
+        override_dir: &str,
+        override_manifest: PackageManifest,
+    ) -> Result<Self, WorkspaceError> {
+        Self::from_layout_with_manifest_loader(layout, |relative_path| {
+            if relative_path == override_dir {
+                return Some(override_manifest.clone());
+            }
+            PackageManifest::from_path(&project_root.join(relative_path).join("package.json")).ok()
+        })
+    }
+
     fn from_layout_with_manifest_loader<F>(
         layout: &WorkspaceLayout,
         mut load_manifest: F,

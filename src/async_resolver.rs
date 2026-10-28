@@ -1448,7 +1448,14 @@ impl<'a> AsyncGraphResolver<'a> {
                                 .and_then(|m| m.source_dir.clone()),
                         },
                     );
-                    self.resolve_children(&path, &dependencies, optional, dev)
+                    // npm installs a workspace member's own dependencies
+                    // hoisted at the project root: the member is reached
+                    // through a live symlink, so Node resolves its imports
+                    // from the member's real directory and only the root
+                    // slots are visible to it. A conflicting root slot nests
+                    // under the link, which the live symlink exposes as the
+                    // member's own `node_modules`.
+                    self.resolve_children_hoisted(&path, &dependencies, optional, dev)
                         .await?;
                     return Ok(Some(path));
                 }
@@ -1636,6 +1643,41 @@ impl<'a> AsyncGraphResolver<'a> {
                 .await?
             {
                 if let Some(node) = self.nodes.get_mut(parent_path) {
+                    node.targets.insert(child.clone(), target);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve a workspace link's own dependencies hoisted at the project
+    /// root (npm's shape for member packages reached through live symlinks);
+    /// a conflicting root slot nests the child under the link, where the
+    /// symlink exposes it as the member's own `node_modules`.
+    async fn resolve_children_hoisted(
+        &mut self,
+        member_path: &str,
+        dependencies: &BTreeMap<String, String>,
+        optional: bool,
+        dev: bool,
+    ) -> Result<(), AsyncResolveError> {
+        for (child, child_spec) in dependencies {
+            let child_optional = self.nodes.get(member_path).is_some_and(|node| {
+                optional || node.metadata.optional_dependencies.contains_key(child)
+            });
+            let resolved = match self
+                .resolve_dependency("", child, child_spec, child_optional, dev)
+                .await
+            {
+                Ok(resolved) => resolved,
+                Err(AsyncResolveError::PlacementConflict { .. }) => {
+                    self.resolve_dependency(member_path, child, child_spec, child_optional, dev)
+                        .await?
+                }
+                Err(error) => return Err(error),
+            };
+            if let Some(target) = resolved {
+                if let Some(node) = self.nodes.get_mut(member_path) {
                     node.targets.insert(child.clone(), target);
                 }
             }
@@ -2051,6 +2093,22 @@ pub async fn resolve_manifest_with_options_and_target_async_sink(
             .await?
         {
             root_targets.insert(name.clone(), (spec.clone(), path));
+        }
+    }
+    // Workspace members are root-level links even when no manifest edge
+    // depends on them (npm links every configured member at the root), so
+    // their packages and bins resolve project-wide.
+    if let Some(workspace) = workspace {
+        for edge in workspace.top_level_links() {
+            if root_targets.contains_key(&edge.name) {
+                continue;
+            }
+            if let Some(path) = res
+                .resolve_dependency("", &edge.name, &edge.spec, false, false)
+                .await?
+            {
+                root_targets.insert(edge.name.clone(), (edge.spec.clone(), path));
+            }
         }
     }
 
