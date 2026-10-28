@@ -4,7 +4,7 @@
 # internal `use bpm::…` paths and `CARGO_BIN_EXE_bpm` test references are
 # unchanged; `cargo install bloom-pm` still puts a `bpm` binary on PATH.
 name = "bloom-pm"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 description = "Bloom Package Manager: an npm-compatible, performance-focused package installer"
 license = "MIT"
