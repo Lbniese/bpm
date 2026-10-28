@@ -20,7 +20,7 @@ cd my-project
 bpm doctor              # inspect project configuration
 bpm fetch lodash        # download and cache a package by name (npm/bun-style)
 bpm fetch lodash@4.17.21 # or by exact version / semver range
-bpm import              # convert package-lock.json to bpm.lock
+bpm import              # convert package-lock.json (npm v2/v3), yarn.lock (yarn v1), or pnpm-lock.yaml (pnpm v9/v10) to bpm.lock
 bpm install --frozen    # materialize node_modules from bpm.lock
 ```
 

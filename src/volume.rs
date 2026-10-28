@@ -1766,13 +1766,11 @@ pub fn attach_project_local(
 /// `<project>/node_modules/<entry>` as a symlink to the volume entry
 /// (created or confirmed; a wrong target is replaced).
 ///
-/// OPT-IN EXPERIMENT behind `BPM_PROJECT_VIEW=relay`. Relays trade the
-/// architecture's isolation guarantee ("projects never
-/// receive writable ... relay aliases" — in-place writes under a relay reach
-/// the shared immutable graph) for a near-free attach, the same trade both
-/// bun and pnpm make by sharing file content across projects. The default
-/// remains the isolated Reflink view; this variant exists so the trade-off
-/// can be measured and decided on data.
+/// The auto-default project view on Unix (`BPM_PROJECT_VIEW` selects
+/// `reflink` or `local` explicitly). Relays trade the architecture's
+/// isolation guarantee (in-place writes under a relay reach the shared
+/// immutable graph) for a near-free attach — the same trade bun and pnpm
+/// make by sharing file content across projects.
 #[cfg(unix)]
 pub fn attach_project_relay(
     project_root: &Path,

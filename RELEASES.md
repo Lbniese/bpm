@@ -47,9 +47,13 @@ and `gh release download ... --pattern SHA256SUMS*` then
 `install.sh` follows `latest` automatically — smoke it without sudo:
 
 ```bash
-BPM_VERSION=vX.Y.Z BPM_INSTALL_DIR="$(mktemp -d)" \
-  curl -fsSL https://raw.githubusercontent.com/Lbniese/bpm/main/install.sh | sh
+export BPM_VERSION=vX.Y.Z BPM_INSTALL_DIR="$(mktemp -d)"
+curl -fsSL https://raw.githubusercontent.com/Lbniese/bpm/main/install.sh | sh
+"$BPM_INSTALL_DIR/bpm" --version
 ```
+
+(The `export` matters: `VAR=... curl ... | sh` scopes the variables to
+`curl`, and the installer `sh` never sees them.)
 
 ## 3. Publish to crates.io
 
