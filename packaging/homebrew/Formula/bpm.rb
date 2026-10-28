@@ -1,29 +1,29 @@
 class Bpm < Formula
   desc "Bloom Package Manager: an npm-compatible, performance-focused package installer"
   homepage "https://lbniese.github.io/bpm/"
-  url "https://github.com/Lbniese/bpm/releases/download/v0.5.0/bpm-x86_64-apple-darwin.tar.gz"
-  sha256 "667f7b793b4afbaf1cda92b3bbe7c084bdad73663247491b01bed3e301ca718f"
+  url "https://github.com/Lbniese/bpm/releases/download/v0.5.1/bpm-x86_64-apple-darwin.tar.gz"
+  sha256 "ed892f9f43adfd9bf6e2473774135a20affdc5680fb6eaa7528de4c425634d22"
   license "MIT"
 
   # Release tarballs are a single prebuilt `bpm` binary per target; the
   # checksums come from the signed SHA256SUMS on each release.
   on_macos do
     if Hardware::CPU.intel?
-      url "https://github.com/Lbniese/bpm/releases/download/v0.5.0/bpm-x86_64-apple-darwin.tar.gz"
-      sha256 "667f7b793b4afbaf1cda92b3bbe7c084bdad73663247491b01bed3e301ca718f"
+      url "https://github.com/Lbniese/bpm/releases/download/v0.5.1/bpm-x86_64-apple-darwin.tar.gz"
+      sha256 "ed892f9f43adfd9bf6e2473774135a20affdc5680fb6eaa7528de4c425634d22"
     else
-      url "https://github.com/Lbniese/bpm/releases/download/v0.5.0/bpm-aarch64-apple-darwin.tar.gz"
-      sha256 "f0ecb226835db71983178aef2d7ea360a5e2f7df6ebba6be2c9f3f79a7cfc8fc"
+      url "https://github.com/Lbniese/bpm/releases/download/v0.5.1/bpm-aarch64-apple-darwin.tar.gz"
+      sha256 "1fc24fa417f91bedb082a8280dbf1610de59e20c4d48d2e3dee35f1dbfcae9ad"
     end
   end
 
   on_linux do
     if Hardware::CPU.intel?
-      url "https://github.com/Lbniese/bpm/releases/download/v0.5.0/bpm-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "151528f86d262820c8ea64b225106df3b9dc3c86605f1e26e7144ade1574c3b0"
+      url "https://github.com/Lbniese/bpm/releases/download/v0.5.1/bpm-x86_64-unknown-linux-gnu.tar.gz"
+      sha256 "8b3d2998e1d07215f4d8354d3232da4e32d6f110ba6228b241b5af5100792e1a"
     else
-      url "https://github.com/Lbniese/bpm/releases/download/v0.5.0/bpm-aarch64-unknown-linux-gnu.tar.gz"
-      sha256 "96b8c023d82b5f2eb9c5e8be36ddf38c299d2c9898dbd3400ceda25e47e97cb7"
+      url "https://github.com/Lbniese/bpm/releases/download/v0.5.1/bpm-aarch64-unknown-linux-gnu.tar.gz"
+      sha256 "a0e9795559013658083613dc7c7e2c6819a1d1d7a7372105488082a9a3405c3f"
     end
   end
 
