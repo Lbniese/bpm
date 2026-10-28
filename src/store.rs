@@ -461,6 +461,43 @@ impl ArtifactStore {
         }
     }
 
+    /// Ensure a locally computed artifact (a patched tarball) is stored
+    /// content-addressed exactly once. The bytes' digest is the artifact id,
+    /// so publication is verification; repeated calls with the same bytes
+    /// perform no work.
+    pub fn ensure_artifact_from_bytes(
+        &self,
+        bytes: &[u8],
+        metrics: &mut Metrics,
+    ) -> Result<ArtifactRef, StoreError> {
+        let mut hasher = Sha512::new();
+        hasher.update(bytes);
+        let mut digest = [0u8; 64];
+        digest.copy_from_slice(&hasher.finalize());
+        let id = Sha512Digest::from_bytes(digest);
+        let _guard = self.acquire_lock(&id.to_hex())?;
+        let dest = self.artifact_path(&id);
+        if dest.exists() {
+            metrics.record("artifact_publish", std::time::Duration::ZERO);
+            return Ok(ArtifactRef {
+                id,
+                path: dest,
+                cached: true,
+            });
+        }
+        let tmp = self.unique_tmp(&format!("patch-{}", id.to_hex()))?;
+        let published = metrics.measure("artifact_publish", || -> Result<bool, StoreError> {
+            fs::write(&tmp, bytes).map_err(|source| io_err(&tmp, source))?;
+            self.publish_file(&tmp, &dest)
+        });
+        let created = published?;
+        Ok(ArtifactRef {
+            id,
+            path: dest,
+            cached: !created,
+        })
+    }
+
     /// Ensure the extracted image for `id` exists, extracting once if needed.
     /// Repeated calls perform no extraction work. Requires the archive to exist.
     pub fn ensure_image(

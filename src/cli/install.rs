@@ -470,7 +470,12 @@ pub(super) fn install_resolved_lockfile(
         None
     };
 
-    let work = build_install_work(&lockfile, options.frozen, lock_kind.filename())?;
+    let work = build_install_work(
+        &lockfile,
+        options.frozen,
+        lock_kind.filename(),
+        project_root,
+    )?;
     let workers = adaptive_workers(options.concurrency, work.len(), project_root);
     let download_workers = download_worker_count(workers);
     let outcomes = std::thread::scope(|scope| -> anyhow::Result<Vec<FetchOutcome>> {
@@ -1260,6 +1265,13 @@ struct InstallWork {
     name: String,
     url: String,
     integrity: Option<Integrity>,
+    /// Patch overlay for entries whose lock source is `LockSource::Patch`
+    /// with an http(s) `resolved`: URL and integrity describe the INNER
+    /// artifact and the patch applies between verification and extraction,
+    /// producing its own content-addressed artifact. Native patch
+    /// resolution instead publishes the patched artifact itself and names
+    /// it in `resolved`, which needs no overlay here.
+    patch: Option<PathBuf>,
 }
 
 struct FetchOutcome {
@@ -1280,7 +1292,9 @@ struct PendingArtifact {
 struct FetchFail {
     name: String,
     url: String,
-    source: Box<StoreError>,
+    /// Store failures and patch-overlay failures both surface here; the
+    /// concrete types only share the error trait.
+    source: Box<dyn std::error::Error + Send + Sync>,
 }
 
 /// Adapts the resolver's [`ResolveSink`] to the install download pipeline's
@@ -1296,6 +1310,7 @@ impl resolver::ResolveSink for ChannelSink {
             name: unit.name,
             url: unit.url,
             integrity: unit.integrity,
+            patch: None,
         });
     }
 }
@@ -1539,7 +1554,7 @@ fn spawn_fetch_pipeline<'scope, 'env>(
                 let speculative = item.path.is_none();
                 governor.acquire();
                 let dl_start = Instant::now();
-                let result = if let Some(remote) = remote.as_ref() {
+                let fetched = if let Some(remote) = remote.as_ref() {
                     store
                         .ensure_artifact_with_remote(
                             &http,
@@ -1556,18 +1571,34 @@ fn spawn_fetch_pipeline<'scope, 'env>(
                         item.integrity.as_ref(),
                         &mut local,
                     )
-                }
-                .map(|artifact| PendingArtifact {
-                    path: item.path.clone(),
-                    name: item.name.clone(),
-                    url: item.url.clone(),
-                    artifact,
-                })
-                .map_err(|source| FetchFail {
-                    name: item.name.clone(),
-                    url: item.url.clone(),
-                    source: Box::new(source),
-                });
+                };
+                let result = (|| -> Result<PendingArtifact, FetchFail> {
+                    let mut artifact = fetched.map_err(|source| FetchFail {
+                        name: item.name.clone(),
+                        url: item.url.clone(),
+                        source: Box::new(source),
+                    })?;
+                    // A patch overlay applies between verification and
+                    // extraction: the fetched artifact is the inner tarball
+                    // named by the lock's resolved + integrity, and the
+                    // patched bytes are published as their own
+                    // content-addressed artifact whose id images and volume
+                    // staging key from.
+                    if let Some(patch_path) = &item.patch {
+                        artifact = apply_install_patch(store, &artifact, patch_path, &mut local)
+                            .map_err(|error| FetchFail {
+                                name: item.name.clone(),
+                                url: item.url.clone(),
+                                source: Box::new(error),
+                            })?;
+                    }
+                    Ok(PendingArtifact {
+                        path: item.path.clone(),
+                        name: item.name.clone(),
+                        url: item.url.clone(),
+                        artifact,
+                    })
+                })();
                 // Cache hits carry no congestion signal; only fresh network
                 // downloads feed the governor, with their transferred size.
                 let network = result
@@ -1908,6 +1939,7 @@ impl resolver::ResolveSink for TryChannelSink {
             name: unit.name,
             url: unit.url,
             integrity: unit.integrity,
+            patch: None,
         };
         if let Err(err) = self.tx.try_send(work) {
             // Retain the unit exactly once in emission order. A `Full` channel
@@ -1947,6 +1979,7 @@ impl resolver::ResolveSink for TryChannelSink {
             name: hint.name,
             url: hint.url,
             integrity: hint.integrity,
+            patch: None,
         };
         // Speculation must never create post-resolution overflow or block the
         // tokio worker. If the pipeline is busy, drop the hint; placement will
@@ -2701,10 +2734,49 @@ fn finalize_install(
     write_metrics(metrics, options.json_metrics.clone())
 }
 
+/// Error applying a lockfile patch overlay during install.
+#[derive(Debug, thiserror::Error)]
+enum PatchApplyError {
+    #[error("cannot read patch overlay {path}: {source}")]
+    Read {
+        path: String,
+        source: std::io::Error,
+    },
+    #[error("cannot read the fetched artifact to patch: {0}")]
+    Artifact(#[from] StoreError),
+    #[error("{0}")]
+    Apply(#[from] bpm::patch::PatchError),
+}
+
+/// Apply a lockfile patch overlay between verification and extraction. The
+/// fetched artifact is the inner tarball named by the lock's resolved +
+/// integrity; the patched bytes are published as their own content-addressed
+/// artifact, and the patched id flows to image extraction and volume staging
+/// unchanged.
+fn apply_install_patch(
+    store: &ArtifactStore,
+    artifact: &bpm::store::ArtifactRef,
+    patch_path: &Path,
+    metrics: &mut Metrics,
+) -> Result<bpm::store::ArtifactRef, PatchApplyError> {
+    let patch_text = fs::read_to_string(patch_path).map_err(|source| PatchApplyError::Read {
+        path: patch_path.display().to_string(),
+        source,
+    })?;
+    let artifact_file = store.artifact_path(&artifact.id);
+    let bytes = fs::read(&artifact_file).map_err(|source| PatchApplyError::Read {
+        path: artifact_file.display().to_string(),
+        source,
+    })?;
+    let patched = bpm::patch::apply_unified_patch_to_tgz(&bytes, &patch_text)?;
+    Ok(store.ensure_artifact_from_bytes(&patched, metrics)?)
+}
+
 fn build_install_work(
     lockfile: &Lockfile,
     frozen: bool,
     lock_label: &str,
+    project_root: &Path,
 ) -> anyhow::Result<Vec<InstallWork>> {
     let mut work = Vec::new();
     let target = resolver::current_target_platform();
@@ -2770,11 +2842,28 @@ fn build_install_work(
             ),
             None => None,
         };
+        // A patch overlay shifts the entry to the inner-artifact convention:
+        // resolved+integrity describe the unpatched registry tarball and the
+        // overlay applies after verification. Native patch entries instead
+        // name the patched store artifact directly and need no overlay.
+        let patch =
+            lockfile.resolution.packages.get(&package.path).and_then(
+                |resolution| match &resolution.source {
+                    LockSource::Patch { patch, .. }
+                        if package.resolved.starts_with("http://")
+                            || package.resolved.starts_with("https://") =>
+                    {
+                        Some(project_root.join(patch))
+                    }
+                    _ => None,
+                },
+            );
         work.push(InstallWork {
             path: Some(package.path.clone()),
             name: package.name.clone(),
             url: package.resolved.clone(),
             integrity,
+            patch,
         });
     }
     Ok(work)

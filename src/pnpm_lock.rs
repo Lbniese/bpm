@@ -9,16 +9,20 @@
 //!
 //! pnpm 10 writes multi-document locks (install contexts separated by
 //! `---`); the document with the largest `packages` map is imported and
-//! the selection is recorded as a diagnostic. Patched entries, `file:`
-//! directory dependencies, and metadata-only entries without a fetchable
-//! resolution are refused with diagnostics rather than guessed.
+//! the selection is recorded as a diagnostic. Patched entries resolve to
+//! their base package plus a [`crate::lockfile::LockSource::Patch`]
+//! overlay (the patch file comes from the lock's or the project's
+//! `patchedDependencies` table and must live inside the project),
+//! `file:` directory dependencies become live link entries like workspace
+//! links, and metadata-only entries without a fetchable resolution are
+//! refused with diagnostics rather than guessed.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 
 use crate::diagnostic::{sort_diagnostics, Diagnostic, Severity};
 use crate::hoist::Placer;
-use crate::lockfile::{Lockfile, PackageEntry, RootEntry};
+use crate::lockfile::{LockSource, Lockfile, PackageEntry, PackageResolution, RootEntry};
 use crate::manifest::PackageManifest;
 use crate::npm_lock::ImportReport;
 
@@ -285,9 +289,15 @@ fn split_flow_key(text: &str) -> Result<(String, &str), String> {
 
 /// Parse every YAML document in `text` (pnpm 10 writes multiple, separated
 /// by `---`).
+///
+/// Explicit key syntax (`? <key>` then `: <value>`) is pre-normalized into
+/// ordinary `key: value` lines: pnpm emits it for package ids longer than
+/// YAML's key-line threshold (common in locks with deep peer suffixes).
 pub(crate) fn parse_documents(text: &str) -> Result<Vec<Yaml>, String> {
     let mut documents = Vec::new();
     let mut current: Vec<(usize, String)> = Vec::new();
+    // A `? <key>` line waits for its `: <value>` line at the same indent.
+    let mut pending_key: Option<(usize, String)> = None;
     for raw in text.lines() {
         let trimmed_end = raw.trim_end();
         if trimmed_end == "---" || trimmed_end == "..." {
@@ -300,6 +310,35 @@ pub(crate) fn parse_documents(text: &str) -> Result<Vec<Yaml>, String> {
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
+        let indent = trimmed_end.len() - trimmed.len();
+        if let Some((key_indent, key)) = pending_key.take() {
+            if trimmed.starts_with(':') && indent == key_indent {
+                // `: <first entry>` opens the value's map: the key line plus
+                // the remainder re-indented as that map's first entry. A
+                // non-mapping scalar folds into a one-line entry instead.
+                let inline = trimmed[1..].trim();
+                match split_key(inline) {
+                    Some((name, Some(value))) => {
+                        current.push((key_indent, format!("{key}:")));
+                        current.push((key_indent + 2, format!("{name}: {value}")));
+                    }
+                    Some((name, None)) => {
+                        current.push((key_indent, format!("{key}:")));
+                        current.push((key_indent + 2, format!("{name}:")));
+                    }
+                    // A scalar value (`: 1.3.0`).
+                    _ => current.push((key_indent, format!("{key}: {inline}"))),
+                }
+                continue;
+            }
+            // No `: <value>` line: the key's value is null.
+            current.push((key_indent, format!("{key}:")));
+            // Fall through to process the current line normally.
+        }
+        if let Some(key) = trimmed.strip_prefix("? ") {
+            pending_key = Some((indent, unquote(key)));
+            continue;
+        }
         if trimmed.contains(" #") {
             return Err(format!("inline comments are unsupported: {trimmed:?}"));
         }
@@ -308,8 +347,10 @@ pub(crate) fn parse_documents(text: &str) -> Result<Vec<Yaml>, String> {
                 "anchors and block scalars are unsupported: {trimmed:?}"
             ));
         }
-        let indent = trimmed_end.len() - trimmed.len();
         current.push((indent, trimmed.to_string()));
+    }
+    if let Some((key_indent, key)) = pending_key.take() {
+        current.push((key_indent, format!("{key}:")));
     }
     if !current.is_empty() {
         documents.push(current);
@@ -339,18 +380,30 @@ struct PnpmEntry {
     cpu: Vec<String>,
 }
 
-/// Strip pnpm id decorations: leading `/`, peer-suffix parens, and detect
-/// patch suffixes (refused by the caller).
-fn normalize_id(id: &str) -> Option<String> {
-    if id.contains("_patch=") {
-        return None;
-    }
-    let bare = id.strip_prefix('/').unwrap_or(id);
-    let base = match bare.find('(') {
-        Some(at) => &bare[..at],
-        None => bare,
+/// Markers pnpm appends to package ids for patched dependencies
+/// (`/foo@1.0.0_patch=<hash>`; pnpm 10 also writes `_patch_hash=` and
+/// `(patch_hash=` forms). A package named `foo_patch` never matches: the
+/// markers continue with `=` or `(`, not an id character.
+fn patch_marker_at(id: &str) -> Option<usize> {
+    ["_patch=", "_patch_hash=", "(patch_hash="]
+        .iter()
+        .filter_map(|marker| id.find(marker))
+        .min()
+}
+
+/// Strip pnpm id decorations: leading `/`, peer-suffix parens, and patch
+/// suffixes (patched ids normalize onto their base package so dependency
+/// edges compose; the patch overlay is recorded separately).
+fn normalize_id(id: &str) -> String {
+    let id = match patch_marker_at(id) {
+        Some(at) => &id[..at],
+        None => id,
     };
-    Some(base.to_string())
+    let bare = id.strip_prefix('/').unwrap_or(id);
+    match bare.find('(') {
+        Some(at) => bare[..at].to_string(),
+        None => bare.to_string(),
+    }
 }
 
 /// Lexically normalize a slash path (resolve `.` and `..` without touching
@@ -383,6 +436,109 @@ fn split_registry_id(id: &str) -> Option<(String, String)> {
 fn derive_registry_url(name: &str, version: &str) -> String {
     let base = name.rsplit('/').next().unwrap_or(name);
     format!("https://registry.npmjs.org/{name}/-/{base}-{version}.tgz")
+}
+
+/// Patch table entries (`name@version` or bare `name` -> patch path) from a
+/// YAML node; pnpm writes either a bare path string or a `{path, hash}` map.
+fn patches_from_yaml(node: Option<&Yaml>) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for (key, value) in node.map(Yaml::entries).unwrap_or_default() {
+        let path = value
+            .as_str()
+            .map(str::to_string)
+            .or_else(|| value.get("path").and_then(Yaml::as_str).map(str::to_string));
+        if let Some(path) = path {
+            out.insert(key.to_string(), path);
+        }
+    }
+    out
+}
+
+/// The `patchedDependencies` table from the root manifest's package.json
+/// (pnpm <= 9 records it there).
+fn read_manifest_patches(manifest_path: &Path) -> Result<BTreeMap<String, String>, PnpmLockError> {
+    let text = std::fs::read_to_string(manifest_path).map_err(|source| PnpmLockError::Read {
+        path: manifest_path.display().to_string(),
+        source,
+    })?;
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        // A manifest that fails JSON parsing is the manifest loader's error
+        // to report; the import itself only needs this one table.
+        return Ok(BTreeMap::new());
+    };
+    match value.get("patchedDependencies") {
+        None | Some(serde_json::Value::Null) => Ok(BTreeMap::new()),
+        Some(value) => serde_json::from_value(value.clone()).map_err(|error| {
+            PnpmLockError::Manifest(format!("malformed patchedDependencies: {error}"))
+        }),
+    }
+}
+
+/// Patch file paths for patched packages, merged from every place pnpm
+/// records them (later wins): pnpm 10 keeps the table in
+/// `pnpm-workspace.yaml` and mirrors it (with the content hash) in the
+/// lock's own top-level `patchedDependencies`, which is authoritative;
+/// older pnpm records the table in the root manifest.
+fn merged_patch_paths(
+    document: &Yaml,
+    manifest_path: &Path,
+) -> Result<BTreeMap<String, String>, PnpmLockError> {
+    let mut paths = std::fs::read_to_string(manifest_path.with_file_name("pnpm-workspace.yaml"))
+        .ok()
+        .and_then(|text| parse_documents(&text).ok())
+        .and_then(|documents| documents.first().cloned())
+        .map(|config| patches_from_yaml(config.get("patchedDependencies")))
+        .unwrap_or_default();
+    paths.extend(read_manifest_patches(manifest_path)?);
+    paths.extend(patches_from_yaml(document.get("patchedDependencies")));
+    Ok(paths)
+}
+
+/// The real package name behind an importer `npm:` alias specifier
+/// (`npm:obug@1.0.2` -> `obug`, `npm:@scope/foo` -> `@scope/foo`; a range
+/// part is optional).
+fn alias_real_name(spec: &str) -> String {
+    match spec.rfind('@') {
+        Some(at) if at > 0 => spec[..at].to_string(),
+        _ => spec.to_string(),
+    }
+}
+
+/// Clone the real entry's artifact fields into a synthetic entry named for
+/// the alias: consumers require the alias NAME while the artifact is the
+/// real package. The real entry's dependency edges come along so a package
+/// referenced ONLY through the alias still places its own dependencies.
+fn push_alias_entry(
+    entries: &mut Vec<PnpmEntry>,
+    by_id: &mut BTreeMap<String, usize>,
+    alias_name: &str,
+    real_index: usize,
+) -> usize {
+    let real = entries[real_index].clone();
+    let version = real.version.clone();
+    entries.push(PnpmEntry {
+        name: alias_name.to_string(),
+        version: real.version,
+        resolved: real.resolved,
+        integrity: real.integrity,
+        dependencies: real.dependencies,
+        optional_dependencies: real.optional_dependencies,
+        os: real.os,
+        cpu: real.cpu,
+        ..Default::default()
+    });
+    let alias_index = entries.len() - 1;
+    by_id.insert(format!("{alias_name}@{version}"), alias_index);
+    alias_index
+}
+
+/// The directory target of a pnpm `file:` dependency id: bare
+/// (`file:libs/local`) or id-prefixed (`local-lib@file:libs/local`).
+fn file_target_of(id: &str) -> Option<&str> {
+    match id.split_once("@file:") {
+        Some((_, target)) => (!target.is_empty()).then_some(target),
+        None => id.strip_prefix("file:").filter(|target| !target.is_empty()),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -452,15 +608,17 @@ pub fn import_pnpm_v9(
     // Workspace links, from importers AND snapshot edges (`vue: link:packages/vue`).
     let mut links: BTreeMap<String, String> = BTreeMap::new();
     let mut by_id: BTreeMap<String, usize> = BTreeMap::new();
+    // Identities whose importer version field carried a patch hash — pnpm 10
+    // keeps the packages entry under the BASE id, so the importer field is
+    // where a patch is visible. A flagged identity without a usable
+    // `patchedDependencies` entry is refused rather than installed unpatched.
+    let mut patched_importer_flags: BTreeSet<String> = BTreeSet::new();
+    // Patch file paths for patched packages, from the lock's own
+    // `patchedDependencies` table plus the manifest (and pnpm 10's
+    // pnpm-workspace.yaml); see `merged_patch_paths`.
+    let patched_dependencies = merged_patch_paths(document, manifest_path)?;
     for (id, metadata) in packages.entries() {
-        let Some(normalized) = normalize_id(id) else {
-            diagnostics.push(Diagnostic::new(
-                Severity::Warning,
-                "PNPM_PATCH_UNSUPPORTED",
-                format!("patched package {id:?} cannot be imported yet"),
-            ));
-            continue;
-        };
+        let normalized = normalize_id(id);
         if by_id.contains_key(&normalized) {
             continue;
         }
@@ -474,17 +632,27 @@ pub fn import_pnpm_v9(
             .and_then(|r| r.get("tarball"))
             .and_then(Yaml::as_str)
             .map(str::to_string);
-        if integrity.is_none() && tarball.is_none() {
-            continue;
-        }
         let (name, version) = match split_registry_id(&normalized) {
             Some(parts) => parts,
             None => (String::new(), normalized.clone()),
         };
-        let resolved = tarball
-            .clone()
-            .filter(|url| !url.is_empty())
-            .unwrap_or_else(|| derive_registry_url(&name, &version));
+        // File-directory entries (`local-lib@file:libs/local`) carry no
+        // fetchable resolution: they materialize through their link
+        // placement and only contribute dependency edges.
+        let is_file_entry = version.starts_with("file:");
+        if integrity.is_none() && tarball.is_none() && !is_file_entry {
+            continue;
+        }
+        // File-directory entries materialize through their link placement;
+        // they carry no tarball to derive a URL for.
+        let resolved = if is_file_entry {
+            String::new()
+        } else {
+            tarball
+                .clone()
+                .filter(|url| !url.is_empty())
+                .unwrap_or_else(|| derive_registry_url(&name, &version))
+        };
         let index = entries.len();
         entries.push(PnpmEntry {
             name,
@@ -504,9 +672,7 @@ pub fn import_pnpm_v9(
         by_id.insert(normalized, index);
     }
     for (id, edges) in snapshots.map(Yaml::entries).unwrap_or_default() {
-        let Some(normalized) = normalize_id(id) else {
-            continue;
-        };
+        let normalized = normalize_id(id);
         let Some(&index) = by_id.get(&normalized) else {
             continue;
         };
@@ -533,7 +699,7 @@ pub fn import_pnpm_v9(
             // Peer-context variants of the same version can resolve a
             // dependency differently; the FIRST variant (pnpm's primary,
             // file order) wins so one entry carries one consistent edge set.
-            if let Some(norm) = target.as_str().and_then(normalize_id) {
+            if let Some(norm) = target.as_str().map(normalize_id) {
                 entry.dependencies.entry(dep.to_string()).or_insert(norm);
             }
         }
@@ -542,7 +708,7 @@ pub fn import_pnpm_v9(
             .map(Yaml::entries)
             .unwrap_or_default()
         {
-            if let Some(norm) = target.as_str().and_then(normalize_id) {
+            if let Some(norm) = target.as_str().map(normalize_id) {
                 entry.dependencies.entry(dep.to_string()).or_insert(norm);
                 entry.optional_dependencies.insert(dep.to_string());
             }
@@ -552,7 +718,7 @@ pub fn import_pnpm_v9(
             .map(Yaml::entries)
             .unwrap_or_default()
         {
-            if let Some(norm) = target.as_str().and_then(normalize_id) {
+            if let Some(norm) = target.as_str().map(normalize_id) {
                 // Peers recorded with a resolved target resolve like ordinary
                 // deps; a `true`/absent target is a met-peer marker only.
                 if by_id.contains_key(&norm) {
@@ -586,7 +752,9 @@ pub fn import_pnpm_v9(
         entries[index].name = name;
     }
     entries.retain(|entry| {
-        let keep = !entry.name.is_empty();
+        // File-directory entries are named by their importing declaration
+        // later; only registry-shaped entries need a name already.
+        let keep = !entry.name.is_empty() || entry.version.starts_with("file:");
         if !keep {
             diagnostics.push(Diagnostic::new(
                 Severity::Warning,
@@ -650,6 +818,52 @@ pub fn import_pnpm_v9(
         );
     }
 
+    // Manifest-level `npm:` aliases (`"debug": "npm:obug@1.0.2"`): the
+    // importer `version` field carries the REAL package's id and only the
+    // specifier names it. Expand each into a synthetic entry named for the
+    // alias, so the importer loop's ordinary lookup finds the artifact under
+    // the declared name (npm places alias installs at `node_modules/<name>`).
+    for (_, importer) in importers.entries() {
+        for group in ["dependencies", "devDependencies", "optionalDependencies"] {
+            for (name, spec) in importer.get(group).map(Yaml::entries).unwrap_or_default() {
+                let Some(fields) = spec.get("version").and_then(Yaml::as_str) else {
+                    continue;
+                };
+                if fields.starts_with("link:")
+                    || file_target_of(fields).is_some()
+                    || fields.starts_with("https://")
+                {
+                    continue;
+                }
+                let normalized = normalize_id(fields);
+                if by_id.contains_key(&format!("{name}@{normalized}")) {
+                    continue;
+                }
+                let Some(real_name) = spec
+                    .get("specifier")
+                    .and_then(Yaml::as_str)
+                    .and_then(|s| s.strip_prefix("npm:"))
+                    .map(alias_real_name)
+                else {
+                    continue;
+                };
+                let real = by_id
+                    .get(&format!("{real_name}@{normalized}"))
+                    .or_else(|| by_id.get(&normalized))
+                    .copied();
+                if let Some(real_index) = real {
+                    let alias_index = push_alias_entry(&mut entries, &mut by_id, name, real_index);
+                    // Importer fields carry the real package's FULL id
+                    // (`is-odd@3.0.1`), so the importer loop's first lookup
+                    // probe is `alias@<full id>`; index the synthetic under
+                    // that shape too (the canonical `alias@version` key from
+                    // `push_alias_entry` stays for BFS identity lookups).
+                    by_id.insert(format!("{name}@{normalized}"), alias_index);
+                }
+            }
+        }
+    }
+
     // Dependency keys are bare versions (`10.0.0`) or full ids (tarball
     // URLs); registry keys compose with the dependency name.
     let lookup = |name: &str, key: &str| -> Option<usize> {
@@ -670,12 +884,15 @@ pub fn import_pnpm_v9(
     for (path, importer) in importers.entries() {
         for group in ["dependencies", "devDependencies", "optionalDependencies"] {
             for (name, spec) in importer.get(group).map(Yaml::entries).unwrap_or_default() {
-                if let Some(target) = spec
+                // Workspace and file-directory links both resolve relative to
+                // the declaring importer and materialize as live links. File
+                // ids are bare (`file:libs/local`) or id-prefixed
+                // (`local-lib@file:libs/local`).
+                let target = spec
                     .get("version")
                     .and_then(Yaml::as_str)
-                    .and_then(|v| v.strip_prefix("link:"))
-                {
-                    // Link targets are relative to the DECLARING importer.
+                    .and_then(|v| v.strip_prefix("link:").or_else(|| file_target_of(v)));
+                if let Some(target) = target {
                     let resolved = normalize_path(&format!("{path}/{target}"));
                     let resolved = if importer_paths.contains(&resolved) {
                         resolved
@@ -756,18 +973,49 @@ pub fn import_pnpm_v9(
                     }
                     continue;
                 }
-                let Some(normalized) = normalize_id(fields) else {
-                    diagnostics.push(Diagnostic::new(
-                        Severity::Warning,
-                        "PNPM_PATCH_UNSUPPORTED",
-                        format!("patched dependency {name:?} cannot be imported yet"),
-                    ));
+                if file_target_of(fields).is_some() {
+                    // File-directory links were collected in the pre-pass; a
+                    // declared root edge keeps the manifest's specifier for
+                    // the drift check, and the linked directory's own
+                    // dependencies resolve from the link's context. The
+                    // placement name is the DECLARED key (npm semantics), not
+                    // the linked package's own name.
+                    if importer_path == "." && !root_dependencies.contains_key(name) {
+                        root_dependencies.insert(
+                            name.to_string(),
+                            spec.get("specifier")
+                                .and_then(Yaml::as_str)
+                                .unwrap_or(fields)
+                                .to_string(),
+                        );
+                    }
+                    if let Some(&index) = by_id.get(fields) {
+                        entries[index].name = name.to_string();
+                        if !seeds.iter().any(|(seed, _, _)| *seed == index) {
+                            seeds.push((
+                                index,
+                                context.clone(),
+                                Reach {
+                                    prod: kind.prod || importer_path != ".",
+                                    optional_only: kind.optional_only && importer_path == ".",
+                                    any_optional: kind.any_optional || kind.optional_only,
+                                },
+                            ));
+                        }
+                    }
                     continue;
-                };
+                }
+                let normalized = normalize_id(fields);
                 if importer_path == "." && root_dependencies.contains_key(name) {
                     continue;
                 }
                 if let Some(index) = lookup(name, &normalized) {
+                    if patch_marker_at(fields).is_some() {
+                        patched_importer_flags.insert(format!(
+                            "{}@{}",
+                            entries[index].name, entries[index].version
+                        ));
+                    }
                     if importer_path == "." {
                         root_dependencies.insert(
                             name.to_string(),
@@ -826,6 +1074,34 @@ pub fn import_pnpm_v9(
     let mut visited: BTreeSet<(usize, String)> = BTreeSet::new();
     while let Some((index, dependent, kind)) = queue.pop_front() {
         let entry = &entries[index];
+        if entry.version.starts_with("file:") {
+            // File-directory entries materialize through their link
+            // placement, never as their own package placement; only their
+            // dependency edges join the graph, resolving from the link's
+            // context like npm resolves a symlinked package's deps.
+            if visited.insert((index, dependent.clone())) {
+                let link_context = if entry.name.is_empty() {
+                    String::new()
+                } else {
+                    format!("node_modules/{}", entry.name)
+                };
+                for (dep_name, dep_key) in &entry.dependencies {
+                    if let Some(dep_index) = lookup(dep_name, dep_key) {
+                        let optional = entry.optional_dependencies.contains(dep_name);
+                        queue.push_back((
+                            dep_index,
+                            link_context.clone(),
+                            Reach {
+                                prod: kind.prod,
+                                optional_only: kind.optional_only && optional,
+                                any_optional: optional,
+                            },
+                        ));
+                    }
+                }
+            }
+            continue;
+        }
         let identity = format!("{}@{}", entry.name, entry.version);
         if !visited.insert((index, dependent.clone())) {
             if let Some(existing) = reach.get_mut(&identity) {
@@ -867,6 +1143,7 @@ pub fn import_pnpm_v9(
     lockfile.resolution.root.dev_dependencies = manifest.dev_dependencies.clone();
     lockfile.resolution.root.optional_dependencies = manifest.optional_dependencies.clone();
 
+    let project_root = lock_path.parent().unwrap_or_else(|| Path::new("."));
     for (index, path) in placed_entries {
         let entry = &entries[index];
         let identity = format!("{}@{}", entry.name, entry.version);
@@ -879,8 +1156,47 @@ pub fn import_pnpm_v9(
         for (dep, key) in &entry.dependencies {
             dependencies.insert(dep.clone(), key.clone());
         }
+        // A patch-flagged identity resolves to its base package plus a patch
+        // overlay; when the flag has no usable `patchedDependencies` entry,
+        // the placement is refused rather than silently installing unpatched
+        // content.
+        let overlay = if patched_importer_flags.contains(&identity) {
+            match patched_dependencies
+                .get(&identity)
+                .or_else(|| patched_dependencies.get(&entry.name))
+            {
+                Some(patch) => {
+                    let escapes = patch.starts_with("../")
+                        || std::path::Path::new(patch).is_absolute()
+                        || patch.split('/').any(|segment| segment == "..");
+                    if escapes || !project_root.join(patch).is_file() {
+                        diagnostics.push(Diagnostic::new(
+                            Severity::Warning,
+                            "PNPM_PATCH_UNSUPPORTED",
+                            format!(
+                                "patched package {identity:?} declares patch file {patch:?}, which is missing or outside the project; it cannot be imported"
+                            ),
+                        ));
+                        continue;
+                    }
+                    Some(patch.clone())
+                }
+                None => {
+                    diagnostics.push(Diagnostic::new(
+                        Severity::Warning,
+                        "PNPM_PATCH_UNSUPPORTED",
+                        format!(
+                            "patched package {identity:?} has no patchedDependencies entry; declare it with a patch file inside the project"
+                        ),
+                    ));
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
         lockfile.packages.push(PackageEntry {
-            path,
+            path: path.clone(),
             name: entry.name.clone(),
             version: entry.version.clone(),
             resolved: entry.resolved.clone(),
@@ -894,8 +1210,30 @@ pub fn import_pnpm_v9(
             bin: BTreeMap::new(),
             dependencies,
         });
+        if let Some(patch) = overlay {
+            lockfile.resolution.packages.insert(
+                path,
+                PackageResolution {
+                    source: LockSource::Patch {
+                        source: Box::new(LockSource::Registry {
+                            registry: "https://registry.npmjs.org".to_string(),
+                        }),
+                        patch,
+                    },
+                    dev_optional: !kind.prod,
+                    peer: false,
+                    libc: Vec::new(),
+                    dependencies: BTreeMap::new(),
+                    optional_dependencies: BTreeMap::new(),
+                    peer_dependencies: BTreeMap::new(),
+                    optional_peers: BTreeSet::new(),
+                    peer_context: BTreeMap::new(),
+                    workspace_target: None,
+                    has_install_script: false,
+                },
+            );
+        }
     }
-    let project_root = lock_path.parent().unwrap_or_else(|| Path::new("."));
     for (name, target) in &links {
         // An npm-shaped tree can only materialize in-repo workspace links;
         // pnpm monorepos sometimes link across sibling checkouts
@@ -972,16 +1310,65 @@ mod tests {
     }
 
     #[test]
+    fn parses_explicit_key_syntax() {
+        // pnpm emits `? <long id>` / `: <value>` when a package id exceeds
+        // YAML's plain key-line threshold.
+        let documents = parse_documents(
+            "packages:\n\n  short@1.0.0:\n    resolution: {integrity: sha512-S}\n\n  ? 'long@1.0.0(react@19.0.0)(typescript@5.9.3)'\n  : resolution: {integrity: sha512-L}\n    engines: {node: '>=18'}\n\nsnapshots:\n\n  long@1.0.0(react@19.0.0)(typescript@5.9.3):\n    dependencies:\n      short: 1.0.0\n",
+        )
+        .unwrap();
+        let root = &documents[0];
+        let long = root
+            .get("packages")
+            .and_then(|packages| packages.get("long@1.0.0(react@19.0.0)(typescript@5.9.3)"))
+            .expect("explicit key parsed as a packages entry");
+        assert_eq!(
+            long.get("resolution")
+                .and_then(|resolution| resolution.get("integrity"))
+                .and_then(Yaml::as_str),
+            Some("sha512-L")
+        );
+        let engines = long
+            .get("engines")
+            .map(Yaml::string_list)
+            .unwrap_or_default();
+        assert!(engines.is_empty(), "engines is a map, not a list");
+        assert_eq!(
+            long.get("engines")
+                .and_then(|engines| engines.get("node"))
+                .and_then(Yaml::as_str),
+            Some(">=18")
+        );
+        let edge = root
+            .get("snapshots")
+            .and_then(|snapshots| snapshots.get("long@1.0.0(react@19.0.0)(typescript@5.9.3)"))
+            .and_then(|snapshot| snapshot.get("dependencies"))
+            .and_then(|dependencies| dependencies.get("short"))
+            .and_then(Yaml::as_str);
+        assert_eq!(edge, Some("1.0.0"));
+    }
+
+    #[test]
     fn normalizes_ids() {
         assert_eq!(
             normalize_id("/@scope/util@1.0.0(util@2.0.0)"),
-            Some("@scope/util@1.0.0".to_string())
+            "@scope/util@1.0.0".to_string()
         );
+        assert_eq!(normalize_id("left-pad@1.3.0"), "left-pad@1.3.0".to_string());
+        // Patch suffixes normalize onto the base package; a package genuinely
+        // named with a `_patch` prefix never matches (the marker continues
+        // with `=` or `(`).
+        assert_eq!(normalize_id("foo@1.0.0_patch=abc"), "foo@1.0.0".to_string());
         assert_eq!(
-            normalize_id("left-pad@1.3.0"),
-            Some("left-pad@1.3.0".to_string())
+            normalize_id("foo@1.0.0_patch_hash=abc"),
+            "foo@1.0.0".to_string()
         );
-        assert_eq!(normalize_id("foo@1.0.0_patch=abc"), None);
+        assert_eq!(normalize_id("foo_patch@1.0.0"), "foo_patch@1.0.0");
+        assert_eq!(
+            patch_marker_at("foo_patch@1.0.0"),
+            None,
+            "a `_patch` name prefix is not a patch marker"
+        );
     }
 
     #[test]
@@ -1042,6 +1429,257 @@ mod tests {
         assert_eq!(
             lock.root.dependencies.get("left-pad").map(String::as_str),
             Some("^1.3.0")
+        );
+    }
+
+    fn write_manifest(dir: &Path, json: &str) {
+        std::fs::write(dir.join("package.json"), json).unwrap();
+    }
+
+    #[test]
+    fn imports_root_npm_alias_under_the_declared_name() {
+        // Real pnpm shape: the importer version field carries the real
+        // package's FULL id (`is-odd@3.0.1`), only the specifier names the
+        // alias.
+        let lock = "---\nlockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies:\n      debug:\n        specifier: npm:obug@1.0.2\n        version: obug@1.0.2\n\npackages:\n\n  obug@1.0.2:\n    resolution: {integrity: sha512-OOOO}\n    dependencies:\n      tiny: 1.0.0\n\n  tiny@1.0.0:\n    resolution: {integrity: sha512-TTTT}\n\nsnapshots:\n\n  obug@1.0.2:\n    dependencies:\n      tiny: 1.0.0\n";
+        let dir = tempfile::tempdir().unwrap();
+        write_manifest(
+            dir.path(),
+            r#"{"name":"app","dependencies":{"debug":"npm:obug@1.0.2"}}"#,
+        );
+        std::fs::write(dir.path().join("pnpm-lock.yaml"), lock).unwrap();
+        let report = import_pnpm_v9(
+            &dir.path().join("pnpm-lock.yaml"),
+            &dir.path().join("package.json"),
+        )
+        .unwrap();
+        assert!(
+            !report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "PNPM_MISSING_RESOLUTION"),
+            "alias must resolve through the real package: {:?}",
+            report.diagnostics
+        );
+        let alias = report
+            .lockfile
+            .packages
+            .iter()
+            .find(|package| package.name == "debug")
+            .expect("alias placed under the declared name");
+        assert_eq!(alias.path, "node_modules/debug");
+        assert_eq!(alias.version, "1.0.2");
+        assert_eq!(
+            alias.resolved,
+            "https://registry.npmjs.org/obug/-/obug-1.0.2.tgz"
+        );
+        // The alias placement carries the real package's dependency edges.
+        let tiny = report
+            .lockfile
+            .packages
+            .iter()
+            .find(|package| package.name == "tiny")
+            .expect("alias target's dependencies install");
+        assert_eq!(tiny.path, "node_modules/tiny");
+        assert_eq!(
+            report
+                .lockfile
+                .root
+                .dependencies
+                .get("debug")
+                .map(String::as_str),
+            Some("npm:obug@1.0.2"),
+            "the root edge keeps the manifest's specifier for the drift check"
+        );
+    }
+
+    #[test]
+    fn imports_file_directory_dependency_as_a_link() {
+        // Real pnpm 10 shape: the importer version field and the packages
+        // key carry `<real-name>@file:<path>`; the placement name is the
+        // importer's declared key.
+        let lock = "---\nlockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies:\n      local:\n        specifier: file:libs/local\n        version: local-lib@file:libs/local\n\npackages:\n\n  local-lib@file:libs/local:\n    resolution: {directory: libs/local, type: directory}\n    dependencies:\n      tiny: 1.0.0\n\n  tiny@1.0.0:\n    resolution: {integrity: sha512-TTTT}\n\nsnapshots:\n\n  local-lib@file:libs/local:\n    dependencies:\n      tiny: 1.0.0\n";
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("libs/local")).unwrap();
+        write_manifest(
+            dir.path(),
+            r#"{"name":"app","dependencies":{"local":"file:libs/local"}}"#,
+        );
+        std::fs::write(dir.path().join("pnpm-lock.yaml"), lock).unwrap();
+        let report = import_pnpm_v9(
+            &dir.path().join("pnpm-lock.yaml"),
+            &dir.path().join("package.json"),
+        )
+        .unwrap();
+        assert!(
+            !report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "PNPM_LINK_OUTSIDE_PROJECT"),
+            "in-project file dep must link: {:?}",
+            report.diagnostics
+        );
+        let link = report
+            .lockfile
+            .packages
+            .iter()
+            .find(|package| package.name == "local")
+            .expect("file dep placed under its declared name");
+        assert!(link.link);
+        assert_eq!(link.workspace_target.as_deref(), Some("libs/local"));
+        assert_eq!(link.path, "node_modules/local");
+        // The linked directory's own dependencies join the hoisted graph.
+        let tiny = report
+            .lockfile
+            .packages
+            .iter()
+            .find(|package| package.name == "tiny")
+            .expect("file dep's dependencies install");
+        assert_eq!(tiny.path, "node_modules/tiny");
+        assert_eq!(
+            report
+                .lockfile
+                .root
+                .dependencies
+                .get("local")
+                .map(String::as_str),
+            Some("file:libs/local")
+        );
+    }
+
+    #[test]
+    fn imports_patched_dependency_with_a_patch_overlay() {
+        let lock = "---\nlockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies:\n      left-pad:\n        specifier: 1.3.0\n        version: 1.3.0(patch_hash=abc)\n\npackages:\n\n  left-pad@1.3.0_patch=abc:\n    resolution: {integrity: sha512-LLLL}\n\nsnapshots:\n\n  left-pad@1.3.0_patch=abc: {}\n";
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("patches")).unwrap();
+        std::fs::write(
+            dir.path().join("patches/left-pad-1.3.0.patch"),
+            "--- a/index.js\n+++ b/index.js\n",
+        )
+        .unwrap();
+        write_manifest(
+            dir.path(),
+            r#"{"name":"app","dependencies":{"left-pad":"1.3.0"},"patchedDependencies":{"left-pad@1.3.0":"patches/left-pad-1.3.0.patch"}}"#,
+        );
+        std::fs::write(dir.path().join("pnpm-lock.yaml"), lock).unwrap();
+        let report = import_pnpm_v9(
+            &dir.path().join("pnpm-lock.yaml"),
+            &dir.path().join("package.json"),
+        )
+        .unwrap();
+        assert!(
+            !report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "PNPM_PATCH_UNSUPPORTED"),
+            "declared patch must import: {:?}",
+            report.diagnostics
+        );
+        let package = report
+            .lockfile
+            .packages
+            .iter()
+            .find(|package| package.name == "left-pad")
+            .expect("base package resolves under the patched id");
+        assert_eq!(package.version, "1.3.0");
+        assert_eq!(package.integrity.as_deref(), Some("sha512-LLLL"));
+        let resolution = report
+            .lockfile
+            .resolution
+            .packages
+            .get("node_modules/left-pad")
+            .expect("patch overlay recorded");
+        match &resolution.source {
+            LockSource::Patch { source, patch } => {
+                assert_eq!(patch, "patches/left-pad-1.3.0.patch");
+                assert!(matches!(**source, LockSource::Registry { .. }));
+            }
+            other => panic!("expected a patch overlay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn imports_pnpm10_patch_table_from_the_lock_itself() {
+        // pnpm 10 records patchedDependencies (with the patch path) in the
+        // lock and in pnpm-workspace.yaml; the packages entry stays under the
+        // BASE id and only importer/snapshot ids carry the hash suffix.
+        let lock = "---\nlockfileVersion: '9.0'\n\npatchedDependencies:\n  is-odd@3.0.1:\n    hash: 5d8f\n    path: patches/is-odd@3.0.1.patch\n\nimporters:\n\n  .:\n    dependencies:\n      is-odd:\n        specifier: 3.0.1\n        version: 3.0.1(patch_hash=5d8f)\n\npackages:\n\n  is-odd@3.0.1:\n    resolution: {integrity: sha512-LLLL}\n\nsnapshots:\n\n  is-odd@3.0.1(patch_hash=5d8f):\n    dependencies:\n      is-number: 6.0.0\n\n  is-number@6.0.0: {}\n";
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("patches")).unwrap();
+        std::fs::write(
+            dir.path().join("patches/is-odd@3.0.1.patch"),
+            "--- a/index.js\n+++ b/index.js\n",
+        )
+        .unwrap();
+        write_manifest(
+            dir.path(),
+            r#"{"name":"app","dependencies":{"is-odd":"3.0.1"}}"#,
+        );
+        std::fs::write(dir.path().join("pnpm-lock.yaml"), lock).unwrap();
+        let report = import_pnpm_v9(
+            &dir.path().join("pnpm-lock.yaml"),
+            &dir.path().join("package.json"),
+        )
+        .unwrap();
+        assert!(
+            !report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "PNPM_PATCH_UNSUPPORTED"),
+            "lock-declared patch must import: {:?}",
+            report.diagnostics
+        );
+        let package = report
+            .lockfile
+            .packages
+            .iter()
+            .find(|package| package.name == "is-odd")
+            .expect("patched base resolves");
+        assert_eq!(package.version, "3.0.1");
+        let resolution = report
+            .lockfile
+            .resolution
+            .packages
+            .get("node_modules/is-odd")
+            .expect("patch overlay recorded");
+        match &resolution.source {
+            LockSource::Patch { patch, .. } => {
+                assert_eq!(patch, "patches/is-odd@3.0.1.patch")
+            }
+            other => panic!("expected a patch overlay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn refuses_patched_dependency_without_a_usable_declaration() {
+        let lock = "---\nlockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies:\n      left-pad:\n        specifier: 1.3.0\n        version: 1.3.0(patch_hash=abc)\n\npackages:\n\n  left-pad@1.3.0_patch=abc:\n    resolution: {integrity: sha512-LLLL}\n\nsnapshots:\n\n  left-pad@1.3.0_patch=abc: {}\n";
+        let dir = tempfile::tempdir().unwrap();
+        // No patchedDependencies in the manifest, no patch file on disk.
+        write_manifest(
+            dir.path(),
+            r#"{"name":"app","dependencies":{"left-pad":"1.3.0"}}"#,
+        );
+        std::fs::write(dir.path().join("pnpm-lock.yaml"), lock).unwrap();
+        let report = import_pnpm_v9(
+            &dir.path().join("pnpm-lock.yaml"),
+            &dir.path().join("package.json"),
+        )
+        .unwrap();
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "PNPM_PATCH_UNSUPPORTED"),
+            "an undeclared patch must refuse rather than install unpatched: {:?}",
+            report.diagnostics
+        );
+        assert!(
+            !report
+                .lockfile
+                .packages
+                .iter()
+                .any(|package| package.name == "left-pad"),
+            "the patched placement must not be emitted unpatched"
         );
     }
 }
